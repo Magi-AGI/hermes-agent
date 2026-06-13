@@ -303,6 +303,7 @@ from hermes_cli.subcommands.skills import build_skills_parser
 from hermes_cli.subcommands.pairing import build_pairing_parser
 from hermes_cli.subcommands.plugins import build_plugins_parser
 from hermes_cli.subcommands.mcp import build_mcp_parser
+from hermes_cli.subcommands.trace import build_trace_parser
 from hermes_cli.subcommands.claw import build_claw_parser
 
 
@@ -4200,6 +4201,13 @@ def cmd_status(args):
     from hermes_cli.status import show_status
 
     show_status(args)
+
+
+def cmd_trace(args):
+    """Upload a session transcript to Hugging Face Agent Trace Viewer."""
+    from hermes_cli.trace import run_trace
+
+    run_trace(args)
 
 
 def cmd_cron(args):
@@ -12219,7 +12227,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "project", "proxy",
         "prompt-size",
         "send", "sessions", "setup",
-        "skills", "slack", "status", "tools", "uninstall", "update",
+        "skills", "slack", "status", "tools", "trace", "uninstall", "update",
         "version", "webhook", "whatsapp", "whatsapp-cloud", "chat", "secrets", "security",
         # Help-ish invocations — plugin commands not being listed in
         # top-level --help is an acceptable trade-off for skipping an
@@ -13071,6 +13079,11 @@ def main():
     # skills command  (parser built in hermes_cli/subcommands/skills.py)
     # =========================================================================
     build_skills_parser(subparsers, cmd_skills=cmd_skills)
+
+    # =========================================================================
+    # trace command  (parser built in hermes_cli/subcommands/trace.py)
+    # =========================================================================
+    build_trace_parser(subparsers, cmd_trace=cmd_trace)
 
     # =========================================================================
     # bundles command — skill bundles (alias /<name> for multiple skills)
