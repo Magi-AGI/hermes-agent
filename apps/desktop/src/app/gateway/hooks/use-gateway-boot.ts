@@ -25,7 +25,7 @@ import {
 } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile, normalizeProfileKey, touchActiveGatewayBackend } from '@/store/profile'
-import { secondaryWindowProfile } from '@/store/windows'
+import { isSecondaryWindow, secondaryWindowProfile } from '@/store/windows'
 import {
   $activeSessionId,
   $attentionSessionIds,
@@ -375,6 +375,19 @@ export function useGatewayBoot({
           const fallbackProfile = normalizeProfileKey(profileFromWindow ?? conn.profile)
           $activeGatewayProfile.set(fallbackProfile)
           setPrimaryGateway(gateway, fallbackProfile)
+        }
+
+        if (isSecondaryWindow()) {
+          // Secondary pop-out windows render one chat and have no sidebar. Avoid
+          // the primary-window boot tail (config + full session-list REST calls):
+          // those calls go through hermes:api and can stall a pop-out for the full
+          // backend timeout while the owning profile is busy. Route-resume loads
+          // the specific stored transcript after the gateway is open.
+          setSessionsLoading(false)
+          completeDesktopBoot()
+          bootCompleted = true
+
+          return
         }
 
         setDesktopBootStep({

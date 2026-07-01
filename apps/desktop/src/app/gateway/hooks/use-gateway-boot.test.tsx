@@ -105,13 +105,19 @@ function fakeDesktop() {
   }
 }
 
-function Harness() {
+function Harness({
+  refreshHermesConfig = async () => undefined,
+  refreshSessions = async () => undefined
+}: {
+  refreshHermesConfig?: () => Promise<void>
+  refreshSessions?: () => Promise<void>
+} = {}) {
   useGatewayBoot({
     handleGatewayEvent: () => undefined,
     onConnectionReady: () => undefined,
     onGatewayReady: () => undefined,
-    refreshHermesConfig: async () => undefined,
-    refreshSessions: async () => undefined
+    refreshHermesConfig,
+    refreshSessions
   })
 
   return null
@@ -184,6 +190,19 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
 
     expect(desktop.getConnection).toHaveBeenCalledWith('wikireader')
     expect($activeGatewayProfile.get()).toBe('wikireader')
+  })
+
+  it('does not run primary-window config/session refresh during secondary-window boot', async () => {
+    window.history.replaceState(null, '', '/?win=secondary&profile=wikireader#/session-1')
+    const refreshHermesConfig = vi.fn(async () => undefined)
+    const refreshSessions = vi.fn(async () => undefined)
+
+    render(<Harness refreshHermesConfig={refreshHermesConfig} refreshSessions={refreshSessions} />)
+    await flushAsync()
+
+    expect($gatewayState.get()).toBe('open')
+    expect(refreshHermesConfig).not.toHaveBeenCalled()
+    expect(refreshSessions).not.toHaveBeenCalled()
   })
 
   it('INITIAL boot against a dead VPS: getConnection hangs (waitForHermes) → app sits in the connecting combo, then fails', async () => {

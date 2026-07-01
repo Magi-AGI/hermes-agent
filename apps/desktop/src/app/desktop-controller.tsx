@@ -1030,7 +1030,7 @@ export function DesktopController() {
   }, [gatewayState, refreshCronJobs])
 
   useEffect(() => {
-    if (gatewayState === 'open' && !activeSessionId && freshDraftReady) {
+    if (!isSecondaryWindow() && gatewayState === 'open' && !activeSessionId && freshDraftReady) {
       void refreshCurrentModel()
       void refreshHermesConfig()
     }
