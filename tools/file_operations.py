@@ -31,7 +31,7 @@ import difflib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, ClassVar
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from tools.binary_extensions import BINARY_EXTENSIONS
 
 from agent.file_safety import (
@@ -720,6 +720,132 @@ def normalize_search_pagination(offset: Any = DEFAULT_SEARCH_OFFSET,
     normalized_offset = max(0, _coerce_int(offset, DEFAULT_SEARCH_OFFSET))
     normalized_limit = max(1, _coerce_int(limit, DEFAULT_SEARCH_LIMIT))
     return normalized_offset, normalized_limit
+
+
+_WINDOWS_CLOUD_DIR_PATTERNS: tuple[str, ...] = (
+    "OneDrive*",
+    "Dropbox",
+    "iCloudDrive",
+    "Google Drive",
+    "GoogleDrive",
+)
+
+
+def _is_local_windows_search_backend(env: object) -> bool:
+    """Return True when search_files is operating on the local Windows host.
+
+    File operations can target remote/container backends even when Hermes itself
+    runs on Windows. Cloud-placeholder protection is only meaningful for the
+    local host filesystem; applying Windows path rules to a Linux container path
+    would be a false positive.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        from tools.environments.local import LocalEnvironment
+    except Exception:  # noqa: BLE001
+        return False
+    return isinstance(env, LocalEnvironment)
+
+
+def _normalize_windows_search_path(path: str) -> str:
+    """Normalize Win32/MSYS path spellings for string-level safety checks."""
+    value = os.path.expandvars(os.path.expanduser(str(path or ""))).strip().replace("\\", "/")
+    # Git Bash/MSYS spellings: /c/Users/Alice -> C:/Users/Alice
+    m = re.match(r"^/([A-Za-z])/(.*)$", value)
+    if m:
+        value = f"{m.group(1).upper()}:/{m.group(2)}"
+    # file:///C:/Users/Alice occasionally arrives from dragged paths.
+    if value.lower().startswith("file:///") and len(value) > 8:
+        value = value[8:]
+    while len(value) > 3 and value.endswith("/"):
+        value = value[:-1]
+    return value
+
+
+def _windows_home_path() -> str:
+    return _normalize_windows_search_path(os.environ.get("USERPROFILE") or str(Path.home()))
+
+
+def _windows_effective_search_root(path: str, cwd: str) -> str:
+    raw = str(path or ".").strip()
+    if raw in {"", "."}:
+        return _normalize_windows_search_path(cwd)
+    normalized = _normalize_windows_search_path(raw)
+    if re.match(r"^[A-Za-z]:/", normalized) or normalized.startswith("//"):
+        return normalized
+    base = _normalize_windows_search_path(cwd)
+    try:
+        return _normalize_windows_search_path(str(PureWindowsPath(base) / normalized))
+    except Exception:  # noqa: BLE001
+        return normalized
+
+
+def _windows_path_parts(path: str) -> list[str]:
+    normalized = _normalize_windows_search_path(path)
+    parts = [part for part in re.split(r"/+", normalized) if part]
+    if parts and re.fullmatch(r"[A-Za-z]:", parts[0]):
+        parts = parts[1:]
+    return parts
+
+
+def _windows_cloud_dir_component(path: str) -> Optional[str]:
+    for part in _windows_path_parts(path):
+        lower = part.lower()
+        if lower.startswith("onedrive"):
+            return part
+        if lower in {"dropbox", "iclouddrive", "google drive", "googledrive"}:
+            return part
+    return None
+
+
+def _windows_cloud_search_error(path: str, cwd: str, env: object) -> Optional[str]:
+    """Return a fail-closed error for dangerous Windows search roots."""
+    if not _is_local_windows_search_backend(env):
+        return None
+
+    root = _windows_effective_search_root(path, cwd)
+    home = _windows_home_path()
+    if root.lower() == home.lower():
+        return (
+            "Refusing broad search rooted at the Windows home directory. "
+            "Use an explicit project subdirectory instead; searching home can "
+            "traverse OneDrive/Dropbox Files-On-Demand placeholders and hydrate "
+            "large cloud trees."
+        )
+
+    cloud_component = _windows_cloud_dir_component(root)
+    if cloud_component:
+        return (
+            f"Refusing to search Windows cloud-sync directory '{cloud_component}' "
+            "because content search can hydrate offline placeholder files. Move "
+            "the target into a local project folder or search a narrower, fully "
+            "available checkout."
+        )
+
+    return None
+
+
+def _windows_cloud_rg_glob_args(enabled: bool) -> list[str]:
+    if not enabled:
+        return []
+    args: list[str] = []
+    for pattern in _WINDOWS_CLOUD_DIR_PATTERNS:
+        args.extend(["--glob", f"!{pattern}/**"])
+    return args
+
+
+def _windows_cloud_grep_exclude_args(enabled: bool) -> list[str]:
+    if not enabled:
+        return []
+    return [f"--exclude-dir={pattern}" for pattern in _WINDOWS_CLOUD_DIR_PATTERNS]
+
+
+def _windows_cloud_find_prune_expr(enabled: bool, escape) -> str:
+    if not enabled:
+        return ""
+    name_expr = " -o ".join(f"-iname {escape(pattern)}" for pattern in _WINDOWS_CLOUD_DIR_PATTERNS)
+    return f"\\( -type d \\( {name_expr} \\) -prune \\) -o "
 
 
 _REGEX_NEWLINE_ESCAPE_RE = re.compile(r"(?<!\\)(?:\\\\)*\\n")
@@ -1980,6 +2106,11 @@ class ShellFileOperations(FileOperations):
         """
         offset, limit = normalize_search_pagination(offset, limit)
 
+        effective_cwd = getattr(self.env, 'cwd', None) or self.cwd
+        safety_error = _windows_cloud_search_error(path, effective_cwd, self.env)
+        if safety_error:
+            return SearchResult(error=safety_error, total_count=0)
+
         # Expand ~ and other shell paths
         path = self._expand_path(path)
         
@@ -2053,6 +2184,10 @@ class ShellFileOperations(FileOperations):
         # Exclude hidden directories (matching ripgrep's default behavior).
         hidden_exclude = "-not -path '*/.*'" if not has_hidden_path_ancestor else ""
         hidden_filter_expr = f" {hidden_exclude}" if hidden_exclude else ""
+        cloud_prune_expr = _windows_cloud_find_prune_expr(
+            _is_local_windows_search_backend(self.env),
+            self._escape_shell_arg,
+        )
 
         # Use shell pagination for standard roots. For hidden roots, gather full
         # output so we can re-apply hidden-descendant filtering while allowing
@@ -2061,7 +2196,7 @@ class ShellFileOperations(FileOperations):
         if not has_hidden_path_ancestor:
             pagination_expr = f" | tail -n +{offset + 1} | head -n {limit}"
 
-        cmd = f"find {self._escape_shell_arg(path)}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
+        cmd = f"find {self._escape_shell_arg(path)} {cloud_prune_expr}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
               f"-printf '%T@ %p\\n' 2>/dev/null | sort -rn{pagination_expr}"
 
         result = self._exec(cmd, timeout=60)
@@ -2069,7 +2204,7 @@ class ShellFileOperations(FileOperations):
 
         if not stdout.strip() and not limit_reason:
             # Try without -printf (BSD find compatibility -- macOS)
-            cmd_simple = f"find {self._escape_shell_arg(path)}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
+            cmd_simple = f"find {self._escape_shell_arg(path)} {cloud_prune_expr}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
                         f"2>/dev/null | sort -rn{pagination_expr}"
             result = self._exec(cmd_simple, timeout=60)
             stdout, limit_reason = _search_stdout_and_limit(result)
@@ -2124,9 +2259,15 @@ class ShellFileOperations(FileOperations):
             glob_pattern = pattern
 
         fetch_limit = limit + offset
+        cloud_glob_args = _windows_cloud_rg_glob_args(_is_local_windows_search_backend(self.env))
+        cloud_glob_expr = " ".join(
+            f"{arg} {self._escape_shell_arg(value)}"
+            for arg, value in zip(cloud_glob_args[0::2], cloud_glob_args[1::2])
+        )
+        cloud_glob_expr = f" {cloud_glob_expr}" if cloud_glob_expr else ""
         # Try mtime-sorted first (rg 13+); fall back to unsorted if not supported.
         cmd_sorted = (
-            f"rg --files --sortr=modified -g {self._escape_shell_arg(glob_pattern)} "
+            f"rg --files --sortr=modified{cloud_glob_expr} -g {self._escape_shell_arg(glob_pattern)} "
             f"{self._escape_shell_arg(path)} 2>/dev/null "
             f"| head -n {fetch_limit}"
         )
@@ -2137,7 +2278,7 @@ class ShellFileOperations(FileOperations):
         if not all_files and not limit_reason:
             # --sortr may have failed on older rg; retry without it.
             cmd_plain = (
-                f"rg --files -g {self._escape_shell_arg(glob_pattern)} "
+                f"rg --files{cloud_glob_expr} -g {self._escape_shell_arg(glob_pattern)} "
                 f"{self._escape_shell_arg(path)} 2>/dev/null "
                 f"| head -n {fetch_limit}"
             )
@@ -2177,6 +2318,9 @@ class ShellFileOperations(FileOperations):
                         limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
         """Search using ripgrep."""
         cmd_parts = ["rg", "--line-number", "--no-heading", "--with-filename"]
+
+        for arg in _windows_cloud_rg_glob_args(_is_local_windows_search_backend(self.env)):
+            cmd_parts.append(arg if arg == "--glob" else self._escape_shell_arg(arg))
         
         # Add context if requested
         if context > 0:
@@ -2307,6 +2451,9 @@ class ShellFileOperations(FileOperations):
         # Exclude hidden directories (matching ripgrep's default behavior).
         # This prevents searching inside .hub/index-cache/, .git/, etc.
         cmd_parts.append("--exclude-dir='.*'")
+        for arg in _windows_cloud_grep_exclude_args(_is_local_windows_search_backend(self.env)):
+            key, value = arg.split("=", 1)
+            cmd_parts.append(f"{key}={self._escape_shell_arg(value)}")
         
         # Add context if requested
         if context > 0:
