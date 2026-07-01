@@ -5988,7 +5988,12 @@ ipcMain.handle('hermes:window:openSession', async (_event, sessionId, opts) => {
     return { ok: false, error: 'invalid-session-id' }
   }
 
-  createSessionWindow(sessionId.trim(), { watch: opts?.watch === true })
+  const profile = typeof opts?.profile === 'string' ? opts.profile.trim() : ''
+
+  createSessionWindow(sessionId.trim(), {
+    watch: opts?.watch === true,
+    ...(profile ? { profile } : {})
+  })
 
   return { ok: true }
 })

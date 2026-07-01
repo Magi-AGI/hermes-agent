@@ -1,5 +1,22 @@
 const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const path = require('node:path')
 const test = require('node:test')
+
+function readSource(name) {
+  return fs.readFileSync(path.join(__dirname, name), 'utf8').replace(/\r\n/g, '\n')
+}
+
+function openSessionIpcSnippet() {
+  const source = readSource('main.cjs')
+  const start = source.indexOf("ipcMain.handle('hermes:window:openSession'")
+  const end = source.indexOf("ipcMain.handle('hermes:window:openNewSession'", start)
+
+  assert.notEqual(start, -1, 'openSession IPC handler missing')
+  assert.notEqual(end, -1, 'openNewSession IPC handler missing after openSession handler')
+
+  return source.slice(start, end)
+}
 
 const {
   buildSessionWindowUrl,
@@ -97,6 +114,22 @@ test('buildSessionWindowUrl encodes the profile query value', () => {
   const url = buildSessionWindowUrl('abc', { devServer: 'http://localhost:5173', profile: 'wiki admin' })
 
   assert.equal(url, 'http://localhost:5173/?win=secondary&profile=wiki+admin#/abc')
+})
+
+test('main-process openSession IPC forwards the owning profile to the window URL builder', () => {
+  const snippet = openSessionIpcSnippet()
+
+  assert.match(snippet, /opts\?\.profile/, 'openSession IPC must read opts.profile')
+  assert.match(
+    snippet,
+    /createSessionWindow\(sessionId\.trim\(\), \{[\s\S]*profile[\s\S]*\}\)/,
+    'openSession IPC must pass profile through to createSessionWindow'
+  )
+  assert.doesNotMatch(
+    snippet,
+    /createSessionWindow\(sessionId\.trim\(\), \{ watch: opts\?\.watch === true \}\)/,
+    'openSession IPC must not drop every option except watch'
+  )
 })
 
 test('buildSessionWindowUrl routes new-session windows to the draft (#/)', () => {
