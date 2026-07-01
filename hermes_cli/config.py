@@ -1957,6 +1957,9 @@ DEFAULT_CONFIG = {
         "local": {
             "model": "base",  # tiny, base, small, medium, large-v3
             "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
+            "initial_prompt": "",  # optional faster-whisper priming prompt / style guide
+            "hotwords": "",  # optional comma-separated faster-whisper hotword vocabulary
+            "cuda_dll_dirs": [],  # optional Windows CUDA DLL dirs (e.g. torch/lib with cublas64_12.dll)
         },
         "openai": {
             "model": "whisper-1",  # whisper-1, gpt-4o-mini-transcribe, gpt-4o-transcribe

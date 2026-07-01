@@ -110,6 +110,8 @@ GROQ_MODELS = {"whisper-large-v3", "whisper-large-v3-turbo", "distil-whisper-lar
 # Singleton for the local model — loaded once, reused across calls
 _local_model: Optional[object] = None
 _local_model_name: Optional[str] = None
+_windows_cuda_dll_handles: list[object] = []
+_windows_cuda_dlls_prepared = False
 
 # ---------------------------------------------------------------------------
 # Config helpers
@@ -1085,6 +1087,102 @@ def _looks_like_cuda_lib_error(exc: BaseException) -> bool:
     return any(marker in msg for marker in _CUDA_LIB_ERROR_MARKERS)
 
 
+def _iter_windows_cuda_dll_dirs(local_cfg: Dict[str, Any]) -> list[Path]:
+    """Return candidate CUDA DLL directories for faster-whisper on Windows."""
+    raw_dirs = (
+        local_cfg.get("cuda_dll_dirs")
+        or os.getenv("HERMES_LOCAL_STT_CUDA_DLL_DIRS")
+        or []
+    )
+    if isinstance(raw_dirs, str):
+        # Accept either Windows PATH-style semicolons or os.pathsep/newlines.
+        pieces: list[str] = []
+        for chunk in raw_dirs.replace("\n", os.pathsep).split(os.pathsep):
+            pieces.extend(part.strip() for part in chunk.split(";") if part.strip())
+        raw_dirs = pieces
+    elif not isinstance(raw_dirs, (list, tuple)):
+        raw_dirs = []
+
+    candidates = [Path(str(item)).expanduser() for item in raw_dirs if str(item).strip()]
+
+    # If torch is installed in the active environment, its Windows wheels carry
+    # the CUDA runtime DLLs ctranslate2 needs (cublas/cublasLt/cudart/cudnn).
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("torch")
+        if spec and spec.origin:
+            candidates.append(Path(spec.origin).resolve().parent / "lib")
+    except Exception:
+        pass
+
+    # Reuse CUDA DLLs from sibling/system Python installs.  This keeps Hermes'
+    # slim venv from needing a full torch install just to satisfy ctranslate2's
+    # Windows dynamic linker requirements.
+    programs = Path.home() / "AppData" / "Local" / "Programs" / "Python"
+    if programs.exists():
+        candidates.extend(programs.glob("Python*/Lib/site-packages/torch/lib"))
+
+    seen: set[str] = set()
+    result: list[Path] = []
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        key = str(resolved).lower()
+        if key in seen or not resolved.exists():
+            continue
+        seen.add(key)
+        result.append(resolved)
+    return result
+
+
+def _prepare_windows_cuda_dlls() -> None:
+    """Preload CUDA DLLs needed by ctranslate2/faster-whisper on Windows.
+
+    PyTorch's Windows wheels bundle cublas/cublasLt/cudart/cudnn and make them
+    visible when torch is imported. Hermes' venv intentionally avoids a full
+    torch install for local STT, so ctranslate2 can see a CUDA device but fail
+    at first encode with ``cublas64_12.dll is not found``.  Preloading the DLLs
+    from configured or discovered torch/lib directories gives ctranslate2 the
+    same runtime it gets in the WhisperX recovery pipeline.
+    """
+    global _windows_cuda_dlls_prepared
+    if os.name != "nt" or _windows_cuda_dlls_prepared:
+        return
+    _windows_cuda_dlls_prepared = True
+
+    try:
+        import ctypes
+    except Exception:
+        return
+
+    local_cfg = _load_stt_config().get("local", {})
+    dll_names = (
+        "cudart64_12.dll",
+        "cublasLt64_12.dll",
+        "cublas64_12.dll",
+        "cudnn64_9.dll",
+    )
+    loaded = 0
+    for dll_dir in _iter_windows_cuda_dll_dirs(local_cfg):
+        try:
+            _windows_cuda_dll_handles.append(os.add_dll_directory(str(dll_dir)))
+        except (FileNotFoundError, OSError):
+            pass
+        for dll_name in dll_names:
+            dll_path = dll_dir / dll_name
+            if not dll_path.exists():
+                continue
+            try:
+                ctypes.CDLL(str(dll_path))
+                loaded += 1
+            except OSError as exc:
+                logger.debug("Could not preload CUDA DLL %s: %s", dll_path, exc)
+    if loaded:
+        logger.info("Preloaded %d CUDA DLL(s) for local faster-whisper", loaded)
+
+
 def _load_local_whisper_model(model_name: str):
     """Load faster-whisper with graceful CUDA → CPU fallback.
 
@@ -1098,6 +1196,7 @@ def _load_local_whisper_model(model_name: str):
     We try ``auto`` first (fast CUDA path when it works), and on any CUDA
     library load failure fall back to CPU + int8.
     """
+    _prepare_windows_cuda_dlls()
     from faster_whisper import WhisperModel
     try:
         return WhisperModel(model_name, device="auto", compute_type="auto")
@@ -1128,14 +1227,38 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
             _local_model_name = model_name
 
         # Language: config.yaml (stt.local.language) > env var > auto-detect.
+        # Priming: faster-whisper supports both initial_prompt and hotwords;
+        # expose them via config so local STT can be biased toward the user's
+        # domain vocabulary without switching to a paid cloud provider.
+        local_cfg = _load_stt_config().get("local", {})
         _forced_lang = (
-            _load_stt_config().get("local", {}).get("language")
+            local_cfg.get("language")
             or os.getenv(LOCAL_STT_LANGUAGE_ENV)
             or None
         )
         transcribe_kwargs = {"beam_size": 5}
         if _forced_lang:
             transcribe_kwargs["language"] = _forced_lang
+
+        initial_prompt = (
+            local_cfg.get("initial_prompt")
+            or local_cfg.get("prompt")
+            or os.getenv("HERMES_LOCAL_STT_INITIAL_PROMPT")
+            or None
+        )
+        if initial_prompt:
+            transcribe_kwargs["initial_prompt"] = str(initial_prompt)
+
+        hotwords = (
+            local_cfg.get("hotwords")
+            or local_cfg.get("keywords")
+            or os.getenv("HERMES_LOCAL_STT_HOTWORDS")
+            or None
+        )
+        if isinstance(hotwords, (list, tuple)):
+            hotwords = ", ".join(str(item) for item in hotwords if str(item).strip())
+        if hotwords:
+            transcribe_kwargs["hotwords"] = str(hotwords)
 
         try:
             segments, info = _local_model.transcribe(file_path, **transcribe_kwargs)
