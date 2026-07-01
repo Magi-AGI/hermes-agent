@@ -191,6 +191,9 @@ export function useSessionStateCache({
       syncRuntimeMetadataToView(state)
       pendingViewStateRef.current = { sessionId, state }
 
+      const isVisibleSessionRefresh = viewSessionIdRef.current === sessionId
+      const isTranscriptSwap = !isVisibleSessionRefresh
+
       // Terminal / attention transitions (turn finished, error, or the agent is
       // now waiting on the user) MUST reach the view immediately. Electron
       // throttles `requestAnimationFrame` to ~0 while the window is
@@ -201,7 +204,11 @@ export function useSessionStateCache({
       // state anyway). The plain busy heartbeat stays RAF-batched: that
       // coalescing exists only to keep periodic `session.info` updates from
       // churning `$messages` and jerking the scroll position while reading.
-      const isCriticalTransition = !state.busy || state.needsInput
+      // A whole-transcript switch can be huge. Let the click/route change paint
+      // before publishing the next session's message array; same-session terminal
+      // transitions stay synchronous so a finishing turn never waits for a
+      // throttled background-frame callback.
+      const isCriticalTransition = (!state.busy || state.needsInput) && !isTranscriptSwap
 
       if (isCriticalTransition) {
         if (viewSyncRafRef.current !== null && typeof window !== 'undefined') {

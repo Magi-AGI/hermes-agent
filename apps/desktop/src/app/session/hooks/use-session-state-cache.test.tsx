@@ -249,9 +249,16 @@ describe('useSessionStateCache — cross-thread error isolation', () => {
   afterEach(() => {
     cleanup()
     $messages.set([])
+    vi.restoreAllMocks()
   })
 
   it('does not leak a failed turn into another thread on switch', () => {
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb: FrameRequestCallback) => {
+      cb(0)
+
+      return null as unknown as number
+    })
+
     $messages.set([])
     let cache!: Cache
     const { rerender } = render(<ViewHarness activeSessionId="thread-A" onReady={c => (cache = c)} />)
@@ -288,6 +295,53 @@ describe('useSessionStateCache — cross-thread error isolation', () => {
 
     expect($messages.get().map(message => message.id)).toEqual(['user-b', 'assistant-b'])
     expect($messages.get().some(message => message.error === 'Out of funds')).toBe(false)
+  })
+
+  it('yields one animation frame before publishing a cross-thread transcript switch', () => {
+    $messages.set([])
+    let rafCallback: FrameRequestCallback | null = null
+    let cache!: Cache
+
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb: FrameRequestCallback) => {
+      rafCallback = cb
+
+      return 42
+    })
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => undefined)
+
+    const { rerender } = render(<ViewHarness activeSessionId="thread-A" onReady={c => (cache = c)} />)
+
+    act(() => {
+      cache.updateSessionState(
+        'thread-A',
+        state => ({ ...state, busy: false, messages: [userMessage('user-a', 'large A')] }),
+        'stored-A'
+      )
+    })
+    expect($messages.get()).toEqual([])
+
+    act(() => {
+      rafCallback?.(0)
+    })
+    expect($messages.get().map(message => message.id)).toEqual(['user-a'])
+
+    rerender(<ViewHarness activeSessionId="thread-B" onReady={c => (cache = c)} />)
+    act(() => {
+      cache.updateSessionState(
+        'thread-B',
+        state => ({ ...state, busy: false, messages: [userMessage('user-b', 'large B')] }),
+        'stored-B'
+      )
+    })
+
+    // The old thread stays visible for the rest of the current event turn;
+    // the potentially huge transcript swap happens on the next frame.
+    expect($messages.get().map(message => message.id)).toEqual(['user-a'])
+
+    act(() => {
+      rafCallback?.(16)
+    })
+    expect($messages.get().map(message => message.id)).toEqual(['user-b'])
   })
 
   it('still preserves a same-session local error a heartbeat dropped', () => {
