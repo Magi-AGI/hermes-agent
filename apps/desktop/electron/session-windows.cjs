@@ -42,8 +42,23 @@ function chatWindowWebPreferences(preloadPath) {
 // scratch window; `watch=1` marks a spectator window (e.g. a running subagent's
 // session): the renderer resumes it lazily so the gateway never builds an agent
 // just to stream into it.
-function buildSessionWindowUrl(sessionId, { devServer, rendererIndexPath, watch, newSession } = {}) {
-  const query = `?win=secondary${newSession ? '&new=1' : ''}${watch ? '&watch=1' : ''}`
+function buildSessionWindowUrl(sessionId, { devServer, rendererIndexPath, watch, newSession, profile } = {}) {
+  const queryParams = new URLSearchParams({ win: 'secondary' })
+  const profileKey = typeof profile === 'string' ? profile.trim() : ''
+
+  if (newSession) {
+    queryParams.set('new', '1')
+  }
+
+  if (watch) {
+    queryParams.set('watch', '1')
+  }
+
+  if (!newSession && profileKey) {
+    queryParams.set('profile', profileKey)
+  }
+
+  const query = `?${queryParams.toString()}`
   const route = newSession ? '#/' : `#/${encodeURIComponent(sessionId)}`
 
   if (devServer) {

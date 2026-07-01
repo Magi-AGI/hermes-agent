@@ -7,6 +7,15 @@ import { notifyError } from './notifications'
 // global session sidebar or the install / onboarding overlays.
 const SECONDARY_WINDOW_FLAG = 'secondary'
 const NEW_SESSION_WINDOW_FLAG = '1'
+const PROFILE_QUERY_PARAM = 'profile'
+
+function windowSearchParams(): URLSearchParams | null {
+  try {
+    return new URLSearchParams(window.location.search)
+  } catch {
+    return null
+  }
+}
 
 let secondaryWindowCache: boolean | null = null
 
@@ -15,13 +24,8 @@ export function isSecondaryWindow(): boolean {
     return secondaryWindowCache
   }
 
-  let result = false
-
-  try {
-    result = new URLSearchParams(window.location.search).get('win') === SECONDARY_WINDOW_FLAG
-  } catch {
-    result = false
-  }
+  const params = windowSearchParams()
+  const result = params?.get('win') === SECONDARY_WINDOW_FLAG
 
   secondaryWindowCache = result
 
@@ -35,13 +39,8 @@ export function isNewSessionWindow(): boolean {
     return newSessionWindowCache
   }
 
-  let result = false
-
-  try {
-    result = new URLSearchParams(window.location.search).get('new') === NEW_SESSION_WINDOW_FLAG
-  } catch {
-    result = false
-  }
+  const params = windowSearchParams()
+  const result = params?.get('new') === NEW_SESSION_WINDOW_FLAG
 
   newSessionWindowCache = result
 
@@ -59,17 +58,26 @@ export function isWatchWindow(): boolean {
     return watchWindowCache
   }
 
-  let result = false
-
-  try {
-    result = new URLSearchParams(window.location.search).get('watch') === '1'
-  } catch {
-    result = false
-  }
+  const params = windowSearchParams()
+  const result = params?.get('watch') === '1'
 
   watchWindowCache = result
 
   return result
+}
+
+// Owning profile carried by an existing-session pop-out. This lives alongside
+// `win=secondary` before the HashRouter '#', so the renderer can boot the
+// popped-out window directly against that profile's backend instead of guessing
+// from the active/main window profile.
+export function secondaryWindowProfile(): string | null {
+  if (!isSecondaryWindow() || isNewSessionWindow()) {
+    return null
+  }
+
+  const profile = windowSearchParams()?.get(PROFILE_QUERY_PARAM)?.trim()
+
+  return profile || null
 }
 
 // True when running inside the Electron desktop shell (the preload bridge is
@@ -79,6 +87,24 @@ export function canOpenSessionWindow(): boolean {
 }
 
 type WindowOpenResult = { ok: boolean; error?: string } | undefined
+
+export interface SessionWindowOptions {
+  profile?: null | string
+  watch?: boolean
+}
+
+function cleanSessionWindowOptions(opts?: SessionWindowOptions): SessionWindowOptions | undefined {
+  if (!opts) {
+    return undefined
+  }
+
+  const profile = typeof opts.profile === 'string' ? opts.profile.trim() : ''
+
+  return {
+    ...(opts.watch ? { watch: true } : {}),
+    ...(profile ? { profile } : {})
+  }
+}
 
 // Run a window-open bridge call, surfacing any failure as a toast. Shared by the
 // session pop-out and the new-session pop-out.
@@ -97,12 +123,15 @@ async function openWindow(call: () => Promise<WindowOpenResult>, failMessage: st
 // Open (or focus) a standalone OS window for a single chat session. No-ops
 // gracefully outside Electron so callers can wire it unconditionally.
 // `watch: true` opens a spectator window (lazy resume, live-mirror stream).
-export async function openSessionInNewWindow(sessionId: string, opts?: { watch?: boolean }): Promise<void> {
+export async function openSessionInNewWindow(sessionId: string, opts?: SessionWindowOptions): Promise<void> {
   if (!sessionId || !canOpenSessionWindow()) {
     return
   }
 
-  await openWindow(() => window.hermesDesktop.openSessionWindow(sessionId, opts), 'Could not open chat in a new window')
+  await openWindow(
+    () => window.hermesDesktop.openSessionWindow(sessionId, cleanSessionWindowOptions(opts)),
+    'Could not open chat in a new window'
+  )
 }
 
 // Open a fresh compact window on the new-session draft.

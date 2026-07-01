@@ -57,7 +57,7 @@ import {
 } from '@/store/session'
 import { broadcastSessionsChanged } from '@/store/session-sync'
 import { reportBackendContract } from '@/store/updates'
-import { isWatchWindow } from '@/store/windows'
+import { isWatchWindow, secondaryWindowProfile } from '@/store/windows'
 import type {
   SessionCreateResponse,
   SessionInfo,
@@ -267,11 +267,32 @@ function upsertResolvedSession(session: SessionInfo, storedSessionId: string) {
   ])
 }
 
-async function resolveStoredSession(storedSessionId: string): Promise<SessionInfo | undefined> {
+async function resolveStoredSession(
+  storedSessionId: string,
+  preferredProfile?: null | string
+): Promise<SessionInfo | undefined> {
   const cached = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
 
   if (cached) {
     return cached
+  }
+
+  const preferredKey = preferredProfile ? normalizeProfileKey(preferredProfile) : null
+
+  // A secondary pop-out carries the owning profile in the URL before the hash.
+  // Use it as the first lookup target: the Electron main process cannot infer a
+  // renderer-window-local profile from an unscoped REST call, so getSession(id)
+  // would hit the desktop primary backend and strand the pop-out loader.
+  if (preferredKey) {
+    try {
+      const session = await getSession(storedSessionId, preferredKey)
+
+      upsertResolvedSession(session, storedSessionId)
+
+      return session
+    } catch {
+      // The URL profile may be stale/deleted; fall through to normal discovery.
+    }
   }
 
   // Direct by-id on the live backend — one row lookup, no list scan. Covers
@@ -291,11 +312,12 @@ async function resolveStoredSession(storedSessionId: string): Promise<SessionInf
   // each) rather than pulling every profile's recent sessions. The first hit
   // carries its owning `profile`, which routes the resume to the right backend.
   const activeKey = normalizeProfileKey($activeGatewayProfile.get())
+  const alreadyTried = new Set([activeKey, preferredKey].filter(Boolean) as string[])
 
   const otherProfiles = $profiles
     .get()
     .map(profile => normalizeProfileKey(profile.name))
-    .filter(key => key !== activeKey)
+    .filter(key => !alreadyTried.has(key))
 
   for (const profile of otherProfiles) {
     try {
@@ -639,8 +661,9 @@ export function useSessionActions({
       // gateway call (no-op when it's already on that profile / single-profile).
       // resolveStoredSession finds the row by id (cheap), so an uncached pasted
       // id loads as fast as a sidebar click instead of hanging on a list scan.
-      const storedForProfile = await resolveStoredSession(storedSessionId)
-      const sessionProfile = storedForProfile?.profile
+      const preferredProfile = secondaryWindowProfile()
+      const storedForProfile = await resolveStoredSession(storedSessionId, preferredProfile)
+      const sessionProfile = storedForProfile?.profile ?? preferredProfile ?? undefined
 
       if (resumeRequestRef.current !== requestId) {
         return

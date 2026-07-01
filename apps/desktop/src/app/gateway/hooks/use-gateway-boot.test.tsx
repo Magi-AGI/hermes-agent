@@ -2,6 +2,7 @@ import { act, cleanup, render } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $desktopBoot } from '@/store/boot'
+import { $activeGatewayProfile } from '@/store/profile'
 import { $gatewayState } from '@/store/session'
 
 import { useGatewayBoot } from './use-gateway-boot'
@@ -124,6 +125,8 @@ beforeEach(() => {
   FakeWebSocket.instances = []
   ;(globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket
   ;(window as { hermesDesktop?: unknown }).hermesDesktop = fakeDesktop()
+  window.history.replaceState(null, '', '/')
+  $activeGatewayProfile.set('default')
   $gatewayState.set('idle')
   $desktopBoot.set({
     error: null,
@@ -141,6 +144,8 @@ afterEach(() => {
   cleanup()
   vi.useRealTimers()
   ;(globalThis as { WebSocket: unknown }).WebSocket = originalWebSocket
+  window.history.replaceState(null, '', '/')
+  $activeGatewayProfile.set('default')
   delete (window as { hermesDesktop?: unknown }).hermesDesktop
 })
 
@@ -161,6 +166,26 @@ async function advanceBackoff() {
 }
 
 describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => {
+  it('boots a secondary session window against the profile carried in the URL', async () => {
+    window.history.replaceState(null, '', '/?win=secondary&profile=wikireader#/session-1')
+
+    const desktop = fakeDesktop()
+    desktop.getConnection = vi.fn(async (profile?: string | null) => ({
+      authMode: 'token' as const,
+      baseUrl: `https://vps.example.com/${profile || 'default'}`,
+      profile: profile || 'default',
+      token: 't',
+      wsUrl: `wss://vps.example.com/${profile || 'default'}/api/ws?token=t`
+    }))
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+
+    expect(desktop.getConnection).toHaveBeenCalledWith('wikireader')
+    expect($activeGatewayProfile.get()).toBe('wikireader')
+  })
+
   it('INITIAL boot against a dead VPS: getConnection hangs (waitForHermes) → app sits in the connecting combo, then fails', async () => {
     // The report's actual path: a fresh launch pointed at an unreachable VPS.
     // startHermes()'s remote branch awaits waitForHermes() for 45s before it

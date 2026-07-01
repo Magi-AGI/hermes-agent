@@ -86,6 +86,19 @@ test('buildSessionWindowUrl adds the watch flag for spectator windows, before th
   assert.equal(url, 'http://localhost:5173/?win=secondary&watch=1#/abc')
 })
 
+test('buildSessionWindowUrl adds the owning profile for session pop-outs, before the hash', () => {
+  const url = buildSessionWindowUrl('abc', { devServer: 'http://localhost:5173', profile: 'wikireader' })
+
+  assert.equal(url, 'http://localhost:5173/?win=secondary&profile=wikireader#/abc')
+  assert.ok(url.indexOf('profile=wikireader') < url.indexOf('#'))
+})
+
+test('buildSessionWindowUrl encodes the profile query value', () => {
+  const url = buildSessionWindowUrl('abc', { devServer: 'http://localhost:5173', profile: 'wiki admin' })
+
+  assert.equal(url, 'http://localhost:5173/?win=secondary&profile=wiki+admin#/abc')
+})
+
 test('buildSessionWindowUrl routes new-session windows to the draft (#/)', () => {
   const url = buildSessionWindowUrl(null, { devServer: 'http://localhost:5173', newSession: true })
 

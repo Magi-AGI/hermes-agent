@@ -25,6 +25,7 @@ import {
 } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile, normalizeProfileKey, touchActiveGatewayBackend } from '@/store/profile'
+import { secondaryWindowProfile } from '@/store/windows'
 import {
   $activeSessionId,
   $attentionSessionIds,
@@ -333,7 +334,8 @@ export function useGatewayBoot({
 
     async function boot() {
       try {
-        const conn = await desktop.getConnection()
+        const profileFromWindow = secondaryWindowProfile()
+        const conn = profileFromWindow ? await desktop.getConnection(profileFromWindow) : await desktop.getConnection()
 
         if (cancelled) {
           return
@@ -357,17 +359,22 @@ export function useGatewayBoot({
           return
         }
 
-        // Record which profile the primary (window) backend booted as, so
-        // same-profile resumes are no-op swaps and any reconnect targets the
-        // right backend. Best-effort: a missing preference means "default".
+        // Record which profile this window's primary backend is scoped to, so
+        // same-profile resumes are no-op swaps and reconnect/REST calls target
+        // the right backend. Existing-session pop-outs carry their owning profile
+        // in the URL; ordinary primary windows fall back to the persisted desktop
+        // preference (or the connection descriptor if the preference probe fails).
         try {
-          const pref = await desktop.profile?.get?.()
-          const profileKey = (pref?.profile ?? '').trim() || 'default'
+          const profileKey = profileFromWindow
+            ? normalizeProfileKey(profileFromWindow)
+            : normalizeProfileKey((await desktop.profile?.get?.())?.profile ?? conn.profile)
           $activeGatewayProfile.set(profileKey)
           setPrimaryGateway(gateway, profileKey)
           void ensureGatewayForProfile(profileKey)
         } catch {
-          $activeGatewayProfile.set('default')
+          const fallbackProfile = normalizeProfileKey(profileFromWindow ?? conn.profile)
+          $activeGatewayProfile.set(fallbackProfile)
+          setPrimaryGateway(gateway, fallbackProfile)
         }
 
         setDesktopBootStep({

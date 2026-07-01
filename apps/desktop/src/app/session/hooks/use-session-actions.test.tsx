@@ -3,9 +3,17 @@ import type { MutableRefObject } from 'react'
 import { useEffect } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { getSessionMessages } from '@/hermes'
-import { $activeGatewayProfile, $newChatProfile } from '@/store/profile'
-import { $currentCwd, $messages, $resumeFailedSessionId, setMessages, setResumeFailedSessionId } from '@/store/session'
+import { getSession, getSessionMessages } from '@/hermes'
+import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile } from '@/store/profile'
+import {
+  $currentCwd,
+  $messages,
+  $resumeFailedSessionId,
+  setMessages,
+  setResumeFailedSessionId,
+  setSessions
+} from '@/store/session'
+import { secondaryWindowProfile } from '@/store/windows'
 
 import type { ClientSessionState } from '../../types'
 
@@ -14,10 +22,21 @@ import { useSessionActions } from './use-session-actions'
 vi.mock('@/hermes', async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
   deleteSession: vi.fn(),
+  getSession: vi.fn(),
   getSessionMessages: vi.fn(),
   listAllProfileSessions: vi.fn(),
   setApiRequestProfile: vi.fn(),
   setSessionArchived: vi.fn()
+}))
+
+vi.mock('@/store/profile', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  ensureGatewayProfile: vi.fn(async () => undefined)
+}))
+
+vi.mock('@/store/windows', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  secondaryWindowProfile: vi.fn(() => null)
 }))
 
 const RUNTIME_SESSION_ID = 'rt-new-001'
@@ -162,6 +181,12 @@ describe('resumeSession failure recovery', () => {
     cleanup()
     setResumeFailedSessionId(null)
     setMessages([])
+    setSessions([])
+    $activeGatewayProfile.set('default')
+    vi.mocked(secondaryWindowProfile).mockReturnValue(null)
+    vi.mocked(getSession).mockReset()
+    vi.mocked(getSessionMessages).mockReset()
+    vi.mocked(ensureGatewayProfile).mockClear()
     vi.restoreAllMocks()
   })
 
@@ -255,6 +280,31 @@ describe('resumeSession failure recovery', () => {
     await runResume(requestGateway)
 
     expect($resumeFailedSessionId.get()).toBeNull()
+  })
+
+  it('uses the secondary window URL profile for the initial stored-session lookup and resume', async () => {
+    vi.mocked(secondaryWindowProfile).mockReturnValue('wikireader')
+    vi.mocked(getSession).mockResolvedValue({ id: 'stored-1', profile: 'wikireader' } as never)
+    vi.mocked(getSessionMessages).mockResolvedValue({ messages: [] } as never)
+
+    let resumeParams: Record<string, unknown> | undefined
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.resume') {
+        resumeParams = params
+
+        return { session_id: 'runtime-1', messages: [], info: {} } as never
+      }
+
+      return {} as never
+    })
+
+    await runResume(requestGateway)
+
+    expect(getSession).toHaveBeenCalledWith('stored-1', 'wikireader')
+    expect(ensureGatewayProfile).toHaveBeenCalledWith('wikireader')
+    expect(getSessionMessages).toHaveBeenCalledWith('stored-1', 'wikireader')
+    expect(resumeParams).toMatchObject({ session_id: 'stored-1', profile: 'wikireader' })
   })
 
   it('resumes via the gateway default (deferred build) — not lazy, no eager opt-out', async () => {
