@@ -334,6 +334,81 @@ class ExecuteResult:
     exit_code: int = 0
 
 
+_WINDOWS_CLOUD_DIR_GLOBS = (
+    "OneDrive*",
+    "Dropbox*",
+    "iCloudDrive*",
+    "Creative Cloud Files*",
+)
+
+
+@dataclass(frozen=True)
+class _SearchCloudPolicy:
+    block_reason: Optional[str] = None
+    warning: Optional[str] = None
+    add_excludes: bool = False
+
+
+def _windows_path_parts(path: str) -> list[str]:
+    normalized = (path or "").replace("\\", "/").strip().strip("'\"")
+    return [part for part in normalized.split("/") if part]
+
+
+def _is_windows_user_home_root(path: str) -> bool:
+    """Return True for broad Windows home roots like C:/Users/Lake or /c/Users/Lake."""
+    parts = _windows_path_parts(path)
+    if len(parts) == 3 and re.fullmatch(r"[A-Za-z]:", parts[0] or "") and parts[1].lower() == "users":
+        return True
+    if len(parts) == 3 and re.fullmatch(r"[A-Za-z]", parts[0] or "") and parts[1].lower() == "users":
+        return True
+    return False
+
+
+def _is_windows_cloud_dir_part(part: str) -> bool:
+    lower = part.lower()
+    return (
+        lower.startswith("onedrive")
+        or lower.startswith("dropbox")
+        or lower.startswith("iclouddrive")
+        or lower.startswith("creative cloud files")
+    )
+
+
+def _windows_cloud_search_policy(path: str) -> _SearchCloudPolicy:
+    """Safety policy for Windows cloud placeholder directories.
+
+    OneDrive/Dropbox Files-On-Demand placeholders can hydrate simply because a
+    recursive search opens or stats them. Refuse explicit cloud roots before any
+    shell I/O, and add excludes for broad home-root searches.
+    """
+    parts = _windows_path_parts(path)
+    cloud_part = next((part for part in parts if _is_windows_cloud_dir_part(part)), None)
+    if cloud_part:
+        return _SearchCloudPolicy(
+            block_reason=(
+                f"Refusing to search cloud-synced directory '{cloud_part}' because "
+                "recursive search can hydrate offline placeholder files. "
+                "Use an explicit non-cloud project/repo path instead."
+            )
+        )
+    if _is_windows_user_home_root(path):
+        return _SearchCloudPolicy(
+            warning=(
+                "Windows cloud-synced directories (OneDrive/Dropbox/iCloud/Creative Cloud) "
+                "were excluded from this broad home-root search to avoid hydrating "
+                "offline placeholder files. Prefer a scoped repo/project path."
+            ),
+            add_excludes=True,
+        )
+    return _SearchCloudPolicy()
+
+
+def _merge_search_warning(result: SearchResult, warning: Optional[str]) -> SearchResult:
+    if warning and not result.error:
+        result.warning = f"{warning}\n{result.warning}" if result.warning else warning
+    return result
+
+
 _SEARCH_TIMEOUT_MARKER_RE = re.compile(r"\n?\[Command timed out after \d+s\]\s*$")
 
 
@@ -1982,6 +2057,13 @@ class ShellFileOperations(FileOperations):
 
         # Expand ~ and other shell paths
         path = self._expand_path(path)
+        if path in {"", ".", "./"}:
+            policy_root = getattr(self.env, 'cwd', None) or self.cwd
+        else:
+            policy_root = path
+        cloud_policy = _windows_cloud_search_policy(policy_root)
+        if cloud_policy.block_reason:
+            return SearchResult(error=cloud_policy.block_reason, total_count=0)
         
         # Validate that the path exists before searching
         check = self._exec(f"test -e {self._escape_shell_arg(path)} && echo exists || echo not_found")
@@ -2017,12 +2099,34 @@ class ShellFileOperations(FileOperations):
             )
         
         if target == "files":
-            return self._search_files(pattern, path, limit, offset)
+            result = self._search_files(
+                pattern,
+                path,
+                limit,
+                offset,
+                exclude_windows_cloud_dirs=cloud_policy.add_excludes,
+            )
         else:
-            return self._search_content(pattern, path, file_glob, limit, offset, 
-                                        output_mode, context)
+            result = self._search_content(
+                pattern,
+                path,
+                file_glob,
+                limit,
+                offset,
+                output_mode,
+                context,
+                exclude_windows_cloud_dirs=cloud_policy.add_excludes,
+            )
+        return _merge_search_warning(result, cloud_policy.warning)
     
-    def _search_files(self, pattern: str, path: str, limit: int, offset: int) -> SearchResult:
+    def _search_files(
+        self,
+        pattern: str,
+        path: str,
+        limit: int,
+        offset: int,
+        exclude_windows_cloud_dirs: bool = False,
+    ) -> SearchResult:
         """Search for files by name pattern (glob-like)."""
         # Auto-prepend **/ for recursive search if not already present
         if not pattern.startswith('**/') and '/' not in pattern:
@@ -2040,7 +2144,13 @@ class ShellFileOperations(FileOperations):
         # default, and has parallel directory traversal (~200x faster than
         # find on wide trees).  Mirrors _search_content which already uses rg.
         if self._has_command('rg'):
-            return self._search_files_rg(search_pattern, path, limit, offset)
+            return self._search_files_rg(
+                search_pattern,
+                path,
+                limit,
+                offset,
+                exclude_windows_cloud_dirs=exclude_windows_cloud_dirs,
+            )
 
         # Fallback: find (slower, no .gitignore awareness)
         if not self._has_command('find'):
@@ -2052,7 +2162,13 @@ class ShellFileOperations(FileOperations):
 
         # Exclude hidden directories (matching ripgrep's default behavior).
         hidden_exclude = "-not -path '*/.*'" if not has_hidden_path_ancestor else ""
-        hidden_filter_expr = f" {hidden_exclude}" if hidden_exclude else ""
+        cloud_exclude = ""
+        if exclude_windows_cloud_dirs:
+            cloud_exclude = " ".join(
+                f"-not -path '*/{glob}/*'" for glob in _WINDOWS_CLOUD_DIR_GLOBS
+            )
+        filter_terms = [term for term in (hidden_exclude, cloud_exclude) if term]
+        hidden_filter_expr = f" {' '.join(filter_terms)}" if filter_terms else ""
 
         # Use shell pagination for standard roots. For hidden roots, gather full
         # output so we can re-apply hidden-descendant filtering while allowing
@@ -2108,7 +2224,14 @@ class ShellFileOperations(FileOperations):
             limit_reason=limit_reason,
         )
 
-    def _search_files_rg(self, pattern: str, path: str, limit: int, offset: int) -> SearchResult:
+    def _search_files_rg(
+        self,
+        pattern: str,
+        path: str,
+        limit: int,
+        offset: int,
+        exclude_windows_cloud_dirs: bool = False,
+    ) -> SearchResult:
         """Search for files by name using ripgrep's --files mode.
 
         rg --files respects .gitignore and excludes hidden directories by
@@ -2124,9 +2247,17 @@ class ShellFileOperations(FileOperations):
             glob_pattern = pattern
 
         fetch_limit = limit + offset
+        cloud_glob_args = ""
+        if exclude_windows_cloud_dirs:
+            cloud_glob_args = " ".join(
+                f"--glob {self._escape_shell_arg('!' + glob + '/**')}"
+                for glob in _WINDOWS_CLOUD_DIR_GLOBS
+            )
+            if cloud_glob_args:
+                cloud_glob_args += " "
         # Try mtime-sorted first (rg 13+); fall back to unsorted if not supported.
         cmd_sorted = (
-            f"rg --files --sortr=modified -g {self._escape_shell_arg(glob_pattern)} "
+            f"rg --files --sortr=modified {cloud_glob_args}-g {self._escape_shell_arg(glob_pattern)} "
             f"{self._escape_shell_arg(path)} 2>/dev/null "
             f"| head -n {fetch_limit}"
         )
@@ -2137,7 +2268,7 @@ class ShellFileOperations(FileOperations):
         if not all_files and not limit_reason:
             # --sortr may have failed on older rg; retry without it.
             cmd_plain = (
-                f"rg --files -g {self._escape_shell_arg(glob_pattern)} "
+                f"rg --files {cloud_glob_args}-g {self._escape_shell_arg(glob_pattern)} "
                 f"{self._escape_shell_arg(path)} 2>/dev/null "
                 f"| head -n {fetch_limit}"
             )
@@ -2154,16 +2285,41 @@ class ShellFileOperations(FileOperations):
             limit_reason=limit_reason,
         )
     
-    def _search_content(self, pattern: str, path: str, file_glob: Optional[str],
-                        limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
+    def _search_content(
+        self,
+        pattern: str,
+        path: str,
+        file_glob: Optional[str],
+        limit: int,
+        offset: int,
+        output_mode: str,
+        context: int,
+        exclude_windows_cloud_dirs: bool = False,
+    ) -> SearchResult:
         """Search for content inside files (grep-like)."""
         # Try ripgrep first (fast), fallback to grep (slower but works)
         if self._has_command('rg'):
-            result = self._search_with_rg(pattern, path, file_glob, limit, offset,
-                                          output_mode, context)
+            result = self._search_with_rg(
+                pattern,
+                path,
+                file_glob,
+                limit,
+                offset,
+                output_mode,
+                context,
+                exclude_windows_cloud_dirs=exclude_windows_cloud_dirs,
+            )
         elif self._has_command('grep'):
-            result = self._search_with_grep(pattern, path, file_glob, limit, offset,
-                                            output_mode, context)
+            result = self._search_with_grep(
+                pattern,
+                path,
+                file_glob,
+                limit,
+                offset,
+                output_mode,
+                context,
+                exclude_windows_cloud_dirs=exclude_windows_cloud_dirs,
+            )
         else:
             # Neither rg nor grep available (Windows without Git Bash, etc.)
             return SearchResult(
@@ -2173,8 +2329,17 @@ class ShellFileOperations(FileOperations):
 
         return _maybe_warn_line_oriented_newline_pattern(result, pattern)
     
-    def _search_with_rg(self, pattern: str, path: str, file_glob: Optional[str],
-                        limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
+    def _search_with_rg(
+        self,
+        pattern: str,
+        path: str,
+        file_glob: Optional[str],
+        limit: int,
+        offset: int,
+        output_mode: str,
+        context: int,
+        exclude_windows_cloud_dirs: bool = False,
+    ) -> SearchResult:
         """Search using ripgrep."""
         cmd_parts = ["rg", "--line-number", "--no-heading", "--with-filename"]
         
@@ -2185,6 +2350,10 @@ class ShellFileOperations(FileOperations):
         # Add file glob filter (must be quoted to prevent shell expansion)
         if file_glob:
             cmd_parts.extend(["--glob", self._escape_shell_arg(file_glob)])
+
+        if exclude_windows_cloud_dirs:
+            for glob in _WINDOWS_CLOUD_DIR_GLOBS:
+                cmd_parts.extend(["--glob", self._escape_shell_arg(f"!{glob}/**")])
         
         # Output mode handling
         if output_mode == "files_only":
@@ -2299,14 +2468,26 @@ class ShellFileOperations(FileOperations):
                 limit_reason=limit_reason,
             )
     
-    def _search_with_grep(self, pattern: str, path: str, file_glob: Optional[str],
-                          limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
+    def _search_with_grep(
+        self,
+        pattern: str,
+        path: str,
+        file_glob: Optional[str],
+        limit: int,
+        offset: int,
+        output_mode: str,
+        context: int,
+        exclude_windows_cloud_dirs: bool = False,
+    ) -> SearchResult:
         """Fallback search using grep."""
         cmd_parts = ["grep", "-rnH"]  # -H forces filename even for single-file searches
         
         # Exclude hidden directories (matching ripgrep's default behavior).
         # This prevents searching inside .hub/index-cache/, .git/, etc.
         cmd_parts.append("--exclude-dir='.*'")
+        if exclude_windows_cloud_dirs:
+            for glob in _WINDOWS_CLOUD_DIR_GLOBS:
+                cmd_parts.append(f"--exclude-dir={self._escape_shell_arg(glob)}")
         
         # Add context if requested
         if context > 0:
