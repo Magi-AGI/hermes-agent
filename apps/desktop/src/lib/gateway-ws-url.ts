@@ -1,4 +1,4 @@
-import type { HermesConnection } from '@/global'
+import type { BackendConnectionOptions, HermesConnection } from '@/global'
 
 /**
  * The desktop main process exposes `getGatewayWsUrl()` to re-mint a WebSocket
@@ -27,8 +27,9 @@ import type { HermesConnection } from '@/global'
 export interface ResolveGatewayWsUrlDeps {
   /** `window.hermesDesktop.getGatewayWsUrl`, if the preload exposes it. The
    *  optional profile selects which backend to mint for — critical when swapping
-   *  to a pooled profile, since the default mint resolves the primary backend. */
-  getGatewayWsUrl?: (profile?: null | string) => Promise<string>
+   *  to a pooled profile, since the default mint resolves the primary backend.
+   *  `opts` routes pop-out/secondary windows to their per-session backend (M4b). */
+  getGatewayWsUrl?: (profile?: null | string, opts?: BackendConnectionOptions) => Promise<string>
 }
 
 export class GatewayReauthRequiredError extends Error {
@@ -49,12 +50,14 @@ export function isGatewayReauthRequired(error: unknown): error is GatewayReauthR
 
 export async function resolveGatewayWsUrl(
   desktop: ResolveGatewayWsUrlDeps,
-  conn: Pick<HermesConnection, 'authMode' | 'profile' | 'wsUrl'>
+  conn: Pick<HermesConnection, 'authMode' | 'profile' | 'wsUrl'>,
+  opts?: BackendConnectionOptions
 ): Promise<string> {
   const mint = desktop.getGatewayWsUrl
   // Mint for THIS connection's profile, not the primary. Without it a pooled
   // profile swap re-mints the default backend's URL and connects to the wrong
-  // backend.
+  // backend. `opts` further routes a pop-out to its per-session backend so the
+  // ws URL points at the session backend, not the profile backend.
   const profile = conn.profile ?? null
 
   if (conn.authMode === 'oauth') {
@@ -68,7 +71,7 @@ export async function resolveGatewayWsUrl(
     }
 
     try {
-      return await mint(profile)
+      return await mint(profile, opts)
     } catch (error) {
       throw new GatewayReauthRequiredError(
         'Your remote gateway session has expired. Open Settings → Gateway and click "Sign in" again.',
@@ -80,7 +83,7 @@ export async function resolveGatewayWsUrl(
   // token / local: the URL carries a long-lived token. Re-mint when available
   // (cheap, keeps parity), but the cached URL is a safe fallback.
   if (mint) {
-    const fresh = await mint(profile).catch(() => null)
+    const fresh = await mint(profile, opts).catch(() => null)
 
     if (fresh) {
       return fresh

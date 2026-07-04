@@ -106,6 +106,58 @@ For git installs, Hermes auto-stashes dirty tracked files and untracked files be
 
 Before that stash step, Hermes also restores tracked `package-lock.json` diffs left by npm install/build churn. Commit or manually stash intentional lockfile edits before updating.
 
+## Desktop Backend Isolation
+
+The native desktop app can run more than one Hermes backend at once — one per
+profile, and optionally one per session window — so that a crash or hang in one
+session cannot take down the others. These are **user-facing** knobs, so they
+live in `config.yaml` (not `.env`). Secrets stay in `.env`; this section holds
+only capacity/lifecycle settings.
+
+```yaml
+desktop:
+  backend_isolation: profile  # profile | hybrid | session
+  backend_pool:
+    max_profile_backends: 3
+    max_session_backends_per_profile: 10
+    spawn_concurrency: 10
+    idle_ms: 600000
+    keepalive_fresh_ms: 90000
+    health_timeout_ms: 2500
+    startup_timeout_ms: 90000
+    auto_reap_orphans: true
+```
+
+`backend_isolation` chooses how backends are scoped:
+
+- `profile` (default): one shared backend per profile. Every window for a profile
+  talks to the same backend.
+- `hybrid`: the primary/profile windows use the shared profile backend, while
+  pop-out / secondary **session** windows each get their own session-scoped
+  backend. This isolates a pop-out's crash from the main window.
+- `session`: every session window uses its own session-scoped backend where
+  supported — maximum isolation, at the cost of more running backends.
+
+`backend_pool` bounds how many backends may run and how they're reaped:
+
+- `max_profile_backends`: cap on concurrent per-profile backends.
+- `max_session_backends_per_profile`: cap on concurrent session backends for a
+  single profile (default `10`).
+- `spawn_concurrency`: cap on simultaneous backend startup attempts.
+- `idle_ms`: idle time before an unused backend is reaped.
+- `keepalive_fresh_ms`: freshness window for keepalive/touch operations before a
+  backend needs another health probe.
+- `health_timeout_ms`: per-probe health-check timeout.
+- `startup_timeout_ms`: how long to wait for a backend to become ready.
+- `auto_reap_orphans`: reclaim orphaned backends left by a previous run.
+
+:::note Legacy alias
+Earlier builds stored the mode at `desktop.backend_pool.backend_isolation`. That
+nested key is still accepted for backward compatibility, but the top-level
+`desktop.backend_isolation` wins when both are present. An unrecognized value
+falls back to `profile`.
+:::
+
 ## Terminal Backend Configuration
 
 Hermes supports six terminal backends. Each determines where the agent's shell commands actually execute — your local machine, a Docker container, a remote server via SSH, a Modal cloud sandbox (direct or via the Nous-managed gateway), a Daytona workspace, or a Singularity/Apptainer container.

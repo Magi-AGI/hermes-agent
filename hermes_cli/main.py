@@ -505,7 +505,44 @@ def _apply_profile_override() -> None:
             sys.argv = sys.argv[:start] + sys.argv[start + consume :]
 
 
+# ---------------------------------------------------------------------------
+# Desktop ownership marker — MUST be stripped before argparse.
+#
+# Hermes Desktop spawns its backend with ``--hermes-desktop-owner=<nonce>`` so
+# the OS-level process command line carries a NON-SECRET ownership signal the
+# Electron reaper can verify (apps/desktop/electron/backend-registry.cjs), as
+# defense-in-depth alongside the authoritative child-written sidecar. The nonce
+# is a random per-spawn id (never a token/secret). It is not a functional Hermes
+# flag, so strip it here: the OS command line still shows it (fixed at process
+# creation, which is what psutil/Win32_Process read), but argparse never sees an
+# unrecognized argument.
+# ---------------------------------------------------------------------------
+_DESKTOP_OWNER_MARKER = "--hermes-desktop-owner"
+
+
+def _strip_desktop_owner_marker() -> None:
+    """Remove ``--hermes-desktop-owner[=<nonce>]`` from sys.argv pre-argparse."""
+    argv = sys.argv[1:]
+    cleaned: list[str] = []
+    skip_next = False
+    for i, token in enumerate(argv):
+        if skip_next:
+            skip_next = False
+            continue
+        if token == _DESKTOP_OWNER_MARKER:
+            # Separate-value form: consume the following value unless it's a flag.
+            nxt = argv[i + 1] if i + 1 < len(argv) else None
+            if nxt is not None and not nxt.startswith("-"):
+                skip_next = True
+            continue
+        if token.startswith(_DESKTOP_OWNER_MARKER + "="):
+            continue
+        cleaned.append(token)
+    sys.argv = [sys.argv[0]] + cleaned
+
+
 _apply_profile_override()
+_strip_desktop_owner_marker()
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.

@@ -1,3 +1,5 @@
+import { routeSessionId } from '@/app/routes'
+import type { BackendConnectionOptions } from '@/global'
 import { notifyError } from './notifications'
 
 // Window flag set by the Electron main process when it opens a standalone
@@ -78,6 +80,38 @@ export function secondaryWindowProfile(): string | null {
   const profile = windowSearchParams()?.get(PROFILE_QUERY_PARAM)?.trim()
 
   return profile || null
+}
+
+// Derive the HashRouter pathname ('/<id>') from the current window's hash. The
+// durable stored session id rides after the '#', e.g. `#/stored-id`.
+function hashPathname(): string {
+  try {
+    const hash = window.location.hash || ''
+    const path = hash.startsWith('#') ? hash.slice(1) : hash
+    return path.startsWith('/') ? path : `/${path}`
+  } catch {
+    return '/'
+  }
+}
+
+// The durable stored session id of an EXISTING-session secondary window, or null
+// for the primary window, non-secondary windows, new-session scratch windows,
+// or non-session routes (reserved paths / empty hash).
+export function secondaryWindowSessionId(): string | null {
+  if (!isSecondaryWindow() || isNewSessionWindow()) {
+    return null
+  }
+  return routeSessionId(hashPathname())
+}
+
+// Backend-connection options for routing a secondary/pop-out window to its
+// per-session backend (M4b). Existing-session (and watch) secondary windows get
+// `{ sessionId, isolation: 'auto' }` — the main process picks a session backend
+// only when backend_isolation is hybrid/session. Primary and new-session windows
+// get undefined, preserving profile/primary backend behavior.
+export function secondaryWindowBackendOptions(): BackendConnectionOptions | undefined {
+  const sessionId = secondaryWindowSessionId()
+  return sessionId ? { sessionId, isolation: 'auto' } : undefined
 }
 
 // True when running inside the Electron desktop shell (the preload bridge is

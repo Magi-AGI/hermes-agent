@@ -12,8 +12,9 @@ declare global {
     hermesDesktop: {
       // Resolve a backend connection. Omit `profile` (or pass the primary) for
       // the window's backend; pass a named profile to lazily spawn/reuse that
-      // profile's backend from the pool.
-      getConnection: (profile?: string | null) => Promise<HermesConnection>
+      // profile's backend from the pool. `opts` routes pop-out/secondary windows
+      // to a per-session backend (M4b) when policy allows.
+      getConnection: (profile?: string | null, opts?: BackendConnectionOptions) => Promise<HermesConnection>
       // Reconnect-after-wake recovery: liveness-probe the cached PRIMARY backend
       // and drop it if a remote one has gone unreachable, so the next
       // getConnection() rebuilds a reachable descriptor instead of the renderer
@@ -23,8 +24,15 @@ declare global {
       revalidateConnection: () => Promise<{ ok: boolean; rebuilt: boolean }>
       // Keepalive: mark a pool profile backend as recently used so the idle
       // reaper spares it while its chat is active.
-      touchBackend: (profile?: string | null) => Promise<{ ok: boolean }>
-      getGatewayWsUrl: (profile?: null | string) => Promise<string>
+      touchBackend: (profile?: string | null, opts?: BackendConnectionOptions) => Promise<{ ok: boolean }>
+      // Task 10: explicit backend recovery controls over structured scopes.
+      // Restart/stop use confirmed teardown; a session op targets only that
+      // session (never sibling sessions or the profile backend).
+      backendStatus: (scope: BackendScopeDescriptor) => Promise<BackendManagementStatus>
+      restartBackend: (scope: BackendScopeDescriptor) => Promise<BackendManagementStatus>
+      stopBackend: (scope: BackendScopeDescriptor) => Promise<BackendStopResult>
+      reconcileBackends: () => Promise<BackendReconcileResult>
+      getGatewayWsUrl: (profile?: null | string, opts?: BackendConnectionOptions) => Promise<string>
       // Open (or focus) a standalone OS window for a single chat session so
       // the user can work with multiple chats side by side. Returns ok:false
       // with an error code when the sessionId is empty/invalid. `profile` is
@@ -175,8 +183,8 @@ declare global {
       onPowerResume?: (callback: () => void) => () => void
       onBootProgress: (callback: (payload: DesktopBootProgress) => void) => () => void
       getBootstrapState: () => Promise<DesktopBootstrapState>
-      resetBootstrap: () => Promise<{ ok: boolean }>
-      repairBootstrap: () => Promise<{ ok: boolean }>
+      resetBootstrap: () => Promise<{ ok: boolean; error?: string }>
+      repairBootstrap: () => Promise<{ ok: boolean; error?: string }>
       cancelBootstrap: () => Promise<{ ok: boolean; cancelled: boolean }>
       onBootstrapEvent: (callback: (payload: DesktopBootstrapEvent) => void) => () => void
       getVersion: () => Promise<DesktopVersionInfo>
@@ -356,6 +364,57 @@ export interface DesktopUpdateProgress {
   at: number
 }
 
+// Options for routing a backend connection to a per-session backend (M4b).
+// `isolation: 'auto'` picks a session backend only when the configured
+// backend_isolation mode (hybrid|session) allows AND a stored sessionId exists;
+// otherwise it resolves to the profile backend.
+export interface BackendConnectionOptions {
+  sessionId?: string
+  isolation?: 'profile' | 'session' | 'auto'
+}
+
+// The backend scope the MAIN process actually resolved a connection to (Task 9a).
+// This is authoritative (unlike the URL's session intent): under default
+// `profile` isolation an existing-session pop-out is profile/primary-scoped, not
+// session-scoped. The renderer keys backend status off this, not the URL.
+export interface BackendScopeDescriptor {
+  scope: 'primary' | 'profile' | 'session'
+  profile: string | null
+  sessionId?: string | null
+}
+
+// Lifecycle state a backend can report through the Task 10 status API.
+export type BackendLifecycleState = 'missing' | 'starting' | 'ready' | 'stopping' | 'failed'
+
+// Result of a Task 10 backendStatus/restartBackend management call. A
+// discriminated union on `ok`: a successful call always carries a concrete
+// state; a failed call (e.g. unconfirmed teardown, or a thrown IPC handler)
+// always carries an error string and may omit the scope echo.
+export type BackendManagementStatus =
+  | {
+      ok: true
+      scope: 'primary' | 'profile' | 'session'
+      profile: string | null
+      sessionId?: string
+      state: BackendLifecycleState
+    }
+  | {
+      ok: false
+      scope?: 'primary' | 'profile' | 'session'
+      profile?: string | null
+      sessionId?: string
+      state?: 'failed'
+      error: string
+    }
+
+// Result of a Task 10 stopBackend call. An unconfirmed stop fails closed: only a
+// confirmed process exit is ok:true.
+export type BackendStopResult = { ok: true; confirmed: true } | { ok: false; confirmed?: false; error: string }
+
+export type BackendReconcileResult =
+  | { ok: true; reaped: number; pruned: number; tombstoned: number; kept: number }
+  | { ok: false; error: string }
+
 export interface HermesConnection {
   baseUrl: string
   isFullscreen: boolean
@@ -369,6 +428,10 @@ export interface HermesConnection {
   // Set for pool (non-primary) backends so the renderer knows which profile a
   // connection belongs to.
   profile?: string
+  // The main-resolved backend scope this connection landed on (Task 9a). Absent
+  // on legacy/primary paths that don't annotate it → the renderer falls back to
+  // a conservative (never-session) scope.
+  backendScope?: BackendScopeDescriptor
   windowButtonPosition: { x: number; y: number } | null
 }
 

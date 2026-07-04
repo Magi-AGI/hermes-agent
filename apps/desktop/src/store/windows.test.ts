@@ -141,3 +141,48 @@ describe('openNewSessionInNewWindow', () => {
     expect(notifyError).toHaveBeenCalledTimes(1)
   })
 })
+
+// The window-flag helpers cache their URL reads at module load, so each case
+// stubs window.location and re-imports the module fresh (vi.resetModules) to get
+// a clean cache.
+describe('secondaryWindowBackendOptions (M4b)', () => {
+  const originalLocation = window.location
+
+  async function loadWithUrl(search: string, hash: string) {
+    Object.defineProperty(window, 'location', {
+      configurable: true,
+      writable: true,
+      value: { ...originalLocation, search, hash, href: `http://localhost/${search}${hash}` }
+    })
+    vi.resetModules()
+    return import('./windows')
+  }
+
+  afterEach(() => {
+    Object.defineProperty(window, 'location', { configurable: true, writable: true, value: originalLocation })
+    vi.resetModules()
+  })
+
+  it('existing-session secondary window → { sessionId, isolation: auto }', async () => {
+    const w = await loadWithUrl('?win=secondary&profile=claudetriad', '#/stored-session')
+    expect(w.secondaryWindowSessionId()).toBe('stored-session')
+    expect(w.secondaryWindowBackendOptions()).toEqual({ sessionId: 'stored-session', isolation: 'auto' })
+  })
+
+  it('new-session secondary window → undefined (new flag suppresses session routing)', async () => {
+    const w = await loadWithUrl('?win=secondary&new=1', '#/stored-session')
+    expect(w.secondaryWindowSessionId()).toBeNull()
+    expect(w.secondaryWindowBackendOptions()).toBeUndefined()
+  })
+
+  it('primary / non-secondary window → undefined even with a route id', async () => {
+    const w = await loadWithUrl('', '#/stored-session')
+    expect(w.secondaryWindowBackendOptions()).toBeUndefined()
+  })
+
+  it('secondary window with no durable route id → undefined', async () => {
+    const w = await loadWithUrl('?win=secondary', '#/')
+    expect(w.secondaryWindowSessionId()).toBeNull()
+    expect(w.secondaryWindowBackendOptions()).toBeUndefined()
+  })
+})

@@ -13490,6 +13490,88 @@ def _write_dashboard_ready_file(actual_port: int) -> None:
         _log.warning("Failed to write dashboard ready file %r: %s", target, exc)
 
 
+def _process_os_create_time() -> float | None:
+    """Return this process's OS create-time (epoch seconds), or None.
+
+    Uses ``psutil.Process(pid).create_time()`` so the sidecar records the exact
+    same clock/instant the Desktop reconciler reads back for the live PID. When
+    psutil is unavailable we return None rather than a bogus wall-clock value:
+    a None create-time makes ownership verification skip the start-time check
+    and fall back to the observable owner nonce, which stays fail-closed.
+    """
+    try:
+        import psutil  # noqa: PLC0415 — optional, imported lazily
+
+        return float(psutil.Process(os.getpid()).create_time())
+    except Exception:
+        return None
+
+
+def _write_dashboard_backend_sidecar(actual_port: int) -> None:
+    """Optionally publish non-secret Desktop backend ownership metadata.
+
+    Electron passes this path only for Desktop-owned backend children. The child
+    writes it after uvicorn has bound its port, so post-restart reconciliation can
+    verify PID/profile/scope/owner metadata without relying on unobservable child
+    environment variables or persisting runtime auth tokens.
+    """
+    target = os.environ.get("HERMES_DESKTOP_BACKEND_SIDECAR")
+    if not target:
+        return
+
+    owner = os.environ.get("HERMES_DESKTOP_BACKEND_OWNER") or ""
+    create_time = _process_os_create_time()
+    tmp_name = ""
+    try:
+        path = Path(target)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "kind": "hermes-desktop-backend",
+            "schemaVersion": 1,
+            "pid": os.getpid(),
+            # OS process create-time (epoch seconds), NOT wall-clock at write.
+            # Reconciliation compares this against a psutil ``create_time()``
+            # reading of the live PID, so it must be the same clock/instant or
+            # the reaper mismatches forever. ``writtenAt`` below stays as the
+            # (unrelated) sidecar-write wall-clock for debugging only.
+            "processStartTime": create_time,
+            "processStartTimeSource": (
+                "os_create_time" if create_time is not None else "unavailable"
+            ),
+            "ownerNonce": owner,
+            "desktopInstanceId": os.environ.get("HERMES_DESKTOP_INSTANCE_ID") or "",
+            "scope": os.environ.get("HERMES_DESKTOP_BACKEND_SCOPE") or "profile",
+            "profile": os.environ.get("HERMES_DESKTOP_BACKEND_PROFILE") or "",
+            "sessionId": os.environ.get("HERMES_DESKTOP_BACKEND_SESSION_ID") or "",
+            "id": os.environ.get("HERMES_DESKTOP_BACKEND_ID") or "",
+            "installRoot": os.environ.get("HERMES_DESKTOP_INSTALL_ROOT") or str(PROJECT_ROOT),
+            "hermesHome": str(get_hermes_home()),
+            "port": int(actual_port),
+            "writtenAt": datetime.now(timezone.utc).isoformat(),
+        }
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=str(path.parent),
+            prefix=f"{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as fh:
+            json.dump(payload, fh, separators=(",", ":"))
+            fh.flush()
+            os.fsync(fh.fileno())
+            tmp_name = fh.name
+        os.replace(tmp_name, path)
+    except Exception as exc:
+        if tmp_name:
+            try:
+                Path(tmp_name).unlink(missing_ok=True)
+            except Exception:
+                pass
+        _log.warning("Failed to write dashboard backend sidecar %r: %s", target, exc)
+
+
+
 def _maybe_open_browser(
     host: str, actual_port: int, open_browser: bool, initial_profile: str
 ) -> None:
@@ -13682,6 +13764,7 @@ def start_server(
             app.state.bound_port = actual_port
 
             _write_dashboard_ready_file(actual_port)
+            _write_dashboard_backend_sidecar(actual_port)
             print(f"HERMES_DASHBOARD_READY port={actual_port}", flush=True)
             print(f"  Hermes Web UI → http://{host}:{actual_port}")
             _maybe_open_browser(host, actual_port, open_browser, initial_profile)

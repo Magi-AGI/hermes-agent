@@ -1,10 +1,15 @@
 const { contextBridge, ipcRenderer, webUtils } = require('electron')
 
 contextBridge.exposeInMainWorld('hermesDesktop', {
-  getConnection: profile => ipcRenderer.invoke('hermes:connection', profile),
+  getConnection: (profile, opts) => ipcRenderer.invoke('hermes:connection', profile, opts),
   revalidateConnection: () => ipcRenderer.invoke('hermes:connection:revalidate'),
-  touchBackend: profile => ipcRenderer.invoke('hermes:backend:touch', profile),
-  getGatewayWsUrl: profile => ipcRenderer.invoke('hermes:gateway:ws-url', profile),
+  touchBackend: (profile, opts) => ipcRenderer.invoke('hermes:backend:touch', profile, opts),
+  // Task 10 backend management (structured BackendScopeDescriptor only).
+  backendStatus: scope => ipcRenderer.invoke('hermes:backend:status', scope),
+  restartBackend: scope => ipcRenderer.invoke('hermes:backend:restart', scope),
+  stopBackend: scope => ipcRenderer.invoke('hermes:backend:stop', scope),
+  reconcileBackends: () => ipcRenderer.invoke('hermes:backend:reconcile'),
+  getGatewayWsUrl: (profile, opts) => ipcRenderer.invoke('hermes:gateway:ws-url', profile, opts),
   openSessionWindow: (sessionId, opts) => ipcRenderer.invoke('hermes:window:openSession', sessionId, opts),
   openNewSessionWindow: () => ipcRenderer.invoke('hermes:window:openNewSession'),
   petOverlay: {

@@ -22,6 +22,9 @@ Three scenarios are covered:
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+from pathlib import Path
 import time
 import threading
 from unittest.mock import patch
@@ -186,3 +189,51 @@ def test_concurrent_status_probes_all_respond():
         f"{len(failed)}/{PROBES} probes failed (codes: {responses}). "
         f"This would cause WinError 10054 and orphan accumulation on desktop."
     )
+
+
+def test_desktop_backend_sidecar_is_child_written_and_secret_free(tmp_path, monkeypatch):
+    sidecar = tmp_path / "backend.sidecar.json"
+    monkeypatch.setenv("HERMES_DESKTOP_BACKEND_SIDECAR", str(sidecar))
+    monkeypatch.setenv("HERMES_DESKTOP_BACKEND_OWNER", "owner-123")
+    monkeypatch.setenv("HERMES_DESKTOP_BACKEND_SCOPE", "profile")
+    monkeypatch.setenv("HERMES_DESKTOP_BACKEND_PROFILE", "claudetriad")
+    monkeypatch.setenv("HERMES_DESKTOP_BACKEND_ID", "profile:claudetriad")
+    monkeypatch.setenv("HERMES_DESKTOP_INSTANCE_ID", "desktop-1")
+    monkeypatch.setenv("HERMES_DESKTOP_INSTALL_ROOT", str(tmp_path / "install"))
+
+    web_server_mod._write_dashboard_backend_sidecar(actual_port=43210)
+
+    payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert payload["kind"] == "hermes-desktop-backend"
+    assert payload["ownerNonce"] == "owner-123"
+    assert payload["profile"] == "claudetriad"
+    assert payload["scope"] == "profile"
+    assert payload["id"] == "profile:claudetriad"
+    assert payload["port"] == 43210
+    assert payload["pid"] == os.getpid()
+    assert payload["installRoot"] == str(tmp_path / "install")
+
+    # processStartTime must be the OS process create-time (epoch seconds), NOT
+    # the wall-clock instant the sidecar was written. It must be an actual
+    # number (not the ISO ``writtenAt`` string) so reconciliation can compare it
+    # against a psutil create_time() reading of the live PID.
+    assert "processStartTime" in payload
+    assert payload["processStartTime"] != payload["writtenAt"]
+    try:
+        import psutil
+
+        expected = psutil.Process(os.getpid()).create_time()
+        assert isinstance(payload["processStartTime"], (int, float))
+        assert payload["processStartTimeSource"] == "os_create_time"
+        # Same clock/instant as the reconciler will read for this PID.
+        assert abs(float(payload["processStartTime"]) - float(expected)) < 2.0
+        # And clearly NOT wall-clock-at-write: the create-time precedes now.
+        assert float(payload["processStartTime"]) <= time.time() + 1.0
+    except ImportError:
+        assert payload["processStartTime"] is None
+        assert payload["processStartTimeSource"] == "unavailable"
+
+    serialized = json.dumps(payload)
+    assert "token" not in serialized.lower()
+    assert "secret" not in serialized.lower()
+    assert "api_key" not in serialized.lower()
