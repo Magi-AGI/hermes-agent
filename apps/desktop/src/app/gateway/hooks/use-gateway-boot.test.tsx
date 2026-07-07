@@ -1,6 +1,7 @@
 import { act, cleanup, render } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { $backendStatuses } from '@/store/backend-status'
 import { $desktopBoot } from '@/store/boot'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $gatewayState } from '@/store/session'
@@ -134,6 +135,7 @@ beforeEach(() => {
   window.history.replaceState(null, '', '/')
   $activeGatewayProfile.set('default')
   $gatewayState.set('idle')
+  $backendStatuses.set({})
   $desktopBoot.set({
     error: null,
     fakeMode: false,
@@ -181,6 +183,82 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
       baseUrl: `https://vps.example.com/${profile || 'default'}`,
       profile: profile || 'default',
       token: 't',
+      wsUrl: `wss://vps.example.com/${profile || 'default'}/api/ws?token=t`,
+      // Main resolved a SESSION backend (hybrid/session isolation).
+      backendScope: { scope: 'session' as const, profile: 'wikireader', sessionId: 'session-1' }
+    }))
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+
+    // M4b: an existing-session pop-out routes to a per-session backend — the
+    // renderer always sends { sessionId, isolation: 'auto' } (the MAIN process
+    // decides profile-vs-session from backend_isolation).
+    const opts = { sessionId: 'session-1', isolation: 'auto' }
+    expect(desktop.getConnection).toHaveBeenCalledWith('wikireader', opts)
+    expect(desktop.getGatewayWsUrl).toHaveBeenCalledWith('wikireader', opts)
+    expect($activeGatewayProfile.get()).toBe('wikireader')
+    // Task 9a: status is keyed to the MAIN-resolved session scope.
+    expect($backendStatuses.get()['session:wikireader:session-1']?.state).toBe('ready')
+  })
+
+  it('Task 9a: a pop-out that main resolves to the PROFILE backend records profile scope, not session', async () => {
+    // Default `profile` isolation: main resolves { isolation:'auto' } to the
+    // profile backend, so status must NOT claim a phantom session backend.
+    window.history.replaceState(null, '', '/?win=secondary&profile=wikireader#/session-1')
+
+    const desktop = fakeDesktop()
+    desktop.getConnection = vi.fn(async (profile?: string | null) => ({
+      authMode: 'token' as const,
+      baseUrl: `https://vps.example.com/${profile || 'default'}`,
+      profile: profile || 'default',
+      token: 't',
+      wsUrl: `wss://vps.example.com/${profile || 'default'}/api/ws?token=t`,
+      backendScope: { scope: 'profile' as const, profile: 'wikireader' }
+    }))
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+
+    expect($backendStatuses.get()['profile:wikireader']?.state).toBe('ready')
+    // No phantom session-scoped status for a backend that was not resolved.
+    expect($backendStatuses.get()['session:wikireader:session-1']).toBeUndefined()
+  })
+
+  it('Task 9a: a boot failure is attributed to the main-resolved (session) scope', async () => {
+    window.history.replaceState(null, '', '/?win=secondary&profile=wikireader#/session-1')
+    // The socket errors on connect (dead backend) AFTER getConnection resolved
+    // with a session scope → the failure is keyed to that session scope.
+    FakeWebSocket.mode = 'fail'
+
+    const desktop = fakeDesktop()
+    desktop.getConnection = vi.fn(async (profile?: string | null) => ({
+      authMode: 'token' as const,
+      baseUrl: `https://vps.example.com/${profile || 'default'}`,
+      profile: profile || 'default',
+      token: 't',
+      wsUrl: `wss://vps.example.com/${profile || 'default'}/api/ws?token=t`,
+      backendScope: { scope: 'session' as const, profile: 'wikireader', sessionId: 'session-1' }
+    }))
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+
+    expect($backendStatuses.get()['session:wikireader:session-1']?.state).toBe('failed')
+  })
+
+  it('reconnect for a secondary session window re-resolves ITS session backend (not the profile backend)', async () => {
+    window.history.replaceState(null, '', '/?win=secondary&profile=wikireader#/session-1')
+
+    const desktop = fakeDesktop()
+    desktop.getConnection = vi.fn(async (profile?: string | null) => ({
+      authMode: 'token' as const,
+      baseUrl: `https://vps.example.com/${profile || 'default'}`,
+      profile: profile || 'default',
+      token: 't',
       wsUrl: `wss://vps.example.com/${profile || 'default'}/api/ws?token=t`
     }))
     ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
@@ -188,8 +266,45 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     render(<Harness />)
     await flushAsync()
 
-    expect(desktop.getConnection).toHaveBeenCalledWith('wikireader')
-    expect($activeGatewayProfile.get()).toBe('wikireader')
+    const opts = { sessionId: 'session-1', isolation: 'auto' }
+    expect(desktop.getConnection).toHaveBeenCalledWith('wikireader', opts)
+
+    // Drop the live socket and let the reconnect attempt run; only inspect the
+    // reconnect's calls.
+    desktop.getConnection.mockClear()
+    desktop.getGatewayWsUrl.mockClear()
+    act(() => FakeWebSocket.instances[FakeWebSocket.instances.length - 1].drop())
+    await flushAsync()
+    await advanceBackoff()
+
+    // Reconnect used the SAME session opts, not a bare profile connection.
+    expect(desktop.getConnection).toHaveBeenCalledWith('wikireader', opts)
+    expect(desktop.getGatewayWsUrl).toHaveBeenCalledWith('wikireader', opts)
+  })
+
+  it('keepalive touches the SESSION backend for a secondary session window', async () => {
+    window.history.replaceState(null, '', '/?win=secondary&profile=wikireader#/session-1')
+
+    const desktop = fakeDesktop()
+    desktop.getConnection = vi.fn(async (profile?: string | null) => ({
+      authMode: 'token' as const,
+      baseUrl: `https://vps.example.com/${profile || 'default'}`,
+      profile: profile || 'default',
+      token: 't',
+      wsUrl: `wss://vps.example.com/${profile || 'default'}/api/ws?token=t`
+    }))
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+
+    desktop.touchBackend.mockClear()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000)
+    })
+
+    // The session backend (not the profile backend) is kept fresh.
+    expect(desktop.touchBackend).toHaveBeenCalledWith('wikireader', { sessionId: 'session-1', isolation: 'auto' })
   })
 
   it('does not run primary-window config/session refresh during secondary-window boot', async () => {

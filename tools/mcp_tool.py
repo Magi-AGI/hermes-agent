@@ -262,6 +262,54 @@ except ImportError:
     logger.debug("mcp package not installed -- MCP tool support disabled")
 
 
+# ---------------------------------------------------------------------------
+# Always-bound fallbacks for optional MCP SDK types
+# ---------------------------------------------------------------------------
+# The conditional imports above only bind these names when the installed MCP
+# SDK actually provides them (they were added across several SDK releases).
+# Downstream code and tests import a subset of these names *unconditionally*
+# (e.g. ``from tools.mcp_tool import CreateMessageResultWithTools``), which
+# raised ``ImportError`` on SDK versions that predate the symbol. Bind a
+# harmless placeholder for any name the SDK did not supply so the module always
+# imports. Real behavior stays gated on the ``_MCP_*_TYPES`` booleans above, so
+# a placeholder never enables a feature; it only keeps the name resolvable.
+class _UnavailableMcpType:
+    """Placeholder for an MCP SDK type absent in the installed SDK version.
+
+    Hermes never instantiates these — the class exists only so module-level
+    names stay bound and ``isinstance(value, <Name>)`` returns ``False`` instead
+    of raising ``NameError``. A distinct subclass is bound per missing name so
+    the isinstance checks stay total and can't accidentally conflate two types.
+    """
+
+    __slots__ = ()
+
+
+def _bind_optional_mcp_type(name: str) -> None:
+    """Bind ``name`` to a placeholder type if the SDK import left it unbound."""
+    if globals().get(name) is None:
+        globals()[name] = type(name, (_UnavailableMcpType,), {})
+
+
+for _optional_mcp_type_name in (
+    "CreateMessageResult",
+    "CreateMessageResultWithTools",
+    "ErrorData",
+    "SamplingCapability",
+    "SamplingToolsCapability",
+    "TextContent",
+    "ToolUseContent",
+    "ElicitRequestParams",
+    "ElicitResult",
+    "ServerNotification",
+    "ToolListChangedNotification",
+    "PromptListChangedNotification",
+    "ResourceListChangedNotification",
+):
+    _bind_optional_mcp_type(_optional_mcp_type_name)
+del _optional_mcp_type_name
+
+
 def _check_message_handler_support() -> bool:
     """Check if ClientSession accepts ``message_handler`` kwarg.
 
@@ -2943,6 +2991,8 @@ _parallel_safe_servers: set = set()
 # captured at registration time so parallel safety never relies on prefix
 # guessing.
 _mcp_tool_server_names: Dict[str, str] = {}
+_mcp_tool_original_names: Dict[str, str] = {}
+_mcp_proxy_tool_names: set[str] = set()
 
 # Dedicated event loop running in a background daemon thread.
 _mcp_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -3966,17 +4016,21 @@ _UTILITY_CAPABILITY_ATTRS = {
 }
 
 
-def _track_mcp_tool_server(tool_name: str, server_name: str) -> None:
-    """Remember the exact MCP server that registered *tool_name*."""
+def _track_mcp_tool_server(tool_name: str, server_name: str, original_tool_name: str | None = None) -> None:
+    """Remember the exact MCP server and original MCP name for *tool_name*."""
     safe_server_name = sanitize_mcp_name_component(server_name)
     with _lock:
         _mcp_tool_server_names[tool_name] = safe_server_name
+        if original_tool_name:
+            _mcp_tool_original_names[tool_name] = original_tool_name
 
 
 def _forget_mcp_tool_server(tool_name: str) -> None:
-    """Forget MCP server provenance for a deregistered tool."""
+    """Forget MCP provenance for a deregistered tool."""
     with _lock:
         _mcp_tool_server_names.pop(tool_name, None)
+        _mcp_tool_original_names.pop(tool_name, None)
+        _mcp_proxy_tool_names.discard(tool_name)
 
 
 def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dict) -> List[dict]:
@@ -4113,7 +4167,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             is_async=False,
             description=schema["description"],
         )
-        _track_mcp_tool_server(tool_name_prefixed, name)
+        _track_mcp_tool_server(tool_name_prefixed, name, mcp_tool.name)
         registered_names.append(tool_name_prefixed)
 
     # Register MCP Resources & Prompts utility tools, filtered by config and
@@ -4150,7 +4204,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             is_async=False,
             description=schema["description"],
         )
-        _track_mcp_tool_server(util_name, name)
+        _track_mcp_tool_server(util_name, name, handler_key)
         registered_names.append(util_name)
 
     if registered_names:
@@ -4184,6 +4238,382 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         ", ".join(registered_names),
     )
     return registered_names
+
+
+def is_mcp_proxy_mode() -> bool:
+    """Return True when this process should proxy MCP via a profile broker."""
+    return str(os.environ.get("HERMES_MCP_MODE") or "").strip().lower() == "proxy"
+
+
+def _mcp_proxy_call_timeout() -> float | None:
+    raw = str(os.environ.get("HERMES_MCP_PROXY_CALL_TIMEOUT_S") or "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+        return value if value > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _mcp_proxy_required_servers(required_servers: List[str] | None = None) -> set[str]:
+    if required_servers is not None:
+        raw_items = required_servers
+    else:
+        raw = os.environ.get("HERMES_MCP_PROXY_REQUIRED_SERVERS") or ""
+        raw_items = raw.split(",")
+    return {str(item).strip() for item in raw_items if str(item).strip()}
+
+
+def _load_mcp_proxy_catalog_from_env() -> dict | None:
+    raw = os.environ.get("HERMES_MCP_PROXY_CATALOG_JSON")
+    if raw:
+        try:
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else None
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"invalid HERMES_MCP_PROXY_CATALOG_JSON: {exc}") from exc
+    path = os.environ.get("HERMES_MCP_PROXY_CATALOG_FILE")
+    if path:
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else None
+        except OSError as exc:
+            raise RuntimeError(f"could not read HERMES_MCP_PROXY_CATALOG_FILE: {exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"invalid HERMES_MCP_PROXY_CATALOG_FILE JSON: {exc}") from exc
+    return None
+
+
+def _call_mcp_proxy_broker_from_env(tool_name: str, arguments: dict, **kwargs) -> dict:
+    """Default proxy broker call placeholder.
+
+    M4 supplies live broker connection details for session backends. Until then,
+    unit tests and in-process callers can inject ``broker_call`` directly via
+    ``register_mcp_proxy_tools``; an unconfigured proxy handler returns a clear
+    broker-unavailable error instead of spawning native MCP servers.
+    """
+    return {
+        "error": {
+            "code": "mcp_broker_unavailable",
+            "message": "MCP proxy broker connection is not configured",
+        }
+    }
+
+
+def _normalise_mcp_proxy_broker_result(result: dict) -> dict:
+    if not isinstance(result, dict):
+        return {"error": "MCP broker returned a non-object response"}
+    if "error" in result:
+        err = result.get("error")
+        if isinstance(err, dict):
+            message = err.get("message") or err.get("code") or "MCP broker error"
+            payload = {"error": str(message)}
+            code = err.get("code")
+            if code is not None:
+                payload["code"] = code
+            return payload
+        return {"error": str(err)}
+    payload = {}
+    if "result" in result:
+        payload["result"] = result.get("result")
+    if "structuredContent" in result:
+        payload["structuredContent"] = result.get("structuredContent")
+    return payload if payload else {k: v for k, v in result.items() if k not in {"call_id", "server", "tool", "origin", "queue_wait_ms"}}
+
+
+def _make_mcp_proxy_tool_handler(tool_name: str, broker_call):
+    def _handler(args: dict, **kwargs) -> str:
+        if not isinstance(args, dict):
+            args = {}
+        call_id = kwargs.get("task_id") or kwargs.get("tool_call_id")
+        try:
+            broker_result = broker_call(
+                tool_name,
+                args,
+                call_id=str(call_id) if call_id else None,
+                timeout=_mcp_proxy_call_timeout(),
+            )
+        except Exception as exc:
+            logger.exception("MCP proxy tool %s broker call failed: %s", tool_name, exc)
+            return json.dumps({"error": f"MCP proxy broker call failed: {type(exc).__name__}: {exc}"}, ensure_ascii=False)
+        return json.dumps(_normalise_mcp_proxy_broker_result(broker_result), ensure_ascii=False)
+
+    return _handler
+
+
+def register_mcp_proxy_tools(
+    catalog: dict | None,
+    *,
+    broker_call=None,
+    required_servers: List[str] | None = None,
+) -> List[str]:
+    """Register MCP proxy tools from a profile-backend broker catalog."""
+    from tools.registry import registry
+
+    if not isinstance(catalog, dict):
+        catalog = {"tools": [], "toolset_aliases": {}}
+    tools = catalog.get("tools") or []
+    if not isinstance(tools, list):
+        tools = []
+    servers_present = {str(tool.get("server") or "").strip() for tool in tools if isinstance(tool, dict)}
+    missing_required = sorted(_mcp_proxy_required_servers(required_servers) - servers_present)
+    if missing_required:
+        raise RuntimeError(f"missing required MCP broker servers: {', '.join(missing_required)}")
+
+    broker_call = broker_call or _call_mcp_proxy_broker_from_env
+    new_names: List[str] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        name = str(tool.get("name") or "").strip()
+        server_name = str(tool.get("server") or "").strip()
+        toolset = str(tool.get("toolset") or f"mcp-{server_name}").strip()
+        schema = tool.get("schema")
+        if not name.startswith("mcp_") or not server_name or not toolset or not isinstance(schema, dict):
+            continue
+        schema = dict(schema)
+        schema.setdefault("name", name)
+        registry.register(
+            name=name,
+            toolset=toolset,
+            schema=schema,
+            handler=_make_mcp_proxy_tool_handler(name, broker_call),
+            check_fn=lambda: True,
+            is_async=False,
+            description=str(tool.get("description") or schema.get("description") or ""),
+            max_result_size_chars=tool.get("max_result_size_chars"),
+        )
+        _track_mcp_tool_server(name, server_name)
+        new_names.append(name)
+
+    aliases = catalog.get("toolset_aliases") or {}
+    if isinstance(aliases, dict):
+        for alias, target in aliases.items():
+            alias = str(alias or "").strip()
+            target = str(target or "").strip()
+            if alias and target.startswith("mcp-"):
+                registry.register_toolset_alias(alias, target)
+
+    with _lock:
+        stale = set(_mcp_proxy_tool_names) - set(new_names)
+        _mcp_proxy_tool_names.clear()
+        _mcp_proxy_tool_names.update(new_names)
+    for stale_name in stale:
+        registry.deregister(stale_name)
+        _forget_mcp_tool_server(stale_name)
+
+    return new_names
+
+
+def register_mcp_proxy_tools_from_env() -> List[str]:
+    return register_mcp_proxy_tools(_load_mcp_proxy_catalog_from_env())
+
+
+def _mcp_tool_runtime_names(tool_name: str) -> tuple[str | None, str | None, object | None]:
+    """Resolve a registered Hermes MCP tool to raw server + original MCP tool names."""
+    with _lock:
+        safe_server_name = _mcp_tool_server_names.get(tool_name)
+        original_tool_name = _mcp_tool_original_names.get(tool_name)
+        active_servers = dict(_servers)
+
+    if not safe_server_name:
+        return None, None, None
+
+    server_name = None
+    server = None
+    for candidate_name, candidate_server in active_servers.items():
+        if sanitize_mcp_name_component(candidate_name) == safe_server_name:
+            server_name = candidate_name
+            server = candidate_server
+            break
+
+    if original_tool_name is None:
+        prefix = f"mcp_{safe_server_name}_"
+        if tool_name.startswith(prefix):
+            original_tool_name = tool_name[len(prefix):]
+
+    return server_name, original_tool_name, server
+
+
+def _mcp_call_result_payload(result) -> dict:
+    """Convert MCP CallToolResult-like objects to Hermes tool-result fields."""
+    if getattr(result, "isError", False):
+        error_text = ""
+        for block in (getattr(result, "content", None) or []):
+            if hasattr(block, "text") and block.text:
+                error_text += block.text
+        return {"error": {"code": "mcp_tool_error", "message": _sanitize_error(error_text or "MCP tool returned an error")}}
+
+    parts: List[str] = []
+    for block in (getattr(result, "content", None) or []):
+        if hasattr(block, "text") and block.text:
+            parts.append(block.text)
+            continue
+        image_tag = _cache_mcp_image_block(block)
+        if image_tag:
+            parts.append(image_tag)
+    payload: dict = {"result": "\n".join(parts) if parts else ""}
+    structured = getattr(result, "structuredContent", None)
+    if structured is not None:
+        payload["structuredContent"] = structured
+    return payload
+
+
+def export_mcp_broker_catalog(origin_profile: str | None = None) -> dict:
+    """Export the profile backend's MCP catalog for session-backend proxy use."""
+    from tools.registry import registry
+
+    with _lock:
+        active_servers = dict(_servers)
+        provenance = dict(_mcp_tool_server_names)
+        aliases = registry.get_registered_toolset_aliases()
+
+    active_safe_names = {
+        sanitize_mcp_name_component(name): name for name in active_servers.keys()
+    }
+    tools: List[dict] = []
+    for tool_name in sorted(provenance):
+        safe_server = provenance.get(tool_name)
+        raw_server = active_safe_names.get(safe_server)
+        if raw_server is None:
+            continue
+        entry = registry.get_entry(tool_name)
+        if entry is None:
+            continue
+        tools.append({
+            "name": entry.name,
+            "server": raw_server,
+            "toolset": entry.toolset,
+            "schema": entry.schema,
+            "description": entry.description,
+            "is_async": bool(entry.is_async),
+            "max_result_size_chars": entry.max_result_size_chars,
+        })
+
+    return {
+        "version": 1,
+        "profile": (origin_profile or "").strip() or None,
+        "tools": tools,
+        "toolset_aliases": {
+            alias: target for alias, target in sorted(aliases.items()) if target.startswith("mcp-")
+        },
+    }
+
+
+def export_mcp_broker_status(origin_profile: str | None = None) -> dict:
+    """Return secret-free broker status for session-backend health checks."""
+    return {
+        "version": 1,
+        "profile": (origin_profile or "").strip() or None,
+        "servers": get_mcp_status(),
+    }
+
+
+# Default wall-clock budget for a single broker tool call when the caller does
+# not pass one. Bounds how long a session backend's proxied MCP call can occupy
+# a broker executor worker; the session backend also passes its own timeout.
+_BROKER_DEFAULT_TIMEOUT_SECONDS = 120.0
+
+
+def call_mcp_broker_tool(
+    tool_name: str,
+    arguments: dict | None,
+    *,
+    origin_profile: str | None = None,
+    origin_session_id: str | None = None,
+    call_id: str | None = None,
+    timeout: float | None = None,
+) -> dict:
+    """Forward one session-backend proxy call to the profile-owned MCP server.
+
+    The broker remains unary request/response for MVP. Calls reuse the same
+    per-server ``_rpc_lock`` as native MCP handlers, so same-server requests
+    serialize while different servers can run independently on the MCP loop.
+    """
+    if not isinstance(arguments, dict):
+        arguments = {}
+    effective_timeout = _BROKER_DEFAULT_TIMEOUT_SECONDS if timeout is None else max(0.001, float(timeout))
+    server_name, original_tool_name, server = _mcp_tool_runtime_names(tool_name)
+    base = {
+        "call_id": call_id,
+        "tool": tool_name,
+        "server": server_name,
+        "origin": {
+            "profile": (origin_profile or "").strip() or None,
+            "session_id": (origin_session_id or "").strip() or None,
+        },
+    }
+    if not server_name or not original_tool_name or server is None or getattr(server, "session", None) is None:
+        return {
+            **base,
+            "error": {
+                "code": "mcp_broker_unavailable",
+                "message": f"MCP broker server for tool '{tool_name}' is not connected",
+                "server": server_name,
+            },
+            "queue_wait_ms": 0,
+        }
+
+    async def _call():
+        start = time.monotonic()
+        acquired = False
+        try:
+            try:
+                await asyncio.wait_for(server._rpc_lock.acquire(), timeout=effective_timeout)
+                acquired = True
+            except asyncio.TimeoutError:
+                return {
+                    **base,
+                    "error": {
+                        "code": "mcp_broker_queue_timeout",
+                        "message": f"Timed out waiting for MCP server '{server_name}' queue",
+                        "server": server_name,
+                    },
+                    "queue_wait_ms": int((time.monotonic() - start) * 1000),
+                }
+            queue_wait_ms = int((time.monotonic() - start) * 1000)
+            server._pending_call_context = contextvars.copy_context()
+            try:
+                result = await server.session.call_tool(original_tool_name, arguments=arguments)
+            finally:
+                server._pending_call_context = None
+            return {
+                **base,
+                **_mcp_call_result_payload(result),
+                "server": server_name,
+                "queue_wait_ms": queue_wait_ms,
+            }
+        finally:
+            if acquired:
+                server._rpc_lock.release()
+
+    _ensure_mcp_loop()
+    try:
+        return _run_on_mcp_loop(_call, timeout=effective_timeout + 0.5)
+    except TimeoutError:
+        return {
+            **base,
+            "error": {
+                "code": "mcp_broker_timeout",
+                "message": f"MCP broker call timed out after {effective_timeout:.1f}s",
+                "server": server_name,
+            },
+            "queue_wait_ms": 0,
+        }
+    except InterruptedError:
+        return {**base, "error": {"code": "interrupted", "message": "User sent a new message"}, "queue_wait_ms": 0}
+    except Exception as exc:
+        return {
+            **base,
+            "error": {
+                "code": "mcp_broker_error",
+                "message": _sanitize_error(str(exc) or type(exc).__name__),
+                "server": server_name,
+            },
+            "queue_wait_ms": 0,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -4309,6 +4739,10 @@ def discover_mcp_tools() -> List[str]:
     Returns:
         List of all registered MCP tool names.
     """
+    if is_mcp_proxy_mode():
+        logger.debug("MCP proxy mode enabled -- registering broker catalog tools")
+        return register_mcp_proxy_tools_from_env()
+
     if not _MCP_AVAILABLE:
         logger.debug("MCP SDK not available -- skipping MCP tool discovery")
         return []

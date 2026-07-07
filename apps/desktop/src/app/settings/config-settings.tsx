@@ -2,6 +2,7 @@ import type { ChangeEvent, ReactNode } from 'react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 
+import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
@@ -25,6 +26,28 @@ import { MemoryConnect } from './memory/connect'
 import { ModelSettings } from './model-settings'
 import { EmptyState, ListRow, LoadingState, SettingsContent } from './primitives'
 import { ProviderConfigPanel } from './provider-config-panel'
+
+const DESKTOP_BACKEND_NUMERIC_MINIMUMS: Record<string, number> = {
+  'desktop.backend_pool.idle_ms': 1_000,
+  'desktop.backend_pool.max_profile_backends': 1,
+  'desktop.backend_pool.max_session_backends_per_profile': 1
+}
+
+function normalizeConfigFieldValue(key: string, value: unknown): unknown {
+  const minimum = DESKTOP_BACKEND_NUMERIC_MINIMUMS[key]
+
+  if (minimum === undefined) {
+    return value
+  }
+
+  const n = Number(value)
+
+  if (!Number.isFinite(n)) {
+    return minimum
+  }
+
+  return Math.max(minimum, Math.round(n))
+}
 
 // On the Voice page, only surface the sub-fields of the *selected* TTS/STT
 // provider — otherwise every provider's options render at once (the "totally
@@ -230,6 +253,7 @@ export function ConfigSettings({
   const [schema, setSchema] = useState<Record<string, ConfigFieldSchema> | null>(null)
   const [elevenLabsVoiceOptions, setElevenLabsVoiceOptions] = useState<string[] | null>(null)
   const [elevenLabsVoiceLabels, setElevenLabsVoiceLabels] = useState<Record<string, string>>({})
+  const [reapingBackends, setReapingBackends] = useState(false)
   const saveVersionRef = useRef(0)
   const [saveVersion, setSaveVersion] = useState(0)
 
@@ -304,6 +328,28 @@ export function ConfigSettings({
     saveVersionRef.current += 1
     setConfig(next)
     setSaveVersion(saveVersionRef.current)
+  }
+
+  const handleReapBackends = async () => {
+    setReapingBackends(true)
+
+    try {
+      const result = await window.hermesDesktop.reconcileBackends()
+
+      if (!result.ok) {
+        throw new Error(result.error || 'Backend reconciliation failed')
+      }
+
+      notify({
+        kind: 'success',
+        title: 'Backend reaper complete',
+        message: `reaped ${result.reaped ?? 0}, pruned ${result.pruned ?? 0}, tombstoned ${result.tombstoned ?? 0}, kept ${result.kept ?? 0}`
+      })
+    } catch (err) {
+      notifyError(err, 'Failed to reap orphaned Desktop backends')
+    } finally {
+      setReapingBackends(false)
+    }
   }
 
   const sectionFields = useMemo(() => {
@@ -404,7 +450,7 @@ export function ConfigSettings({
                     ? enumOptionsFor(key, getNested(config, key), config, elevenLabsVoiceOptions ?? undefined)
                     : enumOptionsFor(key, getNested(config, key), config)
                 }
-                onChange={value => updateConfig(setNested(config, key, value))}
+                onChange={value => updateConfig(setNested(config, key, normalizeConfigFieldValue(key, value)))}
                 optionLabels={key === 'tts.elevenlabs.voice_id' ? elevenLabsVoiceLabels : undefined}
                 schema={field}
                 schemaKey={key}
@@ -415,6 +461,19 @@ export function ConfigSettings({
               ) : null}
             </div>
           ))}
+        </div>
+      )}
+      {activeSectionId === 'advanced' && (
+        <div className="mt-4 border-t border-border/40 pt-3">
+          <ListRow
+            action={
+              <Button disabled={reapingBackends} onClick={() => void handleReapBackends()} size="sm" variant="textStrong">
+                {reapingBackends ? 'Reaping…' : 'Reap orphaned backends'}
+              </Button>
+            }
+            description="Immediately reconciles the Desktop backend registry and reaps only verified orphaned backend processes."
+            title="Reap orphaned backends"
+          />
         </div>
       )}
       <input

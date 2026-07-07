@@ -25,7 +25,8 @@ import {
 } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile, normalizeProfileKey, touchActiveGatewayBackend } from '@/store/profile'
-import { isSecondaryWindow, secondaryWindowProfile } from '@/store/windows'
+import { type BackendScopeRef, conservativeWindowBackendScope, setBackendStatus } from '@/store/backend-status'
+import { isSecondaryWindow, secondaryWindowBackendOptions, secondaryWindowProfile } from '@/store/windows'
 import {
   $activeSessionId,
   $attentionSessionIds,
@@ -123,6 +124,28 @@ export function useGatewayBoot({
     // genuinely changes between reads).
     const gatewayOpen = () => gateway.connectionState === 'open'
 
+    // Latch this window's identity ONCE for the hook instance (M4b). A window's
+    // secondary/profile/session route is fixed for its lifetime (the flags are
+    // read from a static URL), so boot, reconnect, and keepalive must all target
+    // the SAME backend. For an existing-session pop-out these route to the
+    // per-session backend; for primary/new-session windows `backendOptions` is
+    // undefined and behavior is unchanged.
+    const isSecondary = isSecondaryWindow()
+    const secondaryProfile = secondaryWindowProfile()
+    const backendOptions = secondaryWindowBackendOptions()
+
+    // Task 9a: the backend scope this window is bound to. Starts conservative
+    // (NEVER session — URL intent isn't proof a session backend exists under the
+    // default `profile` isolation) and is upgraded to the MAIN-resolved scope
+    // (conn.backendScope) once getConnection returns, so ready/reconnect/failed/
+    // unresponsive statuses key off the real backend identity.
+    let backendScope: BackendScopeRef = conservativeWindowBackendScope(secondaryProfile)
+    const adoptResolvedScope = (conn: { backendScope?: BackendScopeRef }) => {
+      if (conn?.backendScope) {
+        backendScope = conn.backendScope
+      }
+    }
+
     const clearReconnectTimer = () => {
       if (reconnectTimer !== null) {
         clearTimeout(reconnectTimer)
@@ -145,12 +168,20 @@ export function useGatewayBoot({
         // "Starting Hermes…". The probe is a no-op for a healthy or local backend.
         await desktop.revalidateConnection?.().catch(() => undefined)
 
-        const conn = await desktop.getConnection($activeGatewayProfile.get())
+        // Reconnect to the SAME backend the initial boot used. A secondary
+        // session pop-out must re-resolve its per-session backend (with the same
+        // opts), not silently fall back to the profile backend; the primary
+        // window keeps following the active profile with no opts.
+        const conn = await desktop.getConnection(
+          isSecondary ? secondaryProfile : $activeGatewayProfile.get(),
+          backendOptions
+        )
 
         if (cancelled) {
           return
         }
 
+        adoptResolvedScope(conn)
         publish(conn)
         // Re-mint the WS URL before reconnecting. OAuth tickets are single-use
         // with a short TTL, so the ticket baked into the cached conn.wsUrl is
@@ -158,13 +189,18 @@ export function useGatewayBoot({
         // as an opaque "Could not connect to Hermes gateway". resolveGatewayWsUrl
         // mints a fresh ticket (or throws a reauth error in OAuth mode rather
         // than connecting with a stale one). For local/token gateways the URL
-        // carries a long-lived token and the re-mint is a cheap no-op.
-        const wsUrl = await resolveGatewayWsUrl(desktop, conn)
+        // carries a long-lived token and the re-mint is a cheap no-op. Pass the
+        // latched backendOptions so a session pop-out re-mints against ITS
+        // session backend.
+        const wsUrl = await resolveGatewayWsUrl(desktop, conn, backendOptions)
         await gateway.connect(wsUrl)
 
         if (cancelled) {
           return
         }
+
+        // Task 9a: a reconnect restored this window's backend (main-resolved scope).
+        setBackendStatus(backendScope, 'ready')
 
         reconnectAttempt = 0
         // Resync state that may have moved on the backend while we were asleep.
@@ -185,6 +221,10 @@ export function useGatewayBoot({
         if (!cancelled && !gatewayOpen()) {
           if (reconnectAttempt >= RECONNECT_ESCALATE_AFTER && !escalated) {
             escalated = true
+            // Task 9a: prolonged reconnect failure → mark THIS window's backend
+            // (main-resolved / last-known scope) unresponsive, distinct from a
+            // primary install/setup failure.
+            setBackendStatus(backendScope, 'unresponsive', { lastError: translateNow('boot.errors.gatewayConnectionLost') })
             failDesktopBoot(translateNow('boot.errors.gatewayConnectionLost'))
           }
 
@@ -286,7 +326,14 @@ export function useGatewayBoot({
     // Keep live pool backends alive while this window is open (the main process
     // can't observe the direct renderer↔backend WS). No-op for the primary.
     const keepaliveTimer = setInterval(() => {
-      touchActiveGatewayBackend()
+      if (backendOptions) {
+        // Session-scoped pop-out: keep ITS session backend fresh, with the SAME
+        // (profile, opts) boot/reconnect used. Touching the profile backend here
+        // would let the session backend idle-reap while the window is open.
+        void window.hermesDesktop?.touchBackend?.(secondaryProfile, backendOptions).catch(() => undefined)
+      } else {
+        touchActiveGatewayBackend()
+      }
       touchSecondaryGateways()
     }, 60_000)
 
@@ -334,12 +381,24 @@ export function useGatewayBoot({
 
     async function boot() {
       try {
-        const profileFromWindow = secondaryWindowProfile()
-        const conn = profileFromWindow ? await desktop.getConnection(profileFromWindow) : await desktop.getConnection()
+        // Task 9a: this window's backend is coming up (conservative scope until
+        // main resolves the real one — never a fake session scope).
+        setBackendStatus(backendScope, 'starting')
+        // Use the latched window identity (M4b): existing-session pop-outs pass
+        // isolation:'auto'; main resolves it to a session backend only under
+        // hybrid/session isolation, otherwise the profile/primary backend.
+        const conn = secondaryProfile
+          ? await desktop.getConnection(secondaryProfile, backendOptions)
+          : await desktop.getConnection(null, backendOptions)
 
         if (cancelled) {
           return
         }
+
+        // Task 9a: getConnection has resolved the backend — adopt its scope NOW
+        // so any later connect failure is attributed to the real (main-resolved)
+        // scope, not the conservative pre-connection fallback.
+        adoptResolvedScope(conn)
 
         setDesktopBootStep({
           phase: 'renderer.gateway.connect',
@@ -351,13 +410,20 @@ export function useGatewayBoot({
         // ticket is single-use with a short TTL, so the ticket baked into
         // conn.wsUrl is stale; resolveGatewayWsUrl() re-mints it and, on
         // failure, throws a reauth error rather than connecting with a dead
-        // ticket (which would surface as an opaque "connection closed").
-        const wsUrl = await resolveGatewayWsUrl(desktop, conn)
+        // ticket (which would surface as an opaque "connection closed"). Pass the
+        // same session backendOptions so the ws URL targets the session backend.
+        const wsUrl = await resolveGatewayWsUrl(desktop, conn, backendOptions)
         await gateway.connect(wsUrl)
 
         if (cancelled) {
           return
         }
+
+        // Task 9a: backend up. Scope was already adopted right after
+        // getConnection; for a hybrid/session pop-out that's the session scope,
+        // under default profile isolation the profile/primary scope — never a
+        // phantom session one.
+        setBackendStatus(backendScope, 'ready')
 
         // Record which profile this window's primary backend is scoped to, so
         // same-profile resumes are no-op swaps and reconnect/REST calls target
@@ -365,14 +431,14 @@ export function useGatewayBoot({
         // in the URL; ordinary primary windows fall back to the persisted desktop
         // preference (or the connection descriptor if the preference probe fails).
         try {
-          const profileKey = profileFromWindow
-            ? normalizeProfileKey(profileFromWindow)
+          const profileKey = secondaryProfile
+            ? normalizeProfileKey(secondaryProfile)
             : normalizeProfileKey((await desktop.profile?.get?.())?.profile ?? conn.profile)
           $activeGatewayProfile.set(profileKey)
           setPrimaryGateway(gateway, profileKey)
           void ensureGatewayForProfile(profileKey)
         } catch {
-          const fallbackProfile = normalizeProfileKey(profileFromWindow ?? conn.profile)
+          const fallbackProfile = normalizeProfileKey(secondaryProfile ?? conn.profile)
           $activeGatewayProfile.set(fallbackProfile)
           setPrimaryGateway(gateway, fallbackProfile)
         }
@@ -420,6 +486,11 @@ export function useGatewayBoot({
       } catch (err) {
         if (!cancelled) {
           const message = err instanceof Error ? err.message : String(err)
+          // Task 9a: attribute the failure to THIS window's backend scope
+          // (main-resolved when we got a connection, else the conservative
+          // fallback) so later per-session recovery UI can distinguish it from a
+          // genuine primary-install/setup problem.
+          setBackendStatus(backendScope, 'failed', { lastError: message })
           failDesktopBoot(message)
           notifyError(err, translateNow('boot.errors.desktopBootFailed'))
           setSessionsLoading(false)

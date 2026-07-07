@@ -36,6 +36,47 @@ describe('useRouteResume', () => {
     vi.restoreAllMocks()
   })
 
+  it('resumes the ROUTE stored id, never the active/cached runtime id (Task 8)', () => {
+    // A session-backend pop-out must open the transcript named in its URL, not
+    // whatever runtime session happens to be active. Even with a bogus active
+    // runtime id and a stale stored→runtime cache entry, the route id wins.
+    const resumeSession = vi.fn(async () => undefined)
+    const startFreshSessionDraft = vi.fn()
+    const activeSessionIdRef: MutableRefObject<null | string> = { current: 'runtime-wrong' }
+    const runtimeIdByStoredSessionIdRef = {
+      current: new Map([
+        ['other-session', 'runtime-x'],
+        ['stored-session-1', 'stale-runtime']
+      ])
+    }
+    // Not yet loaded → stranded on the routed session, so the resume fires.
+    const selectedStoredSessionIdRef: MutableRefObject<null | string> = { current: null }
+
+    render(
+      <RouteResumeHarness
+        activeSessionId="runtime-wrong"
+        activeSessionIdRef={activeSessionIdRef}
+        creatingSessionRef={{ current: false }}
+        currentView="chat"
+        freshDraftReady={false}
+        gatewayState="open"
+        locationPathname="/stored-session-1"
+        resumeSession={resumeSession}
+        routedSessionId="stored-session-1"
+        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+        selectedStoredSessionId={null}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        startFreshSessionDraft={startFreshSessionDraft}
+      />
+    )
+
+    expect(resumeSession).toHaveBeenCalledWith('stored-session-1', true)
+    expect(resumeSession).not.toHaveBeenCalledWith('runtime-wrong', expect.anything())
+    expect(resumeSession).not.toHaveBeenCalledWith('stale-runtime', expect.anything())
+    // A routed resume is never a fresh-draft (no accidental new session).
+    expect(startFreshSessionDraft).not.toHaveBeenCalled()
+  })
+
   it('does not re-resume the old session during a /:sid -> /new transition', () => {
     const resumeSession = vi.fn(async () => undefined)
     const startFreshSessionDraft = vi.fn()

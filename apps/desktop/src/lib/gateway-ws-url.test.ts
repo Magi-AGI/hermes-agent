@@ -59,6 +59,28 @@ describe('resolveGatewayWsUrl', () => {
       await expect(resolveGatewayWsUrl({}, { wsUrl: tokenConn.wsUrl })).resolves.toBe(tokenConn.wsUrl)
     })
   })
+
+  describe('session backend options (M4b)', () => {
+    const sessionOpts = { sessionId: 'stored-session', isolation: 'auto' as const }
+
+    it('passes opts (and the conn profile) into the mint for OAuth', async () => {
+      const getGatewayWsUrl = vi.fn().mockResolvedValue('ws://host/api/ws?ticket=fresh')
+      await resolveGatewayWsUrl({ getGatewayWsUrl }, { ...oauthConn, profile: 'claudetriad' }, sessionOpts)
+      expect(getGatewayWsUrl).toHaveBeenCalledWith('claudetriad', sessionOpts)
+    })
+
+    it('passes opts into the mint for the token/local re-mint path', async () => {
+      const getGatewayWsUrl = vi.fn().mockResolvedValue('ws://host/api/ws?token=fresh')
+      await resolveGatewayWsUrl({ getGatewayWsUrl }, { ...tokenConn, profile: 'claudetriad' }, sessionOpts)
+      expect(getGatewayWsUrl).toHaveBeenCalledWith('claudetriad', sessionOpts)
+    })
+
+    it('still falls back to the cached URL when a token/local mint with opts fails', async () => {
+      const getGatewayWsUrl = vi.fn().mockRejectedValue(new Error('transient'))
+      await expect(resolveGatewayWsUrl({ getGatewayWsUrl }, tokenConn, sessionOpts)).resolves.toBe(tokenConn.wsUrl)
+      expect(getGatewayWsUrl).toHaveBeenCalledWith(null, sessionOpts)
+    })
+  })
 })
 
 describe('isGatewayReauthRequired', () => {

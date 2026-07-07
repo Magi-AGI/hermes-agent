@@ -332,3 +332,166 @@ describe('resumeSession failure recovery', () => {
     expect(resumeParams).not.toHaveProperty('eager_build')
   })
 })
+
+// ── Task 8: route resume on a per-session backend ────────────────────────────
+// A session-backend pop-out must open the STORED transcript from its URL and
+// must not create a new session or resume a wrong/stale runtime id — even with a
+// bogus active id or a stale stored→runtime cache left by a prior backend.
+function task8CachedState(overrides: Partial<ClientSessionState> = {}): ClientSessionState {
+  return {
+    storedSessionId: 'stored-popout-1',
+    messages: [],
+    branch: '',
+    cwd: '',
+    model: 'x',
+    provider: '',
+    reasoningEffort: '',
+    serviceTier: '',
+    fast: false,
+    yolo: false,
+    personality: '',
+    busy: false,
+    awaitingResponse: false,
+    streamId: null,
+    sawAssistantPayload: false,
+    pendingBranchGroup: null,
+    interrupted: false,
+    needsInput: false,
+    turnStartedAt: null,
+    ...overrides
+  }
+}
+
+function Task8ResumeHarness({
+  onReady,
+  requestGateway,
+  activeSessionId = null,
+  runtimeMap = new Map<string, string>(),
+  stateMap = new Map<string, ClientSessionState>()
+}: {
+  onReady: (resume: (storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) => void
+  requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+  activeSessionId?: string | null
+  runtimeMap?: Map<string, string>
+  stateMap?: Map<string, ClientSessionState>
+}) {
+  const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
+
+  const actions = useSessionActions({
+    activeSessionId,
+    activeSessionIdRef: ref<string | null>(activeSessionId),
+    busyRef: ref(false),
+    creatingSessionRef: ref(false),
+    ensureSessionState: () => ({}) as ClientSessionState,
+    getRouteToken: () => 'token',
+    navigate: vi.fn() as never,
+    requestGateway,
+    runtimeIdByStoredSessionIdRef: ref(runtimeMap),
+    selectedStoredSessionId: null,
+    selectedStoredSessionIdRef: ref<string | null>(null),
+    sessionStateByRuntimeIdRef: ref(stateMap),
+    syncSessionStateToView: vi.fn(),
+    updateSessionState: (_sessionId, updater) => updater({} as ClientSessionState)
+  })
+
+  useEffect(() => {
+    onReady(actions.resumeSession)
+  }, [actions.resumeSession, onReady])
+
+  return null
+}
+
+describe('resumeSession on a per-session backend (Task 8)', () => {
+  afterEach(() => {
+    cleanup()
+    setResumeFailedSessionId(null)
+    setMessages([])
+    setSessions([])
+    $activeGatewayProfile.set('default')
+    vi.mocked(secondaryWindowProfile).mockReturnValue(null)
+    vi.mocked(getSession).mockReset()
+    vi.mocked(getSessionMessages).mockReset()
+    vi.mocked(ensureGatewayProfile).mockClear()
+    vi.restoreAllMocks()
+  })
+
+  it('cold pop-out resume uses the STORED id (no session.create) despite a bogus active id + stale cache', async () => {
+    vi.mocked(secondaryWindowProfile).mockReturnValue('wikireader')
+    vi.mocked(getSession).mockResolvedValue({ id: 'stored-popout-1', profile: 'wikireader' } as never)
+    vi.mocked(getSessionMessages).mockResolvedValue({ messages: [] } as never)
+
+    const calls: Array<{ method: string; params?: Record<string, unknown> }> = []
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      calls.push({ method, params })
+
+      if (method === 'session.resume') {
+        return { session_id: 'runtime-fresh', messages: [], info: {} } as never
+      }
+
+      return {} as never
+    })
+
+    // Stale stored→runtime mapping WITHOUT a cached state → fast-path is skipped.
+    const runtimeMap = new Map([['stored-popout-1', 'stale-runtime-999']])
+
+    let resume: ((id: string, r?: boolean) => Promise<unknown>) | null = null
+    render(
+      <Task8ResumeHarness
+        onReady={r => (resume = r)}
+        requestGateway={requestGateway}
+        activeSessionId="bogus-runtime-from-other-session"
+        runtimeMap={runtimeMap}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+    await resume!('stored-popout-1', true)
+
+    const resumeCalls = calls.filter(call => call.method === 'session.resume')
+    expect(resumeCalls).toHaveLength(1)
+    expect(resumeCalls[0].params).toMatchObject({ session_id: 'stored-popout-1', profile: 'wikireader' })
+    // Never a new session, never the bogus/stale runtime id.
+    expect(calls.some(call => call.method === 'session.create')).toBe(false)
+    expect(resumeCalls.every(call => call.params?.session_id === 'stored-popout-1')).toBe(true)
+  })
+
+  it('a stale cached runtime (post-restart 404) falls through to a full session.resume on the stored id', async () => {
+    vi.mocked(secondaryWindowProfile).mockReturnValue('wikireader')
+    vi.mocked(getSession).mockResolvedValue({ id: 'stored-popout-1', profile: 'wikireader' } as never)
+    vi.mocked(getSessionMessages).mockResolvedValue({ messages: [] } as never)
+
+    const calls: Array<{ method: string; params?: Record<string, unknown> }> = []
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      calls.push({ method, params })
+
+      if (method === 'session.usage') {
+        // Cached runtime id was minted by a prior backend instance → 404.
+        throw new Error('session not found')
+      }
+
+      if (method === 'session.resume') {
+        return { session_id: 'runtime-fresh', messages: [], info: {} } as never
+      }
+
+      return {} as never
+    })
+
+    // Cached mapping WITH a state → the fast-path fires, hits session.usage, 404s,
+    // then must fall through to a full resume on the STORED id. The cached view
+    // state carries the string cwd/branch the fast-path paints before it 404s.
+    const runtimeMap = new Map([['stored-popout-1', 'stale-runtime-999']])
+    const stateMap = new Map([['stale-runtime-999', task8CachedState()]])
+
+    let resume: ((id: string, r?: boolean) => Promise<unknown>) | null = null
+    render(
+      <Task8ResumeHarness onReady={r => (resume = r)} requestGateway={requestGateway} runtimeMap={runtimeMap} stateMap={stateMap} />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+    await resume!('stored-popout-1', true)
+
+    expect(calls.some(call => call.method === 'session.usage' && call.params?.session_id === 'stale-runtime-999')).toBe(true)
+    const resumeCalls = calls.filter(call => call.method === 'session.resume')
+    expect(resumeCalls).toHaveLength(1)
+    expect(resumeCalls[0].params).toMatchObject({ session_id: 'stored-popout-1' })
+    expect(calls.some(call => call.method === 'session.create')).toBe(false)
+  })
+})

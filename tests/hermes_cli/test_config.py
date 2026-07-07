@@ -97,6 +97,21 @@ class TestLoadConfigDefaults:
             assert "terminal" in config
             assert config["terminal"]["backend"] == "local"
             assert config["display"]["interim_assistant_messages"] is True
+            # Canonical isolation is a top-level desktop key; pool holds only
+            # capacity/lifecycle knobs (max session backends stays at 10).
+            assert config["desktop"]["backend_isolation"] == "profile"
+            assert config["desktop"]["backend_pool"] == {
+                "max_profile_backends": 3,
+                "max_session_backends_per_profile": 10,
+                "spawn_concurrency": 10,
+                "idle_ms": 10 * 60_000,
+                "keepalive_fresh_ms": 90_000,
+                "health_timeout_ms": 2_500,
+                "startup_timeout_ms": 90_000,
+                "auto_reap_orphans": True,
+            }
+            # The nested alias is migrated away from the canonical output.
+            assert "backend_isolation" not in config["desktop"]["backend_pool"]
 
     def test_legacy_root_level_max_turns_migrates_to_agent_config(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
@@ -106,6 +121,85 @@ class TestLoadConfigDefaults:
             config = load_config()
             assert config["agent"]["max_turns"] == 42
             assert "max_turns" not in config
+
+
+class TestDesktopBackendIsolation:
+    """Task 14 — canonical desktop.backend_isolation config surface.
+
+    Canonical path is the top-level ``desktop.backend_isolation``; the nested
+    ``desktop.backend_pool.backend_isolation`` remains a backward-compatible
+    alias. Explicit null sections are treated as unset (defaults), and invalid
+    values fall back to ``profile`` with a warning.
+    """
+
+    def _load(self, tmp_path, yaml_text):
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            (tmp_path / "config.yaml").write_text(yaml_text, encoding="utf-8")
+            return load_config()
+
+    def test_defaults_when_no_file(self, tmp_path):
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            config = load_config()
+        assert config["desktop"]["backend_isolation"] == "profile"
+        assert config["desktop"]["backend_pool"]["max_session_backends_per_profile"] == 10
+
+    def test_desktop_null_returns_defaults_without_warning(self, tmp_path, caplog):
+        with caplog.at_level("WARNING"):
+            config = self._load(tmp_path, "desktop: null\n")
+        assert config["desktop"]["backend_isolation"] == "profile"
+        assert config["desktop"]["backend_pool"]["max_session_backends_per_profile"] == 10
+        assert not any("backend_isolation" in r.message for r in caplog.records)
+
+    def test_backend_pool_null_returns_defaults_without_warning(self, tmp_path, caplog):
+        with caplog.at_level("WARNING"):
+            config = self._load(tmp_path, "desktop:\n  backend_pool: null\n")
+        assert config["desktop"]["backend_isolation"] == "profile"
+        assert config["desktop"]["backend_pool"]["max_session_backends_per_profile"] == 10
+        assert not any("backend_isolation" in r.message for r in caplog.records)
+
+    def test_isolation_null_is_unset_default(self, tmp_path, caplog):
+        with caplog.at_level("WARNING"):
+            config = self._load(tmp_path, "desktop:\n  backend_isolation: null\n")
+        assert config["desktop"]["backend_isolation"] == "profile"
+        assert not any("backend_isolation" in r.message for r in caplog.records)
+
+    def test_top_level_isolation_is_honored(self, tmp_path):
+        config = self._load(tmp_path, "desktop:\n  backend_isolation: session\n")
+        assert config["desktop"]["backend_isolation"] == "session"
+
+    def test_invalid_isolation_falls_back_to_profile_and_warns(self, tmp_path, caplog):
+        with caplog.at_level("WARNING"):
+            config = self._load(tmp_path, "desktop:\n  backend_isolation: bogus\n")
+        assert config["desktop"]["backend_isolation"] == "profile"
+        assert any("backend_isolation" in r.message for r in caplog.records)
+
+    def test_legacy_nested_alias_is_accepted(self, tmp_path):
+        config = self._load(
+            tmp_path, "desktop:\n  backend_pool:\n    backend_isolation: session\n"
+        )
+        assert config["desktop"]["backend_isolation"] == "session"
+        # And migrated off the nested location in the canonical output.
+        assert "backend_isolation" not in config["desktop"]["backend_pool"]
+
+    def test_top_level_wins_over_nested_alias(self, tmp_path):
+        config = self._load(
+            tmp_path,
+            "desktop:\n"
+            "  backend_isolation: hybrid\n"
+            "  backend_pool:\n"
+            "    backend_isolation: session\n",
+        )
+        assert config["desktop"]["backend_isolation"] == "hybrid"
+
+    def test_pool_scalar_override_preserved(self, tmp_path):
+        config = self._load(
+            tmp_path,
+            "desktop:\n  backend_pool:\n    max_profile_backends: 5\n",
+        )
+        assert config["desktop"]["backend_pool"]["max_profile_backends"] == 5
+        # Untouched pool defaults survive the merge; session cap stays 10.
+        assert config["desktop"]["backend_pool"]["max_session_backends_per_profile"] == 10
+        assert config["desktop"]["backend_isolation"] == "profile"
 
 
 class TestLoadConfigParseFailure:

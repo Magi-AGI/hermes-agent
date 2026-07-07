@@ -1780,6 +1780,30 @@ DEFAULT_CONFIG = {
         },
     },
 
+    # Native Electron desktop app settings.
+    "desktop": {
+        # profile | hybrid | session. Canonical, user-facing surface for how the
+        # desktop app scopes backends. profile keeps one backend per profile;
+        # hybrid routes pop-out/secondary session windows to per-session
+        # backends; session gives every isolated session window its own backend.
+        # (Legacy alias: desktop.backend_pool.backend_isolation — still accepted,
+        # but this top-level key wins when both are present.)
+        "backend_isolation": "profile",
+        # Per-profile backend pool used by the desktop app when multiple
+        # profiles/sessions are open concurrently. Secrets stay out of config;
+        # these are capacity/lifecycle knobs only.
+        "backend_pool": {
+            "max_profile_backends": 3,
+            "max_session_backends_per_profile": 10,
+            "spawn_concurrency": 10,
+            "idle_ms": 10 * 60_000,
+            "keepalive_fresh_ms": 90_000,
+            "health_timeout_ms": 2_500,
+            "startup_timeout_ms": 90_000,
+            "auto_reap_orphans": True,
+        },
+    },
+
     # Web dashboard settings
     "dashboard": {
         "theme": "default",  # Dashboard visual theme: "default", "midnight", "ember", "mono", "cyberpunk", "rose"
@@ -4576,7 +4600,7 @@ _KNOWN_ROOT_KEYS = {
     "fallback_providers", "credential_pool_strategies", "toolsets",
     "agent", "terminal", "display", "compression", "delegation",
     "auxiliary", "moa", "custom_providers", "context", "memory", "gateway",
-    "sessions", "streaming", "updates", "mcp_servers",
+    "sessions", "streaming", "updates", "mcp_servers", "desktop",
 }
 
 # Valid fields inside a custom_providers list entry
@@ -5750,6 +5774,88 @@ def _normalize_max_turns_config(config: Dict[str, Any]) -> Dict[str, Any]:
     return config
 
 
+_VALID_BACKEND_ISOLATION = ("profile", "hybrid", "session")
+
+
+def _normalize_desktop_config(
+    config: Dict[str, Any], user_config: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """Normalize ``desktop.*`` backend-isolation config into the canonical shape.
+
+    Reconciles the user-facing config surface for Desktop backend isolation:
+
+      * ``desktop`` or ``desktop.backend_pool`` set to ``null`` in YAML (or any
+        non-dict) is treated as UNSET — defaults are restored, never a literal
+        ``None`` that would explode downstream ``.get()`` calls.
+      * Isolation mode is canonicalised to the top-level
+        ``desktop.backend_isolation``. The legacy nested
+        ``desktop.backend_pool.backend_isolation`` is still accepted as an alias,
+        but an explicitly-set top-level value wins when both are present.
+        ``null`` at either location counts as unset.
+      * Invalid isolation values fall back to ``profile`` with a logged warning.
+
+    ``user_config`` is the RAW parsed user YAML (pre-merge). It is consulted so a
+    *default* top-level value can never mask an explicitly-set nested alias — we
+    resolve precedence from what the user actually wrote, then stamp the winner
+    onto the merged config's canonical top-level key.
+    """
+    if not isinstance(config, dict):
+        return config
+
+    default_desktop = DEFAULT_CONFIG.get("desktop", {})
+    default_pool = default_desktop.get("backend_pool", {})
+
+    desktop = config.get("desktop")
+    if not isinstance(desktop, dict):
+        desktop = copy.deepcopy(default_desktop)
+    pool = desktop.get("backend_pool")
+    if not isinstance(pool, dict):
+        pool = copy.deepcopy(default_pool)
+
+    # What did the USER explicitly write? (raw, pre-merge)
+    user_desktop = {}
+    if isinstance(user_config, dict) and isinstance(user_config.get("desktop"), dict):
+        user_desktop = user_config["desktop"]
+    user_pool = user_desktop.get("backend_pool")
+    if not isinstance(user_pool, dict):
+        user_pool = {}
+
+    top_val = user_desktop.get("backend_isolation")
+    nested_val = user_pool.get("backend_isolation")
+
+    chosen, source = None, None
+    for candidate, src in (
+        (top_val, "desktop.backend_isolation"),
+        (nested_val, "desktop.backend_pool.backend_isolation"),
+    ):
+        if candidate is None:  # unset / explicit null → skip
+            continue
+        chosen, source = candidate, src
+        break
+
+    if chosen is None:
+        resolved = default_desktop.get("backend_isolation", "profile")
+    else:
+        norm = str(chosen).strip().lower()
+        if norm in _VALID_BACKEND_ISOLATION:
+            resolved = norm
+        else:
+            logger.warning(
+                "Invalid %s=%r; falling back to 'profile' (valid: %s)",
+                source,
+                chosen,
+                ", ".join(_VALID_BACKEND_ISOLATION),
+            )
+            resolved = "profile"
+
+    # Canonical output: top-level isolation, nested alias migrated away.
+    pool.pop("backend_isolation", None)
+    desktop["backend_pool"] = pool
+    desktop["backend_isolation"] = resolved
+    config["desktop"] = desktop
+    return config
+
+
 def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> Any:
     """Traverse nested dict keys safely, returning ``default`` on any miss.
 
@@ -6036,6 +6142,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
 
         config = copy.deepcopy(DEFAULT_CONFIG)
 
+        user_config: Dict[str, Any] = {}
         if user_sig is not None:
             try:
                 with open(config_path, encoding="utf-8") as f:
@@ -6051,8 +6158,12 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 config = _deep_merge(config, user_config)
             except Exception as e:
                 _warn_config_parse_failure(config_path, e)
+                user_config = {}
 
-        normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
+        normalized = _normalize_desktop_config(
+            _normalize_root_model_keys(_normalize_max_turns_config(config)),
+            user_config,
+        )
         expanded = _expand_env_vars(normalized)
         # Managed scope wins at the leaf. Applied AFTER user expansion so a user
         # ${VAR} cannot shadow a managed literal: managed values are expanded only

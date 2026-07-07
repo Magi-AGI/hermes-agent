@@ -6,6 +6,7 @@ import { isGatewayReauthRequired, resolveGatewayWsUrl } from '@/lib/gateway-ws-u
 import { $gateway, ensureActiveGatewayOpen, isActivePrimary } from '@/store/gateway'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $gatewayState, setConnection } from '@/store/session'
+import { secondaryWindowBackendOptions } from '@/store/windows'
 
 export function useGatewayRequest() {
   const gatewayState = useStore($gatewayState)
@@ -63,8 +64,13 @@ export function useGatewayRequest() {
       try {
         // Reconnect to whichever profile the gateway is currently routed to (not
         // always the primary), so a sleep/wake reconnect keeps the user on the
-        // profile they were chatting in.
-        const conn = await desktop.getConnection($activeGatewayProfile.get())
+        // profile they were chatting in. For an existing-session pop-out, pass the
+        // SAME session backend options M4b boot/reconnect/keepalive use, so a
+        // request-level transport recovery re-resolves ITS session backend rather
+        // than silently reconnecting to the profile backend. Undefined for primary
+        // and new-session windows → unchanged behavior.
+        const backendOptions = secondaryWindowBackendOptions()
+        const conn = await desktop.getConnection($activeGatewayProfile.get(), backendOptions)
         connectionRef.current = conn
         setConnection(conn)
         // Re-mint the WS URL before reconnecting. OAuth tickets are single-use
@@ -72,7 +78,7 @@ export function useGatewayRequest() {
         // resolveGatewayWsUrl() throws a reauth error in OAuth mode rather than
         // connecting with a stale ticket. Stash it so requestGateway can show
         // the actionable "sign in again" message.
-        const wsUrl = await resolveGatewayWsUrl(desktop, conn)
+        const wsUrl = await resolveGatewayWsUrl(desktop, conn, backendOptions)
         await existing.connect(wsUrl)
 
         return existing

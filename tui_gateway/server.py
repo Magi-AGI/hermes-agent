@@ -3,6 +3,7 @@ import concurrent.futures
 import contextlib
 import contextvars
 import copy
+import hmac
 import inspect
 import json
 import logging
@@ -217,6 +218,29 @@ _pool = concurrent.futures.ThreadPoolExecutor(
     thread_name_prefix="tui-rpc",
 )
 atexit.register(lambda: _pool.shutdown(wait=False, cancel_futures=True))
+
+# MCP broker calls (mcp.call) can block for up to the broker timeout (120s) while
+# a proxied session backend waits on a remote MCP server. They must NOT run on
+# the fast-path reader thread (would stall approval.respond / session.interrupt)
+# and must NOT share the general long-handler _pool (10 same-profile session
+# backends could exhaust it and starve session.resume etc). A DEDICATED bounded
+# executor caps broker concurrency, isolates that load, and still lets calls to
+# DIFFERENT MCP servers run concurrently (same-server calls serialize on the
+# per-server _rpc_lock inside call_mcp_broker_tool, independent of this pool).
+try:
+    _broker_pool_workers = max(
+        2, int(os.environ.get("HERMES_TUI_BROKER_POOL_WORKERS") or "4")
+    )
+except (ValueError, TypeError):
+    _broker_pool_workers = 4
+_broker_pool = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_broker_pool_workers,
+    thread_name_prefix="tui-broker",
+)
+atexit.register(lambda: _broker_pool.shutdown(wait=False, cancel_futures=True))
+
+# Methods routed onto the dedicated broker executor (see _broker_pool above).
+_BROKER_HANDLERS = frozenset({"mcp.call"})
 
 # Reserve real stdout for JSON-RPC only; redirect Python's stdout to stderr
 # so stray print() from libraries/tools becomes harmless gateway.stderr instead
@@ -1095,7 +1119,8 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
             return normalized
 
         _rid, method, _params = normalized
-        if method not in _LONG_HANDLERS:
+        is_broker = method in _BROKER_HANDLERS
+        if not is_broker and method not in _LONG_HANDLERS:
             return handle_request(req)
 
         # Snapshot the context so the pool worker sees the bound transport.
@@ -1109,7 +1134,11 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
             if resp is not None:
                 t.write(resp)
 
-        _pool.submit(lambda: ctx.run(run))
+        # Broker calls go on the dedicated bounded executor so slow MCP calls
+        # can't exhaust the general long-handler pool; everything else stays on
+        # the shared long-handler pool.
+        executor = _broker_pool if is_broker else _pool
+        executor.submit(lambda: ctx.run(run))
 
         return None
     finally:
@@ -4812,6 +4841,99 @@ def _inflight_snapshot(session: dict) -> dict | None:
         "streaming": streaming,
         "user": user,
     }
+
+
+# ── Methods: MCP broker ───────────────────────────────────────────────
+
+
+def _broker_launch_profile() -> str:
+    return (
+        os.environ.get("HERMES_DESKTOP_BACKEND_PROFILE")
+        or os.environ.get("HERMES_PROFILE")
+        or "default"
+    ).strip() or "default"
+
+
+def _configured_mcp_broker_token() -> str:
+    """The optional defense-in-depth broker token, or '' when unset.
+
+    Transport auth (/api/ws) already gates every broker RPC; this token is an
+    extra local-only check the profile backend can require of session backends.
+    Read fresh each call so tests/config changes take effect without restart.
+    """
+    return (os.environ.get("HERMES_MCP_BROKER_TOKEN") or "").strip()
+
+
+def _authorize_mcp_broker_profile(rid, params: dict) -> tuple[str | None, dict | None]:
+    # Optional broker-token gate (defense-in-depth). Enforced ONLY when
+    # configured; the expected/presented values are never echoed in the error or
+    # logged, and the token is a top-level param so it is never forwarded into a
+    # tool call's arguments.
+    expected = _configured_mcp_broker_token()
+    if expected:
+        presented = str(params.get("broker_token") or "")
+        if not presented or not hmac.compare_digest(presented.encode(), expected.encode()):
+            return None, _err(rid, 4033, "mcp broker token missing or invalid")
+    requested = str(params.get("profile") or "").strip() or _broker_launch_profile()
+    launch = _broker_launch_profile()
+    if requested != launch:
+        return None, _err(
+            rid,
+            4031,
+            f"mcp broker profile mismatch: requested profile '{requested}' but backend serves '{launch}'",
+        )
+    return requested, None
+
+
+@method("mcp.catalog")
+def _(rid, params: dict) -> dict:
+    profile, err = _authorize_mcp_broker_profile(rid, params)
+    if err:
+        return err
+    from tools.mcp_tool import export_mcp_broker_catalog
+
+    return _ok(rid, export_mcp_broker_catalog(origin_profile=profile))
+
+
+@method("mcp.status")
+def _(rid, params: dict) -> dict:
+    profile, err = _authorize_mcp_broker_profile(rid, params)
+    if err:
+        return err
+    from tools.mcp_tool import export_mcp_broker_status
+
+    return _ok(rid, export_mcp_broker_status(origin_profile=profile))
+
+
+@method("mcp.call")
+def _(rid, params: dict) -> dict:
+    profile, err = _authorize_mcp_broker_profile(rid, params)
+    if err:
+        return err
+    tool_name = str(params.get("tool") or params.get("name") or "").strip()
+    if not tool_name.startswith("mcp_"):
+        return _err(rid, -32602, "invalid params: expected an MCP tool name")
+    arguments = params.get("arguments") or {}
+    if not isinstance(arguments, dict):
+        return _err(rid, -32602, "invalid params: arguments must be an object")
+    raw_timeout = params.get("timeout")
+    timeout = None
+    if raw_timeout is not None:
+        try:
+            timeout = float(raw_timeout)
+        except (TypeError, ValueError):
+            return _err(rid, -32602, "invalid params: timeout must be numeric")
+    from tools.mcp_tool import call_mcp_broker_tool
+
+    result = call_mcp_broker_tool(
+        tool_name,
+        arguments,
+        origin_profile=profile,
+        origin_session_id=str(params.get("session_id") or "").strip() or None,
+        call_id=str(params.get("call_id") or "").strip() or None,
+        timeout=timeout,
+    )
+    return _ok(rid, result)
 
 
 # ── Methods: session ─────────────────────────────────────────────────

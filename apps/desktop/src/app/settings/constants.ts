@@ -232,6 +232,7 @@ export const ENUM_OPTIONS: Record<string, string[]> = {
   // tools/terminal_tool.py::_create_environment (local/docker/singularity/
   // modal/daytona/ssh). Remote backends need extra env (image, tokens, host).
   'terminal.backend': ['local', 'docker', 'singularity', 'modal', 'daytona', 'ssh'],
+  'desktop.backend_isolation': ['profile', 'hybrid', 'session'],
   'stt.elevenlabs.model_id': ['scribe_v2', 'scribe_v1'],
   'stt.local.model': ['tiny', 'base', 'small', 'medium', 'large-v3'],
   // Speech-to-text backends — kept in sync with the stt block in
@@ -410,6 +411,15 @@ export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
     childTimeoutSeconds: 'Subagent Timeout',
     reasoningEffort: 'Subagent Reasoning Effort'
   },
+  desktop: {
+    backendIsolation: 'Backend isolation',
+    backendPool: {
+      maxProfileBackends: 'Max profile backends',
+      maxSessionBackendsPerProfile: 'Max session backends per profile',
+      idleMs: 'Backend idle timeout',
+      autoReapOrphans: 'Auto-reap orphaned backends'
+    }
+  },
   updates: {
     nonInteractiveLocalChanges: 'In-App Update Local Changes'
   }
@@ -460,6 +470,16 @@ export const FIELD_DESCRIPTIONS: Record<string, string> = defineFieldCopy({
   },
   compression: {
     enabled: 'Summarize older context when conversations get large.'
+  },
+  desktop: {
+    backendIsolation:
+      'Profile keeps one backend per profile. Hybrid gives popped-out sessions their own backend. Session isolates every session window. Restart Desktop to apply.',
+    backendPool: {
+      maxProfileBackends: 'Maximum extra profile-scoped Desktop backends to keep warm. Restart Desktop to apply.',
+      maxSessionBackendsPerProfile: 'Maximum per-session Desktop backends to keep for one profile. Restart Desktop to apply.',
+      idleMs: 'How long an unused pooled Desktop backend can sit idle before reaping. Restart Desktop to apply.',
+      autoReapOrphans: 'Reconcile and reap verified orphaned Desktop backends on startup.'
+    }
   },
   voice: {
     autoTts: 'Automatically speak assistant responses.'
@@ -616,6 +636,11 @@ export const SECTIONS: DesktopConfigSection[] = [
       'delegation.max_concurrent_children',
       'delegation.child_timeout_seconds',
       'delegation.reasoning_effort',
+      'desktop.backend_isolation',
+      'desktop.backend_pool.max_profile_backends',
+      'desktop.backend_pool.max_session_backends_per_profile',
+      'desktop.backend_pool.idle_ms',
+      'desktop.backend_pool.auto_reap_orphans',
       'updates.non_interactive_local_changes'
     ]
   }
