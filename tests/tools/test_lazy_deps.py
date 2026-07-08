@@ -105,6 +105,83 @@ class TestAllowlist:
 
 
 # ---------------------------------------------------------------------------
+# Local STT (faster-whisper) — CUDA runtime durability
+#
+# faster-whisper does not execute anything itself; ctranslate2 is the inference
+# runtime that dlopens the CUDA/cuDNN libraries. faster-whisper==1.2.1 only
+# requires `ctranslate2>=4.0,<5`, so an unpinned lazy install resolves whatever
+# 4.x is newest on PyPI at install time. When that wheel is built against a
+# cuDNN/CUDA major the host DLLs don't provide, ctranslate2 fails to dlopen
+# them and `_load_local_whisper_model` (tools/transcription_tools.py) drops to
+# CPU int8 — transcription still works, just 10-50x slower, behind a single log
+# WARNING that voice-mode users generally never see.
+#
+# `hermes update` can wipe and recreate the venv, re-running the lazy install
+# and re-resolving that range. Pinning ctranslate2 here is what makes a working
+# GPU STT setup survive an update. Keep the pin in lockstep with the `voice`
+# extra in pyproject.toml (enforced by tests/test_project_metadata.py).
+# ---------------------------------------------------------------------------
+
+
+class TestLocalSttCudaPins:
+    def test_stt_faster_whisper_pins_cuda_runtime(self):
+        specs = ld.LAZY_DEPS["stt.faster_whisper"]
+        for required in (
+            "faster-whisper==1.2.1",
+            "ctranslate2==4.7.2",
+            "sounddevice==0.5.5",
+        ):
+            assert required in specs, (
+                f"stt.faster_whisper must pin {required!r} — got {specs!r}"
+            )
+
+    def test_ctranslate2_pin_is_exact(self):
+        # A range (>=4.0,<5) would let a fresh lazy install pick up a wheel
+        # built against a different cuDNN major and drop to CPU silently.
+        pins = [
+            s for s in ld.LAZY_DEPS["stt.faster_whisper"]
+            if ld._pkg_name_from_spec(s) == "ctranslate2"
+        ]
+        assert pins == ["ctranslate2==4.7.2"], (
+            f"ctranslate2 must be exact-pinned, not ranged — got {pins!r}"
+        )
+
+    def test_stt_specs_pass_safety_check(self):
+        for spec in ld.LAZY_DEPS["stt.faster_whisper"]:
+            assert ld._spec_is_safe(spec), f"unsafe spec {spec!r}"
+
+    def test_install_command_covers_ctranslate2(self):
+        cmd = ld.feature_install_command("stt.faster_whisper")
+        assert cmd is not None
+        assert cmd.startswith("uv pip install")
+        assert "ctranslate2==4.7.2" in cmd
+
+    def test_stale_ctranslate2_is_reinstalled(self, monkeypatch):
+        # The durability guarantee: a venv carrying an out-of-range
+        # ctranslate2 must report it as missing so ensure()/hermes update
+        # pull it back to the pinned version.
+        import importlib.metadata as _md
+
+        installed = {
+            "faster-whisper": "1.2.1",
+            "ctranslate2": "4.9.0",  # newer, incompatible with host CUDA DLLs
+            "sounddevice": "0.5.5",
+            "numpy": "2.4.3",
+        }
+
+        def _version(pkg):
+            if pkg in installed:
+                return installed[pkg]
+            raise _md.PackageNotFoundError(pkg)
+
+        monkeypatch.setattr(_md, "version", _version)
+
+        missing = ld.feature_missing("stt.faster_whisper")
+        assert "ctranslate2==4.7.2" in missing
+        assert "faster-whisper==1.2.1" not in missing
+
+
+# ---------------------------------------------------------------------------
 # allow_lazy_installs gating
 # ---------------------------------------------------------------------------
 

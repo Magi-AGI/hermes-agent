@@ -171,6 +171,15 @@ voice = [
   # Local STT pulls in wheel-only transitive deps (ctranslate2, onnxruntime),
   # so keep it out of the base install for source-build packagers like Homebrew.
   "faster-whisper==1.2.1",
+  # ctranslate2 is the runtime that dlopens CUDA/cuDNN. faster-whisper only
+  # caps it transitively (>=4.0,<5), and a 4.x wheel built against a cuDNN
+  # major the host lacks drops STT to CPU — we log a warning, but voice-mode
+  # users see no in-session signal, so the slowdown is effectively invisible
+  # unless someone is reading the logs. Exact-pin it here too so the eager
+  # `[voice]` path can't resolve a different version than the lazy
+  # path — LAZY_DEPS['stt.faster_whisper'] must match (enforced by
+  # tests/test_project_metadata.py::test_pyproject_pins_match_lazy_deps_pins).
+  "ctranslate2==4.7.2",
   "sounddevice==0.5.5",
   "numpy==2.4.3",
 ]
