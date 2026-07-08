@@ -129,8 +129,29 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
 
     # ─── Speech-to-text providers ──────────────────────────────────────────
     "stt.mistral": ("mistralai==2.4.8",),
+    # faster-whisper is a thin wrapper; ctranslate2 is the runtime that dlopens
+    # CUDA/cuDNN. faster-whisper 1.2.1 only requires `ctranslate2>=4.0,<5`, so
+    # an unpinned lazy install resolves whatever 4.x is newest at install time.
+    # A wheel built against a cuDNN major the host doesn't provide can't dlopen
+    # it, and `_load_local_whisper_model` (tools/transcription_tools.py) drops to
+    # CPU int8 — transcription keeps working, 10-50x slower, behind a single log
+    # WARNING that voice-mode users generally never see. `hermes update` can
+    # recreate the venv and re-resolve that range, so a working GPU setup can
+    # regress on any update. Exact-pin the runtime; 4.7.2 is the version
+    # validated against faster-whisper 1.2.1 on CUDA 12 / cuDNN 9.
+    # Keep in sync with the `voice` extra in pyproject.toml.
+    #
+    # NOT pinned here: nvidia-cublas-cu12 / nvidia-cudnn-cu12. Adding them would
+    # make local STT self-contained (no host CUDA runtime needed) at the cost of
+    # ~1.5GB of NVIDIA wheels on EVERY local-STT install, including the CPU-only
+    # and non-NVIDIA hosts this backend is the free default for. Today the DLLs
+    # come from the host (see `stt.local.cuda_dll_dirs`, which can point at an
+    # existing torch install's `torch/lib`). Making them a hard dep is a
+    # packaging decision that wants its own extra (e.g. `voice-cuda`), not a
+    # silent bloat of the default path.
     "stt.faster_whisper": (
         "faster-whisper==1.2.1",
+        "ctranslate2==4.7.2",
         "sounddevice==0.5.5",
         "numpy==2.4.3",
     ),
