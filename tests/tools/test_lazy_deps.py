@@ -542,3 +542,117 @@ class TestRefreshActiveFeatures:
         result = ld.refresh_active_features()
         assert result["a.ok"] == "current"
         assert result["b.fail"].startswith("failed:")
+
+
+# ---------------------------------------------------------------------------
+# Durable-target constraints (_core_constraints_file)
+# ---------------------------------------------------------------------------
+
+
+class _FakeDist:
+    """Minimal importlib.metadata.Distribution stand-in."""
+
+    def __init__(self, name, version, root):
+        self.metadata = {"Name": name}
+        self.version = version
+        self._root = root
+
+    def locate_file(self, path):
+        return self._root / path
+
+
+def _read_constraints(monkeypatch, dists):
+    import importlib.metadata as md
+    monkeypatch.setattr(md, "distributions", lambda: iter(dists))
+    path = ld._core_constraints_file()
+    assert path is not None
+    try:
+        return path.read_text(encoding="utf-8").splitlines()
+    finally:
+        path.unlink()
+
+
+class TestCoreConstraintsFile:
+    def test_core_packages_are_pinned(self, monkeypatch, tmp_path):
+        monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
+        core = tmp_path / "venv" / "site-packages"
+        lines = _read_constraints(monkeypatch, [
+            _FakeDist("httpx", "0.28.1", core),
+            _FakeDist("pydantic", "2.12.0", core),
+        ])
+        assert lines == ["httpx==0.28.1", "pydantic==2.12.0"]
+
+    def test_stale_target_ctranslate2_not_constrained(self, monkeypatch, tmp_path):
+        """A lazy-installed ctranslate2 must not pin the refresh that replaces it.
+
+        Reproduces the durable-target repair deadlock: the store holds 4.9.0
+        from an earlier unpinned install, LAZY_DEPS now asks for 4.7.2, and a
+        constraints file naming 4.9.0 would make that resolve unsatisfiable.
+        """
+        core = tmp_path / "venv" / "site-packages"
+        target = tmp_path / "lazy-packages"
+        monkeypatch.setenv(ld._LAZY_TARGET_ENV, str(target))
+
+        lines = _read_constraints(monkeypatch, [
+            _FakeDist("httpx", "0.28.1", core),
+            # Installed into the durable target by a previous, unpinned run.
+            _FakeDist("ctranslate2", "4.9.0", target),
+            _FakeDist("faster-whisper", "1.2.1", target),
+            # Nested one level down — still inside the target.
+            _FakeDist("numpy", "2.3.0", target / "numpy-2.3.0.dist-info"),
+        ])
+
+        assert lines == ["httpx==0.28.1"]
+        joined = "\n".join(lines)
+        assert "ctranslate2" not in joined
+        assert "faster-whisper" not in joined
+        assert "numpy" not in joined
+
+        # The requested pin is now resolvable against these constraints.
+        for spec in ld.LAZY_DEPS["stt.faster_whisper"]:
+            assert ld._pkg_name_from_spec(spec) not in joined
+
+    def test_core_copy_wins_over_target_copy(self, monkeypatch, tmp_path):
+        # Same package present in both; only the core version is constrained.
+        core = tmp_path / "venv" / "site-packages"
+        target = tmp_path / "lazy-packages"
+        monkeypatch.setenv(ld._LAZY_TARGET_ENV, str(target))
+        lines = _read_constraints(monkeypatch, [
+            _FakeDist("numpy", "2.0.0", core),
+            _FakeDist("numpy", "2.4.3", target),
+        ])
+        assert lines == ["numpy==2.0.0"]
+
+    def test_core_copy_wins_regardless_of_enumeration_order(self, monkeypatch, tmp_path):
+        # Target copy enumerated first must still yield the core pin.
+        core = tmp_path / "venv" / "site-packages"
+        target = tmp_path / "lazy-packages"
+        monkeypatch.setenv(ld._LAZY_TARGET_ENV, str(target))
+        lines = _read_constraints(monkeypatch, [
+            _FakeDist("numpy", "2.4.3", target),
+            _FakeDist("numpy", "2.0.0", core),
+        ])
+        assert lines == ["numpy==2.0.0"]
+
+    def test_unlocatable_dist_still_constrained(self, monkeypatch, tmp_path):
+        # locate_file() blowing up must not silently drop a core pin.
+        target = tmp_path / "lazy-packages"
+        monkeypatch.setenv(ld._LAZY_TARGET_ENV, str(target))
+
+        class _Broken(_FakeDist):
+            def locate_file(self, path):
+                raise OSError("no location")
+
+        lines = _read_constraints(monkeypatch, [_Broken("httpx", "0.28.1", None)])
+        assert lines == ["httpx==0.28.1"]
+
+    def test_no_target_configured_pins_everything(self, monkeypatch, tmp_path):
+        # Without a durable target, no exclusion applies — every dist is pinned
+        # regardless of where it lives (unchanged legacy behavior).
+        monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
+        somewhere = tmp_path / "anywhere" / "site-packages"
+        lines = _read_constraints(monkeypatch, [
+            _FakeDist("httpx", "0.28.1", somewhere),
+            _FakeDist("ctranslate2", "4.9.0", somewhere),
+        ])
+        assert lines == ["ctranslate2==4.9.0", "httpx==0.28.1"]
