@@ -131,6 +131,15 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "stt.mistral": ("mistralai==2.4.8",),
     "stt.faster_whisper": (
         "faster-whisper==1.2.1",
+        # ctranslate2 is faster-whisper's inference engine. faster-whisper
+        # only FLOORS it (ctranslate2>=4.0), so without an exact pin here a
+        # first-use lazy install or a `hermes update` refresh would pull the
+        # newest ctranslate2 on PyPI — which can be ABI-incompatible with the
+        # host's provisioned CUDA/cuDNN runtime and silently (or visibly) drop
+        # STT to CPU/int8. Exact-pin the known-good version so neither install
+        # path can float it forward. Keep in lockstep with the `voice` extra
+        # in pyproject.toml (parity enforced by tests/test_project_metadata.py).
+        "ctranslate2==4.7.2",
         "sounddevice==0.5.5",
         "numpy==2.4.3",
     ),

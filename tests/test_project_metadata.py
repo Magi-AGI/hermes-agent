@@ -186,6 +186,38 @@ def test_pyproject_pins_match_lazy_deps_pins():
     )
 
 
+def test_voice_extra_pins_ctranslate2_matching_lazy_deps():
+    """Local STT's inference engine is ctranslate2, but faster-whisper only
+    FLOORS it (``ctranslate2>=4.0``). Left unpinned, both `pip install
+    hermes-agent[voice]` and the lazy reinstall path
+    (LAZY_DEPS['stt.faster_whisper']) float ctranslate2 to the newest PyPI
+    release, which can be ABI-incompatible with the host CUDA/cuDNN runtime
+    and silently drop STT to CPU/int8. Both surfaces must exact-pin
+    ctranslate2 to the SAME known-good version (the general parity guard in
+    test_pyproject_pins_match_lazy_deps_pins also covers the shared-version
+    invariant; this test additionally asserts the pin is present in both).
+    """
+    from tools.lazy_deps import LAZY_DEPS
+
+    optional_dependencies = _load_optional_dependencies()
+    voice_pins = _exact_pins(optional_dependencies["voice"])
+    lazy_pins = _exact_pins(LAZY_DEPS["stt.faster_whisper"])
+
+    assert "ctranslate2" in voice_pins, (
+        "[voice] extra must exact-pin ctranslate2 — faster-whisper only "
+        "floors it, so an unpinned resolve floats it forward and can break "
+        "the host CUDA/cuDNN runtime."
+    )
+    assert "ctranslate2" in lazy_pins, (
+        "LAZY_DEPS['stt.faster_whisper'] must exact-pin ctranslate2 so a lazy "
+        "reinstall can't pull an unconstrained newer version."
+    )
+    assert voice_pins["ctranslate2"] == lazy_pins["ctranslate2"], (
+        "voice extra and lazy-deps ctranslate2 pins must match: "
+        f"voice=={voice_pins['ctranslate2']} lazy=={lazy_pins['ctranslate2']}"
+    )
+
+
 def test_dev_extra_excluded_from_all():
     """End-user installs should not pull test/lint/debug tooling."""
     optional_dependencies = _load_optional_dependencies()

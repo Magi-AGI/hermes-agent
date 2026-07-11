@@ -327,6 +327,100 @@ class TestActiveFeatures:
         assert "platform.slack" in ld.active_features()
 
 
+# ---------------------------------------------------------------------------
+# CTranslate2 pin for local STT (faster-whisper backend)
+#
+# faster-whisper's inference engine is ctranslate2, but faster-whisper only
+# FLOORS the dependency (``ctranslate2>=4.0``). That means every lazy
+# reinstall path — first-use ``ensure("stt.faster_whisper")`` and the
+# ``hermes update`` refresh pass — is otherwise free to pull whatever the
+# newest ctranslate2 on PyPI happens to be. A newer ctranslate2 can be
+# ABI-incompatible with the CUDA/cuDNN runtime the host was provisioned for
+# and silently (or visibly) drops STT down to CPU/int8. We exact-pin
+# ctranslate2 to the known-good version in the lazy-deps spec (and, in
+# lockstep, the ``voice`` extra in pyproject.toml) so neither install path
+# can float it forward.
+# ---------------------------------------------------------------------------
+
+
+CTRANSLATE2_KNOWN_GOOD = "4.7.2"
+
+
+class TestFasterWhisperCTranslate2Pin:
+    def _ct2_specs(self):
+        return [
+            s for s in ld.LAZY_DEPS["stt.faster_whisper"]
+            if ld._pkg_name_from_spec(s) == "ctranslate2"
+        ]
+
+    def test_stt_faster_whisper_includes_ctranslate2_guard(self):
+        assert self._ct2_specs(), (
+            "stt.faster_whisper must pin ctranslate2 — faster-whisper only "
+            "floors it, so without this a lazy reinstall floats ctranslate2 "
+            "to the newest PyPI release and can break the host CUDA/cuDNN "
+            "runtime, dropping STT to CPU."
+        )
+
+    def test_ctranslate2_is_exact_pin_not_floating(self):
+        # The guard only works if it's an exact ``==`` pin. A bare name,
+        # floor (``>=``), compatible-release (``~=``), or comma range would
+        # all let lazy install pull a newer ctranslate2.
+        for spec in self._ct2_specs():
+            tail = ld._specifier_from_spec(spec)
+            assert tail.startswith("=="), (
+                f"ctranslate2 spec {spec!r} must be an exact `==` pin, not a "
+                f"floor/range that lets a lazy reinstall float it forward"
+            )
+            assert not any(ch in tail for ch in (">", "<", "~", "*", ",")), (
+                f"ctranslate2 spec {spec!r} must resolve to a single exact "
+                f"version, not a range"
+            )
+
+    def test_ctranslate2_pinned_to_known_good_version(self):
+        for spec in self._ct2_specs():
+            assert ld._specifier_from_spec(spec) == f"=={CTRANSLATE2_KNOWN_GOOD}", (
+                f"ctranslate2 must be pinned to the known-good "
+                f"{CTRANSLATE2_KNOWN_GOOD} (matched to the host CUDA/cuDNN "
+                f"runtime); got {spec!r}"
+            )
+
+    def test_ctranslate2_spec_passes_safety(self):
+        for spec in self._ct2_specs():
+            assert ld._spec_is_safe(spec), \
+                f"ctranslate2 spec {spec!r} fails the pip-spec safety check"
+
+    def test_lazy_install_command_carries_ctranslate2_pin(self):
+        # The user-facing / manual install command must reproduce the exact
+        # pin so a hand-run install can't pull an unconstrained ctranslate2.
+        cmd = ld.feature_install_command("stt.faster_whisper")
+        assert cmd is not None
+        assert f"ctranslate2=={CTRANSLATE2_KNOWN_GOOD}" in cmd, (
+            f"lazy/manual install command must carry the exact ctranslate2 "
+            f"pin; got: {cmd}"
+        )
+
+    def test_newer_installed_ctranslate2_is_treated_as_unsatisfied(self, monkeypatch):
+        # Teeth for the guard: with a NEWER ctranslate2 already installed,
+        # feature_missing() must flag ctranslate2 so ensure()/refresh reinstall
+        # the pinned version instead of leaving the incompatible newer one in
+        # place. This is the exact scenario the pin defends against.
+        from importlib.metadata import PackageNotFoundError
+
+        def _version(pkg):
+            if pkg == "ctranslate2":
+                return "4.8.0"  # newer than the known-good pin
+            raise PackageNotFoundError(pkg)
+
+        import importlib.metadata as _md
+        monkeypatch.setattr(_md, "version", _version)
+
+        missing = ld.feature_missing("stt.faster_whisper")
+        assert any(ld._pkg_name_from_spec(s) == "ctranslate2" for s in missing), (
+            "an already-installed newer ctranslate2 must be reported as "
+            "unsatisfied so the exact pin is restored on reinstall"
+        )
+
+
 class TestRefreshActiveFeatures:
     def test_no_active_features_returns_empty(self, monkeypatch):
         monkeypatch.setattr(ld, "active_features", lambda: [])
