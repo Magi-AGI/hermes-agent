@@ -1578,3 +1578,243 @@ class TestShellSafety:
         monkeypatch.delenv(LOCAL_STT_COMMAND_ENV, raising=False)
         use_shell = bool(os.getenv(LOCAL_STT_COMMAND_ENV, "").strip())
         assert use_shell is False
+
+
+# ============================================================================
+# Local STT vocabulary / priming config — language, initial_prompt, hotwords
+# ============================================================================
+
+def _make_capturing_local_model():
+    """Return a mock faster-whisper model whose transcribe() records kwargs."""
+    seg = MagicMock()
+    seg.text = "hi"
+    info = MagicMock()
+    info.language = "en"
+    info.duration = 1.0
+    model = MagicMock()
+    model.transcribe.return_value = ([seg], info)
+    return model
+
+
+@pytest.mark.skipif(
+    not __import__("importlib").util.find_spec("faster_whisper"),
+    reason="faster_whisper not installed",
+)
+class TestLocalVocabConfig:
+    """stt.local vocabulary keys are threaded into faster-whisper transcribe."""
+
+    def _run(self, monkeypatch, tmp_path, local_cfg):
+        monkeypatch.delenv("HERMES_LOCAL_STT_LANGUAGE", raising=False)
+
+        audio = tmp_path / "test.ogg"
+        audio.write_bytes(b"fake")
+
+        model = _make_capturing_local_model()
+
+        with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
+             patch("tools.transcription_tools._load_stt_config",
+                   return_value={"local": local_cfg}), \
+             patch("faster_whisper.WhisperModel", return_value=model), \
+             patch("tools.transcription_tools._local_model", None), \
+             patch("tools.transcription_tools._local_model_name", None):
+            from tools.transcription_tools import _transcribe_local
+            result = _transcribe_local(str(audio), "base")
+
+        assert result["success"] is True
+        return model.transcribe.call_args.kwargs
+
+    def test_language_passed_into_transcribe(self, monkeypatch, tmp_path):
+        kwargs = self._run(monkeypatch, tmp_path, {"language": "es"})
+        assert kwargs.get("language") == "es"
+
+    def test_initial_prompt_passed_when_configured(self, monkeypatch, tmp_path):
+        kwargs = self._run(
+            monkeypatch, tmp_path, {"initial_prompt": "Hermes, faster-whisper, ctranslate2."}
+        )
+        assert kwargs.get("initial_prompt") == "Hermes, faster-whisper, ctranslate2."
+
+    def test_hotwords_passed_when_configured(self, monkeypatch, tmp_path):
+        kwargs = self._run(monkeypatch, tmp_path, {"hotwords": "Hermes, Magi"})
+        assert kwargs.get("hotwords") == "Hermes, Magi"
+
+    def test_hotwords_list_is_joined(self, monkeypatch, tmp_path):
+        kwargs = self._run(monkeypatch, tmp_path, {"hotwords": ["Hermes", " ", "Magi"]})
+        assert kwargs.get("hotwords") == "Hermes, Magi"
+
+    def test_no_vocab_kwargs_when_unset(self, monkeypatch, tmp_path):
+        kwargs = self._run(monkeypatch, tmp_path, {})
+        assert "language" not in kwargs
+        assert "initial_prompt" not in kwargs
+        assert "hotwords" not in kwargs
+
+    def test_cpu_fallback_preserved_with_vocab_config(self, monkeypatch, tmp_path):
+        """A load-time CUDA DLL failure still falls back to CPU and keeps vocab kwargs."""
+        monkeypatch.delenv("HERMES_LOCAL_STT_LANGUAGE", raising=False)
+        audio = tmp_path / "test.ogg"
+        audio.write_bytes(b"fake")
+
+        cpu_model = _make_capturing_local_model()
+        call_args = []
+
+        def fake_whisper(model_name, device, compute_type):
+            call_args.append((device, compute_type))
+            if device == "auto":
+                raise RuntimeError("Library libcublas.so.12 is not found or cannot be loaded")
+            return cpu_model
+
+        with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
+             patch("tools.transcription_tools._load_stt_config",
+                   return_value={"local": {"hotwords": "Hermes"}}), \
+             patch("faster_whisper.WhisperModel", side_effect=fake_whisper), \
+             patch("tools.transcription_tools._local_model", None), \
+             patch("tools.transcription_tools._local_model_name", None):
+            from tools.transcription_tools import _transcribe_local
+            result = _transcribe_local(str(audio), "base")
+
+        assert result["success"] is True
+        assert call_args == [("auto", "auto"), ("cpu", "int8")]
+        assert cpu_model.transcribe.call_args.kwargs.get("hotwords") == "Hermes"
+
+
+# ============================================================================
+# Windows CUDA DLL preloading — _iter_windows_cuda_dll_dirs / _prepare_...
+# ============================================================================
+
+class TestWindowsCudaDllDirs:
+    def test_configured_dirs_included(self, tmp_path):
+        """Configured cuda_dll_dirs that exist are returned, deduplicated."""
+        from tools.transcription_tools import _iter_windows_cuda_dll_dirs
+        dir_a = tmp_path / "torch" / "lib"
+        dir_a.mkdir(parents=True)
+        dirs = _iter_windows_cuda_dll_dirs({"cuda_dll_dirs": [str(dir_a)]})
+        assert dir_a.resolve() in dirs
+
+    def test_string_dirs_split_on_pathsep_and_semicolon(self, tmp_path):
+        from tools.transcription_tools import _iter_windows_cuda_dll_dirs
+        dir_a = tmp_path / "a"
+        dir_b = tmp_path / "b"
+        dir_a.mkdir()
+        dir_b.mkdir()
+        dirs = _iter_windows_cuda_dll_dirs({"cuda_dll_dirs": f"{dir_a};{dir_b}"})
+        assert dir_a.resolve() in dirs
+        assert dir_b.resolve() in dirs
+
+    def test_nonexistent_dirs_excluded(self, tmp_path):
+        from tools.transcription_tools import _iter_windows_cuda_dll_dirs
+        missing = tmp_path / "does-not-exist"
+        dirs = _iter_windows_cuda_dll_dirs({"cuda_dll_dirs": [str(missing)]})
+        assert missing.resolve() not in dirs
+
+    def test_installed_torch_lib_discovered_via_find_spec(self, tmp_path, monkeypatch):
+        """An importable torch with an existing sibling torch/lib is included."""
+        import importlib
+        import tools.transcription_tools as tt
+
+        torch_lib = tmp_path / "torch" / "lib"
+        torch_lib.mkdir(parents=True)
+        fake_origin = tmp_path / "torch" / "__init__.py"
+        fake_origin.write_text("", encoding="utf-8")
+
+        from importlib.machinery import ModuleSpec
+        fake_spec = ModuleSpec("torch", loader=None)
+        fake_spec.origin = str(fake_origin)
+
+        real_find_spec = importlib.util.find_spec
+
+        def fake_find_spec(name, *args, **kwargs):
+            if name == "torch":
+                return fake_spec
+            return real_find_spec(name, *args, **kwargs)
+
+        monkeypatch.setattr(importlib.util, "find_spec", fake_find_spec)
+        # Neutralize the %LOCALAPPDATA% glob so only find_spec can contribute.
+        monkeypatch.delenv("LOCALAPPDATA", raising=False)
+        dirs = tt._iter_windows_cuda_dll_dirs({})
+        assert torch_lib.resolve() in dirs
+
+    def test_localappdata_glob_discovers_torch_lib(self, tmp_path, monkeypatch):
+        """%LOCALAPPDATA%/Programs/Python/Python*/.../torch/lib is discovered."""
+        import tools.transcription_tools as tt
+
+        torch_lib = (
+            tmp_path / "Programs" / "Python" / "Python312"
+            / "Lib" / "site-packages" / "torch" / "lib"
+        )
+        torch_lib.mkdir(parents=True)
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+        dirs = tt._iter_windows_cuda_dll_dirs({})
+        assert torch_lib.resolve() in dirs
+
+
+class TestPrepareWindowsCudaDlls:
+    def test_noop_on_non_windows(self, monkeypatch):
+        import ctypes
+        import tools.transcription_tools as tt
+        monkeypatch.setattr(tt.os, "name", "posix")
+        monkeypatch.setattr(tt, "_windows_cuda_dlls_prepared", False)
+        cdll = MagicMock()
+        monkeypatch.setattr(ctypes, "CDLL", cdll)
+        tt._prepare_windows_cuda_dlls()
+        cdll.assert_not_called()
+
+    def test_preloads_in_dependency_order(self, monkeypatch, tmp_path):
+        import ctypes
+        import tools.transcription_tools as tt
+
+        dll_dir = tmp_path / "torch" / "lib"
+        dll_dir.mkdir(parents=True)
+        expected = [
+            "cudart64_12.dll",
+            "cublasLt64_12.dll",
+            "cublas64_12.dll",
+            "cudnn64_9.dll",
+        ]
+        for name in expected:
+            (dll_dir / name).write_bytes(b"\x00")
+
+        loaded_order = []
+
+        def fake_cdll(path):
+            loaded_order.append(os.path.basename(path))
+            return MagicMock()
+
+        monkeypatch.setattr(tt.os, "name", "nt")
+        monkeypatch.setattr(tt, "_windows_cuda_dlls_prepared", False)
+        monkeypatch.setattr(tt, "_iter_windows_cuda_dll_dirs", lambda cfg: [dll_dir])
+        monkeypatch.setattr(tt, "_load_stt_config", lambda: {"local": {}})
+        monkeypatch.setattr(ctypes, "CDLL", fake_cdll)
+
+        tt._prepare_windows_cuda_dlls()
+
+        assert loaded_order == expected
+        assert tt._windows_cuda_dlls_prepared is True
+
+    def test_idempotent_after_first_pass(self, monkeypatch):
+        import ctypes
+        import tools.transcription_tools as tt
+        monkeypatch.setattr(tt.os, "name", "nt")
+        monkeypatch.setattr(tt, "_windows_cuda_dlls_prepared", True)
+        cdll = MagicMock()
+        monkeypatch.setattr(ctypes, "CDLL", cdll)
+        tt._prepare_windows_cuda_dlls()
+        cdll.assert_not_called()
+
+    def test_no_raise_when_dlls_absent(self, monkeypatch, tmp_path):
+        """A candidate dir with no CUDA DLLs must not raise and must not load."""
+        import ctypes
+        import tools.transcription_tools as tt
+
+        empty_dir = tmp_path / "torch" / "lib"
+        empty_dir.mkdir(parents=True)
+
+        cdll = MagicMock()
+        monkeypatch.setattr(tt.os, "name", "nt")
+        monkeypatch.setattr(tt, "_windows_cuda_dlls_prepared", False)
+        monkeypatch.setattr(tt, "_iter_windows_cuda_dll_dirs", lambda cfg: [empty_dir])
+        monkeypatch.setattr(tt, "_load_stt_config", lambda: {"local": {}})
+        monkeypatch.setattr(ctypes, "CDLL", cdll)
+
+        tt._prepare_windows_cuda_dlls()  # must not raise
+
+        cdll.assert_not_called()
+        assert tt._windows_cuda_dlls_prepared is True
