@@ -328,16 +328,17 @@ class TestNoQueueYet:
 
         assert DEFAULT_CONFIG["compaction_queue"]["enabled"] is False
 
-    def test_coordinator_has_no_callers_yet(self):
-        """Phase 1 is still behaviourally dark: nothing IMPORTS the coordinator.
+    def test_the_coordinator_is_imported_only_by_the_compaction_path(self):
+        """Phase 2 wires the queue into compress_context — and nowhere else.
 
-        Asserted on real import statements, not on a substring: the config block's
-        comment legitimately names ``agent/compaction_coordinator.py`` in prose to
-        explain what the settings drive.
+        (This previously asserted NO importers at all. Phase 2 legitimately adds
+        one; what must not happen is the coordinator leaking into the rest of the
+        runtime. The queue stays behaviourally dark by CONFIG — enabled defaults to
+        false — not by absence of a caller.)
         """
         import subprocess
 
-        imports = subprocess.run(
+        out = subprocess.run(
             ["git", "grep", "-nE",
              r"^\s*(from +agent +import +compaction_coordinator"
              r"|from +agent\.compaction_coordinator +import"
@@ -345,9 +346,9 @@ class TestNoQueueYet:
              "--", "agent", "hermes_cli", "gateway", "tui_gateway"],
             cwd=str(REPO_ROOT), capture_output=True, text=True,
         ).stdout.strip()
-        assert not imports, (
-            f"compaction_coordinator has acquired importers before the wiring "
-            f"phase:\n{imports}"
+        importers = {ln.split(":", 1)[0] for ln in out.splitlines() if ln}
+        assert importers <= {"agent/conversation_compression.py"}, (
+            f"the coordinator is imported outside the compaction path: {sorted(importers)}"
         )
 
     def test_helper_opens_no_database(self, herd, monkeypatch):

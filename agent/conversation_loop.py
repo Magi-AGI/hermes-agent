@@ -1027,10 +1027,18 @@ def run_conversation(
                 if getattr(_compressor, "context_length", 0) else "unknown",
                 compression_attempts,
             )
-            agent._emit_status(
-                f"📦 Pre-API compression: ~{request_pressure_tokens:,} tokens "
-                f"near the context/output limit. Compacting before the next model call."
-            )
+            # NO caller-side "Compacting…" status here.
+            #
+            # The compaction queue may DENY this attempt (another session holds the
+            # slot), in which case _compress_context returns the messages unchanged
+            # and nothing is compacted. Announcing compaction before the call would
+            # narrate work that never happens — and because this branch retries up
+            # to the per-turn attempt cap, the user would see it repeatedly.
+            #
+            # _compress_context now owns the single truthful status: it emits
+            # COMPACTION_STATUS only AFTER the queue admits (or is bypassed/
+            # disabled), i.e. only when compaction is genuinely about to run. The
+            # pressure detail above is preserved in the logger.info.
             messages, active_system_prompt = agent._compress_context(
                 messages,
                 system_message,
@@ -3379,7 +3387,14 @@ def run_conversation(
                             "failed": True,
                             "compression_exhausted": True,
                         }
-                    agent._buffer_status(f"⚠️  Request payload too large (413) — compression attempt {compression_attempts}/{max_compression_attempts}...")
+                    # See the context-overflow branch: no pre-emptive compaction
+                    # status. A queue DENIAL returns unchanged, and this path
+                    # retries — so announcing "compression attempt N/M" before the
+                    # call would repeat a claim that may never be true.
+                    logger.info(
+                        "413 payload too large: attempting compression (attempt %s/%s)",
+                        compression_attempts, max_compression_attempts,
+                    )
 
                     original_len = len(messages)
                     original_tokens = estimate_messages_tokens_rough(messages)
@@ -3574,14 +3589,23 @@ def run_conversation(
                             compressor._context_probe_persistable = True
                         agent._buffer_vprint(f"⚠️  Context length exceeded — using provider limit: {old_ctx:,} → {new_ctx:,} tokens")
                     elif minimax_delta_only_overflow:
+                        # Deliberately does NOT say "and compressing": compaction is
+                        # not guaranteed to happen. The queue may DENY this attempt
+                        # (another session holds the slot), in which case
+                        # _compress_context returns unchanged and nothing is
+                        # compacted — and this branch retries, so the claim would be
+                        # repeated. _compress_context emits the one truthful
+                        # COMPACTION_STATUS after the queue admits it.
                         agent._buffer_vprint(
                             f"Provider reported overflow amount only; "
-                            f"keeping context_length at {old_ctx:,} tokens and compressing."
+                            f"keeping context_length at {old_ctx:,} tokens."
                         )
                     else:
+                        # Same reason as above — state the FACT (we kept the context
+                        # length), not a prediction about compaction.
                         agent._buffer_vprint(
                             f"⚠️  Context length exceeded, but provider did not report a max context length; "
-                            f"keeping context_length at {old_ctx:,} tokens and compressing."
+                            f"keeping context_length at {old_ctx:,} tokens."
                         )
 
                     compression_attempts += 1
@@ -3602,7 +3626,16 @@ def run_conversation(
                             "failed": True,
                             "compression_exhausted": True,
                         }
-                    agent._buffer_status(f"🗜️ Context too large (~{approx_tokens:,} tokens) — compressing ({compression_attempts}/{max_compression_attempts})...")
+                    # No "— compressing…" status before the call: the compaction
+                    # queue may DENY, leaving the messages unchanged, and this
+                    # branch retries up to max_compression_attempts — so a
+                    # pre-emptive status would narrate a compaction that never ran,
+                    # once per attempt. _compress_context emits the truthful
+                    # COMPACTION_STATUS itself once the queue admits it.
+                    logger.info(
+                        "context overflow: attempting compression (~%s tokens, attempt %s/%s)",
+                        f"{approx_tokens:,}", compression_attempts, max_compression_attempts,
+                    )
 
                     original_len = len(messages)
                     original_tokens = estimate_messages_tokens_rough(messages)
@@ -4782,7 +4815,9 @@ def run_conversation(
                     )
 
                 if agent.compression_enabled and _compressor.should_compress(_real_tokens):
-                    agent._safe_print("  ⟳ compacting context…")
+                    # No "⟳ compacting context…" print before the call — the queue
+                    # may deny and compact nothing. _compress_context emits the
+                    # truthful status after admission.
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message,
                         approx_tokens=agent.context_compressor.last_prompt_tokens,

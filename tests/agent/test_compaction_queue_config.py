@@ -291,37 +291,52 @@ class TestQueueStillDark:
         ).stdout.strip()
         return [ln for ln in out.splitlines() if ln]
 
-    def test_no_production_code_IMPORTS_the_coordinator_yet(self):
-        """Fails the moment someone wires the queue in without the rollout step."""
-        imports = self._git_grep(
-            r"^\s*(from +agent +import +compaction_coordinator"
-            r"|from +agent\.compaction_coordinator +import"
-            r"|import +agent\.compaction_coordinator)",
-            self.PROD,
-        )
-        assert not imports, (
-            f"production code imports the coordinator before the wiring phase:\n"
-            + "\n".join(imports)
+    def test_only_the_compaction_path_may_touch_the_coordinator(self):
+        """Phase 2 wires the queue — but ONLY into compress_context.
+
+        The coordinator must not leak into the rest of the runtime. This is the
+        guard that fails if someone starts acquiring slots from, say, the
+        auxiliary client or the gateway.
+        """
+        importers = {
+            ln.split(":", 1)[0]
+            for ln in self._git_grep(
+                r"^\s*(from +agent +import +compaction_coordinator"
+                r"|from +agent\.compaction_coordinator +import"
+                r"|import +agent\.compaction_coordinator)",
+                self.PROD,
+            )
+        }
+        allowed = {"agent/conversation_compression.py"}
+        assert importers <= allowed, (
+            f"the coordinator is imported outside the compaction path: "
+            f"{sorted(importers - allowed)}"
         )
 
-    def test_no_production_code_CALLS_the_slot_primitives_yet(self):
-        calls = self._git_grep(
-            r"(try_acquire_compaction_slot|release_compaction_slot"
-            r"|refresh_compaction_slot|get_compaction_slot_load) *\(",
-            self.PROD,
-        )
-        # The coordinator module defines them; that is not a call site.
-        offenders = [c for c in calls if not c.startswith("agent/compaction_coordinator.py")]
-        assert not offenders, (
-            "compaction slot primitives are called outside the coordinator:\n"
-            + "\n".join(offenders)
+    def test_slot_primitives_are_called_only_from_the_compaction_path(self):
+        callers = {
+            ln.split(":", 1)[0]
+            for ln in self._git_grep(
+                r"(try_acquire_compaction_slot|release_compaction_slot"
+                r"|refresh_compaction_slot|get_compaction_slot_load) *\(",
+                self.PROD,
+            )
+        }
+        allowed = {
+            "agent/compaction_coordinator.py",     # defines them
+            "agent/conversation_compression.py",   # the one wired caller (Phase 2)
+        }
+        assert callers <= allowed, (
+            f"compaction slot primitives are called from unexpected modules: "
+            f"{sorted(callers - allowed)}"
         )
 
-    def test_compression_path_does_not_reference_the_queue(self):
-        for mod in ("agent/conversation_compression.py", "agent/context_compressor.py"):
+    def test_the_route_guard_modules_stay_ignorant_of_the_queue(self):
+        """The privacy guard must not depend on the performance queue."""
+        for mod in ("agent/context_compressor.py", "agent/auxiliary_client.py"):
             src = (REPO_ROOT / mod).read_text(encoding="utf-8")
-            assert "compaction_slot" not in src
             assert "compaction_coordinator" not in src
+            assert "try_acquire_compaction_slot" not in src
 
     def test_the_coordinator_reads_exactly_one_env_var(self):
         """Queue tunables are YAML-only (AGENTS: no new HERMES_* for non-secret

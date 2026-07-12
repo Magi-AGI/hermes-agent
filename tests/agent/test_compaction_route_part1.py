@@ -342,18 +342,23 @@ def test_queue_config_exists_but_is_dark_and_does_not_activate():
         )
 
 
-def test_route_guard_does_not_import_the_coordinator():
+def test_route_guard_modules_do_not_import_the_coordinator():
     """The privacy guard and the performance queue are independent subsystems.
 
-    The route guard ships enabled and must keep working regardless of the queue's
-    state (spec: the guard is a privacy control and is explicitly NOT part of any
-    queue rollback).
+    The route guard ships ENABLED and must keep working regardless of the queue's
+    state — it is a privacy control and is explicitly NOT part of any queue
+    rollback. So the modules that OWN the guard (the auxiliary client, which
+    screens routes, and the compressor, which fails closed on a routing refusal)
+    must never depend on the coordinator.
+
+    ``conversation_compression.py`` is deliberately NOT in this list: Phase 2 wires
+    the queue there, which is the one legitimate place the two subsystems meet —
+    and even there the queue only decides *when* compaction runs, never *where* it
+    routes (see the routing-invariance test in the wiring suite).
     """
     import ast
-    from pathlib import Path
 
-    for mod in ("agent/auxiliary_client.py", "agent/context_compressor.py",
-                "agent/conversation_compression.py"):
+    for mod in ("agent/auxiliary_client.py", "agent/context_compressor.py"):
         tree = ast.parse((REPO_ROOT / mod).read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
