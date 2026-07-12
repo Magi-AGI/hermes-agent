@@ -1,12 +1,24 @@
 """Root-scoped coordinator for the cross-session compaction queue.
 
-**Primitives with NO CALLERS — the queue is DARK.** Path resolution plus the
-leased semaphore (``compaction_slots``) live here. The ``compaction_queue`` config
-block now exists (Phase 1) and the agent reads it at init, but it defaults to
-``enabled: false``, **nothing imports this module**, and compression is not wired
-to it. So this module still cannot change behaviour until a separate,
-user-approved wiring step. That matters because the InstallDir *is* the running
-backend: code that ships dark cannot surprise a live session on restart.
+**The queue is WIRED but ships DARK.** Path resolution plus the leased semaphore
+(``compaction_slots``) live here. ``conversation_compression.compress_context``
+now consults this coordinator (Phase 2) — but only when
+``compaction_queue.enabled`` is true, and that **defaults to false**. On the
+default path the admission check short-circuits *before importing this module*, so
+a disabled queue creates no DB, takes no slot, and leaves compaction behaving
+exactly as it did before. Enabling it remains a separate, user-approved rollout
+step. That matters because the InstallDir *is* the running backend: code that
+ships dark cannot surprise a live session on restart.
+
+Who may touch this module (test-enforced, see
+``tests/agent/test_compaction_queue_config.py``):
+
+* ``agent/conversation_compression.py`` — the ONE mutator. It acquires, refreshes
+  and releases slots around a real compaction.
+* ``hermes_cli/kanban_diagnostics.py`` — a read-only OBSERVER (Phase 3). It calls
+  ``get_compaction_slot_load()`` only, which opens the DB read-only and will not
+  even create it. Observers may look at the queue; they must never take, extend,
+  or drop a slot.
 
 See ``docs/plans/2026-07-11-compaction-queue-spec.md`` §4.2 (substrate), §4.3
 (typed outcomes) and §9.0-GATE (the shared-path gate this design had to pass).
@@ -133,11 +145,13 @@ def compaction_db_path() -> Path:
 
 # ── Leased-semaphore slot primitives ─────────────────────────────────────────
 #
-# PURE ADDITIONS — nothing calls these yet. The `compaction_queue` config block
-# exists (Phase 1) and the agent stores it at init, but it defaults to
-# `enabled: false` and no caller has been wired, so these primitives cannot
-# change behaviour. The InstallDir runs the live backend, so shipping dark is
-# what keeps building here safe.
+# These are called from `conversation_compression.compress_context` (Phase 2) —
+# but ONLY when `compaction_queue.enabled` is true, which defaults to false. The
+# admission check returns before importing this module on the disabled path, so
+# with the shipped default these primitives never run: no DB is created, no slot
+# is taken, and compaction behaves exactly as it did before the queue existed.
+# The InstallDir runs the live backend, so shipping dark is what keeps building
+# here safe; enabling the queue is a separate, user-approved step.
 #
 # The semaphore bounds *concurrent compaction summarisation calls* across every
 # session, process, AND PROFILE under one Hermes root. `slot_id` rows are the

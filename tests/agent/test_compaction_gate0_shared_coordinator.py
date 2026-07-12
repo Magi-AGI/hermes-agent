@@ -296,13 +296,22 @@ print(json.dumps({"coordinator": str(compaction_db_path())}))
         assert Path(out["coordinator"]) == override_root / "compaction.db"
 
 
-class TestNoQueueYet:
-    """Scope discipline.
+class TestQueueScopeDiscipline:
+    """Scope discipline — who is allowed to touch the coordinator, and how.
 
-    Step B was path-helper only. Step C (Phase 0) adds the slot primitives — so
-    those symbols are now EXPECTED. What must still NOT exist is any activation
-    surface: no ``compaction_queue`` config, and no caller wiring the coordinator
-    into compression. The queue stays dark until a separate, user-approved step.
+    This class has tracked the feature's growth, and each phase made it MORE
+    precise rather than looser:
+
+    * Step B — path helper only; the slot primitives did not exist.
+    * Phase 0 — primitives exist but have no callers.
+    * Phase 1 — ``compaction_queue`` config exists, defaulting to disabled.
+    * Phase 2 — ``conversation_compression`` wires admission (the one MUTATOR).
+    * Phase 3 — ``kanban_diagnostics`` reads slot load (a read-only OBSERVER).
+
+    The invariant that has never moved: **only the compaction path may mutate the
+    queue.** Observers may look; they may not take, extend, or drop a slot. And the
+    queue remains behaviourally dark by CONFIG (``enabled`` defaults to false), not
+    by the absence of a caller.
     """
 
     def test_slot_primitives_exist_after_phase_0(self):
@@ -328,28 +337,81 @@ class TestNoQueueYet:
 
         assert DEFAULT_CONFIG["compaction_queue"]["enabled"] is False
 
-    def test_the_coordinator_is_imported_only_by_the_compaction_path(self):
-        """Phase 2 wires the queue into compress_context — and nowhere else.
+    # Who may MUTATE the queue (acquire/refresh/release). This is the invariant
+    # that actually matters and Phase 3 does NOT relax it: a slot taken anywhere
+    # other than the compaction path would bound something that is not a
+    # compaction, and a slot released elsewhere could free another session's lease
+    # mid-compaction — silently breaking the bound.
+    _MUTATORS_ALLOWED = {
+        "agent/compaction_coordinator.py",     # defines them
+        "agent/conversation_compression.py",   # the one wired caller (Phase 2)
+    }
+    # Who may OBSERVE it. Reading the load is side-effect-free by construction:
+    # get_compaction_slot_load opens the DB read-only and will not even create it.
+    _OBSERVERS_ALLOWED = _MUTATORS_ALLOWED | {
+        "hermes_cli/kanban_diagnostics.py",    # Phase 3: read-only slot-load report
+    }
 
-        (This previously asserted NO importers at all. Phase 2 legitimately adds
-        one; what must not happen is the coordinator leaking into the rest of the
-        runtime. The queue stays behaviourally dark by CONFIG — enabled defaults to
-        false — not by absence of a caller.)
-        """
+    def _git_grep(self, pattern):
         import subprocess
 
         out = subprocess.run(
-            ["git", "grep", "-nE",
-             r"^\s*(from +agent +import +compaction_coordinator"
-             r"|from +agent\.compaction_coordinator +import"
-             r"|import +agent\.compaction_coordinator)",
+            ["git", "grep", "-nE", pattern,
              "--", "agent", "hermes_cli", "gateway", "tui_gateway"],
             cwd=str(REPO_ROOT), capture_output=True, text=True,
         ).stdout.strip()
-        importers = {ln.split(":", 1)[0] for ln in out.splitlines() if ln}
-        assert importers <= {"agent/conversation_compression.py"}, (
-            f"the coordinator is imported outside the compaction path: {sorted(importers)}"
+        return {ln.split(":", 1)[0] for ln in out.splitlines() if ln}
+
+    def test_coordinator_imported_only_by_compaction_path_or_readonly_diagnostics(self):
+        """Phase 2 wired the queue into compress_context; Phase 3 adds a READ-ONLY
+        diagnostics reader. Nothing else may import the coordinator.
+
+        History of this guard, because the intent keeps getting narrower rather
+        than looser: it originally asserted NO importers at all (Phase 0/1, when
+        the queue had no callers). Phase 2 legitimately added one. Phase 3 adds a
+        read-only observer. What must never happen is the coordinator leaking into
+        the rest of the runtime — and observers must never become mutators, which
+        the companion test below enforces.
+
+        The queue stays behaviourally dark by CONFIG (enabled defaults to false),
+        not by the absence of a caller.
+        """
+        importers = self._git_grep(
+            r"^\s*(from +agent +import +compaction_coordinator"
+            r"|from +agent\.compaction_coordinator +import"
+            r"|import +agent\.compaction_coordinator)"
         )
+        assert importers <= self._OBSERVERS_ALLOWED, (
+            f"the coordinator is imported outside the compaction path and the "
+            f"read-only diagnostics reader: "
+            f"{sorted(importers - self._OBSERVERS_ALLOWED)}"
+        )
+
+    def test_MUTATING_slot_primitives_stay_confined_to_the_compaction_path(self):
+        """The read-only diagnostics allowance must not widen into mutation."""
+        callers = self._git_grep(
+            r"(try_acquire_compaction_slot|release_compaction_slot"
+            r"|refresh_compaction_slot) *\("
+        )
+        assert callers <= self._MUTATORS_ALLOWED, (
+            f"MUTATING compaction slot primitives are called from unexpected "
+            f"modules: {sorted(callers - self._MUTATORS_ALLOWED)}"
+        )
+
+    def test_diagnostics_reader_never_mutates_the_queue(self):
+        """Pin the read-only surface explicitly, so the Phase 3 allowance cannot
+        quietly become a participant in the queue."""
+        src = (REPO_ROOT / "hermes_cli" / "kanban_diagnostics.py").read_text(encoding="utf-8")
+        for mutator in (
+            "try_acquire_compaction_slot",
+            "refresh_compaction_slot",
+            "release_compaction_slot",
+        ):
+            assert mutator not in src, (
+                f"kanban_diagnostics must never {mutator} — diagnostics OBSERVE the "
+                f"queue, they do not participate in it"
+            )
+        assert "get_compaction_slot_load" in src
 
     def test_helper_opens_no_database(self, herd, monkeypatch):
         """Resolving the path must not create or touch ANY DB file.

@@ -291,12 +291,28 @@ class TestQueueStillDark:
         ).stdout.strip()
         return [ln for ln in out.splitlines() if ln]
 
-    def test_only_the_compaction_path_may_touch_the_coordinator(self):
-        """Phase 2 wires the queue — but ONLY into compress_context.
+    # Who may MUTATE the queue (acquire/refresh/release). This is the invariant
+    # that actually matters: a slot taken anywhere other than the compaction path
+    # would bound (or leak) something that is not a compaction.
+    MUTATORS_ALLOWED = {
+        "agent/compaction_coordinator.py",     # defines them
+        "agent/conversation_compression.py",   # the one wired caller (Phase 2)
+    }
+    # Who may OBSERVE it. Reading the load is side-effect-free by construction
+    # (get_compaction_slot_load opens the DB read-only and does not even create it),
+    # so a diagnostic surface is safe in a way a mutator never is.
+    OBSERVERS_ALLOWED = MUTATORS_ALLOWED | {
+        "hermes_cli/kanban_diagnostics.py",    # Phase 3: read-only slot-load report
+    }
 
-        The coordinator must not leak into the rest of the runtime. This is the
-        guard that fails if someone starts acquiring slots from, say, the
-        auxiliary client or the gateway.
+    def test_only_the_compaction_path_or_readonly_diagnostics_may_touch_the_coordinator(self):
+        """Phase 2 wired the queue into compress_context; Phase 3 adds a READ-ONLY
+        diagnostics reader. Nothing else may import the coordinator.
+
+        The distinction is deliberate and is enforced by the companion test below:
+        an observer may look at the queue, but it may not take, extend, or drop a
+        slot. This is the guard that fails if someone starts acquiring slots from,
+        say, the auxiliary client or the gateway.
         """
         importers = {
             ln.split(":", 1)[0]
@@ -307,28 +323,56 @@ class TestQueueStillDark:
                 self.PROD,
             )
         }
-        allowed = {"agent/conversation_compression.py"}
-        assert importers <= allowed, (
-            f"the coordinator is imported outside the compaction path: "
-            f"{sorted(importers - allowed)}"
+        assert importers <= self.OBSERVERS_ALLOWED, (
+            f"the coordinator is imported outside the compaction path and the "
+            f"read-only diagnostics reader: {sorted(importers - self.OBSERVERS_ALLOWED)}"
         )
 
-    def test_slot_primitives_are_called_only_from_the_compaction_path(self):
+    def test_MUTATING_slot_primitives_are_called_only_from_the_compaction_path(self):
+        """acquire / refresh / release may only be called by the compaction path.
+
+        This is the real invariant, and Phase 3 must NOT relax it. A diagnostics
+        surface that could acquire a slot would bound something that is not a
+        compaction; one that could release a slot could free another session's
+        lease mid-compaction and silently break the bound.
+        """
         callers = {
             ln.split(":", 1)[0]
             for ln in self._git_grep(
                 r"(try_acquire_compaction_slot|release_compaction_slot"
-                r"|refresh_compaction_slot|get_compaction_slot_load) *\(",
+                r"|refresh_compaction_slot) *\(",
                 self.PROD,
             )
         }
-        allowed = {
-            "agent/compaction_coordinator.py",     # defines them
-            "agent/conversation_compression.py",   # the one wired caller (Phase 2)
+        assert callers <= self.MUTATORS_ALLOWED, (
+            f"MUTATING compaction slot primitives are called from unexpected "
+            f"modules: {sorted(callers - self.MUTATORS_ALLOWED)}"
+        )
+
+    def test_diagnostics_may_only_READ_the_queue(self):
+        """Pin the read-only surface explicitly, so the allowance above cannot
+        quietly widen into a mutation."""
+        src = (REPO_ROOT / "hermes_cli" / "kanban_diagnostics.py").read_text(encoding="utf-8")
+        for mutator in (
+            "try_acquire_compaction_slot",
+            "refresh_compaction_slot",
+            "release_compaction_slot",
+        ):
+            assert mutator not in src, (
+                f"kanban_diagnostics must never {mutator} — diagnostics observe the "
+                f"queue, they do not participate in it"
+            )
+        assert "get_compaction_slot_load" in src
+
+    def test_readonly_slot_load_callers_are_bounded(self):
+        """get_compaction_slot_load is safe, but still not a free-for-all."""
+        callers = {
+            ln.split(":", 1)[0]
+            for ln in self._git_grep(r"get_compaction_slot_load *\(", self.PROD)
         }
-        assert callers <= allowed, (
-            f"compaction slot primitives are called from unexpected modules: "
-            f"{sorted(callers - allowed)}"
+        assert callers <= self.OBSERVERS_ALLOWED, (
+            f"the read-only slot load is read from unexpected modules: "
+            f"{sorted(callers - self.OBSERVERS_ALLOWED)}"
         )
 
     def test_the_route_guard_modules_stay_ignorant_of_the_queue(self):

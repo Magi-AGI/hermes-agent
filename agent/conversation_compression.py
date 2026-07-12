@@ -329,9 +329,16 @@ def _admit_to_compaction_queue(
     if not bool(getattr(agent, "compaction_queue_enabled", False)):
         # Default path. The coordinator is never even imported, so a disabled
         # queue cannot touch the DB, the turn, or compaction behaviour.
+        #
+        # NO METRICS HERE, deliberately: a disabled queue did not run, and a
+        # counter suggesting otherwise is a signal an operator could act on. The
+        # queue's metrics must only ever describe a queue that actually ran.
         _clear_pending(agent, sid)
         return _CompactionAdmission(True, bypass_reason="disabled")
 
+    from agent import compaction_metrics as _cm
+
+    _source = str(getattr(agent, "platform", "") or "unknown")
     now = time.time()
 
     # Hard wall: compacting late is better than not fitting at all.
@@ -342,6 +349,7 @@ def _admit_to_compaction_queue(
             approx_tokens, _COMPACTION_HARD_WALL_FRACTION * 100,
             getattr(agent.context_compressor, "context_length", None),
         )
+        _cm.record_queue_failopen(_cm.REASON_HARDWALL)
         _clear_pending(agent, sid)
         return _CompactionAdmission(True, bypass_reason="hardwall")
 
@@ -353,11 +361,16 @@ def _admit_to_compaction_queue(
         max_wait = 300.0
     pending_at = _pending_map(agent).get(sid)
     if pending_at is not None and max_wait > 0 and (now - pending_at) >= max_wait:
+        _waited = now - pending_at
         logger.warning(
             "compaction queue: bypassing (waitcap) — session=%s pending %.0fs >= "
             "max_wait_seconds=%.0f; compacting unbounded so the session makes progress",
-            sid, now - pending_at, max_wait,
+            sid, _waited, max_wait,
         )
+        # Record the ACTUAL wait before clearing it — this is the number that
+        # tells an operator whether max_wait is doing real work.
+        _cm.record_queue_wait_seconds(_waited, _source)
+        _cm.record_queue_failopen(_cm.REASON_WAITCAP)
         _clear_pending(agent, sid)
         return _CompactionAdmission(True, bypass_reason="waitcap")
 
@@ -384,22 +397,48 @@ def _admit_to_compaction_queue(
             "unbounded. The bound is not in effect.",
             type(exc).__name__, exc,
         )
+        # ALERTABLE: the queue is silently not queueing. From the outside this is
+        # indistinguishable from a healthy idle queue, so the counter is the only
+        # way an operator ever finds out.
+        _cm.record_queue_failopen(_cm.REASON_COORDINATOR_ERROR)
         _clear_pending(agent, sid)
         return _CompactionAdmission(True, bypass_reason="coordinator_error")
 
     if outcome is SlotOutcome.ACQUIRED:
+        # Gauges come from the committed transaction, not a polling read.
+        _cm.record_queue_slot_load(result.slots_in_use, result.max_concurrent)
+        _cm.record_queue_reclaimed_expired(result.reclaimed_expired)
+        # How long this session waited before getting in (0.0 if it never queued).
+        _waited_before_acquire = (now - pending_at) if pending_at is not None else 0.0
+        _cm.record_queue_wait_seconds(_waited_before_acquire, _source)
         _clear_pending(agent, sid)
         return _CompactionAdmission(True, slot=result)
 
     if outcome is SlotOutcome.COORDINATOR_ERROR:
+        _cm.record_queue_failopen(_cm.REASON_COORDINATOR_ERROR)
         _clear_pending(agent, sid)
         return _CompactionAdmission(True, bypass_reason="coordinator_error")
 
     # ── DENIED: the queue is genuinely full. Defer with ZERO side effects. ──
+    #
+    # Metrics are the ONE exception to "zero side effects": they are in-process,
+    # invisible to the user, and touch neither the messages nor the session. A
+    # DENIED that recorded nothing would make the feature unobservable exactly
+    # when it is doing its job.
     pending = _pending_map(agent)
     if sid not in pending:
         pending[sid] = now  # first denial — start the wait-cap clock, stay silent
-    _maybe_notify_queued(agent, sid, now - pending[sid])
+    _pending_for = now - pending[sid]
+
+    # DENIED is a SUCCESSFUL observation that the queue is full — never conflated
+    # with a coordinator error (which is a fail-open bypass). Keeping them distinct
+    # is what stops a broken queue from hiding behind "looks busy".
+    _cm.record_queue_denied(_source)
+    _cm.record_queue_slot_load(result.slots_in_use, result.max_concurrent)
+    _cm.record_queue_reclaimed_expired(result.reclaimed_expired)
+    _cm.record_queue_wait_seconds(_pending_for, _source)
+
+    _maybe_notify_queued(agent, sid, _pending_for)
     return _CompactionAdmission(False)
 
 
