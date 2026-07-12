@@ -7,7 +7,50 @@
 - **Branch (this doc):** `lake/compaction-queue-spec`
 - **Mode:** Claude leads/writes. **Spec + implementation plan only — no implementation, no merge.**
 - **Triad:** Claude lead/write · Codex r1, r2, r3 `changes_required` (all addressed) → **r4 `approve_with_notes`, no blockers** (note resolved in rev 5) · Gemini waived (`IneligibleTierError`). See §11.
-- **Revision:** rev 5 — resolves Codex r4's nonblocking note by making the **mixed-source Anthropic policy explicit: scan past metered-shaped candidates to a later OAuth source, fail closed only on exhaustion** (§5.3.1), with a skip metric (§7) and matching tests (§9.6). Rev 4 corrected rev 3's mis-anchored Anthropic evidence and specified `CompressionRoutingRejected` propagation through `context_compressor._generate_summary`.
+- **Revision:** rev 6 — **Gate 0 FAILED against rev 5's substrate.** The coordinator moves from the profile-local `state.db` to a **root-anchored dedicated coordinator DB** (`<root>/compaction.db`), resolved via `get_default_hermes_root()` and mirroring the proven `kanban_home()` pattern (§3.1, §4.2, §8, Gate 0). Everything else in the design is **unchanged** — typed `SlotOutcome`/`SlotResult`, fail-open coordinator vs fail-closed routing, admission after the per-session lock and before `on_pre_compress`, hard-wall + wait-cap bypass, the status-emit move, and the non-routing invariant all stand. Rev 5 resolved Codex r4's mixed-source Anthropic note (scan-past, §5.3.1). Rev 4 corrected rev 3's mis-anchored Anthropic evidence and specified `CompressionRoutingRejected` propagation.
+
+> ### ⚠ Rev 6 correction notice — rev 5's "state.db coordinates every backend" premise was WRONG
+>
+> Rev 5 asserted (§4.2, §8) that *"Only state.db already coordinates every backend process
+> (desktop backend-pool, kanban workers, gateways share one WAL file)"*. **Gate 0 refuted
+> this on source.** `state.db` is anchored to the **active profile's** `HERMES_HOME`
+> (`hermes_state.py:123` → `get_hermes_home()`), and the two processes that generate the
+> herd this feature exists to bound **deliberately span profiles**:
+>
+> - **Kanban workers:** a task's `assignee` **IS a profile name**, and the worker's
+>   `HERMES_HOME` is derived from it — `env["HERMES_HOME"] = resolve_profile_env(profile_arg)`
+>   where `profile_arg = normalize_profile_name(task.assignee)`
+>   (`hermes_cli/kanban_db.py:7704`, `:7709–7720`). **The dispatcher herd is the
+>   cross-profile case by construction.**
+> - **Desktop backend-pool / gateway:** there is no `backend_pool` module — the desktop
+>   backend is the `tui_gateway`, and in app-global remote mode **one backend serves every
+>   profile** (`tui_gateway/server.py:1027`). It opens a **per-session** DB against a
+>   **per-profile** path: `SessionDB(db_path=Path(profile_home) / "state.db")`
+>   (`tui_gateway/server.py:1341–1353`), and spawns slash workers with
+>   `env["HERMES_HOME"] = str(profile_home)` (`:278–304`). One process, many state.db files.
+>
+> **Consequence had we shipped rev 5:** `compaction_slots` would live in a *different file
+> per profile*. `max_concurrent: 1` would have permitted **one concurrent compaction per
+> profile**, silently — N profiles, N simultaneous compactions. Because the coordinator
+> **fails open by design** (§4.3), a mis-scoped coordinator is **indistinguishable from a
+> healthy idle one**: every acquire succeeds, every log line looks clean, and the feature
+> bounds nothing. That is precisely the "queue that silently no-ops" this workstream is
+> forbidden to build.
+>
+> **The fix already exists in-tree.** The kanban **board** hit this exact hazard and solved
+> it by anchoring to the shared root rather than the active profile — `kanban_home()`
+> (`hermes_cli/kanban_db.py:370–391`) resolves through `get_default_hermes_root()` precisely
+> because *"Resolving the kanban paths through the active profile's `HERMES_HOME` would
+> silently fork the board per profile, which breaks the dispatcher / worker handoff."*
+> **`state.db` has no such anchoring; the coordinator now gets it.** Rev 6 is a **substrate
+> relocation only** — the file the coordinator lives in changes; the mechanism (SQLite WAL,
+> serialized writes, leased semaphore) and every other design decision do not.
+>
+> **Scope caveat carried forward (§4.8):** the *profile* was arguably never the right
+> bounding unit either — the overload being prevented is **provider-side**, and a
+> subscription account is typically shared across profiles. Root-scoping bounds
+> **per-machine-root**, which is a strict improvement and matches the herd, but it is not
+> per-account. See §4.8.
 
 > ### ⚠ Rev 4 correction notice — rev 3's Anthropic hazard claim was WRONG
 >
@@ -42,11 +85,19 @@
 ## 1. Problem statement
 
 Context compaction in Hermes is coordinated **per session only**. The existing guard
-(`agent/conversation_compression.py::compress_context`, ~518–619) is a state.db-backed
-lease keyed on `session_id` (`compression_locks`, `hermes_state.py:783`) whose sole job
-is to stop **two agents sharing one `session_id`** (the parent-turn agent and its
-`background_review` fork) from racing a rotation. It is a **per-session mutex**, not a
-concurrency governor across sessions, and it **fails open**.
+(`agent/conversation_compression.py::compress_context`, ~518–619) is a lease keyed on
+`session_id`, held in the **profile-local `state.db`** (`compression_locks`,
+`hermes_state.py:783`), whose sole job is to stop **two agents sharing one `session_id`**
+(the parent-turn agent and its `background_review` fork) from racing a rotation. It is a
+**per-session mutex**, not a concurrency governor across sessions, and it **fails open**.
+
+> **Do not confuse this lock with the new queue coordinator.** The existing per-session
+> `compression_locks` lease stays exactly where it is — in the profile-local `state.db` —
+> because its scope genuinely *is* one session inside one profile, and both racers live in
+> the same process/profile. The **new** cross-session semaphore (`compaction_slots`) is a
+> different mechanism with a different scope and therefore a **different file**: the
+> root-anchored `<root>/compaction.db` (§4.2). The two nest: per-session lock **outer**,
+> compaction slot **inner** (§4.5).
 
 There is **no coordination across sessions or backend processes**. When several large
 sessions cross their compaction threshold at once — typically the kanban dispatcher
@@ -73,8 +124,10 @@ across all sessions and processes, **without** throttling normal agent behaviour
    **Anthropic subscription/OAuth (Claude Max / Claude Code) route** only — never a
    metered route, including the **metered `anthropic` API-key route**, `openai-api`,
    OpenRouter, or Gemini. **Absolute for this workstream: no opt-out** (§5).
-4. **Privacy.** Compaction inputs are business-sensitive. **No new external egress** —
-   the coordinator is local (state.db), never a network service.
+4. **Privacy.** Compaction inputs are business-sensitive. **No new external egress** — the
+   coordinator is a **local SQLite file** (the root-scoped `<root>/compaction.db`, §4.2),
+   never a network service. This constraint is what rules out per-account/cross-machine
+   bounding (§4.8): that would require a network coordinator.
 5. **Fail-open (coordinator).** If the coordinator is unavailable, degrade to today's
    per-session behaviour. **Never block or deadlock.** Deliberately asymmetric with
    constraint 3, which **fails closed** (§5.5).
@@ -92,8 +145,37 @@ across all sessions and processes, **without** throttling normal agent behaviour
   catch `sqlite3.Error` → return `False`/`None`, so **coordinator failure is
   indistinguishable from denial**. Safe for a per-session mutex; **unsafe to copy** for a
   global queue.
-- **Cross-process substrate:** state.db, one shared WAL SQLite file (`hermes_state.py:123`),
-  serialized writes via `_execute_write`.
+- **Cross-process substrate — CORRECTED in rev 6 (Gate 0).** state.db is a WAL SQLite file
+  with serialized writes via `_execute_write`, but it is **profile-scoped, not
+  machine-scoped**: `DEFAULT_DB_PATH = get_hermes_home() / "state.db"`
+  (`hermes_state.py:123`), and `get_hermes_home()` returns `<root>/profiles/<name>` under a
+  non-default profile (`hermes_constants.py:55–108`; `hermes_cli/profiles.py:2209–2225`,
+  `:275`). It therefore coordinates **within one profile only**.
+  - **Kanban workers span profiles:** `profile_arg = normalize_profile_name(task.assignee)`
+    → `env["HERMES_HOME"] = resolve_profile_env(profile_arg)`
+    (`hermes_cli/kanban_db.py:7704`, `:7709–7720`). The assignee **is** the profile, so the
+    dispatcher herd — the motivating scenario (§1) — is inherently cross-profile.
+  - **The desktop backend-pool is the `tui_gateway`, and one backend serves every profile**
+    in app-global remote mode (`tui_gateway/server.py:1027`). It binds each session to that
+    session's profile home and opens a per-profile DB:
+    `SessionDB(db_path=Path(profile_home) / "state.db")` (`:1341–1353`); slash workers are
+    spawned with `env["HERMES_HOME"] = str(profile_home)` (`:278–304`).
+  - **⇒ A coordinator in `state.db` bounds per-profile and cannot see the herd.** The
+    coordinator must live in a **root-anchored** DB (§4.2).
+- **Import-time trap (drives §4.2 / §9.0):** `DEFAULT_DB_PATH` is evaluated at **module
+  import** (`hermes_state.py:123`), and `set_hermes_home_override()` is a **ContextVar**
+  that deliberately does not mutate `os.environ` (`hermes_constants.py:18–35`) — so it does
+  **not** retroactively change `DEFAULT_DB_PATH`. That is exactly why the gateway must pass
+  `db_path` explicitly (`tui_gateway/server.py:1353`). **The coordinator must resolve its
+  path at call time, never rely on an import-time constant**, or it will silently bind to
+  the *launch* profile while running inside a session bound to another.
+- **Root-anchoring precedent (drives §4.2):** the kanban **board** already solved this.
+  `kanban_home()` (`hermes_cli/kanban_db.py:370–391`) resolves via `get_default_hermes_root()`
+  with an `HERMES_KANBAN_HOME` override, explicitly because *"Resolving the kanban paths
+  through the active profile's `HERMES_HOME` would silently fork the board per profile,
+  which breaks the dispatcher / worker handoff."* `get_default_hermes_root()`
+  (`hermes_constants.py:113–133`) returns `<root>` when `HERMES_HOME` is
+  `<root>/profiles/<name>`, and is import-safe (stdlib only).
 - **Trigger sites:** `conversation_loop.py` → `_compress_context` at ~1034 (pre-API
   pressure), ~3131/~3386/~3609/~4786.
 - **Pre-compaction side effect (drives §4.5):** `memory_manager.on_pre_compress` (~632)
@@ -176,16 +258,73 @@ user's **main agent** provider+model). `provider: auto` also enters built-in dis
 *(Accepted by Codex at r2/r3; unchanged in rev 4 except §4.7 status handling.)*
 
 ### 4.1 Summary
-A **state.db-backed leased semaphore** (`compaction_slots`) bounds *concurrent compaction
-summarisation calls* across all sessions and processes to a configurable limit (default
-**1**). It is **advisory admission control, never a blocker**: it wraps inside the existing
-per-session lock, sits only on the compaction path, and fails open on any coordinator error.
+A **leased semaphore** (`compaction_slots`) in a **root-scoped coordinator DB**
+(`<root>/compaction.db`, §4.2 — *not* the profile-local `state.db`) bounds *concurrent
+compaction summarisation calls* across all sessions, processes, **and profiles** under one
+Hermes root, to a configurable limit (default **1**). It is **advisory admission control,
+never a blocker**: it wraps inside the existing per-session lock, sits only on the
+compaction path, and fails open on any coordinator error.
 
-### 4.2 Why state.db
-Only state.db already coordinates every backend process (desktop backend-pool, kanban
-workers, gateways share one WAL file with serialized writes). A gateway-owned in-memory
-queue cannot see sibling processes. The lease pattern already handles atomic acquire, TTL
-reclaim of crashed holders, idempotent release. No new process, no new egress. §8.
+### 4.2 Why a ROOT-SCOPED coordinator DB (rev 6 — replaces "Why state.db")
+
+**Substrate: `<root>/compaction.db`** — a dedicated SQLite WAL file anchored to the shared
+Hermes **root**, not to the active profile's `HERMES_HOME`.
+
+```python
+def compaction_home() -> Path:
+    """Root that anchors the compaction coordinator. Mirrors kanban_home()."""
+    override = os.environ.get("HERMES_COMPACTION_HOME", "").strip()
+    if override:
+        return Path(override).expanduser()
+    from hermes_constants import get_default_hermes_root
+    return get_default_hermes_root()
+
+def compaction_db_path() -> Path:
+    return compaction_home() / "compaction.db"
+```
+
+**Why root-anchored.** A queue that cannot see the herd is not a queue. The herd is
+generated by kanban workers (whose `HERMES_HOME` is the **assignee's profile**) and by the
+`tui_gateway` (which, in app-global remote mode, serves **every profile from one process**)
+— see §3.1. A coordinator in profile-local `state.db` would live in a different file per
+profile, so `max_concurrent: 1` would allow **one concurrent compaction per profile** while
+logging perfectly clean acquires. Because the coordinator **fails open** (§4.3), that
+failure is **invisible**. Root-anchoring is what makes the bound real.
+
+**Why this exact pattern.** It is not novel — it is the fix the codebase already applied to
+the kanban **board** for the identical hazard: `kanban_home()`
+(`hermes_cli/kanban_db.py:370–391`) resolves through `get_default_hermes_root()` because
+per-profile resolution *"would silently fork the board per profile, which breaks the
+dispatcher / worker handoff."* We copy that shape verbatim, including the env override
+(`HERMES_COMPACTION_HOME`, analogous to `HERMES_KANBAN_HOME`) for tests and Docker/custom
+deployments. `get_default_hermes_root()` (`hermes_constants.py:113–133`) already normalises
+`<root>/profiles/<name>` → `<root>` for both native and Docker layouts, and is import-safe.
+
+**Why a DEDICATED db, not `kanban.db` and not `state.db`.**
+- **Not `state.db`:** profile-scoped (the whole bug), and it is the hot session/message
+  store — adding a semaphore's write traffic to the file that already suffers WAL
+  write-lock contention (`hermes_state.py:871–900` documents visible TUI freezes from
+  exactly this) is the wrong trade for a coordination table with no relational ties to
+  sessions or messages.
+- **Not `kanban.db`:** the board is root-scoped and would work, but compaction is **not a
+  kanban concern** — CLI and desktop sessions with no kanban involvement must still be
+  bounded. Piggybacking would couple an agent-wide privacy/perf control to an optional
+  feature's schema and migration history.
+- **A dedicated `compaction.db`** keeps the coordination table's lifecycle, schema version,
+  and write traffic isolated. It is cheap: one small WAL file, created on first use.
+
+**What is unchanged.** The *mechanism* is identical to rev 5 — SQLite WAL, serialized
+writes, a leased semaphore with atomic acquire, TTL reclaim of crashed holders, and
+idempotent release. **Only the file location changes.** No new process, no daemon, no
+socket, **no new egress** (constraint 4). A gateway-owned in-memory queue still cannot see
+sibling processes, which is why an in-process queue remains rejected (§8).
+
+**Path resolution is call-time, never import-time.** Per the §3.1 import-time trap, the
+coordinator resolves `compaction_db_path()` **when it is used**, never via a module-level
+constant — otherwise a session bound to profile B (via the gateway's ContextVar override)
+would coordinate against profile A's launch-time path. Root-anchoring makes this mostly
+moot (the root is the same either way), but the discipline is required so a future
+`HERMES_COMPACTION_HOME` override or a Docker layout cannot be captured at import.
 
 ### 4.3 Typed acquire outcomes
 Copying `compression_locks`' `sqlite3.Error -> False` shape would make a broken coordinator
@@ -219,11 +358,17 @@ class SlotResult:
 | `DENIED` | **True no-op**: messages unchanged, set `first_pending_at`, no side effects, no status spam (§4.7). |
 | `COORDINATOR_ERROR` | **Bypass the queue**, compact unbounded. Log once/session; alertable metric. |
 
+Schema — lives in the **root-scoped `<root>/compaction.db`** (§4.2), **not** in the
+profile-local `state.db`. `session_id` is recorded for diagnostics only; a `profile` column
+is added so an operator can see *which* profiles are contending for the machine-wide bound
+(diagnostics only — **never** a scheduling input, per §4.6):
+
 ```sql
 CREATE TABLE IF NOT EXISTS compaction_slots (
     slot_id     TEXT PRIMARY KEY,   -- "0".."N-1"; row count is the bound
     holder      TEXT NOT NULL,      -- pid:tid:agent:nonce (same shape as lock holder)
     session_id  TEXT NOT NULL,      -- diagnostics only — NOT a scheduling input
+    profile     TEXT NOT NULL DEFAULT '',  -- diagnostics only — which profile holds the slot
     source      TEXT NOT NULL DEFAULT '',  -- diagnostics only (platform / 'kanban')
     acquired_at REAL NOT NULL,
     expires_at  REAL NOT NULL
@@ -286,6 +431,26 @@ reusing the once-per-session dedup pattern of `_last_compression_lock_warning_si
 queued status must **not** carry `COMPACTION_STATUS_MARKER` — the gateway matches on it to
 tag `kind="compacting"` (`tui_gateway/server.py::_status_update`), so including it would
 show "Summarizing…" for a session that is merely waiting.
+
+### 4.8 What the root bound does and does not cover (rev 6, honest scope)
+
+Root-scoping bounds **per machine-root**: every profile under one `<root>` contends for the
+same `max_concurrent` slots. That matches the herd (§3.1) and is what this feature needs.
+
+It is **not** per-provider-account, and that gap is worth stating plainly rather than
+discovering later. The overload being prevented is **provider-side** (constraint: a
+compaction summarisation call is large and slow; N at once against one subscription account
+is what spirals). A subscription account is typically **shared across profiles** — which
+root-scoping now correctly bounds — but it may also be shared across **machines**, which no
+local coordinator can see. Two laptops on one Claude Max account can still each run
+`max_concurrent` compactions.
+
+**Decision: accept this.** A cross-machine coordinator would need a network service — new
+process, new failure surface, and **new egress**, which constraint 4 forbids outright. The
+local root bound removes the realistic herd (one machine, many profiles, kanban dispatch
+fan-out) and is a strict improvement over both today (unbounded) and rev 5 (per-profile).
+Per-account bounding is **explicitly out of scope**; if `wait_seconds` metrics ever show
+cross-machine contention is real, that is a separate, separately-argued change.
 
 ## 5. Subscription-only routing — invariant + required guard
 
@@ -472,19 +637,38 @@ here.**
 
 ## 6. Config surface
 
-All YAML; **no new `HERMES_*` env var** (AGENTS §102–106).
+All tunables are YAML; **no new `HERMES_*` env var for non-secret config** (AGENTS §102–106).
+
+> **One `HERMES_*` addition, and why it does not violate that rule (rev 6).**
+> `HERMES_COMPACTION_HOME` (§4.2) is **not config** — it is a *path override* for tests and
+> unusual deployments (Docker, custom roots), in the same class as the **already-existing**
+> `HERMES_KANBAN_HOME` (`hermes_cli/kanban_db.py:386`) and `HERMES_HOME` itself. It tunes no
+> behaviour; it only relocates the coordinator file. It is required because the multi-process
+> Gate 0 / concurrency tests must point real subprocesses at a temp root **without** touching
+> the developer's real `<root>/compaction.db`, and `HERMES_HOME` cannot serve that purpose —
+> root-anchoring deliberately *ignores* per-profile `HERMES_HOME`, which is the entire point.
+> No queue *tunable* (`max_concurrent`, TTLs, waits) gets an env var; those stay YAML-only.
 
 ```yaml
 compaction_queue:
-  enabled: true               # master switch; false -> today's per-session-only behaviour
-  max_concurrent: 1           # global cap on simultaneous compaction summarisation calls
-                              # across ALL sessions/processes. Clamped >= 1 (0 would
-                              # deadlock all compaction, violating fail-open).
+  enabled: false              # master switch. DEFAULT FALSE through implementation — the
+                              # queue ships dark and is enabled only as a separate,
+                              # explicitly user-approved rollout step (§9.4). false ->
+                              # today's per-session-only behaviour, i.e. no change.
+  max_concurrent: 1           # cap on simultaneous compaction summarisation calls across
+                              # ALL sessions, processes, AND PROFILES under one Hermes root
+                              # (§4.2). Clamped >= 1 (0 would deadlock all compaction,
+                              # violating fail-open).
   max_wait_seconds: 300       # a pending session bypasses on its next re-check AFTER this
                               # elapses. Best-effort liveness, not a latency guarantee.
   slot_ttl_seconds: 300       # lease TTL; crashed holders reclaimed after this.
   notify_after_seconds: 60    # only surface a "compaction queued" status if still pending
                               # this long. First denial is silent (§4.7).
+  # NOTE: the coordinator's location is NOT configurable in YAML. It is always
+  # <root>/compaction.db, resolved at call time via get_default_hermes_root()
+  # (override: HERMES_COMPACTION_HOME, above). Making it a YAML key would let one
+  # profile's config.yaml silently point that profile at a different coordinator file —
+  # reintroducing the exact per-profile fork Gate 0 rejected.
 
 auxiliary:
   compression:
@@ -534,16 +718,42 @@ performance feature.
   metered candidates and then found no subscription route at all".
 - **`compaction.routing_rejected_abort_total`** — fail-closed aborts (§5.5), distinct from
   summary failures.
-- INFO log on acquire/release (`slot_id`, `session_id`, `source`, `waited_ms`) and on route
-  selection — **which provider, which credential SOURCE, and which auth-mode** (the
+- INFO log on acquire/release (`slot_id`, `session_id`, `profile`, `source`, `waited_ms`) and
+  on route selection — **which provider, which credential SOURCE, and which auth-mode** (the
   provenance that does not exist today). WARN once/session on `COORDINATOR_ERROR`.
-- Slot load in diagnostics (`hermes_cli/kanban_diagnostics.py`).
+- **INFO log the RESOLVED coordinator path once per process at first acquire (rev 6).** The
+  rev-5 defect class — a coordinator silently bound to the wrong (per-profile) file — is
+  invisible under fail-open semantics. Printing the actual `<root>/compaction.db` in use is
+  the cheapest way for an operator to confirm the bound is real, and for two herd processes
+  to be compared. `profile` is on the slot row (§4.3) for the same reason: so an operator can
+  see cross-profile contention actually being arbitrated.
+- Slot load in diagnostics (`hermes_cli/kanban_diagnostics.py`) — note the coordinator is
+  root-scoped, so the diagnostic reports the **machine-root-wide** load, not this profile's.
 
 ## 8. Rejected alternatives
 
-- **Gateway-owned in-process queue** — cannot see sibling backend processes.
-- **Dedicated coordinator service/socket** — new process, new failure surface, potential new
-  egress; state.db already coordinates cross-process for free.
+- **Gateway-owned in-process queue** — cannot see sibling backend processes. Worse than it
+  first appears: in app-global remote mode **one gateway serves every profile**
+  (`tui_gateway/server.py:1027`) yet kanban workers are **separate processes**
+  (`hermes_cli/kanban_db.py:7709–7720`), so an in-process queue would miss the entire
+  dispatcher herd — the exact thing being bounded.
+- **The profile-local `state.db` as the coordinator (rev 5) — REJECTED BY GATE 0.** Its
+  stated rationale, *"state.db already coordinates cross-process for free"*, is **false**:
+  state.db is profile-scoped (`hermes_state.py:123` → `get_hermes_home()`), while the herd
+  is cross-profile by construction (kanban `assignee` **is** a profile; the desktop backend
+  serves every profile). It would have bounded **one compaction per profile** while
+  fail-open semantics made the mis-scoping **invisible**. Replaced by the root-anchored
+  `<root>/compaction.db` (§4.2). *This is the rev-6 correction; see the notice at the top.*
+- **Piggybacking the root-scoped `kanban.db`** — it is correctly root-anchored and would
+  technically work, but compaction is not a kanban concern (CLI/desktop sessions with no
+  kanban involvement must still be bounded), and it would couple an agent-wide control to an
+  optional feature's schema/migrations. A dedicated `compaction.db` is cleaner for the same
+  cost (§4.2).
+- **Dedicated coordinator service/socket** — new process, new failure surface, and potential
+  **new egress** (constraint 4). A root-anchored SQLite WAL file coordinates every local
+  process for free, with no daemon.
+- **Cross-machine / per-provider-account bounding** — would require a network service, i.e.
+  new egress; explicitly out of scope (§4.8).
 - **Central FIFO/priority queue with waiter table + scheduler** — deferred, not dismissed
   (§4.6, §9.5).
 - **Copying `compression_locks`' `sqlite3.Error -> False` acquire shape** — converts
@@ -568,12 +778,59 @@ performance feature.
 
 Target branch: `lake/migrate-latest`. **This doc implements nothing.**
 
-### 9.0 Phase 0 — Slot primitives (no behaviour change)
-`hermes_state.py`: `compaction_slots` DDL + index; `SlotOutcome`/`SlotResult`;
-`try_acquire_compaction_slot`, `refresh_compaction_slot`, `release_compaction_slot`,
-`get_compaction_slot_load`. Pure additions, no callers. Code comment at the
-`except sqlite3.Error` site explaining why it returns `COORDINATOR_ERROR` and must not be
-harmonised with the neighbouring lock methods' `-> False` shape.
+### 9.0-GATE — Gate 0: prove the coordinator path is shared (**BLOCKING**, rewritten rev 6)
+
+> **Gate 0 as written in rev 5 — "prove every backend shares the same `state.db`" — was run
+> and FAILED.** It is replaced by the check below. **No queue code may be written until this
+> gate passes.** The gate exists because the failure mode is *silent*: a mis-scoped
+> coordinator fails open, so every acquire succeeds and every log looks healthy while the
+> bound does nothing.
+
+**Claim to prove:** every process in the herd — a **desktop-pool / `tui_gateway` backend**
+(including one serving a *non-launch* profile), a **kanban worker** (whose `HERMES_HOME` is
+its task's **assignee profile**), and a **CLI/gateway agent** — resolves the **same
+root-scoped coordinator path** `<root>/compaction.db`, **regardless of each process's
+per-profile `HERMES_HOME`**.
+
+**How to prove it (must be a real, executable check, not a source-reading exercise):**
+1. Create a temp root with **≥2 distinct profiles** (`<root>/profiles/a`, `<root>/profiles/b`).
+2. Launch **real subprocesses** — not threads, not mocks — with the *divergent* `HERMES_HOME`
+   values the herd actually uses: one at `<root>/profiles/a`, one at `<root>/profiles/b`, one
+   at `<root>` itself.
+3. Have each print its **resolved** `compaction_db_path()` (and, for contrast, its resolved
+   `state.db` path).
+4. **Assert positively that the coordinator paths are EQUAL** across all three, and that they
+   equal `<root>/compaction.db`. Assert the `state.db` paths **differ** — that contrast is the
+   regression test for the rev-5 bug, and it is what makes the gate meaningful rather than
+   tautological.
+5. **Do not mock** `get_hermes_home`, `get_default_hermes_root`, or `SessionDB`. The bug being
+   guarded against is *path resolution*, so mocking path resolution would assert nothing.
+
+**Fail condition:** if any herd process resolves a different coordinator path, **STOP** — the
+substrate is wrong again and the design needs revision, not a workaround.
+
+**Carry-forward hazard (from the Gate 0 investigation, §3.1):** `hermes_state.DEFAULT_DB_PATH`
+is frozen at **import time** and `set_hermes_home_override()` is a ContextVar that does not
+update it. The coordinator must resolve its path **at call time**. A test should assert that
+importing the coordinator module under one `HERMES_HOME` and then calling it under a
+ContextVar override still yields the root path.
+
+### 9.0 Phase 0 — Slot primitives (no behaviour change; substrate corrected in rev 6)
+**New module `agent/compaction_coordinator.py`** (NOT `hermes_state.py` — that class is bound
+to the profile-local DB, which is the bug Gate 0 caught):
+- `compaction_home()` / `compaction_db_path()` — root anchoring via `get_default_hermes_root()`
+  with the `HERMES_COMPACTION_HOME` override, mirroring `kanban_home()`
+  (`hermes_cli/kanban_db.py:370–391`). **Resolved at call time, never an import-time constant.**
+- `compaction_slots` DDL + index (§4.3) against `<root>/compaction.db`; WAL + serialized
+  writes; schema versioned independently of `state.db`'s `SCHEMA_VERSION`.
+- `SlotOutcome` / `SlotResult`; `try_acquire_compaction_slot`, `refresh_compaction_slot`,
+  `release_compaction_slot`, `get_compaction_slot_load`.
+- Code comment at the `except sqlite3.Error` site explaining why it returns
+  `COORDINATOR_ERROR` and must **not** be harmonised with `hermes_state.py`'s neighbouring
+  lock methods' `-> False` shape (§4.3).
+- Pure additions, **no callers** — and `compaction_queue.enabled` stays **false** (§6), so
+  Phase 0 cannot change behaviour even accidentally. The InstallDir runs the live backend;
+  shipping dark is what keeps that safe.
 
 ### 9.1 Phase 0.5 — Subscription-only ROUTE guard (**BLOCKING PREREQUISITE**, §5)
 Standalone privacy fix; worth landing on its own merits even if the queue never ships.
@@ -607,9 +864,11 @@ Standalone privacy fix; worth landing on its own merits even if the queue never 
 **The queue must not be enabled until this phase is merged and its tests pass.**
 
 ### 9.2 Phase 1 — Queue config
-`compaction_queue` block in `DEFAULT_CONFIG`; add to the top-level section allowlist
-(`config.py:5211`); clamp `max_concurrent >= 1`. Populate agent fields at init (beside
-`_compression_lock_ttl_seconds`).
+`compaction_queue` block in `DEFAULT_CONFIG` with **`enabled: false`** (§6); add to the
+top-level section allowlist (`config.py:5211`); clamp `max_concurrent >= 1`. Populate agent
+fields at init (beside `_compression_lock_ttl_seconds`). The coordinator **path is not a YAML
+key** (§6) — it is always `<root>/compaction.db`, so no profile's `config.yaml` can point that
+profile at a different coordinator file and silently re-fork the bound.
 
 ### 9.3 Phase 2 — Wire into compaction (behind `enabled`)
 - `compress_context`: acquire after the per-session lock, **before `on_pre_compress`**
@@ -625,10 +884,17 @@ Standalone privacy fix; worth landing on its own merits even if the queue never 
   the wait-cap).
 
 ### 9.4 Phase 3 — Observability + rollout
-Emit §7 metrics/logs; slot load in diagnostics. Ship `enabled: true`, `max_concurrent: 1`.
+Emit §7 metrics/logs (including the resolved coordinator path); slot load in diagnostics.
+
+**Ship DARK: `enabled: false`, `max_concurrent: 1` (rev 6).** Implementation lands with the
+queue **off**. Turning it on is a **separate, explicitly user-approved step**, not part of
+this build — the InstallDir *is* the running backend, so code that ships dark cannot change
+live behaviour on restart. **Gate 0 (§9.0-GATE) and the cross-profile concurrency test (§9.6)
+must both pass before `enabled: true` is even proposed.**
+
 **Rollback:** `enabled: false` (pure config) → per-session-only behaviour; no migration to
-undo. **The §5 route guard stays on regardless** — privacy control, not a performance one,
-and not part of the queue rollback.
+undo. A stale `<root>/compaction.db` left behind is inert. **The §5 route guard stays on
+regardless** — privacy control, not a performance one, and not part of the queue rollback.
 
 ### 9.5 Future work (only if metrics justify)
 Priority scheduler via `compaction_waiters(session_id PK, source, priority, first_pending_at,
@@ -691,11 +957,26 @@ two connections yields distinct `slot_id`s and respects the cap.
   NOT called**; **no session rotation**; distinct routing-rejection message. Assert the same
   with the flag `True` — the flag must have **no effect** on a routing rejection.
 
-**Multi-session concurrency (the key queue test):** ≥3 agents (in-process, or 3 real processes
-against one temp `HERMES_HOME` state.db) crossing threshold together; poll
-`get_compaction_slot_load` and assert **at most `max_concurrent`** slots held at any instant;
-all eventually compact; no deadlock; no messages lost (in-place `archive_and_compact`
-preserves archived rows).
+**Multi-process, CROSS-PROFILE concurrency (the key queue test — rewritten rev 6):** this is
+the test that would have caught the rev-5 bug, so its shape is not negotiable.
+
+- **≥3 REAL subprocesses** (not threads, not mocks) under **one temp Hermes root**, spanning
+  **≥2 distinct profiles**: e.g. one agent with `HERMES_HOME=<root>/profiles/a`, one with
+  `HERMES_HOME=<root>/profiles/b`, one at `<root>` itself. Point the root at a temp dir via
+  `HERMES_COMPACTION_HOME` (§6) so the developer's real `<root>/compaction.db` is untouched.
+  **A same-profile-only test is insufficient** — it passes just as happily against the
+  rejected profile-local substrate and would prove nothing.
+- Assert all three resolve the **same** `compaction_db_path()` == `<root>/compaction.db`,
+  **and** that their profile-local `state.db` paths **differ**. That contrast is the
+  regression assertion for Gate 0; without it the test is tautological.
+- Cross the threshold together; poll `get_compaction_slot_load` and assert **at most
+  `max_concurrent`** slots are held at any instant **across profiles** (with
+  `max_concurrent: 1`, a passing rev-5 implementation would show **2–3** here — that is the
+  bug, made visible).
+- All eventually compact; no deadlock; no messages lost (in-place `archive_and_compact`
+  preserves archived rows).
+- **Do not mock** `get_hermes_home` / `get_default_hermes_root` / path resolution: the defect
+  class being guarded is *path resolution itself*.
 
 **Fail-open:** coordinator raises → compaction still runs unbounded; numeric hard-wall bypasses
 the slot; wait-cap escalates on the next re-check.
@@ -711,7 +992,8 @@ emit on a denied attempt** (§4.7); kanban dispatch cadence unaffected.
 
 | Failure | Handling |
 |---|---|
-| state.db unavailable / method missing (version skew) | `COORDINATOR_ERROR` → **bypass queue, compact unbounded** (fail-open). Never `DENIED`. Log once/session; alertable. |
+| Root coordinator DB (`<root>/compaction.db`) unavailable — unwritable root, corrupt/locked file, missing coordinator method (module/version skew), `AttributeError` at the call site | `COORDINATOR_ERROR` → **bypass queue, compact unbounded** (fail-open). Never `DENIED`. Log once/session; alertable. |
+| **Coordinator resolves to an unexpected path** (e.g. a stray `HERMES_COMPACTION_HOME`, or a future refactor reintroducing an import-time constant) | **Silent by nature — this is the rev-5 failure class.** Every acquire succeeds and the bound quietly does nothing. Mitigated by Gate 0 (§9.0-GATE) + the cross-profile concurrency test (§9.6), and by logging the **resolved coordinator path** once per process at first acquire so an operator can see which file is actually in use. |
 | Holder crashes mid-compaction | `expires_at` lease reclaimed by the next acquirer's `DELETE expired`. TTL 300s. |
 | Stuck lease-refresher | Bounded ≤1-TTL give-up window — a slot cannot be held past TTL. |
 | Starvation | Wait-cap bypass on the next re-check after `max_wait_seconds`. No ordering guarantee claimed (§4.6). |
