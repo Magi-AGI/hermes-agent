@@ -297,12 +297,18 @@ print(json.dumps({"coordinator": str(compaction_db_path())}))
 
 
 class TestNoQueueYet:
-    """Step B is path-helper ONLY — no slots, no DDL, no config, no wiring."""
+    """Scope discipline.
 
-    def test_module_exposes_only_path_helpers(self):
+    Step B was path-helper only. Step C (Phase 0) adds the slot primitives — so
+    those symbols are now EXPECTED. What must still NOT exist is any activation
+    surface: no ``compaction_queue`` config, and no caller wiring the coordinator
+    into compression. The queue stays dark until a separate, user-approved step.
+    """
+
+    def test_slot_primitives_exist_after_phase_0(self):
         from agent import compaction_coordinator as cc
 
-        for banned in (
+        for expected in (
             "try_acquire_compaction_slot",
             "release_compaction_slot",
             "refresh_compaction_slot",
@@ -310,12 +316,26 @@ class TestNoQueueYet:
             "SlotOutcome",
             "SlotResult",
         ):
-            assert not hasattr(cc, banned), f"{banned} must not exist until Gate 0 passes"
+            assert hasattr(cc, expected), f"Phase 0 must provide {expected}"
 
     def test_no_compaction_queue_config_introduced(self):
         from hermes_cli.config import DEFAULT_CONFIG
 
         assert "compaction_queue" not in DEFAULT_CONFIG
+
+    def test_coordinator_has_no_callers_yet(self):
+        """Phase 0 is behaviourally dark: nothing in the agent imports it."""
+        import subprocess
+
+        hits = subprocess.run(
+            ["git", "grep", "-l", "compaction_coordinator", "--", "agent", "hermes_cli",
+             "gateway", "tui_gateway"],
+            cwd=str(REPO_ROOT), capture_output=True, text=True,
+        ).stdout.split()
+        # The module itself is the only permitted hit — no importers.
+        assert hits in ([], ["agent/compaction_coordinator.py"]), (
+            f"compaction_coordinator has acquired callers before the wiring phase: {hits}"
+        )
 
     def test_helper_opens_no_database(self, herd, monkeypatch):
         """Resolving the path must not create or touch ANY DB file.
