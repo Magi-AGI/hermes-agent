@@ -52,6 +52,10 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
 
+# Process-local counters for the compaction route guard (spec §7). Import-safe:
+# compaction_metrics has no Hermes imports of its own, so this cannot cycle.
+from agent import compaction_metrics
+
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # openai SDK pulls a large type tree (~240 ms cold, including responses/*,
 # graders/*). We expose `OpenAI` here as a thin proxy that imports the SDK on
@@ -2742,6 +2746,7 @@ def _note_route_rejected(provider: str, reason: str) -> None:
     # compaction.route_rejected_total{provider, reason} — alertable.
     # {provider=anthropic, reason=metered_auth_mode} firing means the dual-route
     # API-key fallback was hit in production.
+    compaction_metrics.record_route_rejected(provider, reason)
     logger.warning(
         "Compaction route guard: rejected %s (reason=%s) — not an allowed "
         "subscription route for compaction; no client built, no request issued",
@@ -2754,7 +2759,9 @@ def _note_candidate_skipped(provider: str, source: str, reason: str) -> None:
     if state is None:
         return
     state.skips.append((provider, source, reason))
-    # compaction.credential_candidate_skipped_total{provider, source, reason}
+    # compaction.credential_candidate_skipped_total{provider, source, reason}.
+    # A SKIP is not a rejection: the search continued past this candidate.
+    compaction_metrics.record_credential_candidate_skipped(provider, source, reason)
     logger.info(
         "Compaction route guard: skipped %s credential candidate from %s "
         "(reason=%s), continuing to the next source",
@@ -2822,6 +2829,113 @@ def _allowed_compression_routes() -> frozenset:
             )
         routes.add((provider, auth_mode))
     return frozenset(routes)
+
+
+def validate_configured_compression_routes() -> List[str]:
+    """Statically validate every CONFIGURED compaction route against the allowlist.
+
+    Startup check (spec §5.3 "Startup validation"): surfaces a metered/unknown
+    compaction route when the user starts a session, instead of silently waiting
+    until the first compaction fails closed hours into a long session.
+
+    Covers the configured primary (``auxiliary.compression.provider``) and every
+    configured fallback rung that compaction could reach:
+    ``auxiliary.compression.fallback_chain`` and the top-level
+    ``fallback_providers`` / ``fallback_model`` chain.
+
+    **Network-free and side-effect-free by construction.** It inspects only
+    config: the provider name and any ``base_url`` override. It deliberately does
+    NOT resolve credentials, because resolving an Anthropic credential can walk
+    the Claude Code credential store and trigger an OAuth *refresh over the
+    network* (``anthropic_adapter._refresh_oauth_token``) — far too expensive and
+    side-effecting for a constructor-time check. That means this function can
+    prove a route is **not allowlisted** (wrong provider, or an allowlisted
+    provider aliased to a foreign endpoint), but it cannot prove that an
+    ``anthropic`` route will resolve to the OAuth half rather than the metered
+    x-api-key half. That determination stays with the runtime guard, which sees
+    the actual constructed client and fails closed. Startup validation is
+    therefore an early-warning net, never a replacement for the guard.
+
+    Raises:
+        CompressionRoutingRejected: if ``allowed_routes`` itself is empty or
+            malformed — a configuration error, never an opt-out (§5.4).
+
+    Returns:
+        A list of human-readable problems (empty when every configured route is
+        allowlisted). ``auto``/unset providers yield no problem: they are not a
+        *configured* route, and the runtime guard screens whatever `auto`
+        discovers.
+    """
+    # Raises on empty/malformed/metered config — no opt-out (§5.4).
+    allowed = _allowed_compression_routes()
+    allowed_providers = {provider for provider, _mode in allowed}
+
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+    except Exception as exc:
+        logger.debug("Compaction route validation: could not load config: %s", exc)
+        return []
+
+    aux_compression = ((cfg.get("auxiliary") or {}).get("compression") or {})
+
+    # (label, provider, base_url) for every rung compaction could actually use.
+    candidates: List[Tuple[str, str, str]] = [(
+        "auxiliary.compression.provider",
+        str(aux_compression.get("provider") or "").strip().lower(),
+        str(aux_compression.get("base_url") or "").strip(),
+    )]
+
+    chain = aux_compression.get("fallback_chain")
+    if isinstance(chain, list):
+        for i, entry in enumerate(chain):
+            if not isinstance(entry, dict):
+                continue
+            candidates.append((
+                f"auxiliary.compression.fallback_chain[{i}]",
+                str(entry.get("provider") or "").strip().lower(),
+                str(entry.get("base_url") or "").strip(),
+            ))
+
+    try:
+        from hermes_cli.fallback_config import get_fallback_chain
+        for i, entry in enumerate(get_fallback_chain(cfg)):
+            if not isinstance(entry, dict):
+                continue
+            candidates.append((
+                f"fallback_providers[{i}]",
+                str(entry.get("provider") or "").strip().lower(),
+                str(entry.get("base_url") or "").strip(),
+            ))
+    except Exception as exc:
+        logger.debug("Compaction route validation: could not read fallback chain: %s", exc)
+
+    problems: List[str] = []
+    for label, provider, base_url in candidates:
+        if not provider or provider == "auto":
+            # Not a configured route — `auto` discovery is screened at runtime.
+            continue
+        if provider not in allowed_providers:
+            problems.append(
+                f"{label}: '{provider}' is not an allowed compaction route "
+                f"(metered or unknown). Compaction may only run on: "
+                f"{', '.join(sorted(allowed_providers))}."
+            )
+            continue
+        # An allowlisted provider NAME aliased to a foreign endpoint is still a
+        # metered route — the same trap the runtime guard closes on the
+        # constructed client (§5.3.4).
+        if base_url:
+            expected_host = (
+                "api.anthropic.com" if provider == "anthropic" else "chatgpt.com"
+            )
+            if not base_url_host_matches(base_url, expected_host):
+                problems.append(
+                    f"{label}: '{provider}' is allowlisted but its base_url "
+                    f"({base_url}) does not point at {expected_host} — that is a "
+                    f"metered/foreign endpoint wearing an allowlisted provider name."
+                )
+    return problems
 
 
 def _client_compression_route(client: Any) -> Optional[Tuple[str, str]]:

@@ -167,6 +167,58 @@ def check_compression_model_feasibility(agent: Any) -> None:
     """
     if not agent.compression_enabled:
         return
+
+    # Subscription-only ROUTE validation (spec §5.3). Runs BEFORE the context-window
+    # feasibility probe below: a metered compaction route is a privacy problem, and
+    # the user should hear about it when the session starts rather than discovering
+    # it hours in when the first compaction fails closed. Network-free — it reads
+    # config only (see validate_configured_compression_routes).
+    #
+    # A malformed/empty allowed_routes raises CompressionRoutingRejected: that is a
+    # configuration ERROR, never an opt-out (§5.4), so it is surfaced loudly rather
+    # than swallowed by the broad handler below.
+    try:
+        from agent.auxiliary_client import (
+            CompressionRoutingRejected,
+            validate_configured_compression_routes,
+        )
+        _route_problems = validate_configured_compression_routes()
+    except CompressionRoutingRejected as exc:
+        msg = f"⚠ Compaction route configuration error: {exc}"
+        agent._compression_warning = msg
+        agent._emit_status(msg)
+        logger.error("Compaction route configuration is invalid: %s", exc)
+        # Return: the allowlist itself is unusable, so no compaction route can be
+        # validated or used. Falling through would overwrite this with the generic
+        # "no auxiliary provider" text and hide the actual cause.
+        return
+    except Exception as exc:  # pragma: no cover - defensive; never block startup
+        logger.debug("Compaction route validation skipped: %s", exc)
+        _route_problems = []
+
+    if _route_problems:
+        msg = (
+            "⚠ Compaction is restricted to subscription routes (ChatGPT Codex OAuth "
+            "or Anthropic Claude Max / Claude Code OAuth), but the configured "
+            "compression route(s) are not allowed:\n  - "
+            + "\n  - ".join(_route_problems)
+            + "\nCompaction will fail closed — the conversation is preserved "
+            "unchanged and no summary is sent to a metered provider. Fix "
+            "auxiliary.compression in config.yaml, or authenticate a subscription "
+            "route (`hermes auth codex` or `claude setup-token`)."
+        )
+        agent._compression_warning = msg
+        agent._emit_status(msg)
+        for _problem in _route_problems:
+            logger.warning("Compaction route not allowlisted — %s", _problem)
+        # Return before the context-window feasibility probe below. Two reasons:
+        #   1. That probe's failure text ("compression will drop middle turns
+        #      without a summary") is now FALSE for a routing problem — the guard
+        #      fails CLOSED and preserves every message — so letting it overwrite
+        #      _compression_warning would tell the user the opposite of the truth.
+        #   2. Sizing an auxiliary model we are never allowed to call is moot.
+        return
+
     try:
         from agent.auxiliary_client import (
             _resolve_task_provider_model,
