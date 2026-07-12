@@ -22,7 +22,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from hermes_constants import get_hermes_home
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Optional, Tuple
 from utils import base_url_host_matches, normalize_proxy_env_vars
 
 # NOTE: `import anthropic` is deliberately NOT at module top — the SDK pulls
@@ -1318,6 +1318,174 @@ def resolve_anthropic_token() -> Optional[str]:
     if api_key:
         return api_key
 
+    return None
+
+
+# ── Anthropic credential provenance (subscription-route guard) ───────────────
+#
+# ``resolve_anthropic_token()`` above returns a bare string: callers cannot tell
+# whether they got a Claude Max / Claude Code OAuth credential or a metered
+# Console API key, because `anthropic` is a dual-route provider and step 5 is a
+# genuine API-key fallback.  Context compaction must never egress
+# business-sensitive conversation content to a metered route, so it needs the
+# provenance the bare resolver discards.
+#
+# The mode is decided by the token's SHAPE (``_is_oauth_token``), not by which
+# source supplied it: ``ANTHROPIC_TOKEN`` may hold a Console API key and
+# ``ANTHROPIC_API_KEY`` may hold a legacy OAuth token, so a source-variable rule
+# would be wrong in both directions.  ``source`` is reported for diagnostics.
+
+AUTH_MODE_OAUTH_SUBSCRIPTION = "oauth_subscription"
+AUTH_MODE_API_KEY = "api_key"
+
+SOURCE_ANTHROPIC_TOKEN = "ANTHROPIC_TOKEN"
+SOURCE_CLAUDE_CODE_OAUTH_TOKEN = "CLAUDE_CODE_OAUTH_TOKEN"
+SOURCE_CLAUDE_CODE_CREDENTIALS = "claude_code_credentials"
+SOURCE_CREDENTIAL_POOL = "credential_pool"
+SOURCE_ANTHROPIC_API_KEY = "ANTHROPIC_API_KEY"
+SOURCE_EXPLICIT = "explicit"
+
+
+class AnthropicCredential(NamedTuple):
+    """An Anthropic token plus where it came from and which route it buys."""
+
+    token: str
+    source: str
+    mode: str
+
+    @property
+    def is_subscription(self) -> bool:
+        return self.mode == AUTH_MODE_OAUTH_SUBSCRIPTION
+
+
+def classify_anthropic_auth_mode(token: str, structural_oauth: bool = False) -> Optional[str]:
+    """Classify a token as the subscription (OAuth) route or the metered route.
+
+    ``structural_oauth`` marks credentials whose *store* proves OAuth provenance
+    independently of the token's shape — a ``credential_pool`` entry with
+    ``auth_type == AUTH_TYPE_OAUTH``, or the Claude Code credential file (whose
+    ``accessToken`` is by construction an OAuth access token).  That lets an
+    opaque-but-genuine OAuth token classify correctly.
+
+    A positively metered shape (``sk-ant-api…`` — a Console API key, x-api-key
+    auth, never OAuth) always wins over structural provenance: a mislabelled
+    store entry must not buy a metered key an OAuth verdict.  Failing closed on
+    that contradiction is the whole point of the guard.
+    """
+    token = (token or "").strip()
+    if not token:
+        return None
+    if _is_oauth_token(token):
+        return AUTH_MODE_OAUTH_SUBSCRIPTION
+    if structural_oauth and not token.startswith("sk-ant-api"):
+        return AUTH_MODE_OAUTH_SUBSCRIPTION
+    return AUTH_MODE_API_KEY
+
+
+def _iter_anthropic_credential_candidates() -> Iterator[AnthropicCredential]:
+    """Yield every Anthropic credential candidate, in resolver precedence order.
+
+    Mirrors ``resolve_anthropic_token()``'s order (1→5) and its
+    ``_prefer_refreshable_claude_code_token`` preference, but **does not
+    short-circuit**: it yields every candidate so a caller can skip ones it
+    refuses and keep looking.  ``resolve_anthropic_token()`` is deliberately
+    left untouched (its many callers depend on its exact behaviour); this
+    generator is additive.  ``tests/agent/test_compression_route_guard.py``
+    pins the first yielded candidate to ``resolve_anthropic_token()``'s return
+    so the two cannot drift apart.
+    """
+    creds = read_claude_code_credentials()
+
+    # 1. Hermes-managed OAuth/setup token env var
+    token = os.getenv("ANTHROPIC_TOKEN", "").strip()
+    if token:
+        preferred = _prefer_refreshable_claude_code_token(token, creds)
+        if preferred:
+            yield AnthropicCredential(
+                preferred, SOURCE_CLAUDE_CODE_CREDENTIALS,
+                classify_anthropic_auth_mode(preferred, structural_oauth=True),
+            )
+        else:
+            yield AnthropicCredential(
+                token, SOURCE_ANTHROPIC_TOKEN, classify_anthropic_auth_mode(token),
+            )
+
+    # 2. CLAUDE_CODE_OAUTH_TOKEN
+    cc_token = os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+    if cc_token:
+        preferred = _prefer_refreshable_claude_code_token(cc_token, creds)
+        if preferred:
+            yield AnthropicCredential(
+                preferred, SOURCE_CLAUDE_CODE_CREDENTIALS,
+                classify_anthropic_auth_mode(preferred, structural_oauth=True),
+            )
+        else:
+            yield AnthropicCredential(
+                cc_token, SOURCE_CLAUDE_CODE_OAUTH_TOKEN,
+                classify_anthropic_auth_mode(cc_token),
+            )
+
+    # 3. Claude Code credential file (structural OAuth provenance)
+    resolved_claude_token = _resolve_claude_code_token_from_credentials(creds)
+    if resolved_claude_token:
+        yield AnthropicCredential(
+            resolved_claude_token, SOURCE_CLAUDE_CODE_CREDENTIALS,
+            classify_anthropic_auth_mode(resolved_claude_token, structural_oauth=True),
+        )
+
+    # 4. credential_pool OAuth entry — already filtered on auth_type ==
+    #    AUTH_TYPE_OAUTH by _resolve_anthropic_pool_token(), so provenance is
+    #    structural here rather than shape-inferred.
+    resolved_pool_token = _resolve_anthropic_pool_token()
+    if resolved_pool_token:
+        yield AnthropicCredential(
+            resolved_pool_token, SOURCE_CREDENTIAL_POOL,
+            classify_anthropic_auth_mode(resolved_pool_token, structural_oauth=True),
+        )
+
+    # 5. ANTHROPIC_API_KEY — usually the metered Console key, but may legitimately
+    #    hold a legacy OAuth token, so it is shape-classified like any other.
+    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if api_key:
+        yield AnthropicCredential(
+            api_key, SOURCE_ANTHROPIC_API_KEY, classify_anthropic_auth_mode(api_key),
+        )
+
+
+def resolve_anthropic_token_with_provenance(
+    subscription_only: bool = False,
+    on_skip: Optional[Callable[[AnthropicCredential], None]] = None,
+) -> Optional[AnthropicCredential]:
+    """Resolve an Anthropic credential, reporting its source and auth mode.
+
+    Same resolution ORDER as :func:`resolve_anthropic_token`, but returns the
+    provenance that function discards.
+
+    With ``subscription_only=True`` (the compaction route guard) the walk
+    **scans past** metered-shaped candidates instead of stopping at the first
+    token found, and returns the first OAuth/subscription credential; it returns
+    ``None`` only when every source is exhausted.  Scan-past is required, not
+    merely nicer: ``resolve_anthropic_token()`` short-circuits at each step, so
+    a metered-shaped value parked in ``ANTHROPIC_TOKEN`` (step 1) would
+    otherwise mask a perfectly good Claude Max credential in the Claude Code
+    store (step 3) or the credential pool (step 4) and needlessly fail-close
+    compaction for a user who does have a subscription route.  Privacy is
+    unchanged either way — a metered token is skipped, never used.
+
+    ``on_skip`` is invoked once per skipped candidate (telemetry/logging), so a
+    user whose ``ANTHROPIC_TOKEN`` is metered-shaped can see it was passed over
+    rather than silently ignored.
+    """
+    for candidate in _iter_anthropic_credential_candidates():
+        if not subscription_only or candidate.is_subscription:
+            return candidate
+        logger.info(
+            "Anthropic subscription-only resolve: skipping metered-shaped "
+            "candidate from %s (auth_mode=%s), continuing to next source",
+            candidate.source, candidate.mode,
+        )
+        if on_skip is not None:
+            on_skip(candidate)
     return None
 
 

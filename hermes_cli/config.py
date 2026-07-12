@@ -1598,6 +1598,27 @@ DEFAULT_CONFIG = {
             "api_key": "",
             "timeout": 120,        # seconds — compression summarises large contexts; increase for local models
             "extra_body": {},
+            # Subscription-only ROUTE guard for compaction. Compaction inputs are
+            # business-sensitive (the summariser sees the conversation verbatim),
+            # so they may only egress to a subscription/private route.
+            #
+            # A route is (provider, auth-mode-ACTUALLY-RESOLVED) — NOT a provider
+            # name, and NOT the registry's provider-level auth_type (which types
+            # `anthropic` as api_key, so a registry check would reject Claude Max
+            # outright or admit the metered key). For anthropic the mode is decided
+            # by anthropic_adapter._is_oauth_token() on the RESOLVED token: token
+            # SHAPE is authoritative, not which env var supplied it. Enforced on
+            # every rung — primary, fallback_chain, top-level fallback_providers,
+            # the main-agent safety net, and `auto` discovery.
+            #
+            # THERE IS NO DISABLE VALUE: an empty or malformed list is a
+            # configuration error that fails closed, not an opt-out. The list may be
+            # NARROWED (e.g. Codex only); widening it to a metered route is rejected
+            # at load. See agent/auxiliary_client.py::_allowed_compression_routes.
+            "allowed_routes": [
+                {"provider": "openai-codex", "auth_mode": "oauth_subscription"},   # ChatGPT OAuth
+                {"provider": "anthropic", "auth_mode": "oauth_subscription"},      # Claude Max / Claude Code OAuth only
+            ],
         },
         # Note: session_search no longer uses an auxiliary LLM (PR #27590 —
         # single-shape tool returns DB content directly). The old

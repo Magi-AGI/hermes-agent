@@ -13,6 +13,20 @@ from agent.context_compressor import (
 from hermes_state import SessionDB
 
 
+def _mock_summary(text: str = "a summary"):
+    """Patch the auxiliary summary call to succeed with ``text``.
+
+    Needed by any test that expects compaction to actually happen: compaction is
+    restricted to subscription routes (Codex OAuth / Claude Max OAuth), so a test
+    process with no provider configured now fails CLOSED — messages unchanged —
+    rather than silently dropping the middle window behind a static placeholder.
+    """
+    response = MagicMock()
+    response.choices = [MagicMock()]
+    response.choices[0].message.content = text
+    return patch("agent.context_compressor.call_llm", return_value=response)
+
+
 @pytest.fixture()
 def compressor():
     """Create a ContextCompressor with mocked dependencies."""
@@ -322,12 +336,16 @@ class TestCompress:
 
     def test_compression_increments_count(self, compressor):
         msgs = self._make_messages(10)
-        # Default config (abort_on_summary_failure=False) — fallback path
-        # increments the count even on summary failure.
-        compressor.compress(msgs)
-        assert compressor.compression_count == 1
-        compressor.compress(msgs)
-        assert compressor.compression_count == 2
+        # A real summary must be mocked: compaction is now restricted to
+        # subscription routes, and with no provider configured at all the
+        # summary call fails CLOSED (messages unchanged) instead of dropping the
+        # middle window behind a static placeholder. See
+        # tests/agent/test_compression_route_guard.py.
+        with _mock_summary("a summary"):
+            compressor.compress(msgs)
+            assert compressor.compression_count == 1
+            compressor.compress(msgs)
+            assert compressor.compression_count == 2
 
     def test_protects_first_and_last(self, compressor):
         msgs = self._make_messages(10)
@@ -550,7 +568,8 @@ class TestGenerateSummaryNoneContent:
             {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
             for i in range(10)
         ]
-        result = c.compress(msgs)
+        with _mock_summary("a summary"):
+            result = c.compress(msgs)
         assert len(result) < len(msgs)
 
 
@@ -2393,7 +2412,8 @@ class TestSummaryTargetRatio:
             + [{"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
                for i in range(8)]
         )
-        result = c.compress(msgs)
+        with _mock_summary("a summary"):
+            result = c.compress(msgs)
         # System prompt (msg[0]) survives as head
         assert result[0]["role"] == "system"
         assert result[0]["content"].startswith("System prompt")
