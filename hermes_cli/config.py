@@ -1478,6 +1478,44 @@ DEFAULT_CONFIG = {
                                       # after live validation.
     },
 
+    # Cross-session compaction queue (agent/compaction_coordinator.py).
+    #
+    # Bounds *concurrent compaction summarisation calls* across every session,
+    # process, AND PROFILE under one Hermes root, so a herd of backends crossing
+    # their compaction threshold together (typically the kanban dispatcher fanning
+    # out workers) cannot all hit the auxiliary provider at once. The coordinator
+    # is a leased semaphore in a ROOT-scoped SQLite file (<root>/compaction.db) —
+    # NOT the profile-local state.db, which would silently bound per-profile and
+    # miss the cross-profile herd entirely.
+    #
+    # SHIPS DARK. `enabled: false` is the default and must stay that way until a
+    # separate, explicitly user-approved rollout step: the InstallDir *is* the
+    # running backend, so a default-on queue would change live behaviour on the
+    # next restart. With `enabled: false` this block is inert and compaction keeps
+    # today's per-session-only behaviour.
+    #
+    # There are NO env vars for these tunables (AGENTS: no new HERMES_* for
+    # non-secret config). HERMES_COMPACTION_HOME exists but is a PATH override for
+    # tests/Docker only — it relocates the coordinator file and tunes nothing.
+    "compaction_queue": {
+        "enabled": False,           # master switch. DARK BY DEFAULT — see above.
+        "max_concurrent": 1,        # cap on simultaneous compaction summarisation
+                                    # calls across ALL sessions/processes/profiles
+                                    # under one Hermes root. Deliberately conservative:
+                                    # 1 is the whole point of the feature (serialise the
+                                    # herd). Clamped to >= 1 at load — 0 would deadlock
+                                    # all compaction, violating the fail-open contract.
+        "slot_ttl_seconds": 300,    # lease TTL. A crashed holder's slot is reclaimed by
+                                    # the next acquirer after this, so a hard-killed
+                                    # backend cannot wedge the queue.
+        "max_wait_seconds": 300,    # a session pending longer than this BYPASSES the
+                                    # queue on its next natural re-check (liveness escape
+                                    # hatch, not a latency guarantee). Phase 2.
+        "notify_after_seconds": 60, # only surface a "compaction queued" status if still
+                                    # pending this long; the first denial is silent so a
+                                    # briefly-queued session does not spam the user. Phase 2.
+    },
+
     # Kanban subsystem (orchestrator workers + dispatcher-driven child tasks).
     # See tools/kanban_tools.py and hermes_cli/kanban_db.py for the actual
     # implementations. Per-platform notification opt-out is handled by the
@@ -5222,6 +5260,79 @@ def check_config_version() -> Tuple[int, int]:
 
 
 # =============================================================================
+# Compaction queue settings
+# =============================================================================
+
+# Floors/defaults applied AT LOAD, before any value can reach the coordinator's
+# public primitives. The coordinator itself also coerces defensively (it must —
+# it is a public API), but normalising here means the agent never carries a
+# nonsense value around in the first place.
+_COMPACTION_QUEUE_DEFAULTS = {
+    "enabled": False,
+    "max_concurrent": 1,
+    "slot_ttl_seconds": 300.0,
+    "max_wait_seconds": 300.0,
+    "notify_after_seconds": 60.0,
+}
+
+
+def _coerce_positive_number(value, default: float, minimum: float) -> float:
+    """Best-effort numeric coercion with a hard floor. NEVER raises.
+
+    ``bool`` is rejected explicitly because it is an ``int`` subclass in Python —
+    ``enabled``-style truthiness must not silently become ``max_concurrent: 1``.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return float(default)
+    if value != value or value in (float("inf"), float("-inf")):  # NaN / inf
+        return float(default)
+    return float(max(minimum, value))
+
+
+def get_compaction_queue_settings(config: dict | None = None) -> dict:
+    """Return the normalised ``compaction_queue`` block. Total — never raises.
+
+    A malformed value must not be able to break a turn: this block is consulted on
+    the compaction path, and compaction runs inside the agent loop. So every field
+    falls back to its default rather than raising, and ``max_concurrent`` is
+    clamped to ``>= 1`` — ``0`` would deadlock ALL compaction, which is precisely
+    the fail-open contract's opposite (spec §4.3/§6).
+
+    ``enabled`` is deliberately strict-truthy: only real booleans and the usual
+    YAML-ish string spellings count. Anything else is ``False``, because the safe
+    default for a dark feature is OFF.
+    """
+    if config is None:
+        config = load_config()
+    raw = (config or {}).get("compaction_queue")
+    if not isinstance(raw, dict):
+        raw = {}
+
+    enabled = raw.get("enabled", _COMPACTION_QUEUE_DEFAULTS["enabled"])
+    if isinstance(enabled, str):
+        enabled = enabled.strip().lower() in {"true", "1", "yes", "on"}
+    else:
+        enabled = enabled is True
+
+    return {
+        "enabled": bool(enabled),
+        # int, floored at 1. 0/negative/malformed -> 1 (never 0: that deadlocks).
+        "max_concurrent": int(_coerce_positive_number(
+            raw.get("max_concurrent"), _COMPACTION_QUEUE_DEFAULTS["max_concurrent"], 1,
+        )),
+        "slot_ttl_seconds": _coerce_positive_number(
+            raw.get("slot_ttl_seconds"), _COMPACTION_QUEUE_DEFAULTS["slot_ttl_seconds"], 1.0,
+        ),
+        "max_wait_seconds": _coerce_positive_number(
+            raw.get("max_wait_seconds"), _COMPACTION_QUEUE_DEFAULTS["max_wait_seconds"], 0.0,
+        ),
+        "notify_after_seconds": _coerce_positive_number(
+            raw.get("notify_after_seconds"), _COMPACTION_QUEUE_DEFAULTS["notify_after_seconds"], 0.0,
+        ),
+    }
+
+
+# =============================================================================
 # Config structure validation
 # =============================================================================
 
@@ -5229,7 +5340,8 @@ def check_config_version() -> Tuple[int, int]:
 _KNOWN_ROOT_KEYS = {
     "_config_version", "model", "providers", "fallback_model",
     "fallback_providers", "credential_pool_strategies", "toolsets",
-    "agent", "terminal", "display", "compression", "delegation",
+    "agent", "terminal", "display", "compression", "compaction_queue",
+    "delegation",
     "auxiliary", "moa", "custom_providers", "context", "memory", "gateway",
     "sessions", "streaming", "updates", "mcp_servers",
 }

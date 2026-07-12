@@ -1838,6 +1838,35 @@ def init_agent(
     agent.compression_in_place = compression_in_place
     agent.codex_app_server_auto_compaction = codex_app_server_auto_compaction
 
+    # ── Cross-session compaction queue (Phase 1: config only) ────────────────
+    #
+    # Read and normalised here so Phase 2 can wire compress_context() without
+    # adding more config plumbing. These fields are INERT: nothing reads them yet,
+    # and `compaction_queue.enabled` defaults to False, so the queue cannot change
+    # behaviour on restart. That matters because the InstallDir IS the live backend.
+    #
+    # Values are already clamped by get_compaction_queue_settings() (max_concurrent
+    # >= 1; a 0 would deadlock all compaction), so nothing downstream has to
+    # re-validate them before calling the coordinator primitives.
+    try:
+        from hermes_cli.config import get_compaction_queue_settings
+
+        _cq = get_compaction_queue_settings(_agent_cfg)
+    except Exception:
+        # Never let a malformed queue block break agent startup — the queue is an
+        # optional performance control, and its absence just means today's
+        # per-session-only compaction behaviour.
+        logger.debug("compaction_queue config unreadable; queue disabled", exc_info=True)
+        _cq = {
+            "enabled": False, "max_concurrent": 1, "slot_ttl_seconds": 300.0,
+            "max_wait_seconds": 300.0, "notify_after_seconds": 60.0,
+        }
+    agent.compaction_queue_enabled = bool(_cq["enabled"])
+    agent.compaction_queue_max_concurrent = int(_cq["max_concurrent"])
+    agent.compaction_slot_ttl_seconds = float(_cq["slot_ttl_seconds"])
+    agent.compaction_queue_max_wait_seconds = float(_cq["max_wait_seconds"])
+    agent.compaction_queue_notify_after_seconds = float(_cq["notify_after_seconds"])
+
     # Reject models whose context window is below the minimum required
     # for reliable tool-calling workflows (64K tokens).
     _ctx = getattr(agent.context_compressor, "context_length", 0)

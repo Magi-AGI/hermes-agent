@@ -1,10 +1,12 @@
 """Root-scoped coordinator for the cross-session compaction queue.
 
-**Phase 0 — primitives with NO CALLERS.** Path resolution plus the leased
-semaphore (``compaction_slots``) live here, but nothing imports them yet, there
-is no ``compaction_queue`` config, and compression is not wired. The queue is
-**dark**: this module cannot change behaviour until a separate, user-approved
-wiring step. That matters because the InstallDir *is* the running backend.
+**Primitives with NO CALLERS — the queue is DARK.** Path resolution plus the
+leased semaphore (``compaction_slots``) live here. The ``compaction_queue`` config
+block now exists (Phase 1) and the agent reads it at init, but it defaults to
+``enabled: false``, **nothing imports this module**, and compression is not wired
+to it. So this module still cannot change behaviour until a separate,
+user-approved wiring step. That matters because the InstallDir *is* the running
+backend: code that ships dark cannot surprise a live session on restart.
 
 See ``docs/plans/2026-07-11-compaction-queue-spec.md`` §4.2 (substrate), §4.3
 (typed outcomes) and §9.0-GATE (the shared-path gate this design had to pass).
@@ -129,11 +131,13 @@ def compaction_db_path() -> Path:
     return compaction_home() / COMPACTION_DB_FILENAME
 
 
-# ── Phase 0: leased-semaphore slot primitives ────────────────────────────────
+# ── Leased-semaphore slot primitives ─────────────────────────────────────────
 #
-# PURE ADDITIONS — nothing calls these yet, and no `compaction_queue` config
-# exists, so this phase cannot change behaviour. The InstallDir runs the live
-# backend, so shipping dark is what keeps building here safe.
+# PURE ADDITIONS — nothing calls these yet. The `compaction_queue` config block
+# exists (Phase 1) and the agent stores it at init, but it defaults to
+# `enabled: false` and no caller has been wired, so these primitives cannot
+# change behaviour. The InstallDir runs the live backend, so shipping dark is
+# what keeps building here safe.
 #
 # The semaphore bounds *concurrent compaction summarisation calls* across every
 # session, process, AND PROFILE under one Hermes root. `slot_id` rows are the

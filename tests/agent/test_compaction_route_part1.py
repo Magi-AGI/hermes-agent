@@ -9,9 +9,15 @@ Two additive concerns, neither of which changes the Phase 0.5 guard's decisions:
 * **Startup validation** — a metered/unknown configured compaction route is
   surfaced when the session starts, instead of at the first compaction.
 
-Neither concern may introduce the queue: there is a guard test at the bottom
-asserting no ``compaction_queue`` config/activation snuck in.
+Neither concern may activate the queue. The ``compaction_queue`` config block now
+exists (Phase 1), so the guard tests at the bottom assert what actually matters:
+it defaults to **dark** (``enabled: false``), nothing wires it into the routing
+path, and the route guard does not import the coordinator. The privacy guard and
+the performance queue are independent subsystems — the guard ships enabled and
+must keep working regardless of the queue's state.
 """
+
+from pathlib import Path
 
 import pytest
 from unittest.mock import MagicMock, patch
@@ -24,6 +30,8 @@ from agent.auxiliary_client import (
     compression_route_guard,
     validate_configured_compression_routes,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 OAUTH_TOKEN = "sk-ant-oat01-real-claude-max-token"
 METERED_KEY = "sk-ant-api03-metered-console-key"
@@ -301,17 +309,55 @@ class TestStartupValidationWiring:
         assert "subscription routes" not in (agent._compression_warning or "")
 
 
-# ── C. Scope discipline: no queue in this part ──────────────────────────────
+# ── C. Scope discipline: the queue must not activate ────────────────────────
 
 
-def test_no_queue_config_or_activation_introduced():
-    """Part 1 is the route-guard fast-follow ONLY — the queue is a later slice.
+def test_queue_config_exists_but_is_dark_and_does_not_activate():
+    """The route guard must never depend on, or be changed by, the queue.
 
-    The InstallDir is the running backend, so an accidentally-activated queue
+    This guard originally asserted ``compaction_queue`` was ABSENT from
+    DEFAULT_CONFIG. Phase 1 deliberately adds that block, so the absence check is
+    now stale — but the property it was protecting is not. What actually matters,
+    and what is asserted instead, is that the queue is **dark**: the config exists
+    but defaults to disabled, and nothing has wired it into the auxiliary/routing
+    path. The InstallDir is the running backend, so an accidentally-activated queue
     would be a live-runtime hazard.
     """
-    from hermes_cli.config import DEFAULT_CONFIG
+    from hermes_cli.config import DEFAULT_CONFIG, get_compaction_queue_settings
 
-    assert "compaction_queue" not in DEFAULT_CONFIG
-    for banned in ("compaction_slots", "try_acquire_compaction_slot", "SlotOutcome"):
-        assert not hasattr(ac, banned)
+    # The block exists (Phase 1) but ships OFF.
+    assert DEFAULT_CONFIG["compaction_queue"]["enabled"] is False
+    assert get_compaction_queue_settings(DEFAULT_CONFIG)["enabled"] is False
+
+    # The queue lives in its own module; the auxiliary client — which owns the
+    # route guard — must remain entirely ignorant of it.
+    for banned in (
+        "compaction_slots",
+        "try_acquire_compaction_slot",
+        "release_compaction_slot",
+        "SlotOutcome",
+    ):
+        assert not hasattr(ac, banned), (
+            f"the route guard's module must not grow queue primitives ({banned})"
+        )
+
+
+def test_route_guard_does_not_import_the_coordinator():
+    """The privacy guard and the performance queue are independent subsystems.
+
+    The route guard ships enabled and must keep working regardless of the queue's
+    state (spec: the guard is a privacy control and is explicitly NOT part of any
+    queue rollback).
+    """
+    import ast
+    from pathlib import Path
+
+    for mod in ("agent/auxiliary_client.py", "agent/context_compressor.py",
+                "agent/conversation_compression.py"):
+        tree = ast.parse((REPO_ROOT / mod).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                assert "compaction_coordinator" not in (node.module or ""), mod
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    assert "compaction_coordinator" not in alias.name, mod

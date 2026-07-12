@@ -318,23 +318,36 @@ class TestNoQueueYet:
         ):
             assert hasattr(cc, expected), f"Phase 0 must provide {expected}"
 
-    def test_no_compaction_queue_config_introduced(self):
+    def test_compaction_queue_config_exists_but_is_DARK(self):
+        """Phase 1 adds the config block — but it must default to disabled.
+
+        (This guard previously asserted the block did not exist at all. Phase 1
+        deliberately introduces it; what must NOT change is that it ships off.)
+        """
         from hermes_cli.config import DEFAULT_CONFIG
 
-        assert "compaction_queue" not in DEFAULT_CONFIG
+        assert DEFAULT_CONFIG["compaction_queue"]["enabled"] is False
 
     def test_coordinator_has_no_callers_yet(self):
-        """Phase 0 is behaviourally dark: nothing in the agent imports it."""
+        """Phase 1 is still behaviourally dark: nothing IMPORTS the coordinator.
+
+        Asserted on real import statements, not on a substring: the config block's
+        comment legitimately names ``agent/compaction_coordinator.py`` in prose to
+        explain what the settings drive.
+        """
         import subprocess
 
-        hits = subprocess.run(
-            ["git", "grep", "-l", "compaction_coordinator", "--", "agent", "hermes_cli",
-             "gateway", "tui_gateway"],
+        imports = subprocess.run(
+            ["git", "grep", "-nE",
+             r"^\s*(from +agent +import +compaction_coordinator"
+             r"|from +agent\.compaction_coordinator +import"
+             r"|import +agent\.compaction_coordinator)",
+             "--", "agent", "hermes_cli", "gateway", "tui_gateway"],
             cwd=str(REPO_ROOT), capture_output=True, text=True,
-        ).stdout.split()
-        # The module itself is the only permitted hit — no importers.
-        assert hits in ([], ["agent/compaction_coordinator.py"]), (
-            f"compaction_coordinator has acquired callers before the wiring phase: {hits}"
+        ).stdout.strip()
+        assert not imports, (
+            f"compaction_coordinator has acquired importers before the wiring "
+            f"phase:\n{imports}"
         )
 
     def test_helper_opens_no_database(self, herd, monkeypatch):
