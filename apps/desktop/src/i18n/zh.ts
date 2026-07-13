@@ -1258,6 +1258,8 @@ export const zh: Translations = {
     restartGateway: '重启网关',
     gatewayRestartFailed: '网关重启失败。',
     updateHermes: '更新 Hermes',
+    closeAllSessionWindows: '关闭所有会话窗口',
+    reopenSessionWindows: '重新打开已保存的会话窗口',
     actionRunning: '运行中',
     actionDone: '完成',
     actionFailed: '失败',

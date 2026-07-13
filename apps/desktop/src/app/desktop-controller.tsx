@@ -75,7 +75,7 @@ import {
 import { onSessionsChanged } from '../store/session-sync'
 import { clearSessionTodos, setSessionTodos, todosForHydration } from '../store/todos'
 import { openUpdatesWindow, startUpdatePoller, stopUpdatePoller } from '../store/updates'
-import { isSecondaryWindow } from '../store/windows'
+import { isHeaderlessSecondaryWindow, isSecondaryWindow } from '../store/windows'
 
 import { ChatView } from './chat'
 import { requestComposerFocus, requestComposerInsert } from './chat/composer/focus'
@@ -401,15 +401,17 @@ export function DesktopController() {
   } = useSessionListActions({ profileScope })
 
   // Another window mutated the shared session list (e.g. a chat started in the
-  // pop-out). Re-pull so the sidebar reflects it. Pop-outs have no sidebar, so
-  // only real windows bother.
+  // pop-out, or a rename from another window). Re-pull so the sidebar — or a
+  // header-visible secondary window's title chip/document.title — reflects it.
+  // A still-headerless secondary window (blank new-session draft, no sidebar,
+  // nothing to keep in sync) keeps skipping this.
   useEffect(() => {
-    if (isSecondaryWindow()) {
+    if (isHeaderlessSecondaryWindow(Boolean(selectedStoredSessionId || activeSessionId))) {
       return
     }
 
     return onSessionsChanged(() => void refreshSessions().catch(() => undefined))
-  }, [refreshSessions])
+  }, [activeSessionId, refreshSessions, selectedStoredSessionId])
 
   const toggleSelectedPin = useCallback(() => {
     const sessionId = $selectedStoredSessionId.get()

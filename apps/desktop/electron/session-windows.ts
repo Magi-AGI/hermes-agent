@@ -5,6 +5,8 @@
 
 import { pathToFileURL } from 'node:url'
 
+import { computeWindowOptions, sanitizeWindowState } from './window-state'
+
 // Secondary windows open at the minimum usable size — a compact side panel for
 // subagent watch / cmd-click session pop-out, not a second full desktop.
 const SESSION_WINDOW_MIN_WIDTH = 420
@@ -60,10 +62,17 @@ function buildSessionWindowUrl(sessionId: string, { devServer, rendererIndexPath
 // spawning a duplicate, and a window removes itself from the registry when it
 // closes. The actual BrowserWindow construction is injected (the `factory`) so
 // this module stays free of Electron and is unit-testable.
+//
+// Each entry also carries the `watch` flag it was opened with (a spectator
+// window on a subagent run) — close-all/persistence consumers need it to
+// exclude watch windows from the "reopen saved windows" set. The flag is
+// fixed at creation time: re-requesting the same sessionId with a different
+// watch value still just focuses the existing window (one window per
+// sessionId is the invariant; watch does not "upgrade" or replace it).
 function createSessionWindowRegistry() {
   const windows = new Map()
 
-  function openOrFocus(sessionId, factory) {
+  function openOrFocus(sessionId, factory, { watch = false }: { watch?: boolean } = {}) {
     const key = typeof sessionId === 'string' ? sessionId.trim() : ''
 
     if (!key) {
@@ -72,19 +81,19 @@ function createSessionWindowRegistry() {
 
     const existing = windows.get(key)
 
-    if (existing && !existing.isDestroyed()) {
+    if (existing && !existing.win.isDestroyed()) {
       // Focus-or-create: never duplicate a window for the same chat.
-      if (typeof existing.isMinimized === 'function' && existing.isMinimized()) {
-        existing.restore?.()
+      if (typeof existing.win.isMinimized === 'function' && existing.win.isMinimized()) {
+        existing.win.restore?.()
       }
 
-      if (typeof existing.isVisible === 'function' && !existing.isVisible()) {
-        existing.show?.()
+      if (typeof existing.win.isVisible === 'function' && !existing.win.isVisible()) {
+        existing.win.show?.()
       }
 
-      existing.focus?.()
+      existing.win.focus?.()
 
-      return existing
+      return existing.win
     }
 
     const win = factory(key)
@@ -93,11 +102,11 @@ function createSessionWindowRegistry() {
       return null
     }
 
-    windows.set(key, win)
+    windows.set(key, { win, watch: Boolean(watch) })
 
     // Self-cleanup on close so the registry never holds a destroyed window.
     win.on?.('closed', () => {
-      if (windows.get(key) === win) {
+      if (windows.get(key)?.win === win) {
         windows.delete(key)
       }
     })
@@ -107,18 +116,72 @@ function createSessionWindowRegistry() {
 
   return {
     openOrFocus,
-    get: key => windows.get(key),
+    get: key => windows.get(key)?.win,
     has: key => windows.has(key),
     get size() {
       return windows.size
+    },
+    // Metadata snapshot for close-all / persistence — drops anything already
+    // destroyed as a defensive measure (should be unreachable: 'closed' self-
+    // cleans the map).
+    entries: () =>
+      Array.from(windows.entries())
+        .filter(([, entry]) => entry.win && !entry.win.isDestroyed())
+        .map(([sessionId, entry]) => ({ sessionId, win: entry.win, watch: entry.watch })),
+    // Closes every live window in the registry (including watch windows —
+    // "close all" means all session pop-outs, not just the reopenable set).
+    // Each window's own 'closed' handler removes it from the map.
+    closeAll: () => {
+      for (const { win } of Array.from(windows.values())) {
+        if (win && !win.isDestroyed()) {
+          win.close?.()
+        }
+      }
     }
   }
+}
+
+// computeWindowOptions/sanitizeWindowState default to the MAIN window's
+// minimums (400×620) — calling them unparameterized for a session window would
+// silently under-floor the width by 20px. These wrappers pin the session-window
+// minimums so callers can't get this wrong.
+function sanitizeSessionWindowState(raw?: any) {
+  return sanitizeWindowState(raw, { minWidth: SESSION_WINDOW_MIN_WIDTH, minHeight: SESSION_WINDOW_MIN_HEIGHT })
+}
+
+function computeSessionWindowOptions(state, displays) {
+  return computeWindowOptions(state, displays, {
+    minWidth: SESSION_WINDOW_MIN_WIDTH,
+    minHeight: SESSION_WINDOW_MIN_HEIGHT
+  })
+}
+
+// Validate one persisted "reopen saved session windows" entry. Requires a
+// non-empty sessionId plus sane geometry (via sanitizeSessionWindowState);
+// drops anything else rather than falling back to main-window-sized defaults.
+function sanitizeSessionWindowEntry(raw?: any) {
+  const sessionId = typeof raw?.sessionId === 'string' ? raw.sessionId.trim() : ''
+
+  if (!sessionId) {
+    return null
+  }
+
+  const geometry = sanitizeSessionWindowState(raw)
+
+  if (!geometry) {
+    return null
+  }
+
+  return { sessionId, ...geometry }
 }
 
 export {
   buildSessionWindowUrl,
   chatWindowWebPreferences,
+  computeSessionWindowOptions,
   createSessionWindowRegistry,
+  sanitizeSessionWindowEntry,
+  sanitizeSessionWindowState,
   SESSION_WINDOW_MIN_HEIGHT,
   SESSION_WINDOW_MIN_WIDTH
 }

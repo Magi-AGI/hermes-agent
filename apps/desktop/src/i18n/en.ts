@@ -1078,6 +1078,8 @@ export const en: Translations = {
     restartGateway: 'Restart gateway',
     gatewayRestartFailed: 'Gateway restart failed.',
     updateHermes: 'Update Hermes',
+    closeAllSessionWindows: 'Close all session windows',
+    reopenSessionWindows: 'Reopen saved session windows',
     actionRunning: 'running',
     actionDone: 'done',
     actionFailed: 'failed',

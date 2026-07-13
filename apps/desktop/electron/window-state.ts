@@ -31,14 +31,20 @@ interface SanitizedWindowState {
 
 // Parse raw JSON → clean state, or null if garbage. width/height are required
 // and floored; x/y survive only as a finite pair; isMaximized is strict.
-function sanitizeWindowState(raw?: any): SanitizedWindowState | null {
+// `minWidth`/`minHeight` default to the main window's floor; callers restoring
+// a different window kind (e.g. the compact secondary session windows, whose
+// minimums are larger — see session-windows.ts) pass their own.
+function sanitizeWindowState(
+  raw?: any,
+  { minWidth = MIN_WIDTH, minHeight = MIN_HEIGHT }: { minWidth?: number; minHeight?: number } = {}
+): SanitizedWindowState | null {
   if (!raw || typeof raw !== 'object' || !finite(raw.width) || !finite(raw.height)) {
     return null
   }
 
   const state: SanitizedWindowState = {
-    width: Math.max(MIN_WIDTH, Math.round(raw.width)),
-    height: Math.max(MIN_HEIGHT, Math.round(raw.height)),
+    width: Math.max(minWidth, Math.round(raw.width)),
+    height: Math.max(minHeight, Math.round(raw.height)),
     isMaximized: raw.isMaximized === true
   }
 
@@ -79,7 +85,13 @@ interface WindowOptions {
 // width/height, capped to the largest current display so a size saved on a
 // since-disconnected bigger monitor can't exceed any screen the user now has.
 // Sets x/y only when still on-screen; otherwise Electron centers the window.
-function computeWindowOptions(state, displays): WindowOptions {
+// `minWidth`/`minHeight` default to the main window's floor (see
+// sanitizeWindowState) — pass the caller's own minimums for other window kinds.
+function computeWindowOptions(
+  state,
+  displays,
+  { minWidth = MIN_WIDTH, minHeight = MIN_HEIGHT }: { minWidth?: number; minHeight?: number } = {}
+): WindowOptions {
   const opts: WindowOptions = {
     width: finite(state?.width) ? state.width : DEFAULT_WIDTH,
     height: finite(state?.height) ? state.height : DEFAULT_HEIGHT
@@ -94,8 +106,8 @@ function computeWindowOptions(state, displays): WindowOptions {
   )
 
   if (cap.width && cap.height) {
-    opts.width = clamp(opts.width, MIN_WIDTH, cap.width)
-    opts.height = clamp(opts.height, MIN_HEIGHT, cap.height)
+    opts.width = clamp(opts.width, minWidth, cap.width)
+    opts.height = clamp(opts.height, minHeight, cap.height)
   }
 
   if (
@@ -143,5 +155,7 @@ export {
   MIN_VISIBLE,
   MIN_WIDTH,
   onScreen,
-  sanitizeWindowState
+  type SanitizedWindowState,
+  sanitizeWindowState,
+  type WindowOptions
 }

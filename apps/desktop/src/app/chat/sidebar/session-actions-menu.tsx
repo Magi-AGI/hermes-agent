@@ -22,6 +22,7 @@ import { exportSession } from '@/lib/session-export'
 import { activeGateway } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
 import { $activeSessionId, $selectedStoredSessionId, setSessions } from '@/store/session'
+import { broadcastSessionsChanged } from '@/store/session-sync'
 import { canOpenSessionWindow, openSessionInNewWindow } from '@/store/windows'
 
 import type { SessionTitleResponse } from '../../types'
@@ -80,6 +81,10 @@ interface SessionActions {
   onBranch?: () => void
   onArchive?: () => void
   onDelete?: () => void
+  // Read-only secondary windows (watch/spectator pop-outs) show the title for
+  // identification but must not mutate the session — this forces rename off
+  // even though (unlike pin/delete) it isn't gated by an optional handler prop.
+  disableRename?: boolean
 }
 
 type MenuItem = typeof DropdownMenuItem | typeof ContextMenuItem
@@ -101,7 +106,8 @@ function useSessionActions({
   onPin,
   onBranch,
   onArchive,
-  onDelete
+  onDelete,
+  disableRename = false
 }: SessionActions) {
   const { t } = useI18n()
   const r = t.sidebar.row
@@ -150,7 +156,7 @@ function useSessionActions({
       }
     },
     {
-      disabled: !sessionId,
+      disabled: !sessionId || disableRename,
       icon: 'edit',
       label: r.rename,
       onSelect: () => {
@@ -306,6 +312,11 @@ function RenameSessionDialog({ open, onOpenChange, sessionId, currentTitle, prof
       const result = await renameSessionPreferringRpc(sessionId, next, profile)
       const finalTitle = result.title || next || ''
       setSessions(prev => prev.map(s => (s.id === sessionId ? { ...s, title: finalTitle || null } : s)))
+      // Tell other windows (a session pop-out showing this chat's header, or
+      // another profile window's sidebar) to re-pull so their title stays in
+      // sync — a BroadcastChannel never delivers to its own poster, so this
+      // window already has the update via setSessions above.
+      broadcastSessionsChanged()
       notify({ durationMs: 2_000, kind: 'success', message: r.renamed })
       onOpenChange(false)
     } catch (err) {

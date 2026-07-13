@@ -33,6 +33,12 @@ declare global {
       openSessionWindow: (sessionId: string, opts?: { watch?: boolean }) => Promise<{ ok: boolean; error?: string }>
       // Open (or focus) a compact secondary window on the new-session draft.
       openNewSessionWindow: () => Promise<{ ok: boolean; error?: string }>
+      // Close every live session pop-out (including watch/spectator windows).
+      // Never touches the primary window, pet overlay, or hidden windows.
+      closeAllSessionWindows: () => Promise<{ ok: boolean; error?: string }>
+      // Explicit-action restore of the last-closed session windows' positions
+      // (never automatic on launch). Watch windows are never included.
+      reopenSessionWindows: () => Promise<{ ok: boolean; error?: string }>
       // The pop-out pet overlay: a transparent always-on-top window hosting only
       // the mascot. The main renderer drives it (open/close/drag + state push);
       // the overlay sends control messages back (pop-in, composer submit).

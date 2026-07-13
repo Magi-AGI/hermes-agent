@@ -943,6 +943,8 @@ export interface Translations {
     restartGateway: string
     gatewayRestartFailed: string
     updateHermes: string
+    closeAllSessionWindows: string
+    reopenSessionWindows: string
     actionRunning: string
     actionDone: string
     actionFailed: string

@@ -98,7 +98,9 @@ import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
 import {
   buildSessionWindowUrl,
   chatWindowWebPreferences,
+  computeSessionWindowOptions,
   createSessionWindowRegistry,
+  sanitizeSessionWindowEntry,
   SESSION_WINDOW_MIN_HEIGHT,
   SESSION_WINDOW_MIN_WIDTH
 } from './session-windows'
@@ -373,6 +375,11 @@ const BOOTSTRAP_MARKER_SCHEMA_VERSION = 1
 const DESKTOP_CONNECTION_CONFIG_PATH = path.join(app.getPath('userData'), 'connection.json')
 const DESKTOP_UPDATE_CONFIG_PATH = path.join(app.getPath('userData'), 'updates.json')
 const DESKTOP_WINDOW_STATE_PATH = path.join(app.getPath('userData'), 'window-state.json')
+// Bounds for secondary session windows the user explicitly saved via "close
+// all" / persists as they move — restored only via the explicit "reopen saved
+// session windows" action (never automatically on launch). Sibling file to
+// window-state.json, same writeFileAtomic + debounce idiom.
+const SESSION_WINDOWS_STATE_PATH = path.join(app.getPath('userData'), 'session-windows-state.json')
 // active-profile.json records which Hermes profile the desktop launches its
 // local backend as. When set, startHermes() passes `hermes --profile <name>
 // dashboard …`, which deterministically pins HERMES_HOME (see
@@ -2029,6 +2036,82 @@ function persistWindowState() {
 
 // resized/moved fire many times mid-drag on Linux; debounce to one write.
 const schedulePersistWindowState = debounce(persistWindowState, 250)
+
+// ─── Session-window geometry persistence (session-windows-state.json) ──────
+// Restored ONLY via the explicit "reopen saved session windows" action (Window
+// menu / command palette) — never automatically on Desktop launch, so closing
+// a pop-out never gets silently un-done by the next restart.
+
+function readSessionWindowsState() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(SESSION_WINDOWS_STATE_PATH, 'utf8'))
+
+    return Array.isArray(raw) ? raw.map(sanitizeSessionWindowEntry).filter(Boolean) : []
+  } catch {
+    return []
+  }
+}
+
+// Snapshots every live, non-watch, keyed session window's bounds. Re-derived
+// from the registry each call (not an incremental patch) so a closed window
+// simply falls out of the next write — watch windows are excluded here (the
+// subagent run they spectate may not exist after a restart), not at read time,
+// so the persisted file's meaning stays unambiguous: everything in it is safe
+// to reopen.
+function persistSessionWindowsState() {
+  try {
+    const entries = sessionWindows
+      .entries()
+      .filter(({ watch }) => !watch)
+      .map(({ sessionId, win }) => {
+        if (win.isDestroyed()) {
+          return null
+        }
+
+        const { x, y, width, height } = win.getNormalBounds()
+
+        return { sessionId, x, y, width, height, isMaximized: win.isMaximized() }
+      })
+      .filter(Boolean)
+
+    fs.mkdirSync(path.dirname(SESSION_WINDOWS_STATE_PATH), { recursive: true })
+    writeFileAtomic(SESSION_WINDOWS_STATE_PATH, JSON.stringify(entries, null, 2))
+  } catch (err) {
+    rememberLog(`[session-windows-state] persist failed: ${err?.message || err}`)
+  }
+}
+
+const schedulePersistSessionWindowsState = debounce(persistSessionWindowsState, 250)
+
+// Windows whose upcoming 'closed' event must NOT trigger the individual
+// per-window persistence flush below. closeAllSessionWindows() (see near
+// secondaryWindows/reopenSessionWindows) writes one atomic pre-close-all
+// snapshot before tearing anything down, then marks every window it's about
+// to close here — otherwise each window's own 'closed' handler would fire in
+// turn, recompute from the registry (which excludes destroyed windows), and
+// progressively shrink session-windows-state.json down to a partial or empty
+// set as the sweep works through them, overwriting the very snapshot the
+// close-all sweep just wrote. Self-cleans: each entry is consumed by its own
+// 'closed' handler below.
+const suppressPersistOnClose = new Set()
+
+// Wired only onto keyed, non-watch session windows (new-session drafts have no
+// sessionId to key on; watch windows are excluded from the persisted set — see
+// persistSessionWindowsState). Mirrors the main window's resize/move/maximize
+// debounce + close-flush pattern.
+function wireSessionWindowPersistence(win) {
+  win.on('resized', schedulePersistSessionWindowsState)
+  win.on('moved', schedulePersistSessionWindowsState)
+  win.on('maximize', schedulePersistSessionWindowsState)
+  win.on('unmaximize', schedulePersistSessionWindowsState)
+  win.on('closed', () => {
+    if (suppressPersistOnClose.delete(win)) {
+      return
+    }
+
+    schedulePersistSessionWindowsState.flush()
+  })
+}
 
 // Match the backend's source resolution but bias toward a real git checkout.
 // Dev → SOURCE_REPO_ROOT. Packaged/CLI install → ACTIVE_HERMES_ROOT.
@@ -4689,11 +4772,34 @@ function buildApplicationMenu() {
       { role: 'togglefullscreen' }
     ]
   })
+  // Close-all/reopen-saved act on the secondaryWindows set / sessionWindows
+  // registry, never BrowserWindow.getAllWindows() — they can't touch the
+  // primary window, the pet overlay, or the hidden link-title-fetch window.
+  // Not localized: the rest of this native Menu template is plain English
+  // literals too (the renderer's i18n framework isn't available in the main
+  // process).
+  const sessionWindowMenuItems = [
+    { label: 'Close All Session Windows', click: () => closeAllSessionWindows() },
+    { label: 'Reopen Saved Session Windows', click: () => reopenSessionWindows() }
+  ]
   template.push({
     label: 'Window',
     submenu: IS_MAC
-      ? [{ role: 'minimize' }, { role: 'zoom' }, { role: 'front' }]
-      : [{ role: 'minimize' }, { role: 'close' }]
+      ? [
+          { role: 'minimize' },
+          { role: 'zoom' },
+          { type: 'separator' },
+          ...sessionWindowMenuItems,
+          { type: 'separator' },
+          { role: 'front' }
+        ]
+      : [
+          { role: 'minimize' },
+          { type: 'separator' },
+          ...sessionWindowMenuItems,
+          { type: 'separator' },
+          { role: 'close' }
+        ]
   })
   template.push({
     label: 'Help',
@@ -7001,6 +7107,13 @@ function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {})
 // builder live in session-windows.ts so they stay unit-testable.
 const sessionWindows = createSessionWindowRegistry()
 
+// Every secondary window (keyed session pop-outs, watch/spectator windows,
+// AND new-session drafts — which are deliberately NOT registry-keyed, so
+// sessionWindows alone can't reach them). "Close all" needs this full set;
+// persistence/reopen still go through sessionWindows.entries(), which is
+// scoped to keyed, non-watch windows on purpose (see persistSessionWindowsState).
+const secondaryWindows = new Set<BrowserWindow>()
+
 function focusWindow(win) {
   if (!win || win.isDestroyed()) {
     return
@@ -7019,13 +7132,24 @@ function focusWindow(win) {
 function spawnSecondaryWindow({
   sessionId,
   watch,
-  newSession
-}: { sessionId?: string; watch?: boolean; newSession?: boolean } = {}) {
+  newSession,
+  bounds,
+  isMaximized
+}: {
+  sessionId?: string
+  watch?: boolean
+  newSession?: boolean
+  // Restored geometry from "reopen saved session windows" — omitted for a
+  // normal open, where the window opens at the fixed compact size (Electron
+  // centers it, matching today's behavior).
+  bounds?: { width: number; height: number; x?: number; y?: number }
+  isMaximized?: boolean
+} = {}) {
   const icon = getAppIconPath()
+  const geometry = bounds || { width: SESSION_WINDOW_MIN_WIDTH, height: SESSION_WINDOW_MIN_HEIGHT }
 
   const win = new BrowserWindow({
-    width: SESSION_WINDOW_MIN_WIDTH,
-    height: SESSION_WINDOW_MIN_HEIGHT,
+    ...geometry,
     minWidth: SESSION_WINDOW_MIN_WIDTH,
     minHeight: SESSION_WINDOW_MIN_HEIGHT,
     title: 'Hermes',
@@ -7050,6 +7174,17 @@ function spawnSecondaryWindow({
     win.setWindowButtonPosition?.(WINDOW_BUTTON_POSITION)
   }
 
+  if (isMaximized) {
+    win.maximize()
+  }
+
+  // Tracks every secondary window — keyed, watch, AND new-session drafts —
+  // so "close all" can reach drafts too without touching BrowserWindow's
+  // global window list (which would also catch the primary/pet/hidden
+  // windows). Self-cleans on close, mirroring the registry's own pattern.
+  secondaryWindows.add(win)
+  win.on('closed', () => secondaryWindows.delete(win))
+
   win.once('ready-to-show', () => {
     if (!win.isDestroyed()) {
       win.show()
@@ -7061,6 +7196,10 @@ function spawnSecondaryWindow({
 
   wireCommonWindowHandlers(win)
 
+  // Native title/taskbar/Alt-Tab identification: the renderer sets
+  // document.title to the resolved session title once it has one (ChatHeader
+  // in chat/index.tsx), and nothing here intercepts 'page-title-updated', so
+  // Electron's default title sync does the rest. No IPC round-trip needed.
   win.loadURL(
     buildSessionWindowUrl(sessionId, {
       devServer: DEV_SERVER,
@@ -7073,16 +7212,86 @@ function spawnSecondaryWindow({
   return win
 }
 
-// Open (or focus) a standalone window for a single chat session.
-function createSessionWindow(sessionId, { watch = false } = {}) {
-  return sessionWindows.openOrFocus(sessionId, () => spawnSecondaryWindow({ sessionId, watch }))
+// Open (or focus) a standalone window for a single chat session. `bounds`/
+// `isMaximized` are only passed by reopenSessionWindows() (restoring a saved
+// window) — a normal cmd-click / "New window" open omits them.
+function createSessionWindow(sessionId, { watch = false, bounds, isMaximized }: {
+  watch?: boolean
+  bounds?: { width: number; height: number; x?: number; y?: number }
+  isMaximized?: boolean
+} = {}) {
+  return sessionWindows.openOrFocus(
+    sessionId,
+    () => {
+      const win = spawnSecondaryWindow({ sessionId, watch, bounds, isMaximized })
+
+      // Only keyed, non-watch windows are eligible for "reopen saved windows" —
+      // wired inside the factory so it only fires when a window is actually
+      // created (openOrFocus skips the factory when it just focuses an
+      // existing one, so this never double-wires).
+      if (!watch) {
+        wireSessionWindowPersistence(win)
+      }
+
+      return win
+    },
+    { watch }
+  )
 }
 
 // Open a fresh compact window on the new-session draft (#/). Not registry-keyed:
 // like ⌘N in a browser, every press opens a new window — and a draft window that
 // later converts to a real session must not get refocused as if it were blank.
+// Not persisted (no sessionId to key a saved entry on).
 function createNewSessionWindow() {
   return spawnSecondaryWindow({ newSession: true })
+}
+
+// Closes every secondary session window — keyed pop-outs, watch/spectator
+// windows, AND new-session drafts — via the secondaryWindows Set (never
+// BrowserWindow.getAllWindows(), so the primary/pet-overlay/hidden windows
+// can't be touched). Writes the reopenable (non-watch, keyed) snapshot to
+// disk BEFORE closing anything, then suppresses each closing window's own
+// individual persistence flush — otherwise those would fire one by one as the
+// sweep progresses, each recomputing from the (by-then-shrinking) registry,
+// and overwrite the snapshot with a partial or empty set. See
+// suppressPersistOnClose / wireSessionWindowPersistence.
+function closeAllSessionWindows() {
+  schedulePersistSessionWindowsState.flush()
+
+  // Only keyed, non-watch windows are wired with wireSessionWindowPersistence
+  // (see createSessionWindow), so only those ever consume/delete a
+  // suppressPersistOnClose entry — adding watch/draft windows here would just
+  // leak destroyed-window references that nothing removes.
+  const reopenable = new Set(
+    sessionWindows
+      .entries()
+      .filter(({ watch }) => !watch)
+      .map(({ win }) => win)
+  )
+
+  for (const win of Array.from(secondaryWindows)) {
+    if (win && !win.isDestroyed()) {
+      if (reopenable.has(win)) {
+        suppressPersistOnClose.add(win)
+      }
+
+      win.close()
+    }
+  }
+}
+
+// Reads the persisted "reopen saved session windows" file and re-opens each
+// entry through the registry (never bypassing it), so a session whose window
+// happens to already be open just gets focused instead of duplicated.
+function reopenSessionWindows() {
+  const displays = screen.getAllDisplays()
+
+  for (const entry of readSessionWindowsState()) {
+    const bounds = computeSessionWindowOptions(entry, displays)
+
+    createSessionWindow(entry.sessionId, { watch: false, bounds, isMaximized: entry.isMaximized === true })
+  }
 }
 
 // The pet overlay: a single transparent, frameless, always-on-top window that
@@ -7431,6 +7640,26 @@ ipcMain.handle('hermes:window:openSession', async (_event, sessionId, opts) => {
 })
 ipcMain.handle('hermes:window:openNewSession', async () => {
   createNewSessionWindow()
+
+  return { ok: true }
+})
+// Iterates the secondaryWindows set (not BrowserWindow.getAllWindows()) so
+// this can never touch the primary window, the pet overlay, or the hidden
+// link-title-fetch window. Closes every live session window — watch windows
+// and new-session drafts included — "close all" means all session pop-outs,
+// not just the reopenable (keyed, non-watch) set persistSessionWindowsState
+// tracks. See closeAllSessionWindows() for the snapshot-before-close ordering
+// that keeps session-windows-state.json intact through the sweep.
+ipcMain.handle('hermes:window:closeAllSessionWindows', async () => {
+  closeAllSessionWindows()
+
+  return { ok: true }
+})
+// Explicit-action only (never runs automatically on launch) — reads
+// session-windows-state.json and reopens each saved entry through the
+// registry, so an already-open session just gets focused, never duplicated.
+ipcMain.handle('hermes:window:reopenSessionWindows', async () => {
+  reopenSessionWindows()
 
   return { ok: true }
 })

@@ -1,4 +1,5 @@
 import { ThreadPrimitive, useAuiEvent, useAuiState } from '@assistant-ui/react'
+import { useStore } from '@nanostores/react'
 import {
   type ComponentProps,
   type CSSProperties,
@@ -15,6 +16,7 @@ import { useStickToBottom } from 'use-stick-to-bottom'
 
 import { useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
+import { $activeSessionId, $selectedStoredSessionId } from '@/store/session'
 import {
   onScrollToBottomRequest,
   onThreadEditClose,
@@ -22,7 +24,7 @@ import {
   resetThreadScroll,
   setThreadAtBottom
 } from '@/store/thread-scroll'
-import { isSecondaryWindow } from '@/store/windows'
+import { isHeaderlessSecondaryWindow } from '@/store/windows'
 
 import { MessageRenderBoundary } from '../message-render-boundary'
 
@@ -134,10 +136,18 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   const hiddenCount = firstVisible
   const visibleGroups = hiddenCount > 0 ? groups.slice(hiddenCount) : groups
   const restoreFromBottomRef = useRef<number | null>(null)
-  // Secondary windows (new-session scratch, subagent watch, cmd-click pop-out)
-  // hide the titlebar tool cluster + session header, but the OS traffic lights
-  // still sit in the top-left, so reserve the titlebar gap above the transcript.
-  const secondaryWindow = isSecondaryWindow()
+  // A secondary window without a ChatHeader (a still-blank new-session draft)
+  // hides the titlebar tool cluster + session header, but the OS traffic
+  // lights still sit in the top-left, so this reserves the titlebar gap above
+  // the transcript and masks content sliding under them — the same job the
+  // main window's (and a header-visible secondary window's) opaque <header>
+  // does. Once a secondary window has a real session, ChatHeader in
+  // chat/index.tsx renders and serves that role instead, so this must stay in
+  // lockstep with ChatHeader's own visibility — both derive from the same
+  // isHeaderlessSecondaryWindow(hasSession) predicate.
+  const activeSessionId = useStore($activeSessionId)
+  const selectedSessionId = useStore($selectedStoredSessionId)
+  const headerlessSecondaryWindow = isHeaderlessSecondaryWindow(Boolean(selectedSessionId || activeSessionId))
   // NB: CSS calc() requires whitespace around the +/- operator. This string is
   // assigned verbatim to the --sticky-human-top inline style below (it does not
   // go through Tailwind, which would auto-space it), so the spaces are load-
@@ -146,7 +156,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   // traffic lights.
   const secondaryTitlebarGap = 'calc(var(--titlebar-height) + 0.75rem)'
 
-  const threadContentTopPad = secondaryWindow
+  const threadContentTopPad = headerlessSecondaryWindow
     ? 'pt-[calc(var(--titlebar-height)+0.75rem)]'
     : 'pt-[calc(var(--titlebar-height)-0.5rem)]'
 
@@ -255,16 +265,18 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
       style={
         {
           height: clampToComposer ? 'var(--thread-viewport-height)' : '100%',
-          ...(secondaryWindow ? { '--sticky-human-top': secondaryTitlebarGap } : {})
+          ...(headerlessSecondaryWindow ? { '--sticky-human-top': secondaryTitlebarGap } : {})
         } as CSSProperties
       }
     >
-      {secondaryWindow && (
-        // Secondary windows hide the titlebar chrome, so the scroller runs to
-        // the window's top edge and streamed text slides up under the OS
-        // traffic lights. Content padding alone scrolls away with the text — a
-        // fixed opaque strip (the titlebar's drag region) masks anything behind
-        // it and keeps the window draggable, matching the main window's header.
+      {headerlessSecondaryWindow && (
+        // A headerless secondary window hides the titlebar chrome, so the
+        // scroller runs to the window's top edge and streamed text slides up
+        // under the OS traffic lights. Content padding alone scrolls away with
+        // the text — a fixed opaque strip (the titlebar's drag region) masks
+        // anything behind it and keeps the window draggable. A header-visible
+        // secondary window doesn't need this: ChatHeader's own opaque <header>
+        // (chat/index.tsx) already serves that role, matching the main window.
         <div
           aria-hidden="true"
           className="absolute inset-x-0 top-0 z-10 h-(--titlebar-height) bg-background [-webkit-app-region:drag]"
