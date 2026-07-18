@@ -2588,6 +2588,7 @@ export const zh: Translations = {
     regenerateFailed: '重新生成失败',
     editFailed: '编辑失败',
     resumeFailed: '恢复失败',
+    resumeSucceeded: '已恢复',
     resumeStrandedTitle: '无法加载此会话',
     resumeStrandedBody: '与此会话的连接失败，自动重试已停止。请确认网关正在运行，然后重试。',
     resumeRetry: '重试',

@@ -2031,6 +2031,7 @@ export interface Translations {
     regenerateFailed: string
     editFailed: string
     resumeFailed: string
+    resumeSucceeded: string
     resumeStrandedTitle: string
     resumeStrandedBody: string
     resumeRetry: string
