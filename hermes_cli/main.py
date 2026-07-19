@@ -12285,7 +12285,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "acp", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
-        "dump", "fallback", "gateway", "hooks", "import", "insights",
+        "dump", "fallback", "gateway", "handoff", "hooks", "import", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
         "model", "pairing", "pets", "plugins", "portal", "postinstall", "profile",
@@ -13128,6 +13128,20 @@ def main():
     )
     from hermes_cli.checkpoints import register_cli as _register_checkpoints_cli
     _register_checkpoints_cli(checkpoints_parser)
+
+    # =========================================================================
+    # handoff command — triad relay pipe, lean-artifact lint, decision gates
+    # =========================================================================
+    handoff_parser = subparsers.add_parser(
+        "handoff",
+        help="Capture agent responses to files and relay paths instead of bodies",
+        description="Triad relay pipe. `capture` writes one assistant message "
+        "verbatim to a file and prints its path, so Hermes relays a handle "
+        "rather than re-emitting (and summarizing) the body. Also carries the "
+        "lean-artifact lint and the proposed/acknowledged/locked decision gate.",
+    )
+    from hermes_cli.relaypipe import register_cli as _register_handoff_cli
+    _register_handoff_cli(handoff_parser)
 
     # =========================================================================
     # import command  (parser built in hermes_cli/subcommands/import_cmd.py)
