@@ -7284,14 +7284,34 @@ function closeAllSessionWindows() {
 // Reads the persisted "reopen saved session windows" file and re-opens each
 // entry through the registry (never bypassing it), so a session whose window
 // happens to already be open just gets focused instead of duplicated.
+// Creating every saved window synchronously fires N gateway WebSocket connects
+// + N session resumes in a single burst, which can overwhelm the single-process
+// backend's ready-frame delivery (`ready_send_failed`) and trip the renderer's
+// boot-failure -> reset loop. Open them one at a time with a short gap so each
+// ws handshake settles before the next.
+const REOPEN_SESSION_WINDOW_STAGGER_MS = 400
+
 function reopenSessionWindows() {
   const displays = screen.getAllDisplays()
+  const entries = readSessionWindowsState()
+  let index = 0
 
-  for (const entry of readSessionWindowsState()) {
+  const openNext = () => {
+    if (index >= entries.length) {
+      return
+    }
+
+    const entry = entries[index++]
     const bounds = computeSessionWindowOptions(entry, displays)
 
     createSessionWindow(entry.sessionId, { watch: false, bounds, isMaximized: entry.isMaximized === true })
+
+    if (index < entries.length) {
+      setTimeout(openNext, REOPEN_SESSION_WINDOW_STAGGER_MS)
+    }
   }
+
+  openNext()
 }
 
 // The pet overlay: a single transparent, frameless, always-on-top window that
