@@ -2074,6 +2074,18 @@ function persistSessionWindowsState() {
       })
       .filter(Boolean)
 
+    // Never let an empty live set clobber a non-empty saved snapshot. The state
+    // is re-derived from the live windows each call, so a stray save fired while
+    // no session windows are open (a crash-loop / rollback relaunch, or after the
+    // last pop-out closes) would otherwise wipe a real "Close All" snapshot to [].
+    // Skip the empty write so the saved set stays durable until it is replaced by
+    // a non-empty layout — close-all snapshots while windows are still open, so it
+    // is unaffected. (Trade-off: closing pop-outs individually down to zero no
+    // longer auto-clears the saved set.)
+    if (entries.length === 0) {
+      return
+    }
+
     fs.mkdirSync(path.dirname(SESSION_WINDOWS_STATE_PATH), { recursive: true })
     writeFileAtomic(SESSION_WINDOWS_STATE_PATH, JSON.stringify(entries, null, 2))
   } catch (err) {
