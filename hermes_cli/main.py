@@ -14720,10 +14720,25 @@ def main():
 
     # Execute the command
     if hasattr(args, "func"):
-        args.func(args)
+        result = args.func(args)
+        # Subcommands already signal failure by returning an int — `return 2`
+        # for usage errors exists in checkpoints.py, kanban.py, and migrate.py,
+        # and `handoff lint --strict` returns 1 on a violation. The dispatcher
+        # used to discard these, so a strict lint printed its violation and
+        # still exited 0, which silently defeats any CI/pre-dispatch gate built
+        # on it. Propagate so the process exit code matches what the command
+        # decided.
+        #
+        # bool is an int subclass: exclude it, or a command that returns
+        # True/False would have that reinterpreted as an exit code (True -> 1).
+        if isinstance(result, int) and not isinstance(result, bool):
+            return result
     else:
         parser.print_help()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    # setuptools' console_script wrapper already does sys.exit(main()) for the
+    # installed `hermes` binary; this makes `python -m hermes_cli.main` agree.
+    sys.exit(main())
