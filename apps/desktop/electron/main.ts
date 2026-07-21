@@ -7301,7 +7301,7 @@ function closeAllSessionWindows() {
 // backend's ready-frame delivery (`ready_send_failed`) and trip the renderer's
 // boot-failure -> reset loop. Open them one at a time with a short gap so each
 // ws handshake settles before the next.
-const REOPEN_SESSION_WINDOW_STAGGER_MS = 400
+const REOPEN_SESSION_WINDOW_STAGGER_MS = 1200
 
 function reopenSessionWindows() {
   const displays = screen.getAllDisplays()
