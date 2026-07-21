@@ -1238,6 +1238,50 @@ def _load_local_whisper_model(model_name: str):
         return WhisperModel(model_name, device="cpu", compute_type="int8")
 
 
+def warm_local_model() -> bool:
+    """Preload the local faster-whisper model so the FIRST dictation doesn't pay
+    the cold model-load cost (large-v3 into VRAM is 20-60s).
+
+    Safe to call at backend startup: returns False and never raises when local
+    faster-whisper isn't the active STT path (disabled, cloud provider, or the
+    per-call command CLI because faster-whisper isn't importable) or the load
+    fails — the normal per-call transcribe path still handles everything. Warms
+    the same ``_local_model`` singleton the transcribe path reuses, so once this
+    completes every dictation is fast.
+    """
+    global _local_model, _local_model_name
+
+    try:
+        if not _HAS_FASTER_WHISPER:
+            return False
+
+        stt_config = _load_stt_config()
+        if not is_stt_enabled(stt_config):
+            return False
+
+        # Only warm when the resolved provider actually uses the in-process
+        # faster-whisper path — don't load a model the user won't use.
+        if _get_provider(stt_config) != "local":
+            return False
+
+        local_cfg = stt_config.get("local") or {}
+        model_name = _normalize_local_model(local_cfg.get("model", DEFAULT_LOCAL_MODEL))
+
+        if _local_model is not None and _local_model_name == model_name:
+            return True
+
+        logger.info("Pre-warming local faster-whisper model '%s'...", model_name)
+        _local_model = _load_local_whisper_model(model_name)
+        _local_model_name = model_name
+        logger.info("Local faster-whisper model '%s' pre-warmed and ready", model_name)
+
+        return True
+    except Exception as exc:
+        logger.info("Local STT pre-warm skipped (non-fatal): %s", exc)
+
+        return False
+
+
 def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
     """Transcribe using faster-whisper (local, free)."""
     global _local_model, _local_model_name
