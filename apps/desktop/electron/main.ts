@@ -4792,7 +4792,13 @@ function buildApplicationMenu() {
   // process).
   const sessionWindowMenuItems = [
     { label: 'Close All Session Windows', click: () => closeAllSessionWindows() },
-    { label: 'Reopen Saved Session Windows', click: () => reopenSessionWindows() }
+    {
+      label: 'Reopen Saved Session Windows',
+      click: () =>
+        void reopenSessionWindows().catch(err =>
+          rememberLog(`[session-windows] reopen failed: ${err?.message || err}`)
+        )
+    }
   ]
   template.push({
     label: 'Window',
@@ -7296,34 +7302,71 @@ function closeAllSessionWindows() {
 // Reads the persisted "reopen saved session windows" file and re-opens each
 // entry through the registry (never bypassing it), so a session whose window
 // happens to already be open just gets focused instead of duplicated.
+//
 // Creating every saved window synchronously fires N gateway WebSocket connects
-// + N session resumes in a single burst, which can overwhelm the single-process
-// backend's ready-frame delivery (`ready_send_failed`) and trip the renderer's
-// boot-failure -> reset loop. Open them one at a time with a short gap so each
-// ws handshake settles before the next.
-const REOPEN_SESSION_WINDOW_STAGGER_MS = 1200
+// + N session resumes in a single burst, which overwhelms the single-process
+// backend's ready-frame delivery (`ready_send_failed`) and trips the renderer's
+// boot-failure -> reset loop. A fixed timer stagger only half-helped: a heavy
+// resume stalls the backend event loop for 5-6s, far longer than any sane fixed
+// gap, so windows opened mid-stall still miss their connect.
+//
+// Instead, reopen CONNECTION-AWARE: open one window, wait until its renderer has
+// actually finished loading (its gateway connect + session resume — the CPU-heavy
+// part — gets a head start), then a short settle, then open the next. This adapts
+// to however long each resume takes. A per-window load cap keeps a slow/stuck
+// window from stalling the whole queue, and an already-open (focused) window
+// resolves immediately.
+const REOPEN_WINDOW_LOAD_TIMEOUT_MS = 12_000
+const REOPEN_WINDOW_SETTLE_MS = 500
 
-function reopenSessionWindows() {
-  const displays = screen.getAllDisplays()
-  const entries = readSessionWindowsState()
-  let index = 0
+function waitForSessionWindowLoad(win: BrowserWindow): Promise<void> {
+  return new Promise(resolve => {
+    if (win.isDestroyed() || !win.webContents.isLoading()) {
+      resolve()
 
-  const openNext = () => {
-    if (index >= entries.length) {
       return
     }
 
-    const entry = entries[index++]
+    let settled = false
+    const finish = () => {
+      if (settled) {
+        return
+      }
+
+      settled = true
+      clearTimeout(timer)
+      resolve()
+    }
+
+    const timer = setTimeout(finish, REOPEN_WINDOW_LOAD_TIMEOUT_MS)
+
+    win.webContents.once('did-finish-load', finish)
+    win.webContents.once('did-fail-load', (_event, _code, _desc, _url, isMainFrame) => {
+      if (isMainFrame) {
+        finish()
+      }
+    })
+    win.once('closed', finish)
+  })
+}
+
+async function reopenSessionWindows() {
+  const displays = screen.getAllDisplays()
+  const entries = readSessionWindowsState()
+
+  for (const entry of entries) {
     const bounds = computeSessionWindowOptions(entry, displays)
+    const win = createSessionWindow(entry.sessionId, {
+      watch: false,
+      bounds,
+      isMaximized: entry.isMaximized === true
+    })
 
-    createSessionWindow(entry.sessionId, { watch: false, bounds, isMaximized: entry.isMaximized === true })
-
-    if (index < entries.length) {
-      setTimeout(openNext, REOPEN_SESSION_WINDOW_STAGGER_MS)
+    if (win && !win.isDestroyed()) {
+      await waitForSessionWindowLoad(win)
+      await new Promise(resolve => setTimeout(resolve, REOPEN_WINDOW_SETTLE_MS))
     }
   }
-
-  openNext()
 }
 
 // The pet overlay: a single transparent, frameless, always-on-top window that
@@ -7691,7 +7734,11 @@ ipcMain.handle('hermes:window:closeAllSessionWindows', async () => {
 // session-windows-state.json and reopens each saved entry through the
 // registry, so an already-open session just gets focused, never duplicated.
 ipcMain.handle('hermes:window:reopenSessionWindows', async () => {
-  reopenSessionWindows()
+  // Fire-and-forget: the sequential connection-aware reopen can take several
+  // seconds across many windows; the renderer shouldn't block on it.
+  void reopenSessionWindows().catch(err =>
+    rememberLog(`[session-windows] reopen failed: ${err?.message || err}`)
+  )
 
   return { ok: true }
 })
