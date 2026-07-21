@@ -186,6 +186,7 @@ export interface Translations {
       microphoneStartFailed: string
       microphoneUnsupported: string
       noMicrophone: string
+      noAudioCaptured: string
       noSpeechDetected: string
       playbackFailed: string
       recordingFailed: string

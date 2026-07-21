@@ -141,6 +141,7 @@ export const zh: Translations = {
       microphoneStartFailed: '无法开始麦克风录音。',
       microphoneUnsupported: '当前运行环境不支持麦克风录音。',
       noMicrophone: '未找到麦克风。',
+      noAudioCaptured: '未捕获到音频——可能有其他应用独占了麦克风，或请检查输入设备。',
       noSpeechDetected: '没有检测到语音',
       playbackFailed: '语音播放失败',
       recordingFailed: '语音录制失败',

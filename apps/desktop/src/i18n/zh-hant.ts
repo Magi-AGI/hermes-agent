@@ -141,6 +141,7 @@ export const zhHant = defineLocale({
       microphoneStartFailed: '無法開始麥克風錄音。',
       microphoneUnsupported: '目前執行環境不支援麥克風錄音。',
       noMicrophone: '找不到麥克風。',
+      noAudioCaptured: '未擷取到音訊——可能有其他應用程式獨佔了麥克風，或請檢查輸入裝置。',
       noSpeechDetected: '未偵測到語音',
       playbackFailed: '語音播放失敗',
       recordingFailed: '語音錄製失敗',

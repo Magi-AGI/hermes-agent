@@ -145,6 +145,7 @@ export const en: Translations = {
       microphoneStartFailed: 'Could not start microphone recording.',
       microphoneUnsupported: 'This runtime does not support microphone recording.',
       noMicrophone: 'No microphone was found.',
+      noAudioCaptured: 'No audio captured — another app may have exclusive control of your microphone, or check your input device.',
       noSpeechDetected: 'No speech detected',
       playbackFailed: 'Voice playback failed',
       recordingFailed: 'Voice recording failed',
