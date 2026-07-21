@@ -80,6 +80,13 @@ const SESSION_LIST_REQUEST_TIMEOUT_MS = 60_000
 // agent-turn ceiling (agent.gateway_timeout = 1800s) so the ack timeout only
 // ever fires when the turn itself would have been abandoned server-side.
 export const PROMPT_SUBMIT_REQUEST_TIMEOUT_MS = 1_800_000
+// Local STT (faster-whisper) must load the model into VRAM on the first request
+// after a backend start/mic reconnect — a cold large-v3 load alone is 20-60s, far
+// past the generic 15s fetch default, so the FIRST dictation would time out on the
+// frontend even though the backend transcribes successfully. Match the backend's
+// own STT command ceiling (DEFAULT_COMMAND_STT_TIMEOUT_SECONDS = 300s) so the
+// frontend only gives up once the backend itself would have.
+export const AUDIO_TRANSCRIBE_REQUEST_TIMEOUT_MS = 300_000
 
 export type {
   ActionResponse,
@@ -1000,7 +1007,8 @@ export function transcribeAudio(dataUrl: string, mimeType?: string): Promise<Aud
     body: {
       data_url: dataUrl,
       mime_type: mimeType
-    }
+    },
+    timeoutMs: AUDIO_TRANSCRIBE_REQUEST_TIMEOUT_MS
   })
 }
 
