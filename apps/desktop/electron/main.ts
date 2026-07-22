@@ -2107,11 +2107,21 @@ const schedulePersistSessionWindowsState = debounce(persistSessionWindowsState, 
 // 'closed' handler below.
 const suppressPersistOnClose = new Set()
 
+// Set true in the before-quit handler. A quit (or a taskbar "close all windows"
+// that quits the app) must NOT shrink the saved set — the user's workflow is
+// "every active session is an open pop-out somewhere", so quitting should
+// preserve the whole layout for the next "reopen saved windows". Only a
+// deliberate single-window close while the app keeps running removes a session.
+let appIsQuitting = false
+
 // Wired only onto keyed, non-watch session windows (new-session drafts have no
 // sessionId to key on; watch windows are excluded from the persisted set — see
 // persistSessionWindowsState). Mirrors the main window's resize/move/maximize
-// debounce + close-flush pattern.
+// debounce pattern, and additionally persists on SHOW so a freshly-opened window
+// enters the saved set immediately (crash-safe: the set stays complete even if
+// the window is never moved before a crash).
 function wireSessionWindowPersistence(win) {
+  win.once('show', schedulePersistSessionWindowsState)
   win.on('resized', schedulePersistSessionWindowsState)
   win.on('moved', schedulePersistSessionWindowsState)
   win.on('maximize', schedulePersistSessionWindowsState)
@@ -2121,7 +2131,22 @@ function wireSessionWindowPersistence(win) {
       return
     }
 
-    schedulePersistSessionWindowsState.flush()
+    // On quit, preserve the full snapshot — don't let the close cascade shrink it.
+    if (appIsQuitting) {
+      return
+    }
+
+    // SCHEDULE (debounced), never flush. This is what distinguishes a deliberate
+    // single close from a bulk close-all without needing to detect intent:
+    //  - Lone close (app keeps running): the debounce settles with N-1 live
+    //    windows and correctly drops the closed session from the set.
+    //  - Bulk close-all (taskbar/system tray, not via the app's snapshot path):
+    //    every window closes within the debounce window, so the single trailing
+    //    persist re-derives a live set of 0 — which persistSessionWindowsState's
+    //    empty-guard refuses to write, preserving the full snapshot. (A previous
+    //    `.flush()` here fired per-window and shrank the file step-by-step to
+    //    whatever closed last — the bug that lost the user's layout on crash.)
+    schedulePersistSessionWindowsState()
   })
 }
 
@@ -9392,6 +9417,10 @@ function configureSpellChecker() {
 }
 
 app.on('before-quit', () => {
+  // Preserve the saved session-window layout across quit: from here on, closing
+  // windows must not shrink session-windows-state.json (see wireSessionWindowPersistence).
+  appIsQuitting = true
+
   // The always-on-top overlay isn't a "real" app window; close it so a stray
   // pet can't keep the process alive or float over a quit app.
   closePetOverlay()
