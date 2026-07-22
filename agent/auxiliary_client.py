@@ -55,6 +55,10 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
 
+# Process-local counters for the compaction route guard (spec §7). Import-safe:
+# compaction_metrics has no Hermes imports of its own, so this cannot cycle.
+from agent import compaction_metrics
+
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # openai SDK pulls a large type tree (~240 ms cold, including responses/*,
 # graders/*). We expose `OpenAI` here as a thin proxy that imports the SDK on
@@ -1442,6 +1446,10 @@ class AnthropicAuxiliaryClient:
         self.chat = _AnthropicChatShim(adapter)
         self.api_key = api_key
         self.base_url = base_url
+        # Exposed for introspection: the compaction route guard reads this to
+        # tell the Claude Max / Claude Code OAuth route apart from the metered
+        # x-api-key route (both are this same wrapper class).
+        self.is_oauth = bool(is_oauth)
 
     def close(self):
         close_fn = getattr(self._real_client, "close", None)
@@ -1470,6 +1478,7 @@ class AsyncAnthropicAuxiliaryClient:
         self.chat = _AsyncAnthropicChatShim(async_adapter)
         self.api_key = sync_wrapper.api_key
         self.base_url = sync_wrapper.base_url
+        self.is_oauth = getattr(sync_wrapper, "is_oauth", False)
         # See AsyncCodexAuxiliaryClient: mirror _real_client so cache
         # eviction on a poisoned underlying client also drops this entry.
         self._real_client = sync_wrapper._real_client
@@ -2794,11 +2803,459 @@ def _try_azure_foundry(
     return client, final_model
 
 
+# ── Subscription-only compaction route guard ────────────────────────────────
+#
+# Compaction inputs are business-sensitive: the summariser is handed the middle
+# window of the user's conversation verbatim.  It may therefore run ONLY on a
+# subscription/private route — the ``openai-codex`` ChatGPT OAuth route or the
+# ``anthropic`` Claude Max / Claude Code OAuth route — never on a metered one
+# (``openai-api``, OpenRouter, Gemini, Bedrock, any API-key alias, or the
+# metered ``anthropic`` x-api-key route, which shares a provider name and a
+# client class with the allowed Anthropic route).
+#
+# Enforcement is on the ROUTE — the (provider, auth-mode-ACTUALLY-RESOLVED)
+# pair — not on the provider name, and not on the registry's provider-level
+# ``auth_type`` (which types ``anthropic`` as ``api_key``, so a registry check
+# would reject Claude Max outright or admit the metered key).  It is applied to
+# the CONSTRUCTED CLIENT, so an allowlisted provider name aliased to a metered
+# endpoint via a ``base_url``/``api_key`` override is caught too:
+# ``_maybe_wrap_anthropic`` rewraps *any* Anthropic-Messages-speaking endpoint
+# (Kimi Coding Plan, a custom endpoint, an OpenRouter host) into
+# ``AnthropicAuxiliaryClient``, so the class alone proves nothing — the host
+# must also be Anthropic's.
+#
+# The guard fails CLOSED: when no allowed subscription route is available the
+# compaction call raises ``CompressionRoutingRejected`` rather than egressing.
+# That is deliberately asymmetric with the (future) queue coordinator, which
+# fails open — a routing refusal is a privacy decision, not a capacity one.
+
+
+class CompressionRoutingRejected(Exception):
+    """No allowed subscription route is available for a compaction summary.
+
+    Deliberately NOT a subclass of ``RuntimeError``: ``call_llm`` raises
+    ``RuntimeError`` for "no provider configured", and
+    ``context_compressor._generate_summary`` branches on that shape.  A routing
+    refusal must never be mistaken for a provider fault, because the recovery
+    for a provider fault is *retry somewhere else* — which is exactly the
+    egress this exception exists to prevent.
+    """
+
+
+AUTH_MODE_OAUTH_SUBSCRIPTION = "oauth_subscription"
+AUTH_MODE_API_KEY = "api_key"
+
+# The default allowlist (spec §5.3). There is NO disable value: an empty or
+# malformed ``allowed_routes`` is a configuration error that fails closed, not
+# an opt-out. Users may NARROW this list; widening it to a metered route is
+# rejected at load.
+DEFAULT_ALLOWED_COMPRESSION_ROUTES: Tuple[Tuple[str, str], ...] = (
+    ("openai-codex", AUTH_MODE_OAUTH_SUBSCRIPTION),
+    ("anthropic", AUTH_MODE_OAUTH_SUBSCRIPTION),
+)
+
+# Providers that can be reached over a genuine subscription route at all. A
+# route entry naming anything else is metered by construction.
+_SUBSCRIPTION_CAPABLE_PROVIDERS = frozenset({"openai-codex", "anthropic"})
+
+_COMPRESSION_TASK = "compression"
+
+# Task-local, NOT thread-local. A thread-local would be actively wrong on the
+# async path: ``async_call_llm`` holds the guard across ``await`` points, and
+# every coroutine on an event loop shares one thread — so a concurrent
+# non-compression auxiliary call (title generation, vision, web extract) running
+# on the same loop thread would observe the compaction guard set by a *different*
+# coroutine, get screened as if it were compaction, and fail with a spurious
+# CompressionRoutingRejected. A ContextVar is copied per asyncio Task, so the
+# guard stays inside the coroutine that set it.
+#
+# ContextVar also preserves the sync semantics we need: plain function calls
+# (and threads, which start with an empty context) see exactly the value set by
+# their own caller.
+_compression_guard_var: "contextvars.ContextVar[Optional[_CompressionRouteGuardState]]" = (
+    contextvars.ContextVar("hermes_compression_route_guard", default=None)
+)
+
+
+class _CompressionRouteGuardState:
+    """Per-thread state for one guarded compaction call."""
+
+    __slots__ = ("rejections", "skips")
+
+    def __init__(self) -> None:
+        # (provider, reason) — a candidate route was refused; the search may
+        # continue to the next rung, but this route was never used.
+        self.rejections: List[Tuple[str, str]] = []
+        # (provider, source, reason) — a *credential candidate* was passed over
+        # during the Anthropic scan-past walk. Distinct from a rejection: a skip
+        # means the search continued within the same provider.
+        self.skips: List[Tuple[str, str, str]] = []
+
+
+def _compression_guard() -> Optional[_CompressionRouteGuardState]:
+    return _compression_guard_var.get()
+
+
+def _compression_guard_active() -> bool:
+    return _compression_guard() is not None
+
+
+@contextlib.contextmanager
+def compression_route_guard():
+    """Activate the subscription-only route guard for the current context.
+
+    Scoped to one compaction call so no other auxiliary task's provider
+    behaviour changes — including a concurrent async task on the same event-loop
+    thread (see ``_compression_guard_var``: the state is task-local, not
+    thread-local). Re-entrant calls reuse the outer state.
+
+    The ContextVar is reset via its token rather than being set back to ``None``,
+    so a nested/concurrent activation can never clobber an outer one.
+    """
+    existing = _compression_guard()
+    if existing is not None:
+        yield existing
+        return
+    state = _CompressionRouteGuardState()
+    token = _compression_guard_var.set(state)
+    try:
+        yield state
+    finally:
+        _compression_guard_var.reset(token)
+
+
+def _note_route_rejected(provider: str, reason: str) -> None:
+    state = _compression_guard()
+    if state is None:
+        return
+    state.rejections.append((provider, reason))
+    # compaction.route_rejected_total{provider, reason} — alertable.
+    # {provider=anthropic, reason=metered_auth_mode} firing means the dual-route
+    # API-key fallback was hit in production.
+    compaction_metrics.record_route_rejected(provider, reason)
+    logger.warning(
+        "Compaction route guard: rejected %s (reason=%s) — not an allowed "
+        "subscription route for compaction; no client built, no request issued",
+        provider or "unknown", reason,
+    )
+
+
+def _note_candidate_skipped(provider: str, source: str, reason: str) -> None:
+    state = _compression_guard()
+    if state is None:
+        return
+    state.skips.append((provider, source, reason))
+    # compaction.credential_candidate_skipped_total{provider, source, reason}.
+    # A SKIP is not a rejection: the search continued past this candidate.
+    compaction_metrics.record_credential_candidate_skipped(provider, source, reason)
+    logger.info(
+        "Compaction route guard: skipped %s credential candidate from %s "
+        "(reason=%s), continuing to the next source",
+        provider, source, reason,
+    )
+
+
+def _allowed_compression_routes() -> frozenset:
+    """Load and validate ``auxiliary.compression.allowed_routes``.
+
+    Fails CLOSED: a malformed, empty, or metered entry raises
+    ``CompressionRoutingRejected`` rather than silently disabling the guard.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        raw = (
+            ((cfg.get("auxiliary") or {}).get("compression") or {})
+            .get("allowed_routes")
+        )
+    except CompressionRoutingRejected:
+        raise
+    except Exception:
+        # Config unreadable — fall back to the built-in default rather than
+        # widening. The default is already the most permissive allowed set.
+        return frozenset(DEFAULT_ALLOWED_COMPRESSION_ROUTES)
+
+    if raw is None:
+        return frozenset(DEFAULT_ALLOWED_COMPRESSION_ROUTES)
+
+    if not isinstance(raw, list) or not raw:
+        raise CompressionRoutingRejected(
+            "auxiliary.compression.allowed_routes is empty or malformed. This is a "
+            "configuration error, not a way to disable the subscription-only "
+            "compaction guard. Remove the key to use the default routes "
+            "(openai-codex/oauth_subscription, anthropic/oauth_subscription)."
+        )
+
+    routes = set()
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise CompressionRoutingRejected(
+                f"auxiliary.compression.allowed_routes: malformed entry {entry!r} "
+                f"(expected a mapping with 'provider' and 'auth_mode')."
+            )
+        provider = str(entry.get("provider") or "").strip().lower()
+        auth_mode = str(entry.get("auth_mode") or "").strip().lower()
+        if not provider or not auth_mode:
+            raise CompressionRoutingRejected(
+                f"auxiliary.compression.allowed_routes: entry {entry!r} must set "
+                f"both 'provider' and 'auth_mode'."
+            )
+        if auth_mode != AUTH_MODE_OAUTH_SUBSCRIPTION:
+            raise CompressionRoutingRejected(
+                f"auxiliary.compression.allowed_routes: route "
+                f"({provider}, {auth_mode}) is a metered route. Compaction content "
+                f"is business-sensitive and may only egress to a subscription "
+                f"route; this list can be narrowed but never widened."
+            )
+        if provider not in _SUBSCRIPTION_CAPABLE_PROVIDERS:
+            raise CompressionRoutingRejected(
+                f"auxiliary.compression.allowed_routes: provider {provider!r} has no "
+                f"subscription route (metered by construction). Allowed providers: "
+                f"{', '.join(sorted(_SUBSCRIPTION_CAPABLE_PROVIDERS))}."
+            )
+        routes.add((provider, auth_mode))
+    return frozenset(routes)
+
+
+def validate_configured_compression_routes() -> List[str]:
+    """Statically validate every CONFIGURED compaction route against the allowlist.
+
+    Startup check (spec §5.3 "Startup validation"): surfaces a metered/unknown
+    compaction route when the user starts a session, instead of silently waiting
+    until the first compaction fails closed hours into a long session.
+
+    Covers the configured primary (``auxiliary.compression.provider``) and every
+    configured fallback rung that compaction could reach:
+    ``auxiliary.compression.fallback_chain`` and the top-level
+    ``fallback_providers`` / ``fallback_model`` chain.
+
+    **Network-free and side-effect-free by construction.** It inspects only
+    config: the provider name and any ``base_url`` override. It deliberately does
+    NOT resolve credentials, because resolving an Anthropic credential can walk
+    the Claude Code credential store and trigger an OAuth *refresh over the
+    network* (``anthropic_adapter._refresh_oauth_token``) — far too expensive and
+    side-effecting for a constructor-time check. That means this function can
+    prove a route is **not allowlisted** (wrong provider, or an allowlisted
+    provider aliased to a foreign endpoint), but it cannot prove that an
+    ``anthropic`` route will resolve to the OAuth half rather than the metered
+    x-api-key half. That determination stays with the runtime guard, which sees
+    the actual constructed client and fails closed. Startup validation is
+    therefore an early-warning net, never a replacement for the guard.
+
+    Raises:
+        CompressionRoutingRejected: if ``allowed_routes`` itself is empty or
+            malformed — a configuration error, never an opt-out (§5.4).
+
+    Returns:
+        A list of human-readable problems (empty when every configured route is
+        allowlisted). ``auto``/unset providers yield no problem: they are not a
+        *configured* route, and the runtime guard screens whatever `auto`
+        discovers.
+    """
+    # Raises on empty/malformed/metered config — no opt-out (§5.4).
+    allowed = _allowed_compression_routes()
+    allowed_providers = {provider for provider, _mode in allowed}
+
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+    except Exception as exc:
+        logger.debug("Compaction route validation: could not load config: %s", exc)
+        return []
+
+    aux_compression = ((cfg.get("auxiliary") or {}).get("compression") or {})
+
+    # (label, provider, base_url) for every rung compaction could actually use.
+    candidates: List[Tuple[str, str, str]] = [(
+        "auxiliary.compression.provider",
+        str(aux_compression.get("provider") or "").strip().lower(),
+        str(aux_compression.get("base_url") or "").strip(),
+    )]
+
+    chain = aux_compression.get("fallback_chain")
+    if isinstance(chain, list):
+        for i, entry in enumerate(chain):
+            if not isinstance(entry, dict):
+                continue
+            candidates.append((
+                f"auxiliary.compression.fallback_chain[{i}]",
+                str(entry.get("provider") or "").strip().lower(),
+                str(entry.get("base_url") or "").strip(),
+            ))
+
+    try:
+        from hermes_cli.fallback_config import get_fallback_chain
+        for i, entry in enumerate(get_fallback_chain(cfg)):
+            if not isinstance(entry, dict):
+                continue
+            candidates.append((
+                f"fallback_providers[{i}]",
+                str(entry.get("provider") or "").strip().lower(),
+                str(entry.get("base_url") or "").strip(),
+            ))
+    except Exception as exc:
+        logger.debug("Compaction route validation: could not read fallback chain: %s", exc)
+
+    problems: List[str] = []
+    for label, provider, base_url in candidates:
+        if not provider or provider == "auto":
+            # Not a configured route — `auto` discovery is screened at runtime.
+            continue
+        if provider not in allowed_providers:
+            problems.append(
+                f"{label}: '{provider}' is not an allowed compaction route "
+                f"(metered or unknown). Compaction may only run on: "
+                f"{', '.join(sorted(allowed_providers))}."
+            )
+            continue
+        # An allowlisted provider NAME aliased to a foreign endpoint is still a
+        # metered route — the same trap the runtime guard closes on the
+        # constructed client (§5.3.4).
+        if base_url:
+            expected_host = (
+                "api.anthropic.com" if provider == "anthropic" else "chatgpt.com"
+            )
+            if not base_url_host_matches(base_url, expected_host):
+                problems.append(
+                    f"{label}: '{provider}' is allowlisted but its base_url "
+                    f"({base_url}) does not point at {expected_host} — that is a "
+                    f"metered/foreign endpoint wearing an allowlisted provider name."
+                )
+    return problems
+
+
+def _client_compression_route(client: Any) -> Optional[Tuple[str, str]]:
+    """Classify a CONSTRUCTED client as a (provider, auth_mode) route.
+
+    Returns ``None`` when the client is not on any subscription-capable route
+    (a plain OpenAI/OpenRouter/Gemini/Bedrock client), or when it *looks* like
+    one but its endpoint says otherwise (an ``AnthropicAuxiliaryClient`` pointed
+    at a non-Anthropic host — the base_url/api_key aliasing trap).
+    """
+    if client is None:
+        return None
+    base_url = str(getattr(client, "base_url", "") or "")
+
+    if isinstance(client, (AnthropicAuxiliaryClient, AsyncAnthropicAuxiliaryClient)):
+        # The class proves the *protocol*, not the route: _maybe_wrap_anthropic
+        # rewraps any Anthropic-Messages endpoint (Kimi, custom, OpenRouter) in
+        # this wrapper. Require the real Anthropic host too.
+        if not base_url_host_matches(base_url, "api.anthropic.com"):
+            return None
+        return (
+            "anthropic",
+            AUTH_MODE_OAUTH_SUBSCRIPTION
+            if getattr(client, "is_oauth", False)
+            else AUTH_MODE_API_KEY,
+        )
+
+    if isinstance(client, (CodexAuxiliaryClient, AsyncCodexAuxiliaryClient)):
+        # CodexAuxiliaryClient is also used for Azure Foundry's codex_responses
+        # transport, which is a metered Azure endpoint — so, again, check the
+        # host. The ChatGPT backend is reachable only with an OAuth account
+        # token (registry auth_type=oauth_external), so host implies mode.
+        if not base_url_host_matches(base_url, "chatgpt.com"):
+            return None
+        return ("openai-codex", AUTH_MODE_OAUTH_SUBSCRIPTION)
+
+    return None
+
+
+def _compression_client_allowed(label: str, client: Any) -> bool:
+    """Route screen for one candidate client. Records a rejection when refused.
+
+    Used as a *skip* screen inside the fallback/discovery loops (beside the
+    existing ``_is_provider_unhealthy`` and context-window screens): a refused
+    candidate is skipped and the chain continues to the next rung. Only
+    exhaustion of every rung fails the compaction closed.
+    """
+    if not _compression_guard_active():
+        return True
+    route = _client_compression_route(client)
+    if route is None:
+        _note_route_rejected(
+            label or "unknown",
+            "endpoint_mismatch" if client is not None else "not_allowlisted",
+        )
+        return False
+    if route not in _allowed_compression_routes():
+        _note_route_rejected(
+            route[0],
+            "metered_auth_mode" if route[1] == AUTH_MODE_API_KEY else "not_allowlisted",
+        )
+        return False
+    logger.info(
+        "Compaction route guard: admitted route (provider=%s, auth_mode=%s) via %s",
+        route[0], route[1], label or "primary",
+    )
+    return True
+
+
+def _assert_compression_route(label: str, client: Any) -> None:
+    """Final gate immediately before a compaction request is issued.
+
+    Backstop for the per-rung screens: catches cached clients and any candidate
+    path that did not pass through a screen. Raises rather than skipping — by
+    this point there is nowhere left to fall back to.
+    """
+    if not _compression_guard_active():
+        return
+    if _compression_client_allowed(label, client):
+        return
+    raise CompressionRoutingRejected(
+        f"Compaction refused: no allowed subscription route (resolved "
+        f"provider={label or 'unknown'}). Compaction content is business-sensitive "
+        f"and may only run on the ChatGPT Codex OAuth route or the Anthropic "
+        f"Claude Max / Claude Code OAuth route. Authenticate one of them "
+        f"(`hermes auth codex` or `claude setup-token`) and retry."
+    )
+
+
+def _compression_routing_exhausted() -> CompressionRoutingRejected:
+    """Build the fail-closed error for 'no allowed subscription route'.
+
+    Raised for BOTH shapes of exhaustion, which the spec's failure table treats
+    identically ("all allowed subscription routes unavailable → fail CLOSED,
+    messages unchanged"):
+
+    * every candidate was refused/skipped as metered, and
+    * no candidate existed at all (nothing configured).
+
+    The second case was briefly carved out to preserve the legacy no-provider
+    RuntimeError, but that carve-out was wrong: ``_generate_summary`` converts
+    that RuntimeError into ``None``, and with the default
+    ``abort_on_summary_failure=False`` the compressor then inserts a static
+    placeholder and DROPS THE MIDDLE WINDOW. Fail-closed is about preserving the
+    session unchanged, not only about preventing egress — so an unconfigured
+    install must abort intact rather than lose context.
+    """
+    state = _compression_guard()
+    rejected = ", ".join(sorted({p for p, _ in (state.rejections if state else [])}))
+    skipped = ", ".join(sorted({s for _, s, _ in (state.skips if state else [])}))
+    if rejected or skipped:
+        detail = f" Rejected routes: {rejected}." if rejected else ""
+        if skipped:
+            detail += f" Skipped metered-shaped credentials from: {skipped}."
+    else:
+        detail = " No auxiliary provider is configured at all."
+    return CompressionRoutingRejected(
+        "Compaction refused: no allowed subscription route is available." + detail
+        + " Compaction content is business-sensitive and may only run on the "
+        "ChatGPT Codex OAuth route or the Anthropic Claude Max / Claude Code "
+        "OAuth route. The conversation was left unchanged — no context was lost. "
+        "Authenticate a subscription route (`hermes auth codex` or "
+        "`claude setup-token`) and retry with /compress."
+    )
+
+
 def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optional[str]]:
     try:
         from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
     except ImportError:
         return None, None
+
+    if _compression_guard_active():
+        return _try_anthropic_subscription_only(explicit_api_key)
 
     pool_present, entry = _select_pool_entry("anthropic")
     if pool_present and entry is not None:
@@ -2855,6 +3312,95 @@ def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optiona
         # when _anthropic_sdk is None.  Treat as unavailable.
         return None, None
     return AnthropicAuxiliaryClient(real_client, model, token, base_url, is_oauth=is_oauth), model
+
+
+def _try_anthropic_subscription_only(
+    explicit_api_key: str = None,
+) -> Tuple[Optional[Any], Optional[str]]:
+    """``_try_anthropic`` for the compaction path: OAuth/subscription route only.
+
+    ``anthropic`` is a dual-route provider — the same provider name, the same
+    client class, and (in ``resolve_anthropic_token``) the same bare-string
+    return cover both Claude Max OAuth and the metered Console API key. This
+    resolver refuses the metered half:
+
+    * an explicit API key is classified like any other credential — an explicit
+      metered key is still a metered route, so it does not bypass the guard;
+    * the credential-pool entry is used when it is OAuth (preserving the pool's
+      rotation/refresh semantics), and skipped when it is metered-shaped;
+    * otherwise the provenance resolver walks the standard precedence order and
+      SCANS PAST metered-shaped candidates to a later OAuth source, so a stray
+      metered ``ANTHROPIC_TOKEN`` cannot mask a valid Claude Max credential in
+      the Claude Code store or the pool;
+    * on exhaustion it refuses: no client is built and no request is issued.
+    """
+    try:
+        from agent.anthropic_adapter import (
+            AUTH_MODE_OAUTH_SUBSCRIPTION as _ADAPTER_OAUTH_MODE,
+            SOURCE_CREDENTIAL_POOL,
+            SOURCE_EXPLICIT,
+            build_anthropic_client,
+            classify_anthropic_auth_mode,
+            resolve_anthropic_token_with_provenance,
+        )
+    except ImportError:
+        return None, None
+
+    credential = None
+
+    if explicit_api_key:
+        mode = classify_anthropic_auth_mode(explicit_api_key)
+        if mode != _ADAPTER_OAUTH_MODE:
+            _note_route_rejected("anthropic", "metered_auth_mode")
+            return None, None
+        token, source = explicit_api_key, SOURCE_EXPLICIT
+    else:
+        # Prefer the live pool entry so rotation/refresh still applies, but only
+        # when it is genuinely an OAuth entry.
+        pool_present, entry = _select_pool_entry("anthropic")
+        pool_token = _pool_runtime_api_key(entry) if (pool_present and entry is not None) else None
+        if pool_token:
+            structural_oauth = False
+            try:
+                from agent.credential_pool import AUTH_TYPE_OAUTH
+                structural_oauth = getattr(entry, "auth_type", None) == AUTH_TYPE_OAUTH
+            except ImportError:
+                pass
+            if classify_anthropic_auth_mode(pool_token, structural_oauth=structural_oauth) == _ADAPTER_OAUTH_MODE:
+                token, source = pool_token, SOURCE_CREDENTIAL_POOL
+            else:
+                _note_candidate_skipped("anthropic", SOURCE_CREDENTIAL_POOL, "metered_shape")
+                pool_token = None
+        if not pool_token:
+            credential = resolve_anthropic_token_with_provenance(
+                subscription_only=True,
+                on_skip=lambda c: _note_candidate_skipped("anthropic", c.source, "metered_shape"),
+            )
+            if credential is None:
+                _note_route_rejected("anthropic", "metered_auth_mode")
+                return None, None
+            token, source = credential.token, credential.source
+
+    # Endpoint check (§5.3.4): an allowlisted provider name aliased to a metered
+    # host via ``model.base_url`` must not pass. The non-guarded path accepts any
+    # "Anthropic-compatible" host (OpenRouter speaks the Messages protocol);
+    # compaction requires Anthropic's own endpoint.
+    base_url = _ANTHROPIC_DEFAULT_BASE_URL
+    if not base_url_host_matches(base_url, "api.anthropic.com"):  # pragma: no cover - constant
+        _note_route_rejected("anthropic", "endpoint_mismatch")
+        return None, None
+
+    model = _get_aux_model_for_provider("anthropic") or "claude-haiku-4-5-20251001"
+    logger.info(
+        "Compaction route guard: Anthropic subscription route resolved "
+        "(source=%s, auth_mode=%s, model=%s)",
+        source, _ADAPTER_OAUTH_MODE, model,
+    )
+    try:
+        real_client = build_anthropic_client(token, base_url)
+    except ImportError:
+        return None, None
+    return AnthropicAuxiliaryClient(real_client, model, token, base_url, is_oauth=True), model
 
 
 _AUTO_PROVIDER_LABELS = {
@@ -3611,6 +4157,11 @@ def _retry_same_provider_sync(
             f"Auxiliary {task or 'call'}: provider {resolved_provider} could not be rebuilt after recovery"
         )
 
+    # A credential-pool rotation or refresh can hand back a DIFFERENT credential
+    # than the one the route guard admitted (e.g. an OAuth entry rotating to an
+    # API-key entry). Re-assert before the retry request goes out.
+    _assert_compression_route(resolved_provider, retry_client)
+
     retry_base = str(getattr(retry_client, "base_url", "") or "")
     retry_kwargs = _build_call_kwargs(
         resolved_provider,
@@ -3669,6 +4220,10 @@ async def _retry_same_provider_async(
         raise RuntimeError(
             f"Auxiliary {task or 'call'}: provider {resolved_provider} could not be rebuilt after recovery"
         )
+
+    # A pool rotation/refresh can hand back a different credential than the one
+    # the guard admitted (e.g. an OAuth entry rotating to an API-key entry).
+    _assert_compression_route(resolved_provider, retry_client)
 
     retry_base = str(getattr(retry_client, "base_url", "") or "")
     retry_kwargs = _build_call_kwargs(
@@ -3864,6 +4419,10 @@ def _call_fallback_candidate_sync(
             task or "call", fb_label, fb_timeout, effective_timeout,
         )
         effective_timeout = fb_timeout
+    # Backstop: every fallback rung already screens its candidates, so a
+    # disallowed client should never reach here. Assert before issuing the
+    # request anyway — this is the last line before egress.
+    _assert_compression_route(fb_label, fb_client)
     fb_base = str(getattr(fb_client, "base_url", "") or "")
     fb_kwargs = _build_call_kwargs(
         fb_label, fb_model, messages,
@@ -3881,6 +4440,7 @@ def _call_fallback_candidate_sync(
         if fb_provider not in {"auto", "", None} and _refresh_provider_credentials(fb_provider):
             retry_client, retry_model = _get_cached_client(fb_provider, fb_model)
             if retry_client is not None:
+                _assert_compression_route(fb_provider, retry_client)
                 retry_kwargs = _build_call_kwargs(
                     fb_provider, retry_model or fb_model, messages,
                     temperature=temperature, max_tokens=max_tokens,
@@ -3930,6 +4490,8 @@ async def _call_fallback_candidate_async(
             task or "call", fb_label, fb_timeout, effective_timeout,
         )
         effective_timeout = fb_timeout
+    # Backstop before egress — see the sync twin.
+    _assert_compression_route(fb_label, fb_client)
     fb_base = str(getattr(fb_client, "base_url", "") or "")
     fb_kwargs = _build_call_kwargs(
         fb_label, fb_model, messages,
@@ -3948,6 +4510,7 @@ async def _call_fallback_candidate_async(
             retry_client, retry_model = _get_cached_client(
                 fb_provider, fb_model, async_mode=True)
             if retry_client is not None:
+                _assert_compression_route(fb_provider, retry_client)
                 retry_kwargs = _build_call_kwargs(
                     fb_provider, retry_model or fb_model, messages,
                     temperature=temperature, max_tokens=max_tokens,
@@ -4007,6 +4570,12 @@ def _try_payment_fallback(
             continue
         client, model = try_fn()
         if client is not None:
+            # Subscription-only route screen for compaction — sits beside the
+            # unhealthy screen above so a refused candidate is SKIPPED and the
+            # chain continues, rather than aborting the whole task.
+            if not _compression_client_allowed(label, client):
+                tried.append(f"{label} (not a subscription route)")
+                continue
             logger.info(
                 "Auxiliary %s: %s on %s — falling back to %s (%s)",
                 task or "call", reason, failed_provider, label, model or "default",
@@ -4063,6 +4632,11 @@ def _try_main_agent_model_fallback(
         return None, None, ""
 
     label = f"main-agent({main_provider})"
+    # The main agent model is NOT a privileged rung for compaction: it only
+    # serves a compaction summary if it independently matches an allowed
+    # subscription route (spec §5.3).
+    if not _compression_client_allowed(label, client):
+        return None, None, ""
     logger.info(
         "Auxiliary %s: %s on %s — falling back to main agent model %s (%s)",
         task or "call", reason, failed_provider, label, resolved_model or main_model,
@@ -4208,6 +4782,11 @@ def _try_configured_fallback_chain(
                     )
                     tried.append(f"{label} (context too small: {fb_ctx}<{min_ctx})")
                     continue
+            # A metered provider configured in auxiliary.compression.fallback_chain
+            # does not become allowlisted by being configured (spec §5.4).
+            if not _compression_client_allowed(label, fb_client):
+                tried.append(f"{label} (not a subscription route)")
+                continue
             logger.info(
                 "Auxiliary %s: %s on %s — configured fallback to %s (%s)",
                 task, reason, failed_provider, label, resolved_model or fb_model or "default",
@@ -4341,6 +4920,9 @@ def _try_main_fallback_chain(
                     )
                     tried.append(f"{label} (context too small: {fb_ctx}<{min_ctx})")
                     continue
+            if not _compression_client_allowed(label, fb_client):
+                tried.append(f"{label} (not a subscription route)")
+                continue
             logger.info(
                 "Auxiliary %s: %s on %s — main fallback chain to %s (%s)",
                 task or "call", reason, failed_provider or "auto", label,
@@ -4523,6 +5105,11 @@ def _resolve_auto(
                 explicit_api_key=explicit_api_key,
                 api_mode=runtime_api_mode or None,
             )
+            if client is not None and not _compression_client_allowed(resolved_provider, client):
+                # The user's main provider is not a subscription route for
+                # compaction — skip Step 1 and keep walking. The main agent
+                # model is NOT a privileged rung here (spec §5.3).
+                client = None
             if client is not None:
                 logger.info("Auxiliary auto-detect: using main provider %s (%s)",
                             main_provider, resolved or main_model)
@@ -4552,6 +5139,11 @@ def _resolve_auto(
             continue
         client, model = try_fn()
         if client is not None:
+            # Subscription-only route screen for compaction — skip and continue,
+            # beside the unhealthy screen above.
+            if not _compression_client_allowed(label, client):
+                tried.append(f"{label} (not a subscription route)")
+                continue
             if tried:
                 logger.info("Auxiliary auto-detect: using %s (%s) — skipped: %s",
                             label, model or "default", ", ".join(tried))
@@ -6959,7 +7551,36 @@ def call_llm(
 
     Raises:
         RuntimeError: If no provider is configured.
+        CompressionRoutingRejected: If ``task == "compression"`` and no allowed
+            subscription route is available. Fails CLOSED — the caller must not
+            retry the summary elsewhere.
     """
+    # Compaction content is business-sensitive: activate the subscription-only
+    # route guard for the whole call so every rung (primary resolution, the auto
+    # discovery chain, the task fallback_chain, the top-level fallback_providers,
+    # the main-agent safety net) is screened, and re-enter the real body with it
+    # active. No other auxiliary task's routing behaviour changes.
+    if task == _COMPRESSION_TASK and not _compression_guard_active():
+        with compression_route_guard():
+            return call_llm(
+                task=task,
+                provider=provider,
+                model=model,
+                base_url=base_url,
+                api_key=api_key,
+                main_runtime=main_runtime,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                timeout=timeout,
+                extra_body=extra_body,
+                reasoning_config=reasoning_config,
+                api_mode=api_mode,
+                stream=stream,
+                stream_options=stream_options,
+            )
+
     # Capture one immutable runtime snapshot for keying, resolution, retries,
     # and fallbacks. Reading ambient state independently in each phase lets a
     # concurrent /model switch produce a key for one runtime and a client for
@@ -7007,6 +7628,13 @@ def call_llm(
             api_mode=resolved_api_mode,
             main_runtime=main_runtime,
         )
+        # Screen the explicitly-configured primary provider for compaction. A
+        # metered provider does not become allowlisted by being named in
+        # auxiliary.compression.provider — drop it and let the allowed fallback
+        # rungs below try instead (skip, don't abort: an allowed route may still
+        # exist further down).
+        if client is not None and not _compression_client_allowed(resolved_provider, client):
+            client = None
         if client is None:
             # When the user explicitly chose a non-OpenRouter provider but no
             # credentials were found, honor the task fallback_chain before
@@ -7021,6 +7649,9 @@ def call_llm(
                 if fb_client is not None:
                     client, final_model = fb_client, fb_model
                     resolved_provider = fb_label or resolved_provider
+                elif _compression_guard_active():
+                    # Fail CLOSED, not with the generic "no API key" error.
+                    raise _compression_routing_exhausted()
                 else:
                     raise RuntimeError(
                         f"Provider '{_explicit}' is set in config.yaml but no API key "
@@ -7037,9 +7668,17 @@ def call_llm(
                             task or "call", resolved_provider)
                 client, final_model = _get_cached_client("auto", main_runtime=main_runtime, task=task)
         if client is None:
+            if _compression_guard_active():
+                raise _compression_routing_exhausted()
             raise RuntimeError(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
+
+    # Final gate before any compaction request leaves the process. Backstop for
+    # the per-rung screens above: catches cached clients and any candidate path
+    # that did not pass through a screen (e.g. an allowlisted provider name
+    # aliased to a metered endpoint via base_url/api_key).
+    _assert_compression_route(resolved_provider, client)
 
     effective_timeout = _effective_aux_timeout(task, timeout)
 
@@ -7592,7 +8231,36 @@ async def async_call_llm(
     """Centralized asynchronous LLM call.
 
     Same as call_llm() but async. See call_llm() for full documentation.
+
+    This includes the subscription-only compaction route guard: ``task ==
+    "compression"`` is screened here exactly as it is in ``call_llm``. The guard
+    state is a ContextVar, so it is TASK-local: it is held across this coroutine's
+    ``await`` points and covers resolution, every fallback rung, and request
+    issuance, while a concurrent non-compression auxiliary call on the same
+    event-loop thread never observes it. (A thread-local would be wrong here —
+    every coroutine on a loop shares one thread, so it would leak the guard into
+    unrelated async aux calls and fail them as compaction routing rejections.)
     """
+    # Mirror call_llm(): activate the guard and re-enter with it active, so every
+    # rung and the final pre-egress assert below are screened.
+    if task == _COMPRESSION_TASK and not _compression_guard_active():
+        with compression_route_guard():
+            return await async_call_llm(
+                task=task,
+                provider=provider,
+                model=model,
+                base_url=base_url,
+                api_key=api_key,
+                main_runtime=main_runtime,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                timeout=timeout,
+                extra_body=extra_body,
+                reasoning_config=reasoning_config,
+            )
+
     # Keep every async phase on the same runtime identity, even if another
     # session switches models while this task is awaiting network I/O.
     main_runtime = _normalize_main_runtime(main_runtime)
@@ -7637,6 +8305,11 @@ async def async_call_llm(
             api_mode=resolved_api_mode,
             main_runtime=main_runtime,
         )
+        # Screen the explicitly-configured primary provider for compaction: a
+        # metered provider is not allowlisted just because it is configured.
+        # Skip (don't abort) — an allowed route may still exist further down.
+        if client is not None and not _compression_client_allowed(resolved_provider, client):
+            client = None
         if client is None:
             _explicit = (resolved_provider or "").strip().lower()
             if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
@@ -7648,6 +8321,8 @@ async def async_call_llm(
                         fb_client, fb_model or "", is_vision=(task == "vision")
                     )
                     resolved_provider = fb_label or resolved_provider
+                elif _compression_guard_active():
+                    raise _compression_routing_exhausted()
                 else:
                     raise RuntimeError(
                         f"Provider '{_explicit}' is set in config.yaml but no API key "
@@ -7659,9 +8334,15 @@ async def async_call_llm(
                             task or "call", resolved_provider)
                 client, final_model = _get_cached_client("auto", async_mode=True, main_runtime=main_runtime, task=task)
         if client is None:
+            if _compression_guard_active():
+                raise _compression_routing_exhausted()
             raise RuntimeError(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
+
+    # Final gate before any compaction request leaves the process (async mirror
+    # of the assert in call_llm).
+    _assert_compression_route(resolved_provider, client)
 
     effective_timeout = _effective_aux_timeout(task, timeout)
 

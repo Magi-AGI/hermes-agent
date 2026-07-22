@@ -25,7 +25,7 @@ from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
 
-from agent.auxiliary_client import call_llm, async_call_llm
+from agent.auxiliary_client import CodexAuxiliaryClient, call_llm, async_call_llm
 
 # The committed bounded floor for config-derived compression timeouts.
 # Behaviour contract (see AGENTS.md "Behavior contracts over snapshots"):
@@ -42,18 +42,33 @@ def _ok_response():
     return {"ok": True}
 
 
-def _client_sync():
-    client = MagicMock()
-    client.base_url = "https://api.openai.com/v1"
-    client.chat.completions.create.return_value = _ok_response()
+# These tests declare provider="openai-codex", so the client they hand back must
+# actually BE a Codex-routed client. The compaction route guard
+# (agent/auxiliary_client.py) screens the CONSTRUCTED client, not the provider
+# label — a bare MagicMock on api.openai.com is the metered OpenAI API route no
+# matter what the label says, and is correctly refused. So build a real
+# ``CodexAuxiliaryClient`` on the ChatGPT OAuth endpoint (the allowlisted
+# subscription route) and stub only its ``chat`` shim so the timeout that reaches
+# the wire stays observable.
+CODEX_OAUTH_BASE_URL = "https://chatgpt.com/backend-api/codex"
+
+
+def _codex_client(create_mock):
+    inner = MagicMock()
+    inner.api_key = "codex-oauth-token"
+    inner.base_url = CODEX_OAUTH_BASE_URL
+    client = CodexAuxiliaryClient(inner, "gpt-5.5")
+    client.chat = MagicMock()
+    client.chat.completions.create = create_mock
     return client
+
+
+def _client_sync():
+    return _codex_client(MagicMock(return_value=_ok_response()))
 
 
 def _client_async():
-    client = MagicMock()
-    client.base_url = "https://api.openai.com/v1"
-    client.chat.completions.create = AsyncMock(return_value=_ok_response())
-    return client
+    return _codex_client(AsyncMock(return_value=_ok_response()))
 
 
 def _patches(client, *, task_timeout):

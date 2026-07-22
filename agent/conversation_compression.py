@@ -33,6 +33,7 @@ import inspect
 import logging
 import os
 import tempfile
+import time
 import uuid
 import threading
 from datetime import datetime
@@ -310,6 +311,343 @@ class _CompressionLockLeaseRefresher:
                 break
 
 
+class _CompactionSlotLeaseRefresher:
+    """Keeps a held compaction slot's lease alive while compaction is running.
+
+    Mirrors :class:`_CompressionLockLeaseRefresher` (the per-session lock's
+    refresher) deliberately, including its bounded give-up window — but drives
+    ``refresh_compaction_slot`` on the ROOT-scoped coordinator instead.
+
+    Why this exists: a compaction summary of a 200K-token window can legitimately
+    run for minutes (the auxiliary timeout floor alone is 300s). Without a
+    refresher, a compaction that outlives ``slot_ttl_seconds`` would have its slot
+    TTL-reclaimed *while it is still running*, and a second session would be
+    admitted — silently breaking the bound in exactly the long-summarisation case
+    the queue exists to protect.
+
+    The give-up window is bounded by <= ONE TTL (``ttl / interval`` consecutive
+    failures), so a wedged refresher can never hold a slot past its TTL: the whole
+    point of TTL reclaim is that a dead holder self-heals.
+
+    Distinguishes the coordinator's typed outcomes:
+      * ACQUIRED          — refreshed; reset the failure counter.
+      * COORDINATOR_ERROR — transient DB blip; TOLERATE (bounded), do not conclude
+                            we lost the slot.
+      * DENIED            — we genuinely no longer hold it (reclaimed/released).
+                            Stop immediately; there is nothing left to refresh.
+    """
+
+    def __init__(
+        self,
+        slot_id: str,
+        holder: str,
+        ttl_seconds: float,
+        refresh_interval_seconds: Optional[float] = None,
+    ) -> None:
+        self._slot_id = slot_id
+        self._holder = holder
+        self._ttl_seconds = ttl_seconds
+        if refresh_interval_seconds is None:
+            refresh_interval_seconds = max(1.0, min(60.0, ttl_seconds / 2.0))
+        self._refresh_interval_seconds = max(0.1, float(refresh_interval_seconds))
+        self._max_consecutive_failures = max(
+            1, int(self._ttl_seconds / self._refresh_interval_seconds)
+        )
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="compaction-slot-refresh",
+            daemon=True,
+        )
+
+    def start(self) -> "_CompactionSlotLeaseRefresher":
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive() and threading.current_thread() is not self._thread:
+            self._thread.join(timeout=1.0)
+
+    def _run(self) -> None:
+        from agent.compaction_coordinator import SlotOutcome, refresh_compaction_slot
+
+        consecutive_failures = 0
+        while not self._stop.wait(self._refresh_interval_seconds):
+            try:
+                res = refresh_compaction_slot(
+                    self._slot_id, self._holder, ttl_seconds=self._ttl_seconds,
+                )
+                outcome = res.outcome
+            except Exception as exc:  # incl. AttributeError from module skew
+                logger.debug("compaction slot refresh raised: %s", exc)
+                outcome = SlotOutcome.COORDINATOR_ERROR
+
+            if outcome is SlotOutcome.ACQUIRED:
+                consecutive_failures = 0
+                continue
+            if outcome is SlotOutcome.DENIED:
+                # We lost the lease (TTL-reclaimed, or released elsewhere). There
+                # is nothing to refresh; stop rather than churn the coordinator.
+                logger.debug(
+                    "compaction slot %s no longer held — stopping refresher",
+                    self._slot_id,
+                )
+                break
+            # COORDINATOR_ERROR: transient. Tolerate, bounded by one TTL.
+            consecutive_failures += 1
+            if consecutive_failures >= self._max_consecutive_failures:
+                logger.debug(
+                    "compaction slot refresh failed %d times in a row; stopping "
+                    "refresher for slot %s (lease will expire by TTL)",
+                    consecutive_failures, self._slot_id,
+                )
+                break
+
+
+# Hard-wall fraction of the model's context window (§4.4.3).
+#
+# MUST stay well above ``compression.threshold`` (default 0.50). The two
+# quantities are deliberately DISTINCT: reusing the threshold as the bypass
+# trigger would make EVERY compaction bypass the queue, silently voiding the
+# feature. Threshold-triggered compaction stays QUEUED; only genuine fit-failure
+# pressure bypasses.
+#
+# The pressure estimate is ``approx_tokens`` — the caller-provided pre-API request
+# estimate that ``conversation_loop`` passes into ``compress_context`` (the same
+# value logged as ``tokens=~N`` at compaction start). It is compared against
+# ``agent.context_compressor.context_length`` (the resolved model context window).
+# 0.92 is conservative: at that point the next request genuinely may not fit once
+# reserved output room is subtracted, so waiting for a slot risks overflowing the
+# window — worse than running one extra concurrent compaction.
+_COMPACTION_HARD_WALL_FRACTION = 0.92
+
+
+def _at_compaction_hard_wall(agent: Any, approx_tokens: Optional[int]) -> bool:
+    """True when request pressure is so high that queueing risks not fitting.
+
+    Fail-open reason ``hardwall``. Deliberately conservative and deliberately not
+    the compaction threshold — see ``_COMPACTION_HARD_WALL_FRACTION``.
+    """
+    if not approx_tokens:
+        return False
+    try:
+        ctx = int(getattr(agent.context_compressor, "context_length", 0) or 0)
+        if ctx <= 0:
+            return False
+        return int(approx_tokens) >= int(ctx * _COMPACTION_HARD_WALL_FRACTION)
+    except Exception:
+        return False
+
+
+class _CompactionAdmission:
+    """Outcome of asking the queue for permission to compact.
+
+    ``proceed`` False is the ONLY case that defers; every other case compacts
+    (either holding a slot, or bypassing the queue entirely — fail-open).
+    """
+
+    __slots__ = ("proceed", "slot", "bypass_reason")
+
+    def __init__(self, proceed: bool, slot: Any = None, bypass_reason: Optional[str] = None):
+        self.proceed = proceed
+        self.slot = slot                    # SlotResult when a slot is held
+        self.bypass_reason = bypass_reason  # disabled|hardwall|waitcap|coordinator_error
+
+
+def _pending_map(agent: Any) -> dict:
+    m = getattr(agent, "_compaction_queue_first_pending_at_by_session", None)
+    if not isinstance(m, dict):
+        m = {}
+        agent._compaction_queue_first_pending_at_by_session = m
+    return m
+
+
+def _clear_pending(agent: Any, sid: str) -> None:
+    """Reset pending state — on acquisition, on any bypass, or when disabled."""
+    _pending_map(agent).pop(sid, None)
+    notified = getattr(agent, "_compaction_queue_notified_sids", None)
+    if isinstance(notified, set):
+        notified.discard(sid)
+
+
+def _admit_to_compaction_queue(
+    agent: Any, sid: str, approx_tokens: Optional[int],
+) -> _CompactionAdmission:
+    """Ask the root-scoped queue whether this session may compact right now.
+
+    NEVER blocks. Returns immediately with one of:
+
+      proceed=True,  slot=<SlotResult>            — ACQUIRED; caller must release.
+      proceed=True,  bypass_reason='disabled'     — queue off; coordinator NOT called.
+      proceed=True,  bypass_reason='hardwall'     — fit-failure pressure (§4.4.3).
+      proceed=True,  bypass_reason='waitcap'      — pending past max_wait_seconds.
+      proceed=True,  bypass_reason='coordinator_error' — queue unusable; FAIL OPEN.
+      proceed=False                                — DENIED; defer this cycle, no side effects.
+    """
+    if not bool(getattr(agent, "compaction_queue_enabled", False)):
+        # Default path. The coordinator is never even imported, so a disabled
+        # queue cannot touch the DB, the turn, or compaction behaviour.
+        #
+        # NO METRICS HERE, deliberately: a disabled queue did not run, and a
+        # counter suggesting otherwise is a signal an operator could act on. The
+        # queue's metrics must only ever describe a queue that actually ran.
+        _clear_pending(agent, sid)
+        return _CompactionAdmission(True, bypass_reason="disabled")
+
+    from agent import compaction_metrics as _cm
+
+    _source = str(getattr(agent, "platform", "") or "unknown")
+    now = time.time()
+
+    # Hard wall: compacting late is better than not fitting at all.
+    if _at_compaction_hard_wall(agent, approx_tokens):
+        logger.info(
+            "compaction queue: bypassing (hardwall) — approx_tokens=%s is at/above "
+            "%.0f%% of context_length=%s; compacting unbounded to avoid overflow",
+            approx_tokens, _COMPACTION_HARD_WALL_FRACTION * 100,
+            getattr(agent.context_compressor, "context_length", None),
+        )
+        _cm.record_queue_failopen(_cm.REASON_HARDWALL)
+        _clear_pending(agent, sid)
+        return _CompactionAdmission(True, bypass_reason="hardwall")
+
+    # Wait cap: progress insurance, NOT a latency guarantee. A session that has
+    # been deferred for this long stops waiting on the next natural re-check.
+    try:
+        max_wait = float(getattr(agent, "compaction_queue_max_wait_seconds", 300.0) or 0.0)
+    except (TypeError, ValueError):
+        max_wait = 300.0
+    pending_at = _pending_map(agent).get(sid)
+    if pending_at is not None and max_wait > 0 and (now - pending_at) >= max_wait:
+        _waited = now - pending_at
+        logger.warning(
+            "compaction queue: bypassing (waitcap) — session=%s pending %.0fs >= "
+            "max_wait_seconds=%.0f; compacting unbounded so the session makes progress",
+            sid, _waited, max_wait,
+        )
+        # Record the ACTUAL wait before clearing it — this is the number that
+        # tells an operator whether max_wait is doing real work.
+        _cm.record_queue_wait_seconds(_waited, _source)
+        _cm.record_queue_failopen(_cm.REASON_WAITCAP)
+        _clear_pending(agent, sid)
+        return _CompactionAdmission(True, bypass_reason="waitcap")
+
+    try:
+        from agent.compaction_coordinator import (
+            SlotOutcome,
+            try_acquire_compaction_slot,
+        )
+
+        result = try_acquire_compaction_slot(
+            session_id=sid,
+            max_concurrent=getattr(agent, "compaction_queue_max_concurrent", 1),
+            ttl_seconds=getattr(agent, "compaction_slot_ttl_seconds", 300.0),
+            profile=_active_profile_label(),
+            source=str(getattr(agent, "platform", "") or ""),
+        )
+        outcome = result.outcome
+    except Exception as exc:
+        # Includes AttributeError / ImportError from module-version skew — the
+        # historical no-progress-spin shape (see the per-session lock's identical
+        # guard above). A broken coordinator must NEVER freeze compaction.
+        logger.warning(
+            "compaction queue unavailable (%s: %s) — failing OPEN and compacting "
+            "unbounded. The bound is not in effect.",
+            type(exc).__name__, exc,
+        )
+        # ALERTABLE: the queue is silently not queueing. From the outside this is
+        # indistinguishable from a healthy idle queue, so the counter is the only
+        # way an operator ever finds out.
+        _cm.record_queue_failopen(_cm.REASON_COORDINATOR_ERROR)
+        _clear_pending(agent, sid)
+        return _CompactionAdmission(True, bypass_reason="coordinator_error")
+
+    if outcome is SlotOutcome.ACQUIRED:
+        # Gauges come from the committed transaction, not a polling read.
+        _cm.record_queue_slot_load(result.slots_in_use, result.max_concurrent)
+        _cm.record_queue_reclaimed_expired(result.reclaimed_expired)
+        # How long this session waited before getting in (0.0 if it never queued).
+        _waited_before_acquire = (now - pending_at) if pending_at is not None else 0.0
+        _cm.record_queue_wait_seconds(_waited_before_acquire, _source)
+        _clear_pending(agent, sid)
+        return _CompactionAdmission(True, slot=result)
+
+    if outcome is SlotOutcome.COORDINATOR_ERROR:
+        _cm.record_queue_failopen(_cm.REASON_COORDINATOR_ERROR)
+        _clear_pending(agent, sid)
+        return _CompactionAdmission(True, bypass_reason="coordinator_error")
+
+    # ── DENIED: the queue is genuinely full. Defer with ZERO side effects. ──
+    #
+    # Metrics are the ONE exception to "zero side effects": they are in-process,
+    # invisible to the user, and touch neither the messages nor the session. A
+    # DENIED that recorded nothing would make the feature unobservable exactly
+    # when it is doing its job.
+    pending = _pending_map(agent)
+    if sid not in pending:
+        pending[sid] = now  # first denial — start the wait-cap clock, stay silent
+    _pending_for = now - pending[sid]
+
+    # DENIED is a SUCCESSFUL observation that the queue is full — never conflated
+    # with a coordinator error (which is a fail-open bypass). Keeping them distinct
+    # is what stops a broken queue from hiding behind "looks busy".
+    _cm.record_queue_denied(_source)
+    _cm.record_queue_slot_load(result.slots_in_use, result.max_concurrent)
+    _cm.record_queue_reclaimed_expired(result.reclaimed_expired)
+    _cm.record_queue_wait_seconds(_pending_for, _source)
+
+    _maybe_notify_queued(agent, sid, _pending_for)
+    return _CompactionAdmission(False)
+
+
+def _maybe_notify_queued(agent: Any, sid: str, pending_for: float) -> None:
+    """Emit ONE deduplicated queued notice, only after notify_after_seconds.
+
+    The first denial is silent: a session that waits 200ms for a slot should not
+    tell the user anything at all.
+
+    CRITICAL: this notice must NOT contain ``COMPACTION_STATUS_MARKER``. The
+    gateway matches that marker to tag a status as ``kind="compacting"``
+    (``tui_gateway/server.py::_status_update``), so including it would show
+    "Summarizing…" for a session that is merely *waiting* and has not compacted
+    anything.
+    """
+    try:
+        notify_after = float(
+            getattr(agent, "compaction_queue_notify_after_seconds", 60.0) or 0.0
+        )
+    except (TypeError, ValueError):
+        notify_after = 60.0
+    if notify_after <= 0 or pending_for < notify_after:
+        return
+
+    notified = getattr(agent, "_compaction_queue_notified_sids", None)
+    if not isinstance(notified, set):
+        notified = set()
+        agent._compaction_queue_notified_sids = notified
+    if sid in notified:
+        return
+    notified.add(sid)
+    try:
+        agent._emit_status(
+            "⏳ Context compaction is queued behind another session; "
+            "continuing this turn and will retry shortly."
+        )
+    except Exception:
+        pass
+
+
+def _active_profile_label() -> str:
+    """Diagnostics only — which profile holds the slot. NEVER a scheduling input."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        return Path(get_hermes_home()).name
+    except Exception:
+        return ""
+
+
 def check_compression_model_feasibility(agent: Any) -> None:
     """Warn at session start if the auxiliary compression model's context
     window is smaller than the main model's compression threshold.
@@ -326,6 +664,58 @@ def check_compression_model_feasibility(agent: Any) -> None:
     """
     if not agent.compression_enabled:
         return
+
+    # Subscription-only ROUTE validation (spec §5.3). Runs BEFORE the context-window
+    # feasibility probe below: a metered compaction route is a privacy problem, and
+    # the user should hear about it when the session starts rather than discovering
+    # it hours in when the first compaction fails closed. Network-free — it reads
+    # config only (see validate_configured_compression_routes).
+    #
+    # A malformed/empty allowed_routes raises CompressionRoutingRejected: that is a
+    # configuration ERROR, never an opt-out (§5.4), so it is surfaced loudly rather
+    # than swallowed by the broad handler below.
+    try:
+        from agent.auxiliary_client import (
+            CompressionRoutingRejected,
+            validate_configured_compression_routes,
+        )
+        _route_problems = validate_configured_compression_routes()
+    except CompressionRoutingRejected as exc:
+        msg = f"⚠ Compaction route configuration error: {exc}"
+        agent._compression_warning = msg
+        agent._emit_status(msg)
+        logger.error("Compaction route configuration is invalid: %s", exc)
+        # Return: the allowlist itself is unusable, so no compaction route can be
+        # validated or used. Falling through would overwrite this with the generic
+        # "no auxiliary provider" text and hide the actual cause.
+        return
+    except Exception as exc:  # pragma: no cover - defensive; never block startup
+        logger.debug("Compaction route validation skipped: %s", exc)
+        _route_problems = []
+
+    if _route_problems:
+        msg = (
+            "⚠ Compaction is restricted to subscription routes (ChatGPT Codex OAuth "
+            "or Anthropic Claude Max / Claude Code OAuth), but the configured "
+            "compression route(s) are not allowed:\n  - "
+            + "\n  - ".join(_route_problems)
+            + "\nCompaction will fail closed — the conversation is preserved "
+            "unchanged and no summary is sent to a metered provider. Fix "
+            "auxiliary.compression in config.yaml, or authenticate a subscription "
+            "route (`hermes auth codex` or `claude setup-token`)."
+        )
+        agent._compression_warning = msg
+        agent._emit_status(msg)
+        for _problem in _route_problems:
+            logger.warning("Compaction route not allowlisted — %s", _problem)
+        # Return before the context-window feasibility probe below. Two reasons:
+        #   1. That probe's failure text ("compression will drop middle turns
+        #      without a summary") is now FALSE for a routing problem — the guard
+        #      fails CLOSED and preserves every message — so letting it overwrite
+        #      _compression_warning would tell the user the opposite of the truth.
+        #   2. Sizing an auxiliary model we are never allowed to call is moot.
+        return
+
     try:
         from agent.auxiliary_client import (
             _resolve_task_provider_model,
@@ -810,7 +1200,11 @@ def compress_context(
         f"{approx_tokens:,}" if approx_tokens else "unknown", agent.model,
         focus_topic,
     )
-    agent._emit_status(COMPACTION_STATUS)
+    # NOTE: COMPACTION_STATUS is deliberately NOT emitted here any more. It now
+    # fires only once compaction is genuinely about to run — i.e. after the queue
+    # admits us (or is bypassed/disabled). Emitting it before admission would
+    # announce "Compacting context" to a session that is merely DENIED a slot and
+    # will do nothing this cycle, on every re-check. See the admission block below.
 
     # ── Compression lock ────────────────────────────────────────────────
     # Atomic, state.db-backed lock per session_id.  Without this, two
@@ -950,13 +1344,38 @@ def compress_context(
                 _existing_sp = agent._build_system_prompt(system_message)
             return messages, _existing_sp
     _lock_released = False
+    # Slot state lives in a mutable cell so ``_release_lock`` (defined before the
+    # slot is acquired, because the DENIED path needs it) can still see it.
+    _slot: dict = {"result": None, "refresher": None}
 
     def _release_lock() -> None:
-        """Release the lock keyed on the OLD session_id (before rotation)."""
+        """Release the compaction slot, then the lock keyed on the OLD session_id.
+
+        The slot nests INSIDE the per-session lock (compaction-queue spec §4.5),
+        so it is released first. Called on every exit path — normal return,
+        compress() raising, the routing-rejection abort, and the outer
+        ``finally`` — so a slot cannot leak past a compaction, however it ends.
+        """
         nonlocal _lock_released
         if _lock_released:
             return
         _lock_released = True
+        _slot_refresher = _slot.get("refresher")
+        if _slot_refresher is not None:
+            try:
+                _slot_refresher.stop()
+            except Exception as _slot_stop_err:
+                logger.debug("compaction slot refresher stop failed: %s", _slot_stop_err)
+        _slot_result = _slot.get("result")
+        if _slot_result is not None:
+            try:
+                from agent.compaction_coordinator import release_compaction_slot
+
+                release_compaction_slot(_slot_result.slot_id, _slot_result.holder)
+            except Exception as _slot_err:
+                # Idempotent + TTL-reclaimed: a failed release self-heals within
+                # one TTL, so this must never propagate.
+                logger.debug("compaction slot release failed: %s", _slot_err)
         if _lock_refresher is not None:
             try:
                 _lock_refresher.stop()
@@ -1031,6 +1450,61 @@ def compress_context(
             )
             _lock_refresher.start()
 
+        # ── Cross-session compaction queue (root-scoped leased semaphore) ────
+        #
+        # Admission sits AFTER the per-session lock (so the two nest correctly) and
+        # BEFORE the first pre-compaction side effect, which is
+        # ``memory_manager.on_pre_compress`` — NOT ``context_compressor.compress``.
+        # A DENIED session must be a TRUE no-op: on_pre_compress tells an external
+        # memory provider "context is about to be discarded", so calling it and then
+        # not compacting would be a real side effect on a session that did nothing.
+        #
+        # This NEVER blocks the turn/tool loop. DENIED simply returns the messages
+        # unchanged for this cycle; the next natural re-check retries. That is the
+        # no-throttle guarantee — the queue bounds compaction, not normal work.
+        _admission = _admit_to_compaction_queue(agent, _lock_sid, approx_tokens)
+
+        # Publish the admission decision so CALLERS can tell a real compaction from a
+        # deferred no-op. This is what keeps the "DENIED is user-silent" contract from
+        # being a lie: several call sites in conversation_loop.py used to announce
+        # "Compacting…" BEFORE invoking us, which would narrate a compaction that never
+        # happened (and repeat it on every retry). They now stay quiet and let
+        # compress_context emit the one truthful COMPACTION_STATUS after admission.
+        agent._last_compaction_deferred = not _admission.proceed
+
+        if not _admission.proceed:
+            # DENIED — the queue is full. Zero side effects: no status emit (the first
+            # denial is silent), no on_pre_compress, no compress(), no rotation, no
+            # archive. Reuse the lock-contended unchanged-return shape exactly.
+            logger.info(
+                "compaction deferred: queue full (session=%s) — returning messages "
+                "unchanged; will retry on the next re-check",
+                _lock_sid or "none",
+            )
+            _release_lock()
+            _existing_sp = getattr(agent, "_cached_system_prompt", None)
+            if not _existing_sp:
+                _existing_sp = agent._build_system_prompt(system_message)
+            return messages, _existing_sp
+
+        if _admission.slot is not None:
+            _slot["result"] = _admission.slot
+            try:
+                _slot["refresher"] = _CompactionSlotLeaseRefresher(
+                    _admission.slot.slot_id,
+                    _admission.slot.holder,
+                    float(getattr(agent, "compaction_slot_ttl_seconds", 300.0) or 300.0),
+                    getattr(agent, "_compaction_slot_refresh_interval", None),
+                ).start()
+            except Exception as _ref_err:
+                # A refresher we cannot start is not a reason to abandon compaction —
+                # the slot is held and will expire by TTL at worst.
+                logger.debug("compaction slot refresher failed to start: %s", _ref_err)
+
+        # Compaction is genuinely about to run (we hold a slot, or the queue is
+        # disabled/bypassed). NOW announce it.
+        agent._emit_status(COMPACTION_STATUS)
+
         # Notify external memory provider before compression discards context.
         # The provider's on_pre_compress() may return a string of insights it
         # wants surfaced inside the compression summary; capture and forward it
@@ -1097,14 +1571,26 @@ def compress_context(
         # the no-op via len(returned) == len(input).
         if getattr(agent.context_compressor, "_last_compress_aborted", False):
             try:
-                _err = getattr(agent.context_compressor, "_last_summary_error", None) or "unknown error"
-                if getattr(agent, "_last_compression_summary_warning", None) != _err:
-                    agent._last_compression_summary_warning = _err
-                    agent._emit_warning(
-                        f"⚠ Compression aborted: {_err}. "
-                        "No messages were dropped — conversation continues unchanged. "
-                        "Run /compress to retry, or /new to start a fresh session."
-                    )
+                # A routing refusal carries its own cause+remedy on a dedicated field:
+                # it is deliberately NOT recorded in _last_summary_error (that would
+                # arm the generic summary-failure cooldown), so without this the user
+                # would see a bare "unknown error" for a privacy abort.
+                _routing_msg = getattr(
+                    agent.context_compressor, "_last_summary_routing_message", None,
+                )
+                if _routing_msg:
+                    if getattr(agent, "_last_compression_summary_warning", None) != _routing_msg:
+                        agent._last_compression_summary_warning = _routing_msg
+                        agent._emit_warning(f"⚠ {_routing_msg}")
+                else:
+                    _err = getattr(agent.context_compressor, "_last_summary_error", None) or "unknown error"
+                    if getattr(agent, "_last_compression_summary_warning", None) != _err:
+                        agent._last_compression_summary_warning = _err
+                        agent._emit_warning(
+                            f"⚠ Compression aborted: {_err}. "
+                            "No messages were dropped — conversation continues unchanged. "
+                            "Run /compress to retry, or /new to start a fresh session."
+                        )
                 _existing_sp = getattr(agent, "_cached_system_prompt", None)
                 if not _existing_sp:
                     _existing_sp = agent._build_system_prompt(system_message)
