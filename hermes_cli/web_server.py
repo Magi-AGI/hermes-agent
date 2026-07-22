@@ -170,6 +170,18 @@ def _warm_gateway_module() -> None:
         pass
 
 
+def _warm_local_stt_model() -> None:
+    """Pre-load the local faster-whisper model in a worker thread so the first
+    voice dictation doesn't pay the 20-60s cold model load. No-op (never raises)
+    when local STT isn't the active provider or faster-whisper isn't installed."""
+    try:
+        from tools.transcription_tools import warm_local_model
+
+        warm_local_model()
+    except Exception:
+        pass
+
+
 def _resolve_restart_drain_timeout() -> float:
     try:
         from hermes_cli.gateway import _get_restart_drain_timeout
@@ -197,6 +209,11 @@ async def _lifespan(app: "FastAPI"):
     # Running in an executor means the cost is paid in a worker thread while
     # the server socket is already open and accepting probes.
     asyncio.get_event_loop().run_in_executor(None, _warm_gateway_module)
+
+    # Pre-warm the local STT model (faster-whisper) in a worker thread so the
+    # first voice dictation doesn't pay the 20-60s cold model load into VRAM.
+    # No-op when local STT isn't the active provider; never blocks/fails startup.
+    asyncio.get_event_loop().run_in_executor(None, _warm_local_stt_model)
 
     # Desktop-spawned backends (HERMES_DESKTOP=1) fire cron jobs themselves,
     # since the app has no gateway running the scheduler. Server `hermes

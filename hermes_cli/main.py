@@ -13178,7 +13178,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "acp", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
-        "dump", "fallback", "gateway", "hooks", "import", "insights",
+        "dump", "fallback", "gateway", "handoff", "hooks", "import", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
         "model", "pairing", "pets", "plugins", "portal", "postinstall", "profile",
@@ -14017,6 +14017,20 @@ def main():
     )
     from hermes_cli.checkpoints import register_cli as _register_checkpoints_cli
     _register_checkpoints_cli(checkpoints_parser)
+
+    # =========================================================================
+    # handoff command — triad relay pipe, lean-artifact lint, decision gates
+    # =========================================================================
+    handoff_parser = subparsers.add_parser(
+        "handoff",
+        help="Capture agent responses to files and relay paths instead of bodies",
+        description="Triad relay pipe. `capture` writes one assistant message "
+        "verbatim to a file and prints its path, so Hermes relays a handle "
+        "rather than re-emitting (and summarizing) the body. Also carries the "
+        "lean-artifact lint and the proposed/acknowledged/locked decision gate.",
+    )
+    from hermes_cli.relaypipe import register_cli as _register_handoff_cli
+    _register_handoff_cli(handoff_parser)
 
     # =========================================================================
     # import command  (parser built in hermes_cli/subcommands/import_cmd.py)
@@ -15647,10 +15661,25 @@ def main():
 
     # Execute the command
     if hasattr(args, "func"):
-        args.func(args)
+        result = args.func(args)
+        # Subcommands already signal failure by returning an int — `return 2`
+        # for usage errors exists in checkpoints.py, kanban.py, and migrate.py,
+        # and `handoff lint --strict` returns 1 on a violation. The dispatcher
+        # used to discard these, so a strict lint printed its violation and
+        # still exited 0, which silently defeats any CI/pre-dispatch gate built
+        # on it. Propagate so the process exit code matches what the command
+        # decided.
+        #
+        # bool is an int subclass: exclude it, or a command that returns
+        # True/False would have that reinterpreted as an exit code (True -> 1).
+        if isinstance(result, int) and not isinstance(result, bool):
+            return result
     else:
         parser.print_help()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    # setuptools' console_script wrapper already does sys.exit(main()) for the
+    # installed `hermes` binary; this makes `python -m hermes_cli.main` agree.
+    sys.exit(main())

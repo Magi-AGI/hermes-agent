@@ -169,3 +169,9 @@ apps/desktop/demo/
 # PR body is the archive. See the hermes-agent-dev skill's
 # pr-infographic-workflow reference (storage rule + lapse #8 / #COMMIT-1).
 infographic/
+
+# Triad handoff artifacts (`hermes handoff capture`). Workspace-adjacent by
+# design so reviewer lanes can open the path with no working-dir grant — an
+# unreadable handoff path fails silently, which is the defect the relay pipe
+# exists to remove. The artifacts are relay scratch, never repo content.
+.triad/
