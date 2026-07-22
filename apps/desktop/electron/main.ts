@@ -7306,28 +7306,36 @@ function closeAllSessionWindows() {
 // Creating every saved window synchronously fires N gateway WebSocket connects
 // + N session resumes in a single burst, which overwhelms the single-process
 // backend's ready-frame delivery (`ready_send_failed`) and trips the renderer's
-// boot-failure -> reset loop. A fixed timer stagger only half-helped: a heavy
-// resume stalls the backend event loop for 5-6s, far longer than any sane fixed
-// gap, so windows opened mid-stall still miss their connect.
+// boot-failure -> reset loop. Neither a fixed timer stagger nor gating on the
+// renderer's page-load (did-finish-load) was enough: page-load fires BEFORE the
+// gateway WebSocket connects, so the actual contended step — the ws upgrade +
+// ready frame — still happened in overlapping bursts (crash-recovery reopen of
+// many sessions produced a wall of "couldn't connect to gateway").
 //
-// Instead, reopen CONNECTION-AWARE: open one window, wait until its renderer has
-// actually finished loading (its gateway connect + session resume — the CPU-heavy
-// part — gets a head start), then a short settle, then open the next. This adapts
-// to however long each resume takes. A per-window load cap keeps a slow/stuck
-// window from stalling the whole queue, and an already-open (focused) window
-// resolves immediately.
-const REOPEN_WINDOW_LOAD_TIMEOUT_MS = 12_000
-const REOPEN_WINDOW_SETTLE_MS = 500
+// This is a proper QUEUE: open one window, then wait until THAT window's gateway
+// actually reaches 'open' (the renderer emits 'hermes:window:gateway-ready' from
+// reportPrimaryGatewayState) before opening the next. Connections happen strictly
+// one at a time, so the backend never faces a burst. Correlated by webContents id
+// so another window's signal can't release the queue early. A per-window timeout
+// keeps a slow/stuck/never-connecting window from stalling the whole queue, and
+// an already-open (focused) window that re-fires 'open' resolves it immediately.
+const REOPEN_WINDOW_GATEWAY_TIMEOUT_MS = 20_000
+const REOPEN_WINDOW_SETTLE_MS = 400
 
-function waitForSessionWindowLoad(win: BrowserWindow): Promise<void> {
+function waitForSessionWindowGatewayReady(win: BrowserWindow): Promise<void> {
   return new Promise(resolve => {
+    // Already-open window that "reopen" merely focused: it's finished loading and
+    // its gateway is already connected, so it won't re-emit 'open' — don't wait
+    // the full timeout, just proceed to the next entry.
     if (win.isDestroyed() || !win.webContents.isLoading()) {
       resolve()
 
       return
     }
 
+    const wcId = win.webContents.id
     let settled = false
+
     const finish = () => {
       if (settled) {
         return
@@ -7335,12 +7343,23 @@ function waitForSessionWindowLoad(win: BrowserWindow): Promise<void> {
 
       settled = true
       clearTimeout(timer)
+      ipcMain.removeListener('hermes:window:gateway-ready', onReady)
       resolve()
     }
 
-    const timer = setTimeout(finish, REOPEN_WINDOW_LOAD_TIMEOUT_MS)
+    const onReady = (event: Electron.IpcMainEvent) => {
+      // Only the window we just opened releases the queue — a background
+      // reconnect on some other window must not advance it early.
+      if (event.sender.id === wcId) {
+        finish()
+      }
+    }
 
-    win.webContents.once('did-finish-load', finish)
+    const timer = setTimeout(finish, REOPEN_WINDOW_GATEWAY_TIMEOUT_MS)
+
+    ipcMain.on('hermes:window:gateway-ready', onReady)
+    // Failsafe releases: a window that fails to load or is closed will never emit
+    // gateway-ready, so don't wait the full timeout for it.
     win.webContents.once('did-fail-load', (_event, _code, _desc, _url, isMainFrame) => {
       if (isMainFrame) {
         finish()
@@ -7363,7 +7382,7 @@ async function reopenSessionWindows() {
     })
 
     if (win && !win.isDestroyed()) {
-      await waitForSessionWindowLoad(win)
+      await waitForSessionWindowGatewayReady(win)
       await new Promise(resolve => setTimeout(resolve, REOPEN_WINDOW_SETTLE_MS))
     }
   }

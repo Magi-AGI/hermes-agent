@@ -182,6 +182,7 @@ declare global {
         callback: (payload: { kind: string; name: string; params: Record<string, string> }) => void
       ) => () => void
       signalDeepLinkReady?: () => Promise<{ ok: boolean }>
+      signalSessionGatewayReady?: () => void
       onWindowStateChanged?: (callback: (payload: HermesWindowState) => void) => () => void
       onFocusSession?: (callback: (sessionId: string) => void) => () => void
       onNotificationAction?: (callback: (payload: { actionId: string; sessionId?: string }) => void) => () => void
