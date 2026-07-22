@@ -345,8 +345,9 @@ export function ChatView({
   // waiting for the resume effect (which paints a frame later) to clear them.
   const routeSessionMismatch = isRoutedSessionView && routedSessionId !== selectedSessionId
 
-  // The compact new-session pop-out skips the wordmark/tagline intro — it's a
-  // scratch window, not the full-height empty state.
+  // Only the primary view in a non-secondary window gets the wordmark/tagline
+  // intro. A session tile is an embedded pane, and a secondary window is a
+  // single-chat scratch surface — neither is the full-height empty state.
   const showIntro =
     isPrimary &&
     !isSecondaryWindow() &&
