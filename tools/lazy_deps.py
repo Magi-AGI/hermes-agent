@@ -131,6 +131,15 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "stt.mistral": ("mistralai==2.4.8",),
     "stt.faster_whisper": (
         "faster-whisper==1.2.1",
+        # ctranslate2 is faster-whisper's inference engine. faster-whisper
+        # only FLOORS it (ctranslate2>=4.0), so without an exact pin here a
+        # first-use lazy install or a `hermes update` refresh would pull the
+        # newest ctranslate2 on PyPI — which can be ABI-incompatible with the
+        # host's provisioned CUDA/cuDNN runtime and silently (or visibly) drop
+        # STT to CPU/int8. Exact-pin the known-good version so neither install
+        # path can float it forward. Keep in lockstep with the `voice` extra
+        # in pyproject.toml (parity enforced by tests/test_project_metadata.py).
+        "ctranslate2==4.7.2",
         "sounddevice==0.5.5",
         "numpy==2.4.3",
     ),
@@ -570,6 +579,23 @@ def _is_present(spec: str) -> bool:
         return False
 
 
+def _resolved(path: Any) -> Optional[Path]:
+    """Best-effort ``Path`` resolution; None when the value isn't path-like."""
+    try:
+        return Path(os.fspath(path)).resolve()
+    except Exception:
+        return None
+
+
+def _dist_root(dist: Any) -> Optional[Path]:
+    """Directory a distribution's metadata was discovered in, if knowable."""
+    try:
+        located = dist.locate_file("")
+    except Exception:
+        return None
+    return _resolved(located)
+
+
 def _core_constraints_file() -> Optional[Path]:
     """Write a pip constraints file pinning every package already importable
     in the core environment to its installed version.
@@ -585,6 +611,21 @@ def _core_constraints_file() -> Optional[Path]:
       at install time (resolver conflict) rather than silently installing a
       shadowed copy that can never win on sys.path anyway.
 
+    **Only the CORE environment is constrained.** Once a durable target has
+    been appended to ``sys.path`` (by :func:`activate_durable_lazy_target` or
+    a previous install in this process), ``distributions()`` also enumerates
+    the packages *inside* that target. Pinning those would make the constraints
+    file describe the lazy store's own contents — so a pin bump in
+    :data:`LAZY_DEPS` (say ``ctranslate2==4.7.2`` superseding a previously
+    lazy-installed ``4.9.0``) would be handed to pip as
+    ``--constraint ctranslate2==4.9.0`` alongside the requested
+    ``ctranslate2==4.7.2``, an unsatisfiable resolve. The refresh the pin
+    exists to perform could then never run, and the only repair would be
+    manually wiping the target. Distributions rooted under the target are
+    therefore excluded: they are exactly the packages this install is allowed
+    to replace. A distribution whose location can't be determined is kept
+    (constrained), so an unlocatable core pin is never silently dropped.
+
     Returns the path to a temp constraints file, or None if enumeration
     failed (in which case the caller installs without constraints — still
     safe, just less tidy).
@@ -595,6 +636,9 @@ def _core_constraints_file() -> Optional[Path]:
         return None
     try:
         import tempfile
+        target = _lazy_install_target()
+        target_root = _resolved(target) if target is not None else None
+
         lines = []
         seen = set()
         for dist in distributions():
@@ -605,6 +649,14 @@ def _core_constraints_file() -> Optional[Path]:
             key = name.lower()
             if key in seen:
                 continue
+            if target_root is not None:
+                root = _dist_root(dist)
+                if root is not None and (
+                    root == target_root or target_root in root.parents
+                ):
+                    # Lives in the durable lazy store, not the core env — this
+                    # is exactly what the install may replace, so don't pin it.
+                    continue
             seen.add(key)
             lines.append(f"{name}=={ver}")
         if not lines:

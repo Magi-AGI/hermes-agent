@@ -178,6 +178,14 @@ voice = [
   # Local STT pulls in wheel-only transitive deps (ctranslate2, onnxruntime),
   # so keep it out of the base install for source-build packagers like Homebrew.
   "faster-whisper==1.2.1",
+  # ctranslate2 is faster-whisper's inference engine. faster-whisper only
+  # floors it (ctranslate2>=4.0), so leaving it unpinned lets uv.lock and a
+  # `pip install hermes-agent[voice]` float it to the newest release, which
+  # can be ABI-incompatible with the host CUDA/cuDNN runtime and silently drop
+  # STT to CPU/int8. Exact-pin the known-good version and keep it in lockstep
+  # with LAZY_DEPS['stt.faster_whisper'] (parity enforced by
+  # tests/test_project_metadata.py::test_pyproject_pins_match_lazy_deps_pins).
+  "ctranslate2==4.7.2",
   "sounddevice==0.5.5",
   "numpy==2.4.3",
 ]
