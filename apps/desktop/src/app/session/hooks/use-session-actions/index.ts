@@ -23,6 +23,7 @@ import {
   $currentReasoningEffort,
   $messages,
   $newChatWorkspaceTarget,
+  $resumeFailedSessionId,
   $sessions,
   $yoloActive,
   type NewChatWorkspaceTarget,
@@ -518,6 +519,11 @@ export function useSessionActions({
       resetViewSync()
       setSelectedStoredSessionId(storedSessionId)
       selectedStoredSessionIdRef.current = storedSessionId
+      // Was this session already stranded from a prior failed resume? Capture it
+      // BEFORE the clear below, so a resume that lands after one or more failures
+      // can surface a green "recovered" confirmation. A clean first-try resume is
+      // never stranded, so it stays silent.
+      const wasStrandedResume = $resumeFailedSessionId.get() === storedSessionId
       // Optimistically clear any prior resume-failure latch for this session:
       // we're attempting a fresh resume, so the self-heal in use-route-resume
       // must not keep treating it as stranded. It's re-armed below only if THIS
@@ -914,6 +920,14 @@ export function useSessionActions({
           }),
           storedSessionId
         )
+
+        // Resume landed. If this session had been stranded (bounded auto-retry
+        // after a failed resume, or a manual Retry), show a green confirmation so
+        // the last thing the user sees is "recovered" rather than the earlier red
+        // "Resume failed". A clean first-try resume stays silent (wasStrandedResume).
+        if (wasStrandedResume) {
+          notify({ durationMs: 2_000, kind: 'success', message: copy.resumeSucceeded })
+        }
       } catch (err) {
         if (!isCurrentResume()) {
           return

@@ -41,6 +41,12 @@ declare global {
       // reply). Resolves true for the first window to claim a key, false for
       // peers — so N open windows don't all fire the same cue.
       claimAmbientCue: (key: string) => Promise<boolean>
+      // Close every live session pop-out (including watch/spectator windows).
+      // Never touches the primary window, pet overlay, or hidden windows.
+      closeAllSessionWindows: () => Promise<{ ok: boolean; error?: string }>
+      // Explicit-action restore of the last-closed session windows' positions
+      // (never automatic on launch). Watch windows are never included.
+      reopenSessionWindows: () => Promise<{ ok: boolean; error?: string }>
       // The pop-out pet overlay: a transparent always-on-top window hosting only
       // the mascot. The main renderer drives it (open/close/drag + state push);
       // the overlay sends control messages back (pop-in, composer submit).
@@ -200,6 +206,7 @@ declare global {
         callback: (payload: { kind: string; name: string; params: Record<string, string> }) => void
       ) => () => void
       signalDeepLinkReady?: () => Promise<{ ok: boolean }>
+      signalSessionGatewayReady?: () => void
       onWindowStateChanged?: (callback: (payload: HermesWindowState) => void) => () => void
       onFocusSession?: (callback: (sessionId: string) => void) => () => void
       onNotificationAction?: (callback: (payload: { actionId: string; sessionId?: string }) => void) => () => void

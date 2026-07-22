@@ -86,6 +86,20 @@ function reportGatewayState(profile: string, state: ConnectionState): void {
 
 export function reportPrimaryGatewayState(state: ConnectionState): void {
   reportGatewayState(primaryProfile, state)
+
+  // Signal the main process the moment THIS window's gateway finishes connecting.
+  // The reopen queue waits for this before opening the next saved window, so
+  // reopened sessions connect one at a time instead of a burst that overwhelms
+  // the single-process backend (ready_send_failed storms). Fires on every open
+  // (incl. reconnects); main correlates by sender and only listens per-window
+  // during a reopen, so extra signals are harmless.
+  if (state === 'open') {
+    try {
+      window.hermesDesktop?.signalSessionGatewayReady?.()
+    } catch {
+      // preload bridge absent (tests / non-desktop renderer) — no-op
+    }
+  }
 }
 
 function setActive(profile: string): void {

@@ -44,6 +44,7 @@ import {
   Terminal,
   Users,
   Wrench,
+  X,
   Zap
 } from '@/lib/icons'
 import { normalize } from '@/lib/text'
@@ -61,6 +62,7 @@ import { requestStartWorkSession } from '@/store/projects'
 import { runGatewayRestart } from '@/store/system-actions'
 import { applyBackendUpdate } from '@/store/updates'
 import { canOpenNewWindow, openNewWindow } from '@/store/windows'
+import { canOpenSessionWindow, closeAllSessionWindows, reopenSessionWindows } from '@/store/windows'
 import { luminance } from '@/themes/color'
 import { type ThemeMode, useTheme } from '@/themes/context'
 import { isUserTheme, resolveTheme } from '@/themes/user-themes'
@@ -521,7 +523,27 @@ export function CommandPalette() {
             keywords: ['update', 'upgrade', 'hermes', 'version', 'system', 'restart'],
             label: cc.updateHermes,
             run: () => void applyBackendUpdate()
-          }
+          },
+          // Desktop-only: secondary session pop-out windows don't exist in the
+          // web embed, so hide these alongside the other window-bridge actions.
+          ...(canOpenSessionWindow()
+            ? [
+                {
+                  icon: X,
+                  id: 'cc-close-all-session-windows',
+                  keywords: ['window', 'close', 'session', 'pop-out', 'pop out'],
+                  label: cc.closeAllSessionWindows,
+                  run: () => void closeAllSessionWindows()
+                },
+                {
+                  icon: RefreshCw,
+                  id: 'cc-reopen-session-windows',
+                  keywords: ['window', 'reopen', 'restore', 'session', 'pop-out', 'pop out'],
+                  label: cc.reopenSessionWindows,
+                  run: () => void reopenSessionWindows()
+                }
+              ]
+            : [])
         ]
       },
       {

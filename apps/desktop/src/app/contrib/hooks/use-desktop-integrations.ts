@@ -1,12 +1,20 @@
+import { useStore } from '@nanostores/react'
 import { useEffect, useRef } from 'react'
 
 import { closeActiveTab } from '@/app/chat/close-tab'
 import { storedSessionIdForNotification } from '@/lib/session-ids'
 import { respondToApprovalAction } from '@/store/native-notifications'
-import { getRememberedRoute, getRememberedSessionId, setRememberedRoute, setRememberedSessionId } from '@/store/session'
+import {
+  $activeSessionId,
+  $selectedStoredSessionId,
+  getRememberedRoute,
+  getRememberedSessionId,
+  setRememberedRoute,
+  setRememberedSessionId
+} from '@/store/session'
 import { onSessionsChanged } from '@/store/session-sync'
 import { openUpdatesWindow, startUpdatePoller, stopUpdatePoller } from '@/store/updates'
-import { isSecondaryWindow } from '@/store/windows'
+import { isHeaderlessSecondaryWindow } from '@/store/windows'
 
 import { requestComposerFocus, requestComposerInsert } from '../../chat/composer/focus'
 import { appViewForPath, isOverlayView, NEW_CHAT_ROUTE, sessionRoute } from '../../routes'
@@ -37,6 +45,12 @@ export function useDesktopIntegrations({
   routedSessionId,
   runtimeIdByStoredSessionId
 }: DesktopIntegrationsParams): void {
+  // Drives the cross-window session-list sync effect below: a secondary window
+  // only stays subscribed once it has a resolvable session (see
+  // isHeaderlessSecondaryWindow).
+  const activeSessionId = useStore($activeSessionId)
+  const selectedStoredSessionId = useStore($selectedStoredSessionId)
+
   // Update polling — populates $desktopVersion/$updateStatus, which feed the
   // statusbar version pill and the update toasts. Also honors the main
   // process's "open updates" menu request.
@@ -160,12 +174,16 @@ export function useDesktopIntegrations({
     return () => unsubscribe?.()
   }, [])
 
-  // Another window mutated the shared session list -> re-pull the sidebar.
+  // Another window mutated the shared session list (e.g. a chat started in the
+  // pop-out, or a rename from another window). Re-pull so the sidebar — or a
+  // header-visible secondary window's title chip/document.title — reflects it.
+  // A still-headerless secondary window (blank new-session draft, no sidebar,
+  // nothing to keep in sync) keeps skipping this.
   useEffect(() => {
-    if (isSecondaryWindow()) {
+    if (isHeaderlessSecondaryWindow(Boolean(selectedStoredSessionId || activeSessionId))) {
       return
     }
 
     return onSessionsChanged(() => void refreshSessions())
-  }, [refreshSessions])
+  }, [activeSessionId, refreshSessions, selectedStoredSessionId])
 }

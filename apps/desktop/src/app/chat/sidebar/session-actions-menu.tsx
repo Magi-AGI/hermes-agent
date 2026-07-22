@@ -59,6 +59,7 @@ import {
 } from '@/store/session'
 import { $sessionColorOverrides, setSessionColorOverride } from '@/store/session-color'
 import { $sessionTiles, openSessionTile } from '@/store/session-states'
+import { broadcastSessionsChanged } from '@/store/session-sync'
 import { canOpenSessionWindow, openSessionInNewWindow } from '@/store/windows'
 
 import type { SessionTitleResponse } from '../../types'
@@ -129,6 +130,10 @@ interface SessionActions {
   /** The MAIN tab's escape hatch: hide the zone's tab bar (it sticky-shows
    *  once a tab is ever gained; this is the explicit off switch). */
   onHideTabBar?: () => void
+  // Read-only secondary windows (watch/spectator pop-outs) show the title for
+  // identification but must not mutate the session — this forces rename off
+  // even though (unlike pin/delete) it isn't gated by an optional handler prop.
+  disableRename?: boolean
 }
 
 type MenuItem = typeof DropdownMenuItem | typeof ContextMenuItem
@@ -200,7 +205,8 @@ function useSessionActions({
   onClose,
   onHideTabBar,
   surface = 'row',
-  tabPaneId
+  tabPaneId,
+  disableRename = false
 }: SessionActions) {
   const { t } = useI18n()
   const r = t.sidebar.row
@@ -250,7 +256,7 @@ function useSessionActions({
   // IDENTITY — name/mark/reference the session.
   const identityItems: ItemSpec[] = [
     spec({
-      disabled: !sessionId,
+      disabled: !sessionId || disableRename,
       icon: 'edit',
       label: r.rename,
       onSelect: () => {
@@ -543,6 +549,11 @@ function RenameSessionDialog({ open, onOpenChange, sessionId, currentTitle, prof
       const result = await renameSessionPreferringRpc(sessionId, next, profile)
       const finalTitle = result.title || next || ''
       setSessions(prev => prev.map(s => (s.id === sessionId ? { ...s, title: finalTitle || null } : s)))
+      // Tell other windows (a session pop-out showing this chat's header, or
+      // another profile window's sidebar) to re-pull so their title stays in
+      // sync — a BroadcastChannel never delivers to its own poster, so this
+      // window already has the update via setSessions above.
+      broadcastSessionsChanged()
       notify({ durationMs: 2_000, kind: 'success', message: r.renamed })
       onOpenChange(false)
     } catch (err) {
