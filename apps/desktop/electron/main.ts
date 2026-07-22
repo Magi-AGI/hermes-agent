@@ -5006,6 +5006,7 @@ function buildApplicationMenu() {
       { role: 'togglefullscreen' }
     ]
   })
+
   // Close-all/reopen-saved act on the secondaryWindows set / sessionWindows
   // registry, never BrowserWindow.getAllWindows() — they can't touch the
   // primary window, the pet overlay, or the hidden link-title-fetch window.
@@ -5022,6 +5023,7 @@ function buildApplicationMenu() {
         )
     }
   ]
+
   template.push({
     label: 'Window',
     submenu: IS_MAC
@@ -8337,6 +8339,7 @@ async function reopenSessionWindows() {
 
   for (const entry of entries) {
     const bounds = computeSessionWindowOptions(entry, displays)
+
     const win = createSessionWindow(entry.sessionId, {
       watch: false,
       bounds,
