@@ -5,16 +5,20 @@ import { test } from 'vitest'
 import {
   buildSessionWindowUrl,
   chatWindowWebPreferences,
+  computeSessionWindowOptions,
   createSessionWindowRegistry,
-  instanceWindowBounds
+  instanceWindowBounds,
+  sanitizeSessionWindowEntry,
+  SESSION_WINDOW_MIN_HEIGHT,
+  SESSION_WINDOW_MIN_WIDTH
 } from './session-windows'
 
 // A minimal fake BrowserWindow: tracks listeners + destroyed state and lets a
 // test fire the 'closed' event, mirroring the slice of the Electron API the
 // registry actually touches.
 function makeFakeWindow() {
-  const listeners = {}
-  const calls = { focus: 0, show: 0, restore: 0 }
+  const listeners: Record<string, (() => void) | undefined> = {}
+  const calls = { close: 0, focus: 0, show: 0, restore: 0 }
   let destroyed = false
   let minimized = false
   let visible = true
@@ -31,6 +35,13 @@ function makeFakeWindow() {
     isDestroyed: () => destroyed,
     destroy() {
       destroyed = true
+    },
+    // Real BrowserWindow#close() eventually fires 'closed' (which is what the
+    // registry's self-cleanup listens for) — mirror that synchronously here.
+    close() {
+      calls.close += 1
+      destroyed = true
+      listeners.closed?.()
     },
     isMinimized: () => minimized,
     setMinimized(value) {
@@ -207,4 +218,108 @@ test('chatWindowWebPreferences passes the preload path through and keeps the har
   assert.equal(prefs.contextIsolation, true)
   assert.equal(prefs.sandbox, true)
   assert.equal(prefs.nodeIntegration, false)
+})
+
+// ─── registry metadata (watch flag, entries, closeAll) ─────────────────────
+
+test('registry defaults watch to false and reflects it in entries()', () => {
+  const registry = createSessionWindowRegistry()
+  const win = makeFakeWindow()
+  registry.openOrFocus('s1', () => win)
+
+  assert.deepEqual(registry.entries(), [{ sessionId: 's1', win, watch: false }])
+})
+
+test('registry records the watch flag a window was opened with', () => {
+  const registry = createSessionWindowRegistry()
+  const win = makeFakeWindow()
+  registry.openOrFocus('s1', () => win, { watch: true })
+
+  assert.deepEqual(registry.entries(), [{ sessionId: 's1', win, watch: true }])
+})
+
+test('registry does not change the stored watch flag when re-requested with a different one', () => {
+  // One window per sessionId is the invariant: a normal open request for an
+  // already-open watch window (or vice versa) just focuses it, never
+  // "upgrades" or replaces it.
+  const registry = createSessionWindowRegistry()
+  const win = makeFakeWindow()
+  registry.openOrFocus('s1', () => win, { watch: true })
+  const second = registry.openOrFocus('s1', () => makeFakeWindow(), { watch: false })
+
+  assert.equal(second, win)
+  assert.deepEqual(registry.entries(), [{ sessionId: 's1', win, watch: true }])
+})
+
+test('registry.entries() omits destroyed windows', () => {
+  const registry = createSessionWindowRegistry()
+  const win = makeFakeWindow()
+  registry.openOrFocus('s1', () => win)
+  win.destroy()
+
+  assert.deepEqual(registry.entries(), [])
+})
+
+test('registry.closeAll() closes every live window, including watch windows, and empties the registry', () => {
+  const registry = createSessionWindowRegistry()
+  const normal = makeFakeWindow()
+  const watcher = makeFakeWindow()
+  registry.openOrFocus('s1', () => normal)
+  registry.openOrFocus('s2', () => watcher, { watch: true })
+
+  registry.closeAll()
+
+  assert.equal(normal.calls.close, 1)
+  assert.equal(watcher.calls.close, 1)
+  assert.equal(registry.size, 0)
+})
+
+// ─── sanitizeSessionWindowEntry / computeSessionWindowOptions ──────────────
+
+test('sanitizeSessionWindowEntry requires a non-empty sessionId', () => {
+  assert.equal(sanitizeSessionWindowEntry({ width: 500, height: 700 }), null)
+  assert.equal(sanitizeSessionWindowEntry({ sessionId: '   ', width: 500, height: 700 }), null)
+  assert.equal(sanitizeSessionWindowEntry(null), null)
+})
+
+test('sanitizeSessionWindowEntry drops garbage geometry rather than defaulting to it', () => {
+  assert.equal(sanitizeSessionWindowEntry({ sessionId: 's1', width: 'x', height: 700 }), null)
+})
+
+test('sanitizeSessionWindowEntry floors size to the SESSION window minimums, not the main window minimums', () => {
+  const entry = sanitizeSessionWindowEntry({ sessionId: 's1', width: 10, height: 10 })
+
+  assert.equal(entry.sessionId, 's1')
+  assert.equal(entry.width, SESSION_WINDOW_MIN_WIDTH)
+  assert.equal(entry.height, SESSION_WINDOW_MIN_HEIGHT)
+})
+
+test('sanitizeSessionWindowEntry keeps valid position + isMaximized', () => {
+  const entry = sanitizeSessionWindowEntry({
+    sessionId: 's1',
+    x: 100,
+    y: 50,
+    width: 500,
+    height: 700,
+    isMaximized: true
+  })
+
+  assert.deepEqual(entry, { sessionId: 's1', x: 100, y: 50, width: 500, height: 700, isMaximized: true })
+})
+
+test('computeSessionWindowOptions clamps to the session window minimum width (420), not the main window minimum (400)', () => {
+  const tiny = [{ workArea: { x: 0, y: 0, width: 300, height: 500 } }]
+  const saved = sanitizeSessionWindowEntry({ sessionId: 's1', width: 10, height: 10 })
+
+  assert.deepEqual(computeSessionWindowOptions(saved, tiny), {
+    width: SESSION_WINDOW_MIN_WIDTH,
+    height: SESSION_WINDOW_MIN_HEIGHT
+  })
+})
+
+test('computeSessionWindowOptions restores an on-screen position', () => {
+  const primary = [{ workArea: { x: 0, y: 0, width: 1920, height: 1040 } }]
+  const saved = sanitizeSessionWindowEntry({ sessionId: 's1', x: 200, y: 150, width: 500, height: 700 })
+
+  assert.deepEqual(computeSessionWindowOptions(saved, primary), { width: 500, height: 700, x: 200, y: 150 })
 })

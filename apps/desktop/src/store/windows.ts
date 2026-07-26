@@ -27,6 +27,20 @@ export function isSecondaryWindow(): boolean {
   return result
 }
 
+// Shared "does this secondary window show the ChatHeader" predicate — the
+// single source of truth consumed by both ChatHeader (the title chip/menu)
+// and ThreadMessageList (the top-gap + sticky-offset + drag-mask it only
+// needs when there's no header to serve that role). A secondary window is
+// headerless exactly while it has no resolvable session: a new-session draft
+// before the first message creates a real session, or (in principle) any
+// other still-blank pop-out. Once a session exists — whether the window
+// opened already keyed to one, or a draft just created one — it gets a
+// header, live rename updates, and a real document.title, matching how the
+// main window has always worked.
+export function isHeaderlessSecondaryWindow(hasSession: boolean): boolean {
+  return isSecondaryWindow() && !hasSession
+}
+
 let watchWindowCache: boolean | null = null
 
 // A "watch" window spectates a session that is being driven elsewhere (a
@@ -100,4 +114,24 @@ export async function openNewWindow(): Promise<void> {
   }
 
   await runWindowOpen(() => window.hermesDesktop.openWindow(), 'Could not open a new window')
+}
+
+// Close every live session pop-out (including watch/spectator windows). No-op
+// outside Electron.
+export async function closeAllSessionWindows(): Promise<void> {
+  if (!canOpenSessionWindow() || typeof window.hermesDesktop.closeAllSessionWindows !== 'function') {
+    return
+  }
+
+  await runWindowOpen(() => window.hermesDesktop.closeAllSessionWindows(), 'Could not close session windows')
+}
+
+// Explicit-action restore of the last-closed (non-watch) session windows, at
+// their saved positions. Never runs automatically — only via this call.
+export async function reopenSessionWindows(): Promise<void> {
+  if (!canOpenSessionWindow() || typeof window.hermesDesktop.reopenSessionWindows !== 'function') {
+    return
+  }
+
+  await runWindowOpen(() => window.hermesDesktop.reopenSessionWindows(), 'Could not reopen session windows')
 }

@@ -8,6 +8,8 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   openSessionWindow: (sessionId, opts) => ipcRenderer.invoke('hermes:window:openSession', sessionId, opts),
   openWindow: () => ipcRenderer.invoke('hermes:window:openInstance'),
   claimAmbientCue: key => ipcRenderer.invoke('hermes:ambient:claim', key),
+  closeAllSessionWindows: () => ipcRenderer.invoke('hermes:window:closeAllSessionWindows'),
+  reopenSessionWindows: () => ipcRenderer.invoke('hermes:window:reopenSessionWindows'),
   petOverlay: {
     // Main renderer → main process: window lifecycle + drag. `request` is
     // `{ bounds, screen }`; resolves with the screen bounds it actually used.
@@ -181,6 +183,9 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     return () => ipcRenderer.removeListener('hermes:deep-link', listener)
   },
   signalDeepLinkReady: () => ipcRenderer.invoke('hermes:deep-link-ready'),
+  // Fire-and-forget: tells main this window's gateway finished connecting, so the
+  // reopen queue can release the next saved window (see reopenSessionWindows).
+  signalSessionGatewayReady: () => ipcRenderer.send('hermes:window:gateway-ready'),
   onWindowStateChanged: callback => {
     const listener = (_event, payload) => callback(payload)
     ipcRenderer.on('hermes:window-state-changed', listener)

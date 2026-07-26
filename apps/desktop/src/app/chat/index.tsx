@@ -41,7 +41,7 @@ import {
   sessionMatchesStoredId,
   sessionPinId
 } from '@/store/session'
-import { isSecondaryWindow, isWatchWindow } from '@/store/windows'
+import { isHeaderlessSecondaryWindow, isSecondaryWindow, isWatchWindow } from '@/store/windows'
 import type { ModelOptionsResponse } from '@/types/hermes'
 
 import { primaryRouteSelectedSessionId, routeSessionId } from '../routes'
@@ -129,10 +129,33 @@ function ChatHeader({
       ? pinnedSessionIds.includes(selectedSessionId)
       : false
 
+  const hasSession = Boolean(selectedSessionId || activeSessionId || isRoutedSessionView)
+  // Watch (spectator) windows show the title for identification but are
+  // read-only: no pin/delete/rename. Unlike pin/delete (gated by handler
+  // props below), rename needs the explicit disableRename prop.
+  const readOnly = isWatchWindow()
+
+  // Native OS/taskbar/Alt-Tab identification for secondary windows. Nothing
+  // intercepts 'page-title-updated' for chat windows (see spawnSecondaryWindow
+  // in electron/main.ts), so Electron's default title sync propagates this to
+  // the BrowserWindow automatically — no IPC round-trip needed. The main
+  // window's native title stays the fixed 'Hermes' set at construction; this
+  // effect only runs for secondary windows.
+  useEffect(() => {
+    if (!isSecondaryWindow()) {
+      return
+    }
+
+    document.title = hasSession ? title : 'Hermes'
+  }, [hasSession, title])
+
   // Secondary windows (new-session scratch, subagent watch, cmd-click pop-out)
   // are compact side panels — they drop the session-actions header + border
-  // entirely. A brand-new draft has nothing to pin/delete/rename either.
-  if (isSecondaryWindow() || (!selectedSessionId && !activeSessionId && !isRoutedSessionView)) {
+  // entirely while headerless (a brand-new draft with nothing to pin/delete/
+  // rename yet). Once they have a real session — a keyed pop-out has one
+  // immediately; a new-session draft gets one once the first message creates
+  // it — they get the same header the main window shows.
+  if (isHeaderlessSecondaryWindow(hasSession) || (!selectedSessionId && !activeSessionId && !isRoutedSessionView)) {
     return null
   }
 
@@ -148,8 +171,9 @@ function ChatHeader({
         {showProfileTag && <ProfileTag className="pointer-events-auto mr-1.5" profile={activeStoredSession?.profile} />}
         <SessionActionsMenu
           align="start"
-          onDelete={selectedSessionId ? onDeleteSelectedSession : undefined}
-          onPin={selectedSessionId ? onToggleSelectedPin : undefined}
+          disableRename={readOnly}
+          onDelete={!readOnly && selectedSessionId ? onDeleteSelectedSession : undefined}
+          onPin={!readOnly && selectedSessionId ? onToggleSelectedPin : undefined}
           pinned={selectedIsPinned}
           sessionId={selectedSessionId || activeSessionId || ''}
           sideOffset={8}
@@ -356,8 +380,9 @@ export function ChatView({
   // waiting for the resume effect (which paints a frame later) to clear them.
   const routeSessionMismatch = isRoutedSessionView && routedSessionId !== selectedSessionId
 
-  // The compact new-session pop-out skips the wordmark/tagline intro — it's a
-  // scratch window, not the full-height empty state.
+  // Only the primary view in a non-secondary window gets the wordmark/tagline
+  // intro. A session tile is an embedded pane, and a secondary window is a
+  // single-chat scratch surface — neither is the full-height empty state.
   const showIntro =
     isPrimary &&
     !isSecondaryWindow() &&
