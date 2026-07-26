@@ -1131,3 +1131,97 @@ def compute_task_diagnostics(
         )
     )
     return out
+
+
+# ── Compaction queue slot load (read-only diagnostics) ───────────────────────
+#
+# The cross-session compaction queue (agent/compaction_coordinator.py) bounds
+# concurrent compaction summarisation calls across every session, process AND
+# PROFILE under one Hermes root. This helper exposes its current load so the CLI /
+# dashboard can display it.
+#
+# Two properties matter, and both are test-enforced:
+#
+#   1. READ-ONLY. It must never CREATE the coordinator DB (or its -wal/-shm
+#      sidecars). A diagnostic that materialises the thing it reports on makes
+#      "has the queue ever run here?" unanswerable, and would litter a fresh root
+#      just because somebody opened a dashboard.
+#   2. IT NEVER RAISES. Diagnostics render in UI/CLI paths; a missing or broken
+#      coordinator must degrade to ok=False plus an error string, not take the
+#      page down with it.
+#
+# Scope note: the coordinator is ROOT-scoped, so this reports the
+# MACHINE-ROOT-WIDE load across all profiles — not just the active profile's.
+
+
+def compaction_queue_slot_load(config: Optional[dict] = None) -> dict:
+    """Read the root-scoped compaction queue load. Read-only; never raises.
+
+    Args:
+        config: Full runtime config (or anything carrying a ``compaction_queue``
+            block). Loaded on demand when omitted.
+
+    Returns a normalized dict:
+        enabled        — whether the queue is turned on in config
+        max_concurrent — configured bound (clamped >= 1)
+        slots_in_use   — live slots held right now, or None when unreadable
+        slots_max      — mirrors max_concurrent, for renderers
+        holders        — [{slot_id, holder, session_id, profile, source, ...}]
+        ok             — False when the coordinator could not be read
+        error          — reason string when ok is False, else None
+    """
+    try:
+        from hermes_cli.config import get_compaction_queue_settings
+
+        settings = get_compaction_queue_settings(config)
+        enabled = bool(settings["enabled"])
+        max_concurrent = int(settings["max_concurrent"])  # already clamped >= 1
+    except Exception as exc:  # pragma: no cover - config layer is itself total
+        return {
+            "enabled": False,
+            "max_concurrent": 1,
+            "slots_max": 1,
+            "slots_in_use": None,
+            "holders": [],
+            "ok": False,
+            "error": f"config unreadable: {type(exc).__name__}: {exc}",
+        }
+
+    base = {
+        "enabled": enabled,
+        "max_concurrent": max_concurrent,
+        "slots_max": max_concurrent,
+    }
+
+    try:
+        from agent.compaction_coordinator import get_compaction_slot_load
+
+        load = get_compaction_slot_load(max_concurrent=max_concurrent)
+    except Exception as exc:
+        # Import / module-version skew must not break the dashboard.
+        return {
+            **base,
+            "slots_in_use": None,
+            "holders": [],
+            "ok": False,
+            "error": f"coordinator unavailable: {type(exc).__name__}: {exc}",
+        }
+
+    if not load.ok:
+        # The DB exists but could not be READ. Do NOT report a healthy zero: that
+        # is indistinguishable from an idle queue, and would hide a broken one.
+        return {
+            **base,
+            "slots_in_use": None,
+            "holders": [],
+            "ok": False,
+            "error": load.error,
+        }
+
+    return {
+        **base,
+        "slots_in_use": int(load.slots_in_use),
+        "holders": list(load.holders),
+        "ok": True,
+        "error": None,
+    }
