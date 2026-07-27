@@ -3256,7 +3256,7 @@ def validate_configured_compression_routes() -> List[str]:
             effective_base_url = _configured_provider_base_url(cfg, provider, base_url)
             effective_host = base_url_hostname(effective_base_url)
             if _is_loopback_host(effective_host):
-                if not _loopback_egress_is_proxy_safe(effective_host):
+                if not _loopback_egress_is_proxy_safe(effective_base_url):
                     problems.append(
                         f"{label}: local-loopback compaction is enabled but a proxy "
                         f"env would route {effective_base_url or effective_host} "
@@ -3368,24 +3368,30 @@ def _is_loopback_host(host: str) -> bool:
         return False
 
 
-def _loopback_egress_is_proxy_safe(host: str) -> bool:
-    """True when a request to loopback ``host`` will NOT be routed through a
-    proxy (Codex's egress concern: a proxy env var could forward a localhost URL
+def _loopback_egress_is_proxy_safe(base_url: str) -> bool:
+    """True when a request to ``base_url`` will NOT be routed through a proxy
+    (Codex's egress concern: a proxy env var could forward a localhost URL
     off-box).
 
-    Safe when EITHER no http/https/all proxy env is configured, OR ``NO_PROXY``
-    provably bypasses the loopback host (a ``*`` wildcard or a loopback token).
-    Fails CLOSED: a configured proxy with no proven loopback bypass returns
-    ``False`` so the route is refused rather than silently egressing.
+    Delegates to the SAME decision the auxiliary HTTP client makes —
+    ``process_bootstrap._get_proxy_for_base_url`` (which honors ``NO_PROXY`` via
+    ``urllib.request.proxy_bypass_environment`` against the ACTUAL request host).
+    Using the identical function eliminates the earlier false positive where a
+    generic ``NO_PROXY`` token (e.g. ``127.0.0.1``) was treated as bypassing a
+    DIFFERENT loopback host (e.g. ``127.9.9.9``) that the client would still
+    proxy. Safe iff that function resolves NO proxy for this exact URL.
+
+    Fails CLOSED: any error (or an un-importable bootstrap) returns ``False`` so
+    the route is refused rather than silently egressing.
     """
-    proxy_envs = ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
-    if not any((os.environ.get(k) or "").strip() for k in proxy_envs):
-        return True
-    no_proxy = (os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or "")
-    tokens = {t.strip().lower() for t in no_proxy.split(",") if t.strip()}
-    if "*" in tokens:
-        return True
-    return bool(tokens & {"localhost", "127.0.0.1", "::1", "[::1]", (host or "").strip().lower()})
+    if not base_url:
+        return False
+    try:
+        from agent.process_bootstrap import _get_proxy_for_base_url
+
+        return _get_proxy_for_base_url(base_url) is None
+    except Exception:
+        return False
 
 
 def _loopback_compression_route_admitted(client: Any) -> bool:
@@ -3394,12 +3400,14 @@ def _loopback_compression_route_admitted(client: Any) -> bool:
     All three must hold (fail-closed on any):
       1. the opt-in is set (``allow_local_loopback_route``);
       2. the client's resolved ``base_url`` host is a literal loopback host;
-      3. loopback egress is proxy-safe (won't be forwarded off-box).
+      3. egress to that exact ``base_url`` is proxy-safe (won't be forwarded
+         off-box), decided by the same code the HTTP client uses.
     """
     if not _local_loopback_opt_in():
         return False
-    host = base_url_hostname(str(getattr(client, "base_url", "") or ""))
-    return _is_loopback_host(host) and _loopback_egress_is_proxy_safe(host)
+    base_url = str(getattr(client, "base_url", "") or "")
+    host = base_url_hostname(base_url)
+    return _is_loopback_host(host) and _loopback_egress_is_proxy_safe(base_url)
 
 
 def _client_compression_route(client: Any) -> Optional[Tuple[str, str]]:

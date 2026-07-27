@@ -66,22 +66,54 @@ class TestIsLoopbackHost:
 
 
 class TestLoopbackProxySafety:
+    """Proxy-safety must equal the ACTUAL client decision
+    (process_bootstrap._get_proxy_for_base_url) — no NO_PROXY-token false
+    positives. base_url (not bare host) so the exact request host is matched.
+    """
+
     def test_no_proxy_env_is_safe(self):
-        assert ac._loopback_egress_is_proxy_safe("127.0.0.1") is True
+        assert ac._loopback_egress_is_proxy_safe("http://127.0.0.1:5000/v1") is True
 
     def test_proxy_without_no_proxy_is_unsafe(self, monkeypatch):
         monkeypatch.setenv("HTTPS_PROXY", "http://corp-proxy:8080")
-        assert ac._loopback_egress_is_proxy_safe("127.0.0.1") is False
+        assert ac._loopback_egress_is_proxy_safe("http://127.0.0.1:5000/v1") is False
 
-    def test_proxy_with_loopback_no_proxy_is_safe(self, monkeypatch):
+    def test_proxy_with_matching_no_proxy_is_safe(self, monkeypatch):
         monkeypatch.setenv("HTTPS_PROXY", "http://corp-proxy:8080")
         monkeypatch.setenv("NO_PROXY", "localhost,127.0.0.1,::1")
-        assert ac._loopback_egress_is_proxy_safe("127.0.0.1") is True
+        assert ac._loopback_egress_is_proxy_safe("http://127.0.0.1:5000/v1") is True
 
     def test_proxy_with_wildcard_no_proxy_is_safe(self, monkeypatch):
         monkeypatch.setenv("ALL_PROXY", "socks5://corp-proxy:1080")
         monkeypatch.setenv("NO_PROXY", "*")
-        assert ac._loopback_egress_is_proxy_safe("127.0.0.1") is True
+        assert ac._loopback_egress_is_proxy_safe("http://127.0.0.1:5000/v1") is True
+
+    # ── Codex CP007L: NO_PROXY token must match the ACTUAL request host, not a
+    # different loopback host the client would still proxy. Each of these must
+    # agree with _get_proxy_for_base_url (no false-positive admission).
+    def test_127_0_0_1_with_no_proxy_localhost_only_fails_closed(self, monkeypatch):
+        monkeypatch.setenv("HTTPS_PROXY", "http://corp-proxy:8080")
+        monkeypatch.setenv("NO_PROXY", "localhost")
+        assert ac._loopback_egress_is_proxy_safe("http://127.0.0.1:5000/v1") is False
+
+    def test_127_9_9_9_with_no_proxy_127_0_0_1_fails_closed(self, monkeypatch):
+        monkeypatch.setenv("HTTPS_PROXY", "http://corp-proxy:8080")
+        monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+        assert ac._loopback_egress_is_proxy_safe("http://127.9.9.9:5000/v1") is False
+
+    def test_ipv6_loopback_with_ipv4_only_bypass_fails_closed(self, monkeypatch):
+        monkeypatch.setenv("HTTPS_PROXY", "http://corp-proxy:8080")
+        monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+        assert ac._loopback_egress_is_proxy_safe("http://[::1]:5000/v1") is False
+
+    def test_guard_matches_actual_client_proxy_decision(self, monkeypatch):
+        """Structural guarantee: safe iff the real client resolves no proxy."""
+        from agent.process_bootstrap import _get_proxy_for_base_url
+        monkeypatch.setenv("HTTPS_PROXY", "http://corp-proxy:8080")
+        monkeypatch.setenv("NO_PROXY", "localhost,127.0.0.1,::1")
+        for url in ("http://127.0.0.1:5000/v1", "http://127.9.9.9:5000/v1",
+                    "http://[::1]:5000/v1", "http://localhost:5000/v1"):
+            assert ac._loopback_egress_is_proxy_safe(url) is (_get_proxy_for_base_url(url) is None)
 
 
 class TestRuntimeGateDefaultClosed:
@@ -126,6 +158,20 @@ class TestRuntimeGateOptIn:
         monkeypatch.setenv("HTTPS_PROXY", "http://corp-proxy:8080")
         with compression_route_guard():
             assert ac._compression_client_allowed("mock", _client("http://127.0.0.1:5000/v1")) is False
+
+    def test_proxied_loopback_with_mismatched_no_proxy_rejected(self, monkeypatch):
+        # NO_PROXY bypasses 127.0.0.1 but the request is to 127.9.9.9, which the
+        # client WOULD proxy — must fail closed (Codex CP007L false-positive).
+        monkeypatch.setenv("HTTPS_PROXY", "http://corp-proxy:8080")
+        monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+        with compression_route_guard():
+            assert ac._compression_client_allowed("mock", _client("http://127.9.9.9:5000/v1")) is False
+
+    def test_proxied_loopback_with_matching_no_proxy_admitted(self, monkeypatch):
+        monkeypatch.setenv("HTTPS_PROXY", "http://corp-proxy:8080")
+        monkeypatch.setenv("NO_PROXY", "localhost,127.0.0.1,::1")
+        with compression_route_guard():
+            assert ac._compression_client_allowed("mock", _client("http://127.0.0.1:5000/v1")) is True
 
     def test_anthropic_alias_to_foreign_host_still_rejected(self):
         aliased = _fake_anthropic_client(base_url="https://openrouter.ai/api/v1")
@@ -196,3 +242,19 @@ class TestStartupValidationAgreesWithGate:
         monkeypatch.setattr("hermes_cli.config.load_config", lambda: self._cfg(opt_in=True))
         problems = ac.validate_configured_compression_routes()
         assert any("proxy" in p.lower() for p in problems), problems
+
+    def test_loopback_with_mismatched_no_proxy_flagged(self, monkeypatch):
+        # Provider api 127.9.9.9 but NO_PROXY only bypasses 127.0.0.1 → the
+        # client would proxy → startup validation must flag it (mirrors gate).
+        monkeypatch.setenv("HTTPS_PROXY", "http://corp-proxy:8080")
+        monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+        cfg = self._cfg(opt_in=True, api="http://127.9.9.9:5000/v1")
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+        problems = ac.validate_configured_compression_routes()
+        assert any("proxy" in p.lower() for p in problems), problems
+
+    def test_loopback_with_matching_no_proxy_valid(self, monkeypatch):
+        monkeypatch.setenv("HTTPS_PROXY", "http://corp-proxy:8080")
+        monkeypatch.setenv("NO_PROXY", "localhost,127.0.0.1,::1")
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: self._cfg(opt_in=True))
+        assert ac.validate_configured_compression_routes() == []
