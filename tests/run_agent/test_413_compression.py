@@ -606,8 +606,18 @@ class TestPreflightCompression:
             ("compacted", COMPACTION_DONE_STATUS),
         ]
 
-    def test_compress_context_emits_one_terminal_status_when_lock_is_unavailable(self, agent):
-        """A rejected lock must retire the started desktop compaction phase."""
+    def test_compress_context_emits_no_phase_when_lock_is_unavailable(self, agent):
+        """A contended lock must not open a desktop compaction phase at all.
+
+        CP007D contract: the phase-opening lifecycle status (COMPACTION_STATUS)
+        is emitted only AFTER the cross-session queue admits, which is strictly
+        after lock acquisition. A contended lock returns before admission, so no
+        phase is ever opened — and therefore none needs a terminal "compacted"
+        to retire it. The user sees only the contention warn, never a phantom
+        "compacting" phase left dangling. (The started-then-retired path is
+        covered by test_compress_context_emits_one_terminal_status_after_an_abort,
+        where the lock IS acquired and admission proceeds.)
+        """
         agent.compression_enabled = False
         agent.session_id = "session-with-contended-lock"
         agent._session_db = SimpleNamespace(
@@ -622,8 +632,11 @@ class TestPreflightCompression:
 
         assert compressed is messages
         assert prompt == "You are helpful."
-        assert [event for event, _ in events] == ["lifecycle", "warn", "compacted"]
-        assert events[-1] == ("compacted", COMPACTION_DONE_STATUS)
+        # No "lifecycle" start and no "compacted" terminal — the phase was never
+        # opened. Only the contention warn is surfaced.
+        assert [event for event, _ in events] == ["warn"]
+        assert "lifecycle" not in [event for event, _ in events]
+        assert "compacted" not in [event for event, _ in events]
 
     def test_compress_context_emits_one_terminal_status_after_an_abort(self, agent):
         """An aborted summary must retire the started desktop compaction phase."""

@@ -100,7 +100,7 @@ class TestCallLlmUnsupportedTemperatureRetry:
                   side_effect=lambda resp, _task, **_kw: resp),
         ):
             result = call_llm(
-                task="compression",
+                task="session_search",
                 messages=[{"role": "user", "content": "remember this"}],
                 temperature=0.3,
                 max_tokens=500,
@@ -141,7 +141,7 @@ class TestCallLlmUnsupportedTemperatureRetry:
         ):
             with pytest.raises(RuntimeError, match="Invalid value"):
                 call_llm(
-                    task="compression",
+                    task="session_search",
                     messages=[{"role": "user", "content": "x"}],
                     temperature=0.3,
                     max_tokens=500,
@@ -171,7 +171,7 @@ class TestCallLlmUnsupportedTemperatureRetry:
         ):
             with pytest.raises(RuntimeError):
                 call_llm(
-                    task="compression",
+                    task="session_search",
                     messages=[{"role": "user", "content": "x"}],
                     temperature=None,  # explicit: no temperature sent
                     max_tokens=500,

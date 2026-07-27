@@ -1677,18 +1677,34 @@ def run_conversation(
                 compression_attempts,
                 max_compression_attempts,
             )
-            # NO caller-side "Compacting…" status here.
-            #
-            # The compaction queue may DENY this attempt (another session holds the
-            # slot), in which case _compress_context returns the messages unchanged
-            # and nothing is compacted. Announcing compaction before the call would
-            # narrate work that never happens — and because this branch retries up
-            # to the per-turn attempt cap, the user would see it repeatedly.
-            #
-            # _compress_context now owns the single truthful status: it emits
-            # COMPACTION_STATUS only AFTER the queue admits (or is bypassed/
-            # disabled), i.e. only when compaction is genuinely about to run. The
-            # pressure detail above is preserved in the logger.info.
+            # Upstream's pre-API PRESSURE announcement (📦), routed through the
+            # engine resolver so a quiet engine can suppress it (#35191). This is
+            # NOT the compaction lifecycle status: PRE_API_COMPRESSION_STATUS_TEMPLATE
+            # carries no COMPACTION_STATUS_MARKER ("Compacting context"), so it opens
+            # no desktop compaction PHASE — it just reports the pressure that
+            # triggered this pass, which is true whether or not the cross-session
+            # queue admits this cycle. The one phase-opening lifecycle status
+            # (🗜️ COMPACTION_STATUS) is still emitted ONLY after admission, inside
+            # _compress_context, so a DENIED cycle never opens a phantom phase.
+            _pre_api_status = automatic_compaction_status_message(
+                _compressor,
+                phase="pre_api",
+                default_message=PRE_API_COMPRESSION_STATUS_TEMPLATE.format(
+                    tokens=request_pressure_tokens
+                ),
+                approx_tokens=request_pressure_tokens,
+                threshold_tokens=int(
+                    getattr(_compressor, "threshold_tokens", 0) or 0
+                ),
+                context_length=int(
+                    getattr(_compressor, "context_length", 0) or 0
+                ),
+                model=agent.model,
+                attempt=compression_attempts,
+                max_attempts=max_compression_attempts,
+            )
+            if _pre_api_status:
+                agent._emit_status(_pre_api_status)
             _last_preflight_pressure = request_pressure_tokens
             _pre_api_input = messages
             messages, active_system_prompt = agent._compress_context(
