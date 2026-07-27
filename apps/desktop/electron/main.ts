@@ -5279,9 +5279,7 @@ function buildApplicationMenu() {
     {
       label: 'Reopen Saved Session Windows',
       click: () =>
-        void reopenSessionWindows().catch(err =>
-          rememberLog(`[session-windows] reopen failed: ${err?.message || err}`)
-        )
+        void reopenSessionWindows().catch(err => rememberLog(`[session-windows] reopen failed: ${err?.message || err}`))
     }
   ]
 
@@ -8620,11 +8618,18 @@ function spawnSecondaryWindow({
 // Open (or focus) a standalone window for a single chat session. `bounds`/
 // `isMaximized` are only passed by reopenSessionWindows() (restoring a saved
 // window) — a normal cmd-click / "New window" open omits them.
-function createSessionWindow(sessionId, { watch = false, bounds, isMaximized }: {
-  watch?: boolean
-  bounds?: { width: number; height: number; x?: number; y?: number }
-  isMaximized?: boolean
-} = {}) {
+function createSessionWindow(
+  sessionId,
+  {
+    watch = false,
+    bounds,
+    isMaximized
+  }: {
+    watch?: boolean
+    bounds?: { width: number; height: number; x?: number; y?: number }
+    isMaximized?: boolean
+  } = {}
+) {
   return sessionWindows.openOrFocus(
     sessionId,
     () => {
@@ -9298,9 +9303,7 @@ ipcMain.handle('hermes:window:closeAllSessionWindows', async () => {
 ipcMain.handle('hermes:window:reopenSessionWindows', async () => {
   // Fire-and-forget: the sequential connection-aware reopen can take several
   // seconds across many windows; the renderer shouldn't block on it.
-  void reopenSessionWindows().catch(err =>
-    rememberLog(`[session-windows] reopen failed: ${err?.message || err}`)
-  )
+  void reopenSessionWindows().catch(err => rememberLog(`[session-windows] reopen failed: ${err?.message || err}`))
 
   return { ok: true }
 })
