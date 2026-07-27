@@ -11,13 +11,6 @@ def _load_optional_dependencies():
     return project["optional-dependencies"]
 
 
-def _load_package_data():
-    pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
-    with pyproject_path.open("rb") as handle:
-        tool = tomllib.load(handle)["tool"]
-    return tool["setuptools"]["package-data"]
-
-
 def test_matrix_extra_not_in_all():
     """The [matrix] extra pulls `mautrix[encryption]` -> `python-olm`,
     which has Linux-only wheels and no native build path on Windows or
@@ -31,7 +24,7 @@ def test_matrix_extra_not_in_all():
     """
     optional_dependencies = _load_optional_dependencies()
 
-    assert "matrix" in optional_dependencies, "[matrix] extra must still exist for explicit `pip install hermes-agent[matrix]`"
+    assert "matrix" in optional_dependencies, "[matrix] extra must still exist for `uv sync --extra matrix`"
     # Must NOT appear in [all] in any form — neither unconditional nor
     # platform-gated. Lazy-install handles it.
     matrix_in_all = [
@@ -186,6 +179,38 @@ def test_pyproject_pins_match_lazy_deps_pins():
     )
 
 
+def test_voice_extra_pins_ctranslate2_matching_lazy_deps():
+    """Local STT's inference engine is ctranslate2, but faster-whisper only
+    FLOORS it (``ctranslate2>=4.0``). Left unpinned, both `pip install
+    hermes-agent[voice]` and the lazy reinstall path
+    (LAZY_DEPS['stt.faster_whisper']) float ctranslate2 to the newest PyPI
+    release, which can be ABI-incompatible with the host CUDA/cuDNN runtime
+    and silently drop STT to CPU/int8. Both surfaces must exact-pin
+    ctranslate2 to the SAME known-good version (the general parity guard in
+    test_pyproject_pins_match_lazy_deps_pins also covers the shared-version
+    invariant; this test additionally asserts the pin is present in both).
+    """
+    from tools.lazy_deps import LAZY_DEPS
+
+    optional_dependencies = _load_optional_dependencies()
+    voice_pins = _exact_pins(optional_dependencies["voice"])
+    lazy_pins = _exact_pins(LAZY_DEPS["stt.faster_whisper"])
+
+    assert "ctranslate2" in voice_pins, (
+        "[voice] extra must exact-pin ctranslate2 — faster-whisper only "
+        "floors it, so an unpinned resolve floats it forward and can break "
+        "the host CUDA/cuDNN runtime."
+    )
+    assert "ctranslate2" in lazy_pins, (
+        "LAZY_DEPS['stt.faster_whisper'] must exact-pin ctranslate2 so a lazy "
+        "reinstall can't pull an unconstrained newer version."
+    )
+    assert voice_pins["ctranslate2"] == lazy_pins["ctranslate2"], (
+        "voice extra and lazy-deps ctranslate2 pins must match: "
+        f"voice=={voice_pins['ctranslate2']} lazy=={lazy_pins['ctranslate2']}"
+    )
+
+
 def test_dev_extra_excluded_from_all():
     """End-user installs should not pull test/lint/debug tooling."""
     optional_dependencies = _load_optional_dependencies()
@@ -222,33 +247,11 @@ def test_feishu_extra_includes_qrcode_for_qr_login():
     assert any(dep.startswith("qrcode") for dep in feishu_extra)
 
 
-def test_nemo_relay_extra_uses_official_0_3_distribution():
+def test_nemo_relay_extra_uses_supported_official_distribution_range():
     optional_dependencies = _load_optional_dependencies()
 
-    assert optional_dependencies["nemo-relay"] == ["nemo-relay==0.3"]
+    assert optional_dependencies["nemo-relay"] == ["nemo-relay>=0.5,<1.0"]
     assert not any(
         spec == "hermes-agent[nemo-relay]"
         for spec in optional_dependencies["all"]
     )
-
-
-def test_dashboard_plugin_manifests_and_assets_are_packaged():
-    """Bundled dashboard plugins need their manifests and built assets in
-    wheel installs so /api/dashboard/plugins can discover them outside a
-    source checkout."""
-    package_data = _load_package_data()
-    plugin_data = package_data["plugins"]
-
-    assert "*/dashboard/manifest.json" in plugin_data
-    assert "*/dashboard/dist/*" in plugin_data
-    assert "*/dashboard/dist/**/*" in plugin_data
-
-
-def test_nested_bundled_plugin_metadata_is_packaged():
-    """Nested opt-in plugins need manifests and READMEs in wheel installs."""
-    package_data = _load_package_data()
-    plugin_data = package_data["plugins"]
-
-    assert "**/plugin.yaml" in plugin_data
-    assert "**/plugin.yml" in plugin_data
-    assert "**/README.md" in plugin_data

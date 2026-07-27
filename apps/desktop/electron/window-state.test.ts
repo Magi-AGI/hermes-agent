@@ -5,7 +5,8 @@
  */
 
 import assert from 'node:assert/strict'
-import test from 'node:test'
+
+import { test, vi } from 'vitest'
 
 import {
   computeWindowOptions,
@@ -68,6 +69,12 @@ test('sanitizeWindowState treats isMaximized strictly', () => {
   assert.equal(sanitizeWindowState({ width: 1400, height: 900, isMaximized: 'yes' }).isMaximized, false)
 })
 
+test('sanitizeWindowState floors size to caller-supplied minimums, not the main-window defaults', () => {
+  const state = sanitizeWindowState({ width: 10, height: 10 }, { minWidth: 420, minHeight: 620 })
+  assert.equal(state.width, 420)
+  assert.equal(state.height, 620)
+})
+
 // ─── onScreen ──────────────────────────────────────────────────────────────
 
 test('onScreen accepts a window on the primary or a secondary display', () => {
@@ -116,10 +123,19 @@ test('computeWindowOptions does not clamp when displays are unknown', () => {
   assert.deepEqual(computeWindowOptions(saved, []), { width: 2560, height: 1440 })
 })
 
+test('computeWindowOptions clamps to caller-supplied minimums, not the main-window floor', () => {
+  const tiny = [{ workArea: { x: 0, y: 0, width: 300, height: 500 } }]
+  const saved = sanitizeWindowState({ width: 10, height: 10 }, { minWidth: 420, minHeight: 620 })
+  assert.deepEqual(computeWindowOptions(saved, tiny, { minWidth: 420, minHeight: 620 }), {
+    width: 420,
+    height: 620
+  })
+})
+
 // ─── debounce ──────────────────────────────────────────────────────────────
 
-test('debounce coalesces a burst into one trailing run', t => {
-  t.mock.timers.enable({ apis: ['setTimeout'] })
+test('debounce coalesces a burst into one trailing run', () => {
+  vi.useFakeTimers()
   let calls = 0
 
   const d = debounce(() => {
@@ -130,14 +146,16 @@ test('debounce coalesces a burst into one trailing run', t => {
   d()
   d()
   assert.equal(calls, 0)
-  t.mock.timers.tick(249)
+  vi.advanceTimersByTime(249)
   assert.equal(calls, 0)
-  t.mock.timers.tick(1)
+  vi.advanceTimersByTime(1)
   assert.equal(calls, 1)
+
+  vi.useRealTimers()
 })
 
-test('debounce.flush runs now and cancels the pending timer', t => {
-  t.mock.timers.enable({ apis: ['setTimeout'] })
+test('debounce.flush runs now and cancels the pending timer', () => {
+  vi.useFakeTimers()
   let calls = 0
 
   const d = debounce(() => {
@@ -147,6 +165,8 @@ test('debounce.flush runs now and cancels the pending timer', t => {
   d()
   d.flush()
   assert.equal(calls, 1)
-  t.mock.timers.tick(1000)
+  vi.advanceTimersByTime(1000)
   assert.equal(calls, 1)
+
+  vi.useRealTimers()
 })

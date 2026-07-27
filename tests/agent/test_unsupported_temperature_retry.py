@@ -97,10 +97,10 @@ class TestCallLlmUnsupportedTemperatureRetry:
             patch("agent.auxiliary_client._get_cached_client",
                   return_value=(client, "gpt-5.5")),
             patch("agent.auxiliary_client._validate_llm_response",
-                  side_effect=lambda resp, _task: resp),
+                  side_effect=lambda resp, _task, **_kw: resp),
         ):
             result = call_llm(
-                task="compression",
+                task="session_search",
                 messages=[{"role": "user", "content": "remember this"}],
                 temperature=0.3,
                 max_tokens=500,
@@ -135,13 +135,13 @@ class TestCallLlmUnsupportedTemperatureRetry:
             patch("agent.auxiliary_client._get_cached_client",
                   return_value=(client, "gpt-5.5")),
             patch("agent.auxiliary_client._validate_llm_response",
-                  side_effect=lambda resp, _task: resp),
+                  side_effect=lambda resp, _task, **_kw: resp),
             patch("agent.auxiliary_client._try_payment_fallback",
                   return_value=None),
         ):
             with pytest.raises(RuntimeError, match="Invalid value"):
                 call_llm(
-                    task="compression",
+                    task="session_search",
                     messages=[{"role": "user", "content": "x"}],
                     temperature=0.3,
                     max_tokens=500,
@@ -165,13 +165,13 @@ class TestCallLlmUnsupportedTemperatureRetry:
             patch("agent.auxiliary_client._get_cached_client",
                   return_value=(client, "gpt-5.5")),
             patch("agent.auxiliary_client._validate_llm_response",
-                  side_effect=lambda resp, _task: resp),
+                  side_effect=lambda resp, _task, **_kw: resp),
             patch("agent.auxiliary_client._try_payment_fallback",
                   return_value=None),
         ):
             with pytest.raises(RuntimeError):
                 call_llm(
-                    task="compression",
+                    task="session_search",
                     messages=[{"role": "user", "content": "x"}],
                     temperature=None,  # explicit: no temperature sent
                     max_tokens=500,
@@ -197,7 +197,7 @@ class TestAsyncCallLlmUnsupportedTemperatureRetry:
             patch("agent.auxiliary_client._get_cached_client",
                   return_value=(client, "gpt-5.5")),
             patch("agent.auxiliary_client._validate_llm_response",
-                  side_effect=lambda resp, _task: resp),
+                  side_effect=lambda resp, _task, **_kw: resp),
         ):
             result = await async_call_llm(
                 task="session_search",
@@ -232,7 +232,7 @@ class TestAsyncCallLlmUnsupportedTemperatureRetry:
             patch("agent.auxiliary_client._get_cached_client",
                   return_value=(client, "gpt-5.5")),
             patch("agent.auxiliary_client._validate_llm_response",
-                  side_effect=lambda resp, _task: resp),
+                  side_effect=lambda resp, _task, **_kw: resp),
             patch("agent.auxiliary_client._try_payment_fallback",
                   return_value=None),
         ):

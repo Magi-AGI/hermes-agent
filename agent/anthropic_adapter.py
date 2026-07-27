@@ -22,7 +22,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from hermes_constants import get_hermes_home
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Optional, Tuple
 from utils import base_url_host_matches, normalize_proxy_env_vars
 
 # NOTE: `import anthropic` is deliberately NOT at module top — the SDK pulls
@@ -65,6 +65,7 @@ THINKING_BUDGET = {"xhigh": 32000, "high": 16000, "medium": 8000, "low": 4000}
 # maps to low on every model.  See:
 # https://platform.claude.com/docs/en/about-claude/models/migration-guide
 ADAPTIVE_EFFORT_MAP = {
+    "ultra":   "max",
     "max":     "max",
     "xhigh":   "xhigh",
     "high":    "high",
@@ -126,6 +127,8 @@ _FAST_MODE_SUPPORTED_SUBSTRINGS = ("opus-4-6", "opus-4.6")
 _ANTHROPIC_OUTPUT_LIMITS = {
     # Mythos-class named models (claude-fable-5, …) — 1M context, reasoning
     "claude-fable":      128_000,
+    # Claude Sonnet 5
+    "claude-sonnet-5":   128_000,
     # Claude 4.8
     "claude-opus-4-8":   128_000,
     # Claude 4.7
@@ -246,7 +249,13 @@ def _supports_adaptive_thinking(model: str) -> bool:
     only returns False for the explicit legacy list of older Claude families
     that require manual budget-based thinking. Non-Claude Anthropic-Messages
     models (minimax, qwen3, …) return False so they keep the manual path.
+
+    Kimi / Moonshot models are the exception: their Anthropic-compatible
+    endpoints implement the adaptive contract (``thinking.type="adaptive"``
+    + ``output_config.effort``, including ``xhigh`` and ``display``).
     """
+    if _model_name_is_kimi_family(model):
+        return True
     if not _is_claude_model(model):
         return False
     m = model.lower()
@@ -359,7 +368,7 @@ def _detect_claude_code_version() -> str:
         try:
             result = _sp.run(
                 [cmd, "--version"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
             )
             if result.returncode == 0 and result.stdout.strip():
                 # Output is like "2.1.74 (Claude Code)" or just "2.1.74"
@@ -448,7 +457,8 @@ def _is_kimi_coding_endpoint(base_url: str | None) -> bool:
 
 # Model-name prefixes that identify the Kimi / Moonshot family.  Covers
 # - official slugs: ``kimi-k2.5``, ``kimi_thinking``, ``moonshot-v1-8k``
-# - common release lines: ``k1.5-...``, ``k2-thinking``, ``k25-...``, ``k2.5-...``
+# - common release lines: ``k1.5-...``, ``k2-thinking``, ``k25-...``, ``k2.5-...``,
+#   and the bare Coding Plan slug ``k3`` (plus ``k3.x``/``k3-...`` variants)
 # Matched case-insensitively against the post-``normalize_model_name`` form,
 # so a caller's ``provider/vendor/model`` slug is handled the same as a
 # bare name.
@@ -458,7 +468,13 @@ _KIMI_FAMILY_MODEL_PREFIXES = (
     "k1.", "k1-",
     "k2.", "k2-",
     "k25", "k2.5",
+    "k3.", "k3-",
 )
+
+# Bare release slugs with no separator suffix (Kimi Coding Plan serves K3
+# as the exact slug ``k3``). Kept exact-match so unrelated model names that
+# merely start with the same characters don't get misclassified.
+_KIMI_FAMILY_EXACT_SLUGS = frozenset({"k3"})
 
 
 def _model_name_is_kimi_family(model: str | None) -> bool:
@@ -470,6 +486,8 @@ def _model_name_is_kimi_family(model: str | None) -> bool:
     # Strip vendor prefix (e.g. ``moonshotai/kimi-k2.5`` → ``kimi-k2.5``)
     if "/" in m:
         m = m.rsplit("/", 1)[-1]
+    if m in _KIMI_FAMILY_EXACT_SLUGS:
+        return True
     return m.startswith(_KIMI_FAMILY_MODEL_PREFIXES)
 
 
@@ -533,8 +551,9 @@ def _requires_bearer_auth(base_url: str | None) -> bool:
 
     Some third-party /anthropic endpoints implement Anthropic's Messages API but
     require Authorization: Bearer instead of Anthropic's native x-api-key header.
-    MiniMax's global and China Anthropic-compatible endpoints, and Azure AI
-    Foundry's Anthropic-style endpoint follow this pattern.
+    MiniMax's global and China Anthropic-compatible endpoints, Azure AI
+    Foundry's Anthropic-style endpoint, and Palantir Foundry's LLM proxy
+    follow this pattern.
     """
     normalized = _normalize_base_url_text(base_url)
     if not normalized:
@@ -543,6 +562,11 @@ def _requires_bearer_auth(base_url: str | None) -> bool:
     return (
         normalized.startswith(("https://api.minimax.io/anthropic", "https://api.minimaxi.com/anthropic"))
         or "azure.com" in normalized
+        # Palantir Foundry LLM proxy (<org>.palantirfoundry.com/api/v2/llm/proxy/anthropic)
+        # rejects x-api-key with 401 and requires Authorization: Bearer.
+        # Hostname match (not substring) so e.g. evil.com/palantirfoundry
+        # paths don't trigger Bearer auth.
+        or base_url_host_matches(normalized, "palantirfoundry.com")
     )
 
 
@@ -890,7 +914,7 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
              "-s", "Claude Code-credentials",
              "-w"],
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=5,
             stdin=subprocess.DEVNULL,
         )
@@ -1321,6 +1345,174 @@ def resolve_anthropic_token() -> Optional[str]:
     return None
 
 
+# ── Anthropic credential provenance (subscription-route guard) ───────────────
+#
+# ``resolve_anthropic_token()`` above returns a bare string: callers cannot tell
+# whether they got a Claude Max / Claude Code OAuth credential or a metered
+# Console API key, because `anthropic` is a dual-route provider and step 5 is a
+# genuine API-key fallback.  Context compaction must never egress
+# business-sensitive conversation content to a metered route, so it needs the
+# provenance the bare resolver discards.
+#
+# The mode is decided by the token's SHAPE (``_is_oauth_token``), not by which
+# source supplied it: ``ANTHROPIC_TOKEN`` may hold a Console API key and
+# ``ANTHROPIC_API_KEY`` may hold a legacy OAuth token, so a source-variable rule
+# would be wrong in both directions.  ``source`` is reported for diagnostics.
+
+AUTH_MODE_OAUTH_SUBSCRIPTION = "oauth_subscription"
+AUTH_MODE_API_KEY = "api_key"
+
+SOURCE_ANTHROPIC_TOKEN = "ANTHROPIC_TOKEN"
+SOURCE_CLAUDE_CODE_OAUTH_TOKEN = "CLAUDE_CODE_OAUTH_TOKEN"
+SOURCE_CLAUDE_CODE_CREDENTIALS = "claude_code_credentials"
+SOURCE_CREDENTIAL_POOL = "credential_pool"
+SOURCE_ANTHROPIC_API_KEY = "ANTHROPIC_API_KEY"
+SOURCE_EXPLICIT = "explicit"
+
+
+class AnthropicCredential(NamedTuple):
+    """An Anthropic token plus where it came from and which route it buys."""
+
+    token: str
+    source: str
+    mode: str
+
+    @property
+    def is_subscription(self) -> bool:
+        return self.mode == AUTH_MODE_OAUTH_SUBSCRIPTION
+
+
+def classify_anthropic_auth_mode(token: str, structural_oauth: bool = False) -> Optional[str]:
+    """Classify a token as the subscription (OAuth) route or the metered route.
+
+    ``structural_oauth`` marks credentials whose *store* proves OAuth provenance
+    independently of the token's shape — a ``credential_pool`` entry with
+    ``auth_type == AUTH_TYPE_OAUTH``, or the Claude Code credential file (whose
+    ``accessToken`` is by construction an OAuth access token).  That lets an
+    opaque-but-genuine OAuth token classify correctly.
+
+    A positively metered shape (``sk-ant-api…`` — a Console API key, x-api-key
+    auth, never OAuth) always wins over structural provenance: a mislabelled
+    store entry must not buy a metered key an OAuth verdict.  Failing closed on
+    that contradiction is the whole point of the guard.
+    """
+    token = (token or "").strip()
+    if not token:
+        return None
+    if _is_oauth_token(token):
+        return AUTH_MODE_OAUTH_SUBSCRIPTION
+    if structural_oauth and not token.startswith("sk-ant-api"):
+        return AUTH_MODE_OAUTH_SUBSCRIPTION
+    return AUTH_MODE_API_KEY
+
+
+def _iter_anthropic_credential_candidates() -> Iterator[AnthropicCredential]:
+    """Yield every Anthropic credential candidate, in resolver precedence order.
+
+    Mirrors ``resolve_anthropic_token()``'s order (1→5) and its
+    ``_prefer_refreshable_claude_code_token`` preference, but **does not
+    short-circuit**: it yields every candidate so a caller can skip ones it
+    refuses and keep looking.  ``resolve_anthropic_token()`` is deliberately
+    left untouched (its many callers depend on its exact behaviour); this
+    generator is additive.  ``tests/agent/test_compression_route_guard.py``
+    pins the first yielded candidate to ``resolve_anthropic_token()``'s return
+    so the two cannot drift apart.
+    """
+    creds = read_claude_code_credentials()
+
+    # 1. Hermes-managed OAuth/setup token env var
+    token = os.getenv("ANTHROPIC_TOKEN", "").strip()
+    if token:
+        preferred = _prefer_refreshable_claude_code_token(token, creds)
+        if preferred:
+            yield AnthropicCredential(
+                preferred, SOURCE_CLAUDE_CODE_CREDENTIALS,
+                classify_anthropic_auth_mode(preferred, structural_oauth=True),
+            )
+        else:
+            yield AnthropicCredential(
+                token, SOURCE_ANTHROPIC_TOKEN, classify_anthropic_auth_mode(token),
+            )
+
+    # 2. CLAUDE_CODE_OAUTH_TOKEN
+    cc_token = os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+    if cc_token:
+        preferred = _prefer_refreshable_claude_code_token(cc_token, creds)
+        if preferred:
+            yield AnthropicCredential(
+                preferred, SOURCE_CLAUDE_CODE_CREDENTIALS,
+                classify_anthropic_auth_mode(preferred, structural_oauth=True),
+            )
+        else:
+            yield AnthropicCredential(
+                cc_token, SOURCE_CLAUDE_CODE_OAUTH_TOKEN,
+                classify_anthropic_auth_mode(cc_token),
+            )
+
+    # 3. Claude Code credential file (structural OAuth provenance)
+    resolved_claude_token = _resolve_claude_code_token_from_credentials(creds)
+    if resolved_claude_token:
+        yield AnthropicCredential(
+            resolved_claude_token, SOURCE_CLAUDE_CODE_CREDENTIALS,
+            classify_anthropic_auth_mode(resolved_claude_token, structural_oauth=True),
+        )
+
+    # 4. credential_pool OAuth entry — already filtered on auth_type ==
+    #    AUTH_TYPE_OAUTH by _resolve_anthropic_pool_token(), so provenance is
+    #    structural here rather than shape-inferred.
+    resolved_pool_token = _resolve_anthropic_pool_token()
+    if resolved_pool_token:
+        yield AnthropicCredential(
+            resolved_pool_token, SOURCE_CREDENTIAL_POOL,
+            classify_anthropic_auth_mode(resolved_pool_token, structural_oauth=True),
+        )
+
+    # 5. ANTHROPIC_API_KEY — usually the metered Console key, but may legitimately
+    #    hold a legacy OAuth token, so it is shape-classified like any other.
+    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if api_key:
+        yield AnthropicCredential(
+            api_key, SOURCE_ANTHROPIC_API_KEY, classify_anthropic_auth_mode(api_key),
+        )
+
+
+def resolve_anthropic_token_with_provenance(
+    subscription_only: bool = False,
+    on_skip: Optional[Callable[[AnthropicCredential], None]] = None,
+) -> Optional[AnthropicCredential]:
+    """Resolve an Anthropic credential, reporting its source and auth mode.
+
+    Same resolution ORDER as :func:`resolve_anthropic_token`, but returns the
+    provenance that function discards.
+
+    With ``subscription_only=True`` (the compaction route guard) the walk
+    **scans past** metered-shaped candidates instead of stopping at the first
+    token found, and returns the first OAuth/subscription credential; it returns
+    ``None`` only when every source is exhausted.  Scan-past is required, not
+    merely nicer: ``resolve_anthropic_token()`` short-circuits at each step, so
+    a metered-shaped value parked in ``ANTHROPIC_TOKEN`` (step 1) would
+    otherwise mask a perfectly good Claude Max credential in the Claude Code
+    store (step 3) or the credential pool (step 4) and needlessly fail-close
+    compaction for a user who does have a subscription route.  Privacy is
+    unchanged either way — a metered token is skipped, never used.
+
+    ``on_skip`` is invoked once per skipped candidate (telemetry/logging), so a
+    user whose ``ANTHROPIC_TOKEN`` is metered-shaped can see it was passed over
+    rather than silently ignored.
+    """
+    for candidate in _iter_anthropic_credential_candidates():
+        if not subscription_only or candidate.is_subscription:
+            return candidate
+        logger.info(
+            "Anthropic subscription-only resolve: skipping metered-shaped "
+            "candidate from %s (auth_mode=%s), continuing to next source",
+            candidate.source, candidate.mode,
+        )
+        if on_skip is not None:
+            on_skip(candidate)
+    return None
+
+
 def run_oauth_setup_token() -> Optional[str]:
     """Run 'claude setup-token' interactively and return the resulting token.
 
@@ -1567,7 +1759,10 @@ def _is_bedrock_model_id(model: str) -> bool:
     """
     lower = model.lower()
     # Regional inference-profile prefixes
-    if any(lower.startswith(p) for p in ("global.", "us.", "eu.", "ap.", "jp.")):
+    if any(lower.startswith(p) for p in (
+        "global.", "us.", "eu.", "apac.", "ap.", "au.", "jp.",
+        "ca.", "sa.", "me.", "af.",
+    )):
         return True
     # Bare Bedrock model IDs: provider.model-family
     if lower.startswith("anthropic."):
@@ -1854,6 +2049,28 @@ def _content_parts_to_anthropic_blocks(parts: Any) -> List[Dict[str, Any]]:
     return out
 
 
+_EMPTY_TEXT_PLACEHOLDER = "(empty)"
+
+
+def _safe_text(text: Any) -> str:
+    """Return ``text`` if it's non-whitespace, else a non-whitespace placeholder.
+
+    The Anthropic Messages API rejects requests where a text content block is
+    empty or whitespace-only (HTTP 400 "text content blocks must contain
+    non-whitespace text"). When such a block gets stored in session history —
+    e.g. produced by context compression — it is replayed verbatim on every
+    subsequent turn, permanently wedging the session. Coercing to a
+    non-whitespace placeholder is self-healing: the next API call recovers.
+
+    Mirrors ``bedrock_adapter._safe_text`` (#9486); ref #69512.
+    """
+    if text is None:
+        return _EMPTY_TEXT_PLACEHOLDER
+    if not isinstance(text, str):
+        text = str(text)
+    return text if text.strip() else _EMPTY_TEXT_PLACEHOLDER
+
+
 def _sanitize_replay_block(b: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Strip output-only fields from a stored Anthropic content block so it is
     valid as REQUEST input on replay.
@@ -1871,7 +2088,18 @@ def _sanitize_replay_block(b: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
     btype = b.get("type")
     if btype == "text":
-        out: Dict[str, Any] = {"type": "text", "text": b.get("text", "")}
+        text_val = b.get("text", "")
+        # Bedrock and strict Anthropic-compatible endpoints reject text
+        # blocks where "text" is empty or whitespace-only (#69512). Drop the
+        # blank block (the caller relocates any cache_control it carried and
+        # falls back to a non-whitespace placeholder when nothing survives)
+        # rather than coercing in place — a coerced "(empty)" block would be
+        # model-visible noise next to surviving thinking/tool_use blocks.
+        # Type-safe: captured blocks can carry text=None from an invalid
+        # upstream payload, which a bare .strip() would crash on.
+        if not isinstance(text_val, str) or not text_val.strip():
+            return None
+        out: Dict[str, Any] = {"type": "text", "text": text_val}
         # citations is input-valid ONLY when it's a non-empty list; the SDK
         # emits citations=None on responses, which the input schema rejects.
         cits = b.get("citations")
@@ -1959,9 +2187,17 @@ def _convert_assistant_message(m: Dict[str, Any]) -> Dict[str, Any]:
                 parsed_args = {}
             redacted_input_by_id[_sanitize_tool_id(tc.get("id", ""))] = parsed_args
         replayed: List[Dict[str, Any]] = []
+        _relocated_replay_cache_control = None
+        _dropped_blank_text = False
         for b in ordered_blocks:
             clean = _sanitize_replay_block(b)
             if clean is None:
+                if isinstance(b, dict) and b.get("type") == "text":
+                    _dropped_blank_text = True
+                if isinstance(b, dict) and isinstance(b.get("cache_control"), dict):
+                    # A dropped blank text block can still carry the cache
+                    # breakpoint marker -- relocate it rather than losing it.
+                    _relocated_replay_cache_control = b["cache_control"]
                 continue
             if clean.get("type") == "tool_use":
                 # Override raw (un-redacted) input with the redacted copy when
@@ -1971,20 +2207,68 @@ def _convert_assistant_message(m: Dict[str, Any]) -> Dict[str, Any]:
                 if redacted is not None:
                     clean["input"] = redacted
             replayed.append(clean)
+        # When every text block was blank and nothing cacheable survived
+        # (e.g. signed thinking + a blank text block, or a SOLE blank
+        # cache-marked block), emit the non-whitespace placeholder so the
+        # replayed message stays schema-valid (#69512) and a relocated cache
+        # marker still has a carrier instead of being silently lost.
+        _has_cacheable_replay = any(
+            isinstance(b, dict) and b.get("type") in {"text", "tool_use"}
+            for b in replayed
+        )
+        if not _has_cacheable_replay and (
+            _dropped_blank_text or _relocated_replay_cache_control is not None
+        ):
+            replayed.append({"type": "text", "text": _EMPTY_TEXT_PLACEHOLDER})
         if replayed:
+            if _relocated_replay_cache_control is not None:
+                _apply_assistant_cache_control_to_last_cacheable_block(
+                    replayed, _relocated_replay_cache_control
+                )
             _apply_assistant_cache_control_to_last_cacheable_block(
                 replayed, m.get("cache_control")
             )
             return {"role": "assistant", "content": replayed}
 
     blocks = _extract_preserved_thinking_blocks(m)
+    # Cache markers dropped along with a blank block are relocated onto the
+    # last surviving cacheable block below (via
+    # _apply_assistant_cache_control_to_last_cacheable_block), rather than
+    # lost -- prompt_caching.py's _apply_cache_marker() sets cache_control
+    # directly on content[-1] for list content, so if that last part happens
+    # to be blank text, dropping it silently would lose the breakpoint.
+    _relocated_cache_control = None
     if content:
         if isinstance(content, list):
             converted_content = _convert_content_to_anthropic(content)
             if isinstance(converted_content, list):
-                blocks.extend(converted_content)
+                # Bedrock and strict Anthropic-compatible endpoints reject
+                # text blocks where "text" is empty or whitespace-only. The
+                # ordered-replay path enforces the same invariant via
+                # _sanitize_replay_block(). Type-safe against ANY invalid
+                # "text" value from an upstream payload -- None, or a
+                # truthy non-string like an int -- not just None: checking
+                # isinstance() first (rather than `blk.get("text") or ""`)
+                # means a non-string value is treated as blank/invalid
+                # instead of reaching .strip() and raising AttributeError.
+                for blk in converted_content:
+                    _blk_text = blk.get("text") if isinstance(blk, dict) else None
+                    if (
+                        isinstance(blk, dict)
+                        and blk.get("type") == "text"
+                        and (not isinstance(_blk_text, str) or not _blk_text.strip())
+                    ):
+                        if isinstance(blk.get("cache_control"), dict):
+                            _relocated_cache_control = blk["cache_control"]
+                        continue
+                    blocks.append(blk)
         else:
-            blocks.append({"type": "text", "text": str(content)})
+            # Scalar (non-list) content: a whitespace-only string is the
+            # same invalid-payload case as an empty list block -- drop it
+            # rather than emitting a blank text block.
+            text_str = str(content)
+            if text_str.strip():
+                blocks.append({"type": "text", "text": text_str})
     for tc in m.get("tool_calls", []):
         if not tc or not isinstance(tc, dict):
             continue
@@ -2000,9 +2284,6 @@ def _convert_assistant_message(m: Dict[str, Any]) -> Dict[str, Any]:
             "name": fn.get("name", ""),
             "input": parsed_args,
         })
-    _apply_assistant_cache_control_to_last_cacheable_block(
-        blocks, m.get("cache_control")
-    )
     # Kimi's /coding endpoint (Anthropic protocol) requires assistant
     # tool-call messages to carry reasoning_content when thinking is
     # enabled server-side.  Preserve it as a thinking block so Kimi
@@ -2028,10 +2309,26 @@ def _convert_assistant_message(m: Dict[str, Any]) -> Dict[str, Any]:
     )
     if isinstance(reasoning_content, str) and not _already_has_thinking:
         blocks.insert(0, {"type": "thinking", "thinking": reasoning_content})
-    # Anthropic rejects empty assistant content
-    effective = blocks or content
-    if not effective or effective == "":
-        effective = [{"type": "text", "text": "(empty)"}]
+    # Anthropic rejects empty assistant content. IMPORTANT: fall back only
+    # to the placeholder, never to the raw `content` variable -- `content`
+    # is the UNFILTERED original message content, and can itself be exactly
+    # the blank/whitespace-only payload the filtering above just removed
+    # (a sole blank text block, or scalar whitespace with no tool_calls).
+    # `blocks or content` there would silently restore the invalid provider
+    # payload this function exists to prevent (#69512).
+    effective = blocks if blocks else [{"type": "text", "text": _EMPTY_TEXT_PLACEHOLDER}]
+    # Applied here (after the empty-fallback resolution) rather than
+    # earlier against `blocks` directly, so a cache_control relocated from
+    # a dropped blank block that was the ONLY block still lands on the
+    # (empty) placeholder instead of being silently lost when blocks was
+    # empty at the point the marker would otherwise have been applied.
+    if _relocated_cache_control is not None:
+        _apply_assistant_cache_control_to_last_cacheable_block(
+            effective, _relocated_cache_control
+        )
+    _apply_assistant_cache_control_to_last_cacheable_block(
+        effective, m.get("cache_control")
+    )
     return {"role": "assistant", "content": effective}
 
 
@@ -2269,13 +2566,6 @@ def _manage_thinking_signatures(
     """
     _THINKING_TYPES = frozenset(("thinking", "redacted_thinking"))
     _is_third_party = _is_third_party_anthropic_endpoint(base_url)
-    # Kimi / DeepSeek share a contract: strip signed Anthropic blocks
-    # (neither upstream can validate Anthropic signatures), preserve unsigned
-    # ones synthesised from reasoning_content.  See #13848, #16748.
-    _preserve_unsigned_thinking = (
-        _is_kimi_family_endpoint(base_url, model)
-        or _is_deepseek_anthropic_endpoint(base_url)
-    )
 
     last_assistant_idx = None
     for i in range(len(result) - 1, -1, -1):
@@ -2287,8 +2577,12 @@ def _manage_thinking_signatures(
         if m.get("role") != "assistant" or not isinstance(m.get("content"), list):
             continue
 
-        if _preserve_unsigned_thinking:
-            # Kimi / DeepSeek: strip signed, preserve unsigned.
+        if _is_kimi_family_endpoint(base_url, model):
+            # Kimi does not enforce thinking signatures — replay as-is
+            # (shared cleanup below still strips cache markers + the internal flag).
+            pass
+        elif _is_deepseek_anthropic_endpoint(base_url):
+            # DeepSeek: strip signed, preserve unsigned.
             new_content = []
             for b in m["content"]:
                 if not isinstance(b, dict) or b.get("type") not in _THINKING_TYPES:
@@ -2388,6 +2682,24 @@ def _evict_old_screenshots(result: List[Dict[str, Any]]) -> None:
                 ]
 
 
+def _ensure_leading_user_turn(result: List[Dict[str, Any]]) -> None:
+    """Anthropic requires messages[0] to have role=user.
+
+    After a second context compaction on the auto path the summary can be
+    emitted as role=assistant with nothing in front of it (the system prompt
+    lives outside messages[] or is extracted into the separate ``system``
+    param), so messages[0] ends up assistant and the Messages API rejects
+    the request with HTTP 400 — often masked by a misleading
+    "tool_use ids were found without tool_result blocks" error (#52160).
+
+    Mirror the Bedrock Converse adapter, which unconditionally prepends a
+    minimal user turn when the first message is not user
+    (convert_messages_to_converse).
+    """
+    if result and result[0].get("role") != "user":
+        result.insert(0, {"role": "user", "content": [{"type": "text", "text": " "}]})
+
+
 def convert_messages_to_anthropic(
     messages: List[Dict],
     base_url: str | None = None,
@@ -2446,6 +2758,7 @@ def convert_messages_to_anthropic(
 
     _strip_orphaned_tool_blocks(result)
     result = _merge_consecutive_roles(result)
+    _ensure_leading_user_turn(result)
     _manage_thinking_signatures(result, base_url, model)
     _evict_old_screenshots(result)
 
@@ -2620,25 +2933,19 @@ def build_anthropic_kwargs(
     # MiniMax Anthropic-compat endpoints support thinking (manual mode only,
     # not adaptive).  Haiku does NOT support extended thinking — skip entirely.
     #
-    # Kimi's /coding endpoint speaks the Anthropic Messages protocol but has
-    # its own thinking semantics: when ``thinking.enabled`` is sent, Kimi
-    # validates the message history and requires every prior assistant
-    # tool-call message to carry OpenAI-style ``reasoning_content``.  The
-    # Anthropic path never populates that field, and
-    # ``convert_messages_to_anthropic`` strips all Anthropic thinking blocks
-    # on third-party endpoints — so the request fails with HTTP 400
-    # "thinking is enabled but reasoning_content is missing in assistant
-    # tool call message at index N".  Kimi's reasoning is driven server-side
-    # on the /coding route, so skip Anthropic's thinking parameter entirely
-    # for that host.  (Kimi on chat_completions enables thinking via
-    # extra_body in the ChatCompletionsTransport — see #13503.)
+    # Kimi / Moonshot models also use adaptive thinking: their
+    # Anthropic-compatible endpoints (api.moonshot.cn/anthropic,
+    # api.kimi.com/coding) accept ``thinking.type="adaptive"`` +
+    # ``output_config.effort``, and the replay-validation 400s that
+    # originally motivated dropping the parameter (#13848) no longer
+    # occur.  (Kimi on chat_completions enables thinking via extra_body
+    # in the ChatCompletionsTransport — see #13503.)
     #
     # On 4.7+ the `thinking.display` field defaults to "omitted", which
     # silently hides reasoning text that Hermes surfaces in its CLI. We
     # request "summarized" so the reasoning blocks stay populated — matching
     # 4.6 behavior and preserving the activity-feed UX during long tool runs.
-    _is_kimi_coding = _is_kimi_family_endpoint(base_url, model)
-    if reasoning_config and isinstance(reasoning_config, dict) and not _is_kimi_coding:
+    if reasoning_config and isinstance(reasoning_config, dict):
         if reasoning_config.get("enabled") is not False and "haiku" not in model.lower():
             effort = str(reasoning_config.get("effort", "medium")).lower()
             budget = THINKING_BUDGET.get(effort, 8000)
@@ -2754,6 +3061,7 @@ def create_anthropic_message(
     *,
     log_prefix: str = "",
     prefer_stream: bool = True,
+    on_stream_event=None,
 ) -> Any:
     """Create an Anthropic message, aggregating via stream when available.
 
@@ -2763,6 +3071,13 @@ def create_anthropic_message(
     crash on ``.content``.  Prefer ``messages.stream().get_final_message()`` to
     match the main turn path, falling back to ``create()`` only for providers
     that explicitly do not support streaming, such as restricted Bedrock roles.
+
+    ``on_stream_event``: optional callable invoked once per streamed event
+    (best-effort, exceptions swallowed). Lets callers report forward progress
+    to liveness watchdogs — e.g. the auxiliary compression path ticking its
+    progress hook so a slow-but-generating summary model isn't treated as
+    hung. Only fires on the streaming path; the ``create()`` fallback has no
+    events to report.
     """
     sanitize_anthropic_kwargs(api_kwargs, log_prefix=log_prefix)
 
@@ -2773,6 +3088,18 @@ def create_anthropic_message(
         stream_kwargs.pop("stream", None)
         try:
             with stream_fn(**stream_kwargs) as stream:
+                if callable(on_stream_event):
+                    # Consume the event stream manually so each event can
+                    # tick the caller's progress callback; get_final_message
+                    # then returns the accumulated snapshot.
+                    for _event in stream:
+                        try:
+                            on_stream_event(_event)
+                        except Exception:
+                            logger.debug(
+                                "%son_stream_event callback failed",
+                                log_prefix, exc_info=True,
+                            )
                 return stream.get_final_message()
         except Exception as exc:
             if not _is_stream_unavailable_error(exc):

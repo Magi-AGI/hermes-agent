@@ -1,10 +1,12 @@
 import { ThreadPrimitive, useAuiEvent, useAuiState } from '@assistant-ui/react'
+import { useStore } from '@nanostores/react'
 import {
   type ComponentProps,
   type CSSProperties,
   type FC,
   memo,
   type ReactNode,
+  startTransition,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -15,6 +17,7 @@ import { useStickToBottom } from 'use-stick-to-bottom'
 
 import { useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
+import { $activeSessionId, $selectedStoredSessionId } from '@/store/session'
 import {
   onScrollToBottomRequest,
   onThreadEditClose,
@@ -22,13 +25,13 @@ import {
   resetThreadScroll,
   setThreadAtBottom
 } from '@/store/thread-scroll'
-import { isSecondaryWindow } from '@/store/windows'
+import { isHeaderlessSecondaryWindow } from '@/store/windows'
 
 import { MessageRenderBoundary } from '../message-render-boundary'
 
 type ThreadMessageComponents = ComponentProps<typeof ThreadPrimitive.MessageByIndex>['components']
 
-type MessageGroup = { id: string; weight: number } & (
+export type MessageGroup = { id: string; weight: number } & (
   | { index: number; kind: 'standalone' }
   | { indices: number[]; kind: 'turn' }
 )
@@ -41,6 +44,11 @@ type MessageGroup = { id: string; weight: number } & (
 // WITHOUT a virtualizer — pure rendering, never touches scrollTop, so it can't
 // fight use-stick-to-bottom (the single scroll owner).
 const RENDER_BUDGET = 300
+// On session switch, paint a small budget first (enough for the bottom turn(s)
+// the user actually sees after scroll-to-bottom), then bump to the full budget
+// in a requestAnimationFrame — defers the heavy markdown+syntax-highlight render
+// past the initial commit, so the switch feels instant.
+const FIRST_PAINT_BUDGET = 60
 
 interface ThreadMessageListProps {
   clampToComposer: boolean
@@ -53,7 +61,7 @@ interface ThreadMessageListProps {
 // Group each user message with the assistant turn(s) that follow it so the
 // human bubble can `position: sticky` against the scroller across its whole
 // turn (see StickyHumanMessageContainer in thread.tsx).
-function buildGroups(signature: string): MessageGroup[] {
+export function buildGroups(signature: string): MessageGroup[] {
   if (!signature) {
     return []
   }
@@ -89,6 +97,45 @@ function buildGroups(signature: string): MessageGroup[] {
   return groups
 }
 
+// Walk turns newest-first, summing their part weights until the budget is met;
+// everything before the first kept turn is hidden. Returns the index of that
+// first visible group.
+export function firstVisibleGroupIndex(groups: readonly MessageGroup[], budget: number): number {
+  let firstVisible = groups.length
+
+  for (let i = groups.length - 1, weight = 0; i >= 0; i--) {
+    weight += groups[i].weight
+    firstVisible = i
+
+    if (weight >= budget) {
+      break
+    }
+  }
+
+  return firstVisible
+}
+
+// content-visibility:auto skips off-screen turns for perf, but with
+// contain-intrinsic-size:auto the browser only remembers a turn's size AFTER
+// it has rendered. A turn that finishes streaming near the bottom may have had
+// its (smaller) mid-stream size remembered; when it scrolls just off the top
+// edge and gets skipped, it snaps back to that stale height, shifting content
+// down. With overflow-anchor:none (the viewport can't self-correct) the
+// stick-to-bottom lock drifts and the view creeps up over older turns — the
+// "long session eventually shows old responses" glitch.
+//
+// Keep the newest N turns always-rendered so a turn is only ever virtualized
+// once its layout has settled at its final size (remembered == real → skipping
+// it changes no height). Off-screen OLDER turns still skip, so the dialog/popover
+// recalc win on long transcripts is preserved (that scales with the hundreds of
+// old turns, not this small live tail).
+export const LIVE_TAIL_GROUPS = 6
+
+/** True when a visible group is old enough to virtualize (outside the live tail). */
+export function isVirtualizedGroup(indexInVisible: number, visibleCount: number, liveTail = LIVE_TAIL_GROUPS): boolean {
+  return indexInVisible < visibleCount - liveTail
+}
+
 const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   clampToComposer,
   components,
@@ -116,28 +163,73 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     resize: 'instant'
   })
 
-  const [renderBudget, setRenderBudget] = useState(RENDER_BUDGET)
+  const [renderBudget, setRenderBudget] = useState(FIRST_PAINT_BUDGET)
 
-  // Walk turns newest-first, summing their part weights until the budget is met;
-  // everything before that first kept turn is hidden.
-  let firstVisible = groups.length
+  // Cut the budget during RENDER, not in the post-commit layout effect. An
+  // effect-time cut is too late: React would first build the whole tree with
+  // the full budget (up to 300 parts of markdown + syntax highlighting),
+  // commit it, and only then re-render at the small budget. The render-phase
+  // state adjustment restarts this component immediately — before any child
+  // renders — so the heavy commit never happens.
+  //
+  // Two triggers, because the transcript swap arrives differently per path:
+  // a WARM switch publishes sessionKey + messages in one commit (the key
+  // branch), while a COLD switch changes sessionKey with an empty transcript
+  // and the prefetched messages land hundreds of ms later under the SAME key
+  // (the empty→non-empty branch).
+  const hasGroups = groups.length > 0
+  const [budgetSessionKey, setBudgetSessionKey] = useState(sessionKey)
+  const [hadGroups, setHadGroups] = useState(hasGroups)
 
-  for (let i = groups.length - 1, weight = 0; i >= 0; i--) {
-    weight += groups[i].weight
-    firstVisible = i
+  if (budgetSessionKey !== sessionKey) {
+    setBudgetSessionKey(sessionKey)
+    setHadGroups(hasGroups)
+    setRenderBudget(FIRST_PAINT_BUDGET)
+  } else if (hadGroups !== hasGroups) {
+    setHadGroups(hasGroups)
 
-    if (weight >= renderBudget) {
-      break
+    if (hasGroups) {
+      setRenderBudget(FIRST_PAINT_BUDGET)
     }
   }
 
-  const hiddenCount = firstVisible
+  // Backfill from FIRST_PAINT_BUDGET to the full budget after the small
+  // commit painted — as a TRANSITION, so the heavy markdown + syntax
+  // highlight render of the older turns is interruptible instead of one long
+  // synchronous commit that freezes input right after the switch. Route
+  // changes stay urgent (main.tsx disables router transitions); it's exactly
+  // this backfill that belongs at background priority. "Show earlier" pages
+  // (budget > RENDER_BUDGET) never re-enter here.
+  useEffect(() => {
+    if (renderBudget >= RENDER_BUDGET) {
+      return
+    }
+
+    const rafId = requestAnimationFrame(() => {
+      // Functional max, not a plain set: an urgent "Show earlier" click can
+      // land between scheduling and committing this transition, and a plain
+      // set would rebase over it and shrink the budget back down.
+      startTransition(() => setRenderBudget(budget => Math.max(budget, RENDER_BUDGET)))
+    })
+
+    return () => cancelAnimationFrame(rafId)
+  }, [renderBudget])
+
+  const hiddenCount = firstVisibleGroupIndex(groups, renderBudget)
   const visibleGroups = hiddenCount > 0 ? groups.slice(hiddenCount) : groups
   const restoreFromBottomRef = useRef<number | null>(null)
-  // Secondary windows (new-session scratch, subagent watch, cmd-click pop-out)
-  // hide the titlebar tool cluster + session header, but the OS traffic lights
-  // still sit in the top-left, so reserve the titlebar gap above the transcript.
-  const secondaryWindow = isSecondaryWindow()
+  // A secondary window without a ChatHeader (a still-blank new-session draft)
+  // hides the titlebar tool cluster + session header, but the OS traffic
+  // lights still sit in the top-left, so this reserves the titlebar gap above
+  // the transcript and masks content sliding under them — the same job the
+  // main window's (and a header-visible secondary window's) opaque <header>
+  // does. Once a secondary window has a real session, ChatHeader in
+  // chat/index.tsx renders and serves that role instead, so this must stay in
+  // lockstep with ChatHeader's own visibility — both derive from the same
+  // isHeaderlessSecondaryWindow(hasSession) predicate.
+  const activeSessionId = useStore($activeSessionId)
+  const selectedSessionId = useStore($selectedStoredSessionId)
+  const headerlessSecondaryWindow = isHeaderlessSecondaryWindow(Boolean(selectedSessionId || activeSessionId))
   // NB: CSS calc() requires whitespace around the +/- operator. This string is
   // assigned verbatim to the --sticky-human-top inline style below (it does not
   // go through Tailwind, which would auto-space it), so the spaces are load-
@@ -146,7 +238,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   // traffic lights.
   const secondaryTitlebarGap = 'calc(var(--titlebar-height) + 0.75rem)'
 
-  const threadContentTopPad = secondaryWindow
+  const threadContentTopPad = headerlessSecondaryWindow
     ? 'pt-[calc(var(--titlebar-height)+0.75rem)]'
     : 'pt-[calc(var(--titlebar-height)-0.5rem)]'
 
@@ -187,8 +279,6 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   // Instead: quiet it, glue to the true bottom until the height holds steady,
   // then hand back locked. Live streaming afterward uses the normal resize follow.
   useLayoutEffect(() => {
-    setRenderBudget(RENDER_BUDGET)
-
     const el = scrollRef.current
 
     if (!el) {
@@ -215,8 +305,10 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
       lastHeight = height
       node.scrollTop = height
 
-      // ~5 steady frames ≈ layout has settled; the frame cap bounds slow loads.
-      if (stableFrames >= 5 || ++frame > 90) {
+      // Most session switches are synchronous and stabilize within 2 frames;
+      // the old 90-frame ceiling was for slow async image loads. Cap at 15
+      // frames to minimize the settle-loop racing markdown paint on every switch.
+      if (stableFrames >= 2 || ++frame > 15) {
         void scrollToBottom('instant')
 
         return
@@ -255,16 +347,18 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
       style={
         {
           height: clampToComposer ? 'var(--thread-viewport-height)' : '100%',
-          ...(secondaryWindow ? { '--sticky-human-top': secondaryTitlebarGap } : {})
+          ...(headerlessSecondaryWindow ? { '--sticky-human-top': secondaryTitlebarGap } : {})
         } as CSSProperties
       }
     >
-      {secondaryWindow && (
-        // Secondary windows hide the titlebar chrome, so the scroller runs to
-        // the window's top edge and streamed text slides up under the OS
-        // traffic lights. Content padding alone scrolls away with the text — a
-        // fixed opaque strip (the titlebar's drag region) masks anything behind
-        // it and keeps the window draggable, matching the main window's header.
+      {headerlessSecondaryWindow && (
+        // A headerless secondary window hides the titlebar chrome, so the
+        // scroller runs to the window's top edge and streamed text slides up
+        // under the OS traffic lights. Content padding alone scrolls away with
+        // the text — a fixed opaque strip (the titlebar's drag region) masks
+        // anything behind it and keeps the window draggable. A header-visible
+        // secondary window doesn't need this: ChatHeader's own opaque <header>
+        // (chat/index.tsx) already serves that role, matching the main window.
         <div
           aria-hidden="true"
           className="absolute inset-x-0 top-0 z-10 h-(--titlebar-height) bg-background [-webkit-app-region:drag]"
@@ -298,9 +392,28 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
                 {t.assistant.thread.showEarlier}
               </button>
             )}
-            {visibleGroups.map(group => (
+            {visibleGroups.map((group, indexInVisible) => (
+              // content-visibility:auto — off-screen turns skip style recalc,
+              // layout, and paint. On a long transcript this is what keeps
+              // UNRELATED UI fast: any dialog/popover mount (Radix Presence
+              // reads getComputedStyle) forces a whole-document style recalc,
+              // measured ~650-730ms per open on a 1300-message session and
+              // ~100-200ms with this on. contain-intrinsic-size keeps a
+              // placeholder height for never-rendered turns (auto: remembered
+              // real size once rendered), so scrollbar/anchoring stay stable.
+              // Sticky human bubbles are unaffected — their turn is rendered
+              // whenever any part of it intersects the viewport.
+              //
+              // The live tail (newest turns) is exempt: virtualizing a turn
+              // whose final size hasn't been remembered yet snaps it to a stale
+              // height when it scrolls off, drifting stick-to-bottom up over old
+              // turns. See isVirtualizedGroup.
               <div
-                className="flex min-w-0 flex-col gap-(--conversation-turn-gap) pb-(--conversation-turn-gap)"
+                className={cn(
+                  'flex min-w-0 flex-col gap-(--conversation-turn-gap) pb-(--conversation-turn-gap)',
+                  isVirtualizedGroup(indexInVisible, visibleGroups.length) &&
+                    '[contain-intrinsic-size:auto_37.5rem] [content-visibility:auto]'
+                )}
                 key={group.id}
               >
                 <MessageRenderBoundary resetKey={messageSignature}>

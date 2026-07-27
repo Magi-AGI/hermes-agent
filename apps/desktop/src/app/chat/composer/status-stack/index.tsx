@@ -3,13 +3,17 @@ import { type ReactNode, useEffect, useLayoutEffect, useMemo, useRef } from 'rea
 import { useNavigate } from 'react-router-dom'
 
 import { blurComposerInput } from '@/app/chat/composer/focus'
+import { clearSurfaceVar, setSurfaceVar, STATUS_STACK_VAR } from '@/app/chat/surface-vars'
 import { AGENTS_ROUTE } from '@/app/routes'
+import { BillingBanner } from '@/components/billing-banner'
 import { composerDockCard } from '@/components/chat/composer-dock'
 import { StatusSection } from '@/components/chat/status-section'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
+import { Tip, TipKeybindLabel } from '@/components/ui/tooltip'
 import { type Translations, useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
+import { $billingBlock } from '@/store/billing-block'
 import {
   $statusItemsBySession,
   type ComposerStatusItem,
@@ -69,6 +73,7 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
   const itemsBySession = useStore($statusItemsBySession)
   const previewsBySession = useStore($previewStatusBySession)
   const scrolledUp = useStore($threadScrolledUp)
+  const billing = useStore($billingBlock)
 
   const groups = useMemo(
     () => groupStatusItems(sessionId ? (itemsBySession[sessionId] ?? []) : []),
@@ -122,6 +127,13 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
 
   const sections: { key: string; node: ReactNode }[] = []
 
+  // Billing wall sits at the very top of the stack — it's the most important
+  // thing above the composer when the account is out of credits. Rendered here
+  // (not as a composer-disable) so slash commands stay usable.
+  if (billing && sessionId && billing.sessionId === sessionId) {
+    sections.push({ key: 'billing', node: <BillingBanner sessionId={sessionId} /> })
+  }
+
   for (const group of groups) {
     sections.push({
       key: group.type,
@@ -129,15 +141,17 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
         <StatusSection
           accessory={
             group.type === 'subagent' ? (
-              <Button
-                className="text-muted-foreground/75 hover:text-foreground/90"
-                onClick={openAgents}
-                size="micro"
-                type="button"
-                variant="text"
-              >
-                {t.statusStack.agents}
-              </Button>
+              <Tip label={<TipKeybindLabel actionId="nav.agents" text={t.statusStack.agents} />}>
+                <Button
+                  className="text-muted-foreground/75 hover:text-foreground/90"
+                  onClick={openAgents}
+                  size="micro"
+                  type="button"
+                  variant="text"
+                >
+                  {t.statusStack.agents}
+                </Button>
+              </Tip>
             ) : undefined
           }
           defaultCollapsed={group.type !== 'todo'}
@@ -184,12 +198,12 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
   // height never sees it. Publish our own measured height — bucketed like the
   // composer's, to avoid style invalidation churn — so the thread's
   // last-message clearance can add it and the stack never hides messages.
+  // Scoped to THIS surface: tiles render their own stack (see surface-vars.ts).
   useLayoutEffect(() => {
-    const root = document.documentElement
     const el = stackRef.current
 
     if (!visible || !el) {
-      root.style.removeProperty('--status-stack-measured-height')
+      clearSurfaceVar(el, STATUS_STACK_VAR)
 
       return
     }
@@ -201,7 +215,7 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
 
       if (bucket !== last) {
         last = bucket
-        root.style.setProperty('--status-stack-measured-height', `${bucket}px`)
+        setSurfaceVar(el, STATUS_STACK_VAR, `${bucket}px`)
       }
     }
 
@@ -211,7 +225,7 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
 
     return () => {
       observer.disconnect()
-      root.style.removeProperty('--status-stack-measured-height')
+      clearSurfaceVar(el, STATUS_STACK_VAR)
     }
   }, [visible])
 

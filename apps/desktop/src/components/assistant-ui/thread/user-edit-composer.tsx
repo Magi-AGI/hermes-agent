@@ -31,6 +31,7 @@ import {
 } from '@/app/chat/composer/inline-refs'
 import {
   composerPlainText,
+  insertComposerContentsAtCaret,
   placeCaretEnd,
   refChipElement,
   renderComposerContents,
@@ -38,6 +39,7 @@ import {
 } from '@/app/chat/composer/rich-editor'
 import { detectTrigger, textBeforeCaret, type TriggerState } from '@/app/chat/composer/text-utils'
 import { ComposerTriggerPopover } from '@/app/chat/composer/trigger-popover'
+import { chipTypedUrlOnSpace, linkifyUrls } from '@/app/chat/composer/url-refs'
 import {
   extractDroppedFiles,
   HERMES_PATHS_MIME,
@@ -57,6 +59,7 @@ import { Codicon } from '@/components/ui/codicon'
 import type { HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { attachmentDisplayText, attachmentId, pathLabel } from '@/lib/chat-runtime'
+import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
 import { DATA_IMAGE_URL_RE } from '@/lib/embedded-images'
 import { triggerHaptic } from '@/lib/haptics'
 import { Loader2Icon } from '@/lib/icons'
@@ -79,6 +82,10 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
   const draft = useAuiState(s => s.composer.text)
   const rootRef = useRef<HTMLDivElement | null>(null)
   const editorRef = useRef<HTMLDivElement | null>(null)
+  // Capture the original draft immediately before the first edit. The runtime
+  // may hydrate composer.text after this component's first render, so taking a
+  // mount-time snapshot can incorrectly classify every later blur as dirty.
+  const initialDraftRef = useRef<string | null>(null)
   const draftRef = useRef(draft)
   const dragDepthRef = useRef(0)
   const [dragActive, setDragActive] = useState(false)
@@ -119,6 +126,12 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
     setFocusRequestId(id => id + 1)
   }, [])
 
+  const rememberInitialDraft = useCallback(() => {
+    if (initialDraftRef.current === null) {
+      initialDraftRef.current = draftRef.current
+    }
+  }, [])
+
   const appendExternalText = useCallback(
     (text: string, mode: ComposerInsertMode) => {
       const value = text.trim()
@@ -127,6 +140,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
         return
       }
 
+      rememberInitialDraft()
       const base = mode === 'inline' ? draftRef.current.trimEnd() : draftRef.current
       const sep = mode === 'inline' ? (base ? ' ' : '') : base && !base.endsWith('\n') ? '\n\n' : ''
       const next = `${base}${sep}${value}`
@@ -143,9 +157,10 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
 
       setFocusRequestId(id => id + 1)
     },
-    [aui]
+    [aui, rememberInitialDraft]
   )
 
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     draftRef.current = draft
 
@@ -168,7 +183,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
   }, [focusEditor, focusRequestId])
 
   useEffect(() => {
-    const offFocus = onComposerFocusRequest(target => {
+    const offFocus = onComposerFocusRequest(({ target }) => {
       if (target === 'edit') {
         setFocusRequestId(id => id + 1)
       }
@@ -188,7 +203,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
 
   const syncDraftFromEditor = useCallback(
     (editor: HTMLDivElement) => {
-      const nextDraft = composerPlainText(editor)
+      const nextDraft = sanitizeComposerInput(composerPlainText(editor))
 
       if (nextDraft !== draftRef.current) {
         draftRef.current = nextDraft
@@ -262,6 +277,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
         return
       }
 
+      rememberInitialDraft()
       const serialized = hermesDirectiveFormatter.serialize(item)
       const starter = serialized.endsWith(':')
       const text = starter || serialized.endsWith(' ') ? serialized : `${serialized} `
@@ -311,7 +327,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
       document.execCommand('insertText', false, text)
       finish()
     },
-    [aui, closeTrigger, refreshTrigger, requestEditFocus, trigger]
+    [aui, closeTrigger, refreshTrigger, rememberInitialDraft, requestEditFocus, trigger]
   )
 
   const insertRefStrings = useCallback(
@@ -328,13 +344,14 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
         return false
       }
 
+      rememberInitialDraft()
       draftRef.current = nextDraft
       aui.composer().setText(nextDraft)
       requestEditFocus()
 
       return true
     },
-    [aui, requestEditFocus]
+    [aui, rememberInitialDraft, requestEditFocus]
   )
 
   const insertDroppedRefs = useCallback(
@@ -472,12 +489,13 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
       editor.replaceChildren()
     }
 
+    rememberInitialDraft()
     syncDraftFromEditor(editor)
     window.setTimeout(refreshTrigger, 0)
   }
 
   const handlePaste = (event: ClipboardEvent<HTMLDivElement>) => {
-    const pastedText = event.clipboardData.getData('text')
+    const pastedText = sanitizeComposerInput(event.clipboardData.getData('text'))
 
     if (!pastedText || DATA_IMAGE_URL_RE.test(pastedText.trim())) {
       event.preventDefault()
@@ -486,7 +504,10 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
     }
 
     event.preventDefault()
-    document.execCommand('insertText', false, pastedText)
+    rememberInitialDraft()
+
+    // Links land as `@url:` chips, same as the main composer.
+    insertComposerContentsAtCaret(event.currentTarget, linkifyUrls(pastedText))
     syncDraftFromEditor(event.currentTarget)
   }
 
@@ -517,11 +538,26 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
           return
         }
 
+        const editor = editorRef.current
+
+        // Dirty edit guard: when the user actually typed something, blur must
+        // not cancel the composer — that would discard their in-flight
+        // edits. Compare against the draft captured immediately before the
+        // first edit; when no edit event occurred, the current hydrated draft
+        // is the clean baseline.
+        const initialDraft = initialDraftRef.current ?? draftRef.current
+
+        if (editor && syncDraftFromEditor(editor) !== initialDraft) {
+          closeTrigger()
+
+          return
+        }
+
         closeTrigger()
         aui.composer().cancel()
       }, 80)
     },
-    [aui, closeTrigger, submitting]
+    [aui, closeTrigger, submitting, syncDraftFromEditor]
   )
 
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
@@ -566,6 +602,15 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
     if (event.key === 'Escape') {
       event.preventDefault()
       aui.composer().cancel()
+
+      return
+    }
+
+    // A typed link finished with a space chips like a pasted one.
+    if (chipTypedUrlOnSpace(event)) {
+      event.preventDefault()
+      rememberInitialDraft()
+      syncDraftFromEditor(event.currentTarget)
 
       return
     }

@@ -6,7 +6,6 @@ import { notifyError } from './notifications'
 // never from the router. A "secondary" window renders a single chat without the
 // global session sidebar or the install / onboarding overlays.
 const SECONDARY_WINDOW_FLAG = 'secondary'
-const NEW_SESSION_WINDOW_FLAG = '1'
 
 let secondaryWindowCache: boolean | null = null
 
@@ -28,24 +27,18 @@ export function isSecondaryWindow(): boolean {
   return result
 }
 
-let newSessionWindowCache: boolean | null = null
-
-export function isNewSessionWindow(): boolean {
-  if (newSessionWindowCache !== null) {
-    return newSessionWindowCache
-  }
-
-  let result = false
-
-  try {
-    result = new URLSearchParams(window.location.search).get('new') === NEW_SESSION_WINDOW_FLAG
-  } catch {
-    result = false
-  }
-
-  newSessionWindowCache = result
-
-  return result
+// Shared "does this secondary window show the ChatHeader" predicate — the
+// single source of truth consumed by both ChatHeader (the title chip/menu)
+// and ThreadMessageList (the top-gap + sticky-offset + drag-mask it only
+// needs when there's no header to serve that role). A secondary window is
+// headerless exactly while it has no resolvable session: a new-session draft
+// before the first message creates a real session, or (in principle) any
+// other still-blank pop-out. Once a session exists — whether the window
+// opened already keyed to one, or a draft just created one — it gets a
+// header, live rename updates, and a real document.title, matching how the
+// main window has always worked.
+export function isHeaderlessSecondaryWindow(hasSession: boolean): boolean {
+  return isSecondaryWindow() && !hasSession
 }
 
 let watchWindowCache: boolean | null = null
@@ -78,11 +71,16 @@ export function canOpenSessionWindow(): boolean {
   return typeof window !== 'undefined' && typeof window.hermesDesktop?.openSessionWindow === 'function'
 }
 
+// True when the shell can open a full peer app window (⌘⇧N / "New Window").
+export function canOpenNewWindow(): boolean {
+  return typeof window !== 'undefined' && typeof window.hermesDesktop?.openWindow === 'function'
+}
+
 type WindowOpenResult = { ok: boolean; error?: string } | undefined
 
 // Run a window-open bridge call, surfacing any failure as a toast. Shared by the
-// session pop-out and the new-session pop-out.
-async function openWindow(call: () => Promise<WindowOpenResult>, failMessage: string): Promise<void> {
+// session pop-out and the new-window opener.
+async function runWindowOpen(call: () => Promise<WindowOpenResult>, failMessage: string): Promise<void> {
   try {
     const result = await call()
 
@@ -102,14 +100,38 @@ export async function openSessionInNewWindow(sessionId: string, opts?: { watch?:
     return
   }
 
-  await openWindow(() => window.hermesDesktop.openSessionWindow(sessionId, opts), 'Could not open chat in a new window')
+  await runWindowOpen(
+    () => window.hermesDesktop.openSessionWindow(sessionId, opts),
+    'Could not open chat in a new window'
+  )
 }
 
-// Open a fresh compact window on the new-session draft.
-export async function openNewSessionInNewWindow(): Promise<void> {
-  if (!canOpenSessionWindow() || typeof window.hermesDesktop.openNewSessionWindow !== 'function') {
+// Open a new full-chrome app window — a peer instance of the primary that
+// renders the complete app against the shared backend. No-ops outside Electron.
+export async function openNewWindow(): Promise<void> {
+  if (!canOpenNewWindow()) {
     return
   }
 
-  await openWindow(() => window.hermesDesktop.openNewSessionWindow(), 'Could not open new session window')
+  await runWindowOpen(() => window.hermesDesktop.openWindow(), 'Could not open a new window')
+}
+
+// Close every live session pop-out (including watch/spectator windows). No-op
+// outside Electron.
+export async function closeAllSessionWindows(): Promise<void> {
+  if (!canOpenSessionWindow() || typeof window.hermesDesktop.closeAllSessionWindows !== 'function') {
+    return
+  }
+
+  await runWindowOpen(() => window.hermesDesktop.closeAllSessionWindows(), 'Could not close session windows')
+}
+
+// Explicit-action restore of the last-closed (non-watch) session windows, at
+// their saved positions. Never runs automatically — only via this call.
+export async function reopenSessionWindows(): Promise<void> {
+  if (!canOpenSessionWindow() || typeof window.hermesDesktop.reopenSessionWindows !== 'function') {
+    return
+  }
+
+  await runWindowOpen(() => window.hermesDesktop.reopenSessionWindows(), 'Could not reopen session windows')
 }

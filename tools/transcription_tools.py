@@ -99,6 +99,7 @@ GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 OPENAI_BASE_URL = os.getenv("STT_OPENAI_BASE_URL", "https://api.openai.com/v1")
 XAI_STT_BASE_URL = os.getenv("XAI_STT_BASE_URL", "https://api.x.ai/v1")
 ELEVENLABS_STT_BASE_URL = os.getenv("ELEVENLABS_STT_BASE_URL", "https://api.elevenlabs.io/v1")
+# DeepInfra STT base URL now resolved via hermes_cli.models.deepinfra_base_url (shared).
 
 SUPPORTED_FORMATS = {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".ogg", ".aac", ".flac"}
 LOCAL_NATIVE_AUDIO_FORMATS = {".wav", ".aiff", ".aif"}
@@ -111,6 +112,11 @@ GROQ_MODELS = {"whisper-large-v3", "whisper-large-v3-turbo", "distil-whisper-lar
 # Singleton for the local model — loaded once, reused across calls
 _local_model: Optional[object] = None
 _local_model_name: Optional[str] = None
+
+# Windows CUDA DLL preload state — populated once before the first
+# faster-whisper load so ctranslate2 can dlopen cublas/cudnn from torch/lib.
+_windows_cuda_dll_handles: list = []
+_windows_cuda_dlls_prepared = False
 
 # ---------------------------------------------------------------------------
 # Config helpers
@@ -229,7 +235,7 @@ def _try_lazy_install_stt() -> bool:
     return False
 
 
-# Names of the 6 STT providers with native handlers in this module.
+# Names of the STT providers with native handlers in this module.
 # Kept in sync with ``agent.transcription_registry._BUILTIN_NAMES`` —
 # a regression test fails if they drift. The plugin hook from
 # issue #30398-style follow-up rejects plugins registering under any
@@ -242,6 +248,8 @@ BUILTIN_STT_PROVIDERS = frozenset({
     "openai",
     "mistral",
     "xai",
+    "elevenlabs",
+    "deepinfra",
 })
 
 
@@ -546,11 +554,18 @@ def _run_command_stt(command: str, timeout: float) -> subprocess.CompletedProces
 
     Mirrors ``tools.tts_tool._run_command_tts``.
     """
+    from agent.delegation_context import delegated_child_subprocess_env
+
     popen_kwargs: Dict[str, Any] = {
         "shell": True,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "text": True,
+        # Lossy UTF-8 decode — locale-mismatched bytes from the STT command
+        # must not raise in the reader threads on non-UTF-8 Windows (#45099).
+        "encoding": "utf-8",
+        "errors": "replace",
+        "env": delegated_child_subprocess_env(),
     }
     if os.name == "nt":
         popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -827,11 +842,24 @@ def _get_provider(stt_config: dict) -> str:
             )
             return "none"
 
+        if provider == "deepinfra":
+            if _HAS_OPENAI and (get_env_value("DEEPINFRA_API_KEY") or "").strip():
+                return "deepinfra"
+            logger.warning(
+                "STT provider 'deepinfra' configured but DEEPINFRA_API_KEY not set "
+                "(or openai package missing)"
+            )
+            return "none"
+
         return provider  # Unknown — let it fail downstream
 
-    # --- Auto-detect (no explicit provider): local > groq > openai > xai > elevenlabs -
-    # mistral is intentionally skipped while `mistralai` is quarantined on
-    # PyPI (malicious 2.4.6 release on 2026-05-12).
+    # --- Auto-detect (no explicit provider):
+    #     local > groq > openai > mistral > xai > elevenlabs > deepinfra ---
+    # DeepInfra is tried LAST so adding DEEPINFRA_API_KEY (commonly set for the
+    # chat surface) never silently displaces an existing xAI/ElevenLabs STT
+    # auto-selection; a DeepInfra-only box still resolves to it. mistral is
+    # intentionally skipped while `mistralai` is quarantined on PyPI (malicious
+    # 2.4.6 release on 2026-05-12).
 
     if _HAS_FASTER_WHISPER:
         return "local"
@@ -863,6 +891,9 @@ def _get_provider(stt_config: dict) -> str:
     if get_env_value("ELEVENLABS_API_KEY"):
         logger.info("No local STT available, using ElevenLabs Scribe STT API")
         return "elevenlabs"
+    if _HAS_OPENAI and (get_env_value("DEEPINFRA_API_KEY") or "").strip():
+        logger.info("No local STT available, using DeepInfra Whisper API")
+        return "deepinfra"
     return "none"
 
 
@@ -1086,6 +1117,125 @@ def _looks_like_cuda_lib_error(exc: BaseException) -> bool:
     return any(marker in msg for marker in _CUDA_LIB_ERROR_MARKERS)
 
 
+def _iter_windows_cuda_dll_dirs(local_cfg: Dict[str, Any]) -> list:
+    """Return candidate CUDA DLL directories for faster-whisper on Windows.
+
+    Sources, in priority order:
+
+    1. ``stt.local.cuda_dll_dirs`` from config (list, or a PATH/semicolon/
+       newline-separated string).
+    2. The ``torch/lib`` directory of an installed ``torch`` (its Windows
+       wheels bundle the cublas/cublasLt/cudart/cudnn runtime ctranslate2
+       needs), located via ``importlib.util.find_spec`` — no filesystem scan.
+    3. A **targeted** glob of sibling CPython installs under
+       ``%LOCALAPPDATA%\\Programs\\Python\\Python*\\Lib\\site-packages\\torch\\lib``.
+       Deliberately narrow: no broad home-directory or cloud-root walk.
+
+    Existing directories are resolved, deduplicated (case-insensitively), and
+    returned in priority order.
+    """
+    raw_dirs = local_cfg.get("cuda_dll_dirs") or []
+    if isinstance(raw_dirs, str):
+        # Accept either Windows PATH-style semicolons or os.pathsep/newlines.
+        pieces: list = []
+        for chunk in raw_dirs.replace("\n", os.pathsep).split(os.pathsep):
+            pieces.extend(part.strip() for part in chunk.split(";") if part.strip())
+        raw_dirs = pieces
+    elif not isinstance(raw_dirs, (list, tuple)):
+        raw_dirs = []
+
+    candidates = [Path(str(item)).expanduser() for item in raw_dirs if str(item).strip()]
+
+    # If torch is installed in the active environment, its Windows wheels carry
+    # the CUDA runtime DLLs ctranslate2 needs (cublas/cublasLt/cudart/cudnn).
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("torch")
+        if spec and spec.origin:
+            candidates.append(Path(spec.origin).resolve().parent / "lib")
+    except Exception:
+        pass
+
+    # Reuse CUDA DLLs from sibling CPython installs.  This keeps Hermes' slim
+    # venv from needing a full torch install just to satisfy ctranslate2's
+    # Windows dynamic linker requirements.  Anchored on %LOCALAPPDATA% (so
+    # redirected Windows profiles resolve correctly) with a targeted glob only
+    # — no broad home/cloud-root scan.
+    local_appdata = os.getenv("LOCALAPPDATA")
+    if local_appdata:
+        programs = Path(local_appdata) / "Programs" / "Python"
+        if programs.exists():
+            candidates.extend(programs.glob("Python*/Lib/site-packages/torch/lib"))
+
+    seen: set = set()
+    result: list = []
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        key = str(resolved).lower()
+        if key in seen or not resolved.exists():
+            continue
+        seen.add(key)
+        result.append(resolved)
+    return result
+
+
+def _prepare_windows_cuda_dlls() -> None:
+    """Preload CUDA DLLs needed by ctranslate2/faster-whisper on Windows.
+
+    PyTorch's Windows wheels bundle cublas/cublasLt/cudart/cudnn and make them
+    visible when torch is imported. Hermes' venv intentionally avoids a full
+    torch install for local STT, so ctranslate2 can see a CUDA device but fail
+    at first encode with ``cublas64_12.dll is not found``.  Preloading the DLLs
+    from configured or discovered ``torch/lib`` directories, in dependency
+    order, gives ctranslate2 the runtime it needs.
+
+    Windows-only and idempotent: a no-op on other platforms and after the first
+    successful pass.  Failures are logged at debug level and never raised — the
+    downstream CUDA→CPU fallback still covers a missing runtime.
+    """
+    global _windows_cuda_dlls_prepared
+    if os.name != "nt" or _windows_cuda_dlls_prepared:
+        return
+    _windows_cuda_dlls_prepared = True
+
+    try:
+        import ctypes
+    except Exception:
+        return
+
+    local_cfg = _load_stt_config().get("local") or {}
+    # Dependency order matters: cudart first, then cublasLt (needed by cublas),
+    # then cublas, then cudnn.
+    dll_names = (
+        "cudart64_12.dll",
+        "cublasLt64_12.dll",
+        "cublas64_12.dll",
+        "cudnn64_9.dll",
+    )
+    loaded = 0
+    for dll_dir in _iter_windows_cuda_dll_dirs(local_cfg):
+        add_dll_directory = getattr(os, "add_dll_directory", None)
+        if add_dll_directory is not None:
+            try:
+                _windows_cuda_dll_handles.append(add_dll_directory(str(dll_dir)))
+            except (FileNotFoundError, OSError):
+                pass
+        for dll_name in dll_names:
+            dll_path = dll_dir / dll_name
+            if not dll_path.exists():
+                continue
+            try:
+                ctypes.CDLL(str(dll_path))
+                loaded += 1
+            except OSError as exc:
+                logger.debug("Could not preload CUDA DLL %s: %s", dll_path, exc)
+    if loaded:
+        logger.info("Preloaded %d CUDA DLL(s) for local faster-whisper", loaded)
+
+
 def _load_local_whisper_model(model_name: str):
     """Load faster-whisper with graceful CUDA → CPU fallback.
 
@@ -1099,6 +1249,7 @@ def _load_local_whisper_model(model_name: str):
     We try ``auto`` first (fast CUDA path when it works), and on any CUDA
     library load failure fall back to CPU + int8.
     """
+    _prepare_windows_cuda_dlls()
     from faster_whisper import WhisperModel
     try:
         return WhisperModel(model_name, device="auto", compute_type="auto")
@@ -1111,6 +1262,50 @@ def _load_local_whisper_model(model_name: str):
             exc,
         )
         return WhisperModel(model_name, device="cpu", compute_type="int8")
+
+
+def warm_local_model() -> bool:
+    """Preload the local faster-whisper model so the FIRST dictation doesn't pay
+    the cold model-load cost (large-v3 into VRAM is 20-60s).
+
+    Safe to call at backend startup: returns False and never raises when local
+    faster-whisper isn't the active STT path (disabled, cloud provider, or the
+    per-call command CLI because faster-whisper isn't importable) or the load
+    fails — the normal per-call transcribe path still handles everything. Warms
+    the same ``_local_model`` singleton the transcribe path reuses, so once this
+    completes every dictation is fast.
+    """
+    global _local_model, _local_model_name
+
+    try:
+        if not _HAS_FASTER_WHISPER:
+            return False
+
+        stt_config = _load_stt_config()
+        if not is_stt_enabled(stt_config):
+            return False
+
+        # Only warm when the resolved provider actually uses the in-process
+        # faster-whisper path — don't load a model the user won't use.
+        if _get_provider(stt_config) != "local":
+            return False
+
+        local_cfg = stt_config.get("local") or {}
+        model_name = _normalize_local_model(local_cfg.get("model", DEFAULT_LOCAL_MODEL))
+
+        if _local_model is not None and _local_model_name == model_name:
+            return True
+
+        logger.info("Pre-warming local faster-whisper model '%s'...", model_name)
+        _local_model = _load_local_whisper_model(model_name)
+        _local_model_name = model_name
+        logger.info("Local faster-whisper model '%s' pre-warmed and ready", model_name)
+
+        return True
+    except Exception as exc:
+        logger.info("Local STT pre-warm skipped (non-fatal): %s", exc)
+
+        return False
 
 
 def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
@@ -1129,14 +1324,28 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
             _local_model_name = model_name
 
         # Language: config.yaml (stt.local.language) > env var > auto-detect.
+        # Priming: faster-whisper supports both initial_prompt and hotwords;
+        # expose them via config so local STT can be biased toward the user's
+        # domain vocabulary without switching to a paid cloud provider.
+        local_cfg = _load_stt_config().get("local") or {}
         _forced_lang = (
-            (_load_stt_config().get("local") or {}).get("language")
+            local_cfg.get("language")
             or os.getenv(LOCAL_STT_LANGUAGE_ENV)
             or None
         )
         transcribe_kwargs = {"beam_size": 5}
         if _forced_lang:
             transcribe_kwargs["language"] = _forced_lang
+
+        initial_prompt = local_cfg.get("initial_prompt") or None
+        if initial_prompt:
+            transcribe_kwargs["initial_prompt"] = str(initial_prompt)
+
+        hotwords = local_cfg.get("hotwords") or None
+        if isinstance(hotwords, (list, tuple)):
+            hotwords = ", ".join(str(item) for item in hotwords if str(item).strip())
+        if hotwords:
+            transcribe_kwargs["hotwords"] = str(hotwords)
 
         try:
             segments, info = _local_model.transcribe(file_path, **transcribe_kwargs)
@@ -1188,7 +1397,7 @@ def _prepare_local_audio(file_path: str, work_dir: str) -> tuple[Optional[str], 
     command = [ffmpeg, "-y", "-i", file_path, converted_path]
 
     try:
-        subprocess.run(command, check=True, capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
+        subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=300, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
         return converted_path, None
     except subprocess.TimeoutExpired:
         logger.error("ffmpeg conversion timed out for %s", file_path)
@@ -1234,9 +1443,9 @@ def _transcribe_local_command(file_path: str, model_name: str) -> Dict[str, Any]
             # User-provided templates (env var) may contain shell syntax; auto-detected commands are safe for list mode.
             use_shell = bool(os.getenv(LOCAL_STT_COMMAND_ENV, "").strip())
             if use_shell:
-                subprocess.run(command, shell=True, check=True, capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
+                subprocess.run(command, shell=True, check=True, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=300, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
             else:
-                subprocess.run(shlex.split(command), check=True, capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
+                subprocess.run(shlex.split(command), check=True, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=300, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
             
 
             txt_files = sorted(Path(output_dir).glob("*.txt"))
@@ -1327,22 +1536,36 @@ def _transcribe_groq(file_path: str, model_name: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _transcribe_openai(file_path: str, model_name: str) -> Dict[str, Any]:
-    """Transcribe using OpenAI Whisper API (paid)."""
-    try:
-        api_key, base_url = _resolve_openai_audio_client_config()
-    except ValueError as exc:
-        return {
-            "success": False,
-            "transcript": "",
-            "error": str(exc),
-        }
+def _transcribe_openai(
+    file_path: str,
+    model_name: str,
+    *,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    provider_label: str = "openai",
+) -> Dict[str, Any]:
+    """Transcribe via the OpenAI ``audio.transcriptions.create`` SDK shape.
+
+    Also serves as the shared backend for every OpenAI-compatible STT
+    endpoint (DeepInfra etc.) — callers pass an explicit ``api_key`` /
+    ``base_url`` to skip the OpenAI-only auth chain, and a
+    ``provider_label`` so the response carries the right ``provider``
+    name.
+    """
+    if api_key is None:
+        try:
+            api_key, fallback_base = _resolve_openai_audio_client_config()
+        except ValueError as exc:
+            return {"success": False, "transcript": "", "error": str(exc)}
+        base_url = base_url or fallback_base
 
     if not _HAS_OPENAI:
         return {"success": False, "transcript": "", "error": "openai package not installed"}
 
-    # Auto-correct model if caller passed a Groq-only model
-    if model_name in GROQ_MODELS:
+    # Auto-correct model if caller passed a Groq-only model. Only applies
+    # to the native OpenAI path — third-party endpoints may legitimately
+    # serve a whisper-large-v3 variant.
+    if provider_label == "openai" and model_name in GROQ_MODELS:
         logger.info("Model %s not available on OpenAI, using %s", model_name, DEFAULT_STT_MODEL)
         model_name = DEFAULT_STT_MODEL
 
@@ -1358,10 +1581,12 @@ def _transcribe_openai(file_path: str, model_name: str) -> Dict[str, Any]:
                 )
 
             transcript_text = _extract_transcript_text(transcription)
-            logger.info("Transcribed %s via OpenAI API (%s, %d chars)",
-                         Path(file_path).name, model_name, len(transcript_text))
+            logger.info(
+                "Transcribed %s via %s (%s, %d chars)",
+                Path(file_path).name, provider_label, model_name, len(transcript_text),
+            )
 
-            return {"success": True, "transcript": transcript_text, "provider": "openai"}
+            return {"success": True, "transcript": transcript_text, "provider": provider_label}
         finally:
             close = getattr(client, "close", None)
             if callable(close):
@@ -1376,7 +1601,7 @@ def _transcribe_openai(file_path: str, model_name: str) -> Dict[str, Any]:
     except APIError as e:
         return {"success": False, "transcript": "", "error": f"API error: {e}"}
     except Exception as e:
-        logger.error("OpenAI transcription failed: %s", e, exc_info=True)
+        logger.error("%s transcription failed: %s", provider_label, e, exc_info=True)
         return {"success": False, "transcript": "", "error": f"Transcription failed: {e}"}
 
 # ---------------------------------------------------------------------------
@@ -1511,6 +1736,7 @@ def _transcribe_xai(file_path: str, model_name: str) -> Dict[str, Any]:
                 "success": False,
                 "transcript": "",
                 "error": "xAI STT returned empty transcript",
+                "no_speech": True,
             }
 
         logger.info(
@@ -1598,6 +1824,7 @@ def _transcribe_elevenlabs(file_path: str, model_name: str) -> Dict[str, Any]:
                 "success": False,
                 "transcript": "",
                 "error": "ElevenLabs STT returned empty transcript",
+                "no_speech": True,
             }
 
         logger.info(
@@ -1614,6 +1841,59 @@ def _transcribe_elevenlabs(file_path: str, model_name: str) -> Dict[str, Any]:
     except Exception as e:
         logger.error("ElevenLabs STT transcription failed: %s", e, exc_info=True)
         return {"success": False, "transcript": "", "error": f"ElevenLabs STT transcription failed: {e}"}
+
+
+# ---------------------------------------------------------------------------
+# Provider: DeepInfra (OpenAI-compatible /v1/audio/transcriptions)
+# ---------------------------------------------------------------------------
+
+
+def _transcribe_deepinfra(file_path: str, model_name: str) -> Dict[str, Any]:
+    """Resolve DeepInfra credentials/model, then delegate to the OpenAI handler.
+
+    DeepInfra's STT endpoint is OpenAI-compatible, so the actual SDK
+    call lives in :func:`_transcribe_openai` — this wrapper only owns
+    DeepInfra-specific credential and model resolution, using the shared
+    ``hermes_cli.models`` helpers so every DeepInfra surface resolves the
+    base URL and model ids identically.
+    """
+    api_key = (get_env_value("DEEPINFRA_API_KEY") or "").strip()
+    if not api_key:
+        return {"success": False, "transcript": "", "error": "DEEPINFRA_API_KEY not set"}
+
+    from hermes_cli.models import deepinfra_base_url, deepinfra_model_ids
+
+    stt_config = _load_stt_config()
+    # ``stt.deepinfra: null`` in YAML yields None, not {} — coalesce so the
+    # ``.get`` calls don't raise (no stt.deepinfra block in DEFAULT_CONFIG to
+    # deep-merge over the null).
+    di_config = stt_config.get("deepinfra") if isinstance(stt_config, dict) else None
+    if not isinstance(di_config, dict):
+        di_config = {}
+    base_url = deepinfra_base_url(di_config)
+
+    if not model_name:
+        candidates = deepinfra_model_ids("stt")
+        if not candidates:
+            return {
+                "success": False,
+                "transcript": "",
+                "error": (
+                    "No DeepInfra STT model available. Pin one in "
+                    "config.yaml under stt.deepinfra.model, or check "
+                    "connectivity to api.deepinfra.com so the live catalog "
+                    "can be fetched."
+                ),
+            }
+        model_name = candidates[0]
+
+    return _transcribe_openai(
+        file_path,
+        model_name,
+        api_key=api_key,
+        base_url=base_url,
+        provider_label="deepinfra",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1693,6 +1973,12 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         elevenlabs_cfg = stt_config.get("elevenlabs") or {}
         model_name = model or elevenlabs_cfg.get("model_id", DEFAULT_ELEVENLABS_STT_MODEL)
         return _transcribe_elevenlabs(file_path, model_name)
+
+    if provider == "deepinfra":
+        di_config = stt_config.get("deepinfra")  # may be None (YAML null)
+        di_config = di_config if isinstance(di_config, dict) else {}
+        model_name = model or di_config.get("model") or ""
+        return _transcribe_deepinfra(file_path, model_name)
 
     # User-declared command-type provider
     # (``stt.providers.<name>: type: command``). Fires after the built-in
