@@ -361,6 +361,9 @@ export interface MockBackendOptions {
  */
 export interface MockBackendOptions {
   mockServer?: MockServerOptions
+  /** Extra backend env vars (e.g. NO_PROXY so a loopback compaction route is
+   *  provably proxy-safe under the subscription-only guard). */
+  env?: Record<string, string>
 }
 
 export async function setupMockBackend(options: MockBackendOptions = {}): Promise<MockBackendFixture> {
@@ -379,7 +382,7 @@ export async function setupMockBackend(options: MockBackendOptions = {}): Promis
   writeEnvFile(sandbox.hermesHome)
 
   // 3. Build env + launch
-  const env = buildAppEnv(sandbox)
+  const env = buildAppEnv(sandbox, options.env ?? {})
   const { app, page } = await launchDesktop(env)
 
   return {

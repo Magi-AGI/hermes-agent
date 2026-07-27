@@ -96,14 +96,26 @@ test.describe('session compression in progress', () => {
   test.beforeAll(async () => {
     fixture = await setupMockBackend({
       modelContextLength: 64_000,
+      // Compaction runs on the `mock` provider, whose api points at the
+      // loopback (127.0.0.1) mock server. The CP007D subscription-only guard
+      // rejects that by default, so this scenario opts into the local-loopback
+      // exception (allow_local_loopback_route) — literal loopback is on-box, not
+      // metered cloud egress. `provider: mock` (not `custom`) so the route
+      // resolves to the defined loopback provider and a real client is built and
+      // screened. NO_PROXY (below) makes the loopback route provably proxy-safe.
       extraConfig: `compression:
   threshold_tokens: 22000
   protect_first_n: 0
   protect_last_n: 1
 auxiliary:
   compression:
-    provider: custom
-    model: mock-model`,
+    provider: mock
+    model: mock-model
+    allow_local_loopback_route: true`,
+      env: {
+        NO_PROXY: 'localhost,127.0.0.1,::1',
+        no_proxy: 'localhost,127.0.0.1,::1',
+      },
       mockServer: {
         holdFirstCompletionContaining: 'You are a summarization agent creating a context checkpoint.',
       }

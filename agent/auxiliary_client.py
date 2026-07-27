@@ -2974,6 +2974,19 @@ class CompressionRoutingRejected(Exception):
 
 AUTH_MODE_OAUTH_SUBSCRIPTION = "oauth_subscription"
 AUTH_MODE_API_KEY = "api_key"
+# Route to a LITERAL loopback endpoint (localhost / 127.0.0.0/8 / ::1). Not a
+# metered third-party route: content never leaves the machine, so it is outside
+# the guard's threat model (metered cloud egress). Admitted ONLY with the
+# explicit, default-off opt-in below — see _loopback_compression_route_admitted.
+AUTH_MODE_LOCAL_LOOPBACK = "local_loopback"
+
+# Config opt-in (auxiliary.compression.<this key>). Default off: with it unset a
+# loopback/local route is rejected exactly as a metered one, preserving the
+# CP007D fail-closed posture for every existing install. Turning it on is a
+# deliberate statement that the configured local endpoint keeps compaction
+# content on-box (a local inference server: ollama / llama.cpp / vLLM).
+_LOCAL_LOOPBACK_OPT_IN_KEY = "allow_local_loopback_route"
+LOCAL_LOOPBACK_ROUTE: Tuple[str, str] = ("local-loopback", AUTH_MODE_LOCAL_LOOPBACK)
 
 # The default allowlist (spec §5.3). There is NO disable value: an empty or
 # malformed ``allowed_routes`` is a configuration error that fails closed, not
@@ -3226,16 +3239,40 @@ def validate_configured_compression_routes() -> List[str]:
     except Exception as exc:
         logger.debug("Compaction route validation: could not read fallback chain: %s", exc)
 
+    # Opt-in local-loopback exception (must agree with the runtime gate in
+    # _compression_client_allowed): a configured route whose EFFECTIVE base_url
+    # (explicit, or inherited from its provider definition) is a literal loopback
+    # host is valid when allow_local_loopback_route is set and egress is
+    # proxy-safe. Read once here so startup validation and the runtime guard use
+    # the same predicate.
+    loopback_opt_in = _config_flag_true(aux_compression.get(_LOCAL_LOOPBACK_OPT_IN_KEY))
+
     problems: List[str] = []
     for label, provider, base_url in candidates:
         if not provider or provider == "auto":
             # Not a configured route — `auto` discovery is screened at runtime.
             continue
+        if loopback_opt_in:
+            effective_base_url = _configured_provider_base_url(cfg, provider, base_url)
+            effective_host = base_url_hostname(effective_base_url)
+            if _is_loopback_host(effective_host):
+                if not _loopback_egress_is_proxy_safe(effective_host):
+                    problems.append(
+                        f"{label}: local-loopback compaction is enabled but a proxy "
+                        f"env would route {effective_base_url or effective_host} "
+                        f"off-box. Set NO_PROXY to bypass the loopback host, or "
+                        f"disable auxiliary.compression.{_LOCAL_LOOPBACK_OPT_IN_KEY}."
+                    )
+                # A literal loopback route is on-box, not metered egress — valid.
+                continue
         if provider not in allowed_providers:
             problems.append(
                 f"{label}: '{provider}' is not an allowed compaction route "
                 f"(metered or unknown). Compaction may only run on: "
-                f"{', '.join(sorted(allowed_providers))}."
+                f"{', '.join(sorted(allowed_providers))}"
+                + (f" (or a local loopback endpoint via "
+                   f"auxiliary.compression.{_LOCAL_LOOPBACK_OPT_IN_KEY})"
+                   if loopback_opt_in else "") + "."
             )
             continue
         # An allowlisted provider NAME aliased to a foreign endpoint is still a
@@ -3254,6 +3291,117 @@ def validate_configured_compression_routes() -> List[str]:
     return problems
 
 
+def _config_flag_true(value: Any) -> bool:
+    """Truthy coercion for a config opt-in (True / "true" / "1" / "yes" / "on")."""
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"true", "1", "yes", "on"}
+
+
+def _configured_provider_base_url(cfg: Any, provider: str, explicit_base_url: str) -> str:
+    """Resolve a configured route's effective base_url for STARTUP validation.
+
+    An explicit ``auxiliary.compression.base_url`` wins; otherwise inherit the
+    endpoint from the named provider's definition (``providers.<name>.api`` /
+    ``base_url``, or a ``custom_providers`` list entry). Network-free: reads only
+    config, matching validate_configured_compression_routes' constructor-time
+    contract.
+    """
+    if explicit_base_url:
+        return explicit_base_url
+    name = (provider or "").strip().lower()
+    if not name:
+        return ""
+    try:
+        providers = cfg.get("providers")
+        if isinstance(providers, dict):
+            entry = providers.get(name) or providers.get(provider)
+            if isinstance(entry, dict):
+                return str(entry.get("api") or entry.get("base_url") or "").strip()
+        custom = cfg.get("custom_providers")
+        if isinstance(custom, list):
+            for cp in custom:
+                if isinstance(cp, dict) and str(cp.get("name") or "").strip().lower() == name:
+                    return str(cp.get("base_url") or cp.get("api") or "").strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def _local_loopback_opt_in() -> bool:
+    """Return the ``auxiliary.compression.allow_local_loopback_route`` opt-in.
+
+    Default OFF. Fails CLOSED: any error reading config returns ``False`` so a
+    loopback route is never admitted unless the opt-in is provably set.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        comp = (cfg.get("auxiliary") or {}).get("compression") or {}
+        return _config_flag_true(comp.get(_LOCAL_LOOPBACK_OPT_IN_KEY))
+    except Exception:
+        return False
+
+
+def _is_loopback_host(host: str) -> bool:
+    """True ONLY for a literal loopback host: ``localhost`` or an address in
+    ``127.0.0.0/8`` / ``::1``.
+
+    Deliberately strict — everything else is refused:
+      * public hosts and allowlisted provider names aliased to them;
+      * private LAN ranges (10/8, 172.16/12, 192.168/16) — ``.is_private`` but
+        NOT ``.is_loopback``;
+      * ``0.0.0.0`` / ``::`` wildcard (``.is_unspecified``);
+      * anything non-parseable (userinfo/path/query spoofing is already stripped
+        by ``base_url_hostname``, which returns only the parsed hostname).
+    """
+    host = (host or "").strip().lower().rstrip(".")
+    if not host:
+        return False
+    if host in ("localhost", "ip6-localhost", "ip6-loopback"):
+        return True
+    try:
+        import ipaddress
+
+        return ipaddress.ip_address(host.strip("[]")).is_loopback
+    except ValueError:
+        return False
+
+
+def _loopback_egress_is_proxy_safe(host: str) -> bool:
+    """True when a request to loopback ``host`` will NOT be routed through a
+    proxy (Codex's egress concern: a proxy env var could forward a localhost URL
+    off-box).
+
+    Safe when EITHER no http/https/all proxy env is configured, OR ``NO_PROXY``
+    provably bypasses the loopback host (a ``*`` wildcard or a loopback token).
+    Fails CLOSED: a configured proxy with no proven loopback bypass returns
+    ``False`` so the route is refused rather than silently egressing.
+    """
+    proxy_envs = ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
+    if not any((os.environ.get(k) or "").strip() for k in proxy_envs):
+        return True
+    no_proxy = (os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or "")
+    tokens = {t.strip().lower() for t in no_proxy.split(",") if t.strip()}
+    if "*" in tokens:
+        return True
+    return bool(tokens & {"localhost", "127.0.0.1", "::1", "[::1]", (host or "").strip().lower()})
+
+
+def _loopback_compression_route_admitted(client: Any) -> bool:
+    """Whether ``client`` qualifies for the opt-in local-loopback compaction route.
+
+    All three must hold (fail-closed on any):
+      1. the opt-in is set (``allow_local_loopback_route``);
+      2. the client's resolved ``base_url`` host is a literal loopback host;
+      3. loopback egress is proxy-safe (won't be forwarded off-box).
+    """
+    if not _local_loopback_opt_in():
+        return False
+    host = base_url_hostname(str(getattr(client, "base_url", "") or ""))
+    return _is_loopback_host(host) and _loopback_egress_is_proxy_safe(host)
+
+
 def _client_compression_route(client: Any) -> Optional[Tuple[str, str]]:
     """Classify a CONSTRUCTED client as a (provider, auth_mode) route.
 
@@ -3261,6 +3409,11 @@ def _client_compression_route(client: Any) -> Optional[Tuple[str, str]]:
     (a plain OpenAI/OpenRouter/Gemini/Bedrock client), or when it *looks* like
     one but its endpoint says otherwise (an ``AnthropicAuxiliaryClient`` pointed
     at a non-Anthropic host — the base_url/api_key aliasing trap).
+
+    NOTE: this stays a PURE client-shape classifier (no config reads). The
+    opt-in local-loopback exception is applied by ``_compression_client_allowed``
+    and ``validate_configured_compression_routes`` so the config read happens in
+    exactly one place per screen.
     """
     if client is None:
         return None
@@ -3303,6 +3456,20 @@ def _compression_client_allowed(label: str, client: Any) -> bool:
         return True
     route = _client_compression_route(client)
     if route is None:
+        # Opt-in local-loopback exception: a literal loopback endpoint is not
+        # metered cloud egress. Admitted ONLY when the operator has explicitly
+        # set allow_local_loopback_route AND the egress is proxy-safe; otherwise
+        # falls through to the normal fail-closed rejection below.
+        if _loopback_compression_route_admitted(client):
+            logger.warning(
+                "Compaction route guard: admitting LOCAL LOOPBACK route via %s "
+                "(auxiliary.compression.%s=true). Compaction content is being sent "
+                "to a local endpoint (%s) and stays on-box; ensure that endpoint "
+                "does not forward off-machine.",
+                label or "primary", _LOCAL_LOOPBACK_OPT_IN_KEY,
+                base_url_hostname(str(getattr(client, "base_url", "") or "")) or "loopback",
+            )
+            return True
         _note_route_rejected(
             label or "unknown",
             "endpoint_mismatch" if client is not None else "not_allowlisted",
@@ -3335,9 +3502,11 @@ def _assert_compression_route(label: str, client: Any) -> None:
     raise CompressionRoutingRejected(
         f"Compaction refused: no allowed subscription route (resolved "
         f"provider={label or 'unknown'}). Compaction content is business-sensitive "
-        f"and may only run on the ChatGPT Codex OAuth route or the Anthropic "
-        f"Claude Max / Claude Code OAuth route. Authenticate one of them "
-        f"(`hermes auth codex` or `claude setup-token`) and retry."
+        f"and by default may only run on the ChatGPT Codex OAuth route or the "
+        f"Anthropic Claude Max / Claude Code OAuth route. Authenticate one of them "
+        f"(`hermes auth codex` or `claude setup-token`) and retry — or, for a "
+        f"local inference endpoint that keeps content on-box, set "
+        f"auxiliary.compression.{_LOCAL_LOOPBACK_OPT_IN_KEY}: true."
     )
 
 
@@ -3370,11 +3539,13 @@ def _compression_routing_exhausted() -> CompressionRoutingRejected:
         detail = " No auxiliary provider is configured at all."
     return CompressionRoutingRejected(
         "Compaction refused: no allowed subscription route is available." + detail
-        + " Compaction content is business-sensitive and may only run on the "
-        "ChatGPT Codex OAuth route or the Anthropic Claude Max / Claude Code "
-        "OAuth route. The conversation was left unchanged — no context was lost. "
-        "Authenticate a subscription route (`hermes auth codex` or "
-        "`claude setup-token`) and retry with /compress."
+        + " Compaction content is business-sensitive and by default may only run "
+        "on the ChatGPT Codex OAuth route or the Anthropic Claude Max / Claude "
+        "Code OAuth route. The conversation was left unchanged — no context was "
+        "lost. Authenticate a subscription route (`hermes auth codex` or "
+        "`claude setup-token`) and retry with /compress — or, for a local "
+        f"inference endpoint that keeps content on-box, set "
+        f"auxiliary.compression.{_LOCAL_LOOPBACK_OPT_IN_KEY}: true."
     )
 
 

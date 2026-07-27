@@ -1736,6 +1736,19 @@ DEFAULT_CONFIG = {
                 {"provider": "openai-codex", "auth_mode": "oauth_subscription"},   # ChatGPT OAuth
                 {"provider": "anthropic", "auth_mode": "oauth_subscription"},      # Claude Max / Claude Code OAuth only
             ],
+            # Opt-in escape hatch for a LOCAL inference endpoint. DEFAULT FALSE —
+            # off preserves the subscription-only fail-closed posture exactly.
+            # When true, compaction may ALSO run on a client whose resolved
+            # base_url host is a literal loopback address (localhost / 127.0.0.0/8
+            # / ::1) — a local model server (ollama / llama.cpp / vLLM) keeps the
+            # business-sensitive summary content on-box, so it is outside the
+            # metered-cloud-egress threat model the guard exists for. It admits
+            # ONLY literal loopback: public hosts, private-LAN ranges, 0.0.0.0,
+            # and allowlisted provider names aliased to non-loopback hosts stay
+            # rejected. It also fails closed if a proxy env var would forward the
+            # loopback request off-box unless NO_PROXY bypasses it. See
+            # agent/auxiliary_client.py::_loopback_compression_route_admitted.
+            "allow_local_loopback_route": False,
         },
         # Note: session_search no longer uses an auxiliary LLM (PR #27590 —
         # single-shape tool returns DB content directly). The old
