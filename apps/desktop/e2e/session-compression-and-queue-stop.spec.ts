@@ -119,19 +119,26 @@ auxiliary:
     const { page } = fixture
     const queued = 'E2E_QUEUED_DURING_COMPACTION'
 
-    // A normal message crosses the tiny configured context budget. The mock
-    // blocks only the resulting summary request, so these assertions run
-    // during automatic compaction rather than a slash-command path.
-    // The payload must cross threshold_tokens (22k) on its OWN weight
-    // (~12k tokens) on top of the system prompt. Do not shrink it: at
-    // repeat(500) the trigger only worked because the ambient system prompt
-    // (skills index + tool schemas) happened to carry it over the line, and
-    // a 160-token skills-index cleanup on main broke the test for a day.
+    // A normal message crosses the configured context budget. The mock blocks
+    // only the resulting summary request, so these assertions run during
+    // automatic compaction rather than a slash-command path.
+    //
+    // The trigger payload must cross the pre-API compaction threshold
+    // (compression.threshold_tokens: 22k → effective 22k after the small-context
+    // cap) on its OWN weight, NOT by leaning on the ambient system prompt. The
+    // rough estimator is ~4 chars/token (estimate_tokens_rough): the 33-char
+    // unit × repeat(4000) ≈ 132k chars ≈ 33k tokens, comfortably over the 22k
+    // threshold and well under the 64k window. Earlier revisions used repeat(1500)
+    // (~12k tokens) and only crossed the line because the skills-index + tool
+    // schemas in the system prompt happened to add the missing ~10k; when that
+    // ambient prompt shrank on current upstream the trigger fell below 22k, the
+    // summary request was never issued, and waitForHeldCompletion() hung (CP007H).
+    // Keep the payload self-sufficient so system-prompt drift can't un-trigger it.
     await pasteAndSend(page, 'E2E_COMPACTION_HISTORY_ONE '.repeat(5))
     await waitForTranscript(page, MOCK_REPLY)
     await pasteAndSend(page, 'E2E_COMPACTION_HISTORY_TWO '.repeat(5))
     await waitForTranscript(page, MOCK_REPLY)
-    await pasteAndSend(page, 'E2E_TRIGGER_AUTOMATIC_COMPACTION '.repeat(1500))
+    await pasteAndSend(page, 'E2E_TRIGGER_AUTOMATIC_COMPACTION '.repeat(4000))
     await fixture.mock.waitForHeldCompletion()
     await expect(page.getByRole('status', { name: 'Summarizing thread' }).last()).toBeVisible()
 
