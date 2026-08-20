@@ -24,6 +24,7 @@ from typing import Any
 
 from hermes_constants import get_hermes_home
 from tools.environments.local import hermes_subprocess_env
+from tui_gateway.relay_buffer import RelayBuffer
 
 logger = logging.getLogger(__name__)
 _Thread = threading.Thread
@@ -47,6 +48,7 @@ MUTATOR_ROUTE_TABLE: dict[str, str] = {
 _REGISTRY_NAME = "dashboard-compute-host.json"
 _RESPAWN_WINDOW_SECS = 300.0
 _SHUTDOWN_TIMEOUT_SECS = 10.0
+_ORPHAN_EXIT_CODE = 18  # must match compute_host._ORPHAN_EXIT_CODE
 
 
 def append_log_record(path: str | Path, record: str) -> None:
@@ -128,6 +130,24 @@ def is_compute_host_identity(pid: int) -> bool:
     return "tui_gateway.compute_host" in cmd
 
 
+class _SupervisorRelayDelivery:
+    """Adapts HostSupervisor methods to the RelayDelivery Protocol (names differ):
+    the supervisor has ``rpc_sink`` (matches) but ``_complete_turn`` /
+    ``_fail_session_turns``, not the Protocol's ``complete_turn`` / ``fail_session``."""
+
+    def __init__(self, sup: "HostSupervisor") -> None:
+        self._sup = sup
+
+    def rpc_sink(self, message: dict) -> None:
+        self._sup.rpc_sink(message)
+
+    def complete_turn(self, frame: dict) -> None:
+        self._sup._complete_turn(frame)
+
+    def fail_session(self, sid: str, reason: str, message: str) -> None:
+        self._sup._fail_session_turns(sid, reason, message)
+
+
 class HostSupervisor:
     """Own one persistent compute-host child and relay its frames."""
 
@@ -169,9 +189,43 @@ class HostSupervisor:
         self._pending_controls: dict[str, queue.Queue[dict]] = {}
         self._stderr_tail: list[str] = []
         self._last_progress_counter = 0
+        self._last_hb_monotonic: float = 0.0
+        try:
+            _cfg = float(os.environ.get("HERMES_HOST_HEARTBEAT_TIMEOUT_SECS") or "0")
+        except (TypeError, ValueError):
+            logger.warning("invalid HERMES_HOST_HEARTBEAT_TIMEOUT_SECS=%r; watchdog disabled",
+                           os.environ.get("HERMES_HOST_HEARTBEAT_TIMEOUT_SECS"))
+            _cfg = 0.0
+        if _cfg > 0:
+            self._hb_timeout_secs = max(_cfg, 3.0 * self.heartbeat_secs)
+            if self._hb_timeout_secs != _cfg:
+                logger.warning("hb-watchdog timeout raised %.1fs -> %.1fs (>= 3x heartbeat=%ss)",
+                               _cfg, self._hb_timeout_secs, self.heartbeat_secs)
+        else:
+            self._hb_timeout_secs = 0.0
 
+        # H1: off-drain-thread WS delivery. Constructed BEFORE start()/autostart so
+        # the drain thread always has a relay to enqueue into. The supervisor is
+        # adapted to the RelayDelivery Protocol (its method names differ).
+        self._relay = RelayBuffer(_SupervisorRelayDelivery(self))
+
+        if self._hb_timeout_secs > 0:
+            _Thread(target=self._heartbeat_watchdog_loop,
+                    name="compute-host-hb-watchdog", daemon=True).start()
         if autostart:
-            self.start()
+            try:
+                self.start()
+            except Exception:
+                # Startup failed → the caller gets no object to shut down, so the
+                # threads we already started (relay + opt-in watchdog) would leak.
+                # Tear them down before re-raising: _closing stops the watchdog loop
+                # (`while not self._closing`) and relay.stop() joins the relay thread.
+                self._closing = True
+                try:
+                    self._relay.stop()
+                except Exception:
+                    logger.exception("relay stop during failed startup failed")
+                raise
 
     @property
     def pid(self) -> int:
@@ -198,16 +252,19 @@ class HostSupervisor:
         with self._lock:
             self._closing = True
             proc = self._proc
-        if proc is None:
-            return
+        # H4/R4: registry removal AND relay stop must run even on the proc-is-None
+        # path, so both live in an OUTER finally (the old early-return skipped them).
         try:
-            if proc.poll() is None and proc.stdin is not None:
-                self._send_frame({"type": "shutdown", "request_id": f"shutdown-{uuid.uuid4().hex}"})
-                proc.wait(timeout=_SHUTDOWN_TIMEOUT_SECS)
-        except Exception:
-            self._terminate_process(proc)
+            if proc is not None:
+                try:
+                    if proc.poll() is None and proc.stdin is not None:
+                        self._send_frame({"type": "shutdown", "request_id": f"shutdown-{uuid.uuid4().hex}"})
+                        proc.wait(timeout=_SHUTDOWN_TIMEOUT_SECS)
+                except Exception:
+                    self._terminate_process(proc)
         finally:
             self._remove_registry()
+            self._relay.stop()
 
     def reconcile_startup_orphan(self) -> str:
         """Terminate a stale registered host, guarding against PID reuse."""
@@ -315,6 +372,7 @@ class HostSupervisor:
             raise RuntimeError("compute host respawn disabled after crash loop")
         self._hello_event.clear()
         self._hello = {}
+        self._last_hb_monotonic = 0.0   # a dead host's timestamp must not arm the watchdog against the fresh one
         env = hermes_subprocess_env(inherit_credentials=True)
         env.update(os.environ)
         if self.env:
@@ -402,7 +460,12 @@ class HostSupervisor:
                 logger.warning("compute host emitted invalid json: %r", raw[:200])
                 continue
             if isinstance(frame, dict):
-                self._handle_host_frame(frame)
+                try:
+                    self._handle_host_frame(frame)
+                except Exception:
+                    # INVARIANT: the drain thread must never die on a bad frame — a
+                    # dead drain stops reading stdout and crashes the child.
+                    logger.exception("compute-host frame handling failed; continuing drain")
 
     def _drain_stderr(self, proc: subprocess.Popen[str]) -> None:
         assert proc.stderr is not None
@@ -416,19 +479,28 @@ class HostSupervisor:
         ftype = str(frame.get("type") or "")
         if ftype == "hello":
             self._hello = dict(frame)
+            self._last_hb_monotonic = time.monotonic()
             self._hello_event.set()
             return
         if ftype == "hb":
             self._last_progress_counter = int(frame.get("progress_counter") or self._last_progress_counter)
+            self._last_hb_monotonic = time.monotonic()
             logger.debug("compute host heartbeat: %s", frame)
             return
+        if ftype == "orphan":
+            logger.warning("compute host reported orphan (parent gone): old_ppid=%s confirmations=%s pid=%s",
+                           frame.get("old_ppid"), frame.get("confirmations"), self.pid)
+            return
         if ftype == "rpc":
-            message = frame.get("message")
-            if isinstance(message, dict):
-                self.rpc_sink(message)
+            # H2: WS-bound → enqueue for the relay thread. NEVER call rpc_sink here —
+            # a blocking/throwing WS write on the drain thread wedges stdout drain.
+            self._relay.enqueue("rpc", frame)
             return
         if ftype in {"turn.end", "turn.error"}:
-            self._complete_turn(frame)
+            # _complete_turn → on_complete emits message.complete / session.info
+            # (WS-bound). Route through the relay so it never blocks the drain and
+            # stays ordered behind this session's already-queued rpc frames.
+            self._relay.enqueue("turn_complete", frame)
             return
         if ftype in {"control.ack", "control.error", "interrupt.ack", "reload_mcp.ack", "shutdown.ack"}:
             request_id = str(frame.get("request_id") or "")
@@ -463,6 +535,14 @@ class HostSupervisor:
             except Exception:
                 logger.exception("compute host turn completion callback failed")
 
+    @staticmethod
+    def _classify_exit(code: int) -> tuple[str, str]:
+        if code == _ORPHAN_EXIT_CODE:
+            return ("host_orphan_exit", "compute host self-exited: parent (gateway) confirmed gone")
+        if code == 0:
+            return ("host_exit", "compute host exited cleanly (code 0)")
+        return ("crash", f"compute host exited with code {code}")
+
     def _wait_for_exit(self, proc: subprocess.Popen[str]) -> None:
         code = proc.wait()
         if self._closing:
@@ -472,37 +552,79 @@ class HostSupervisor:
                 return
             self._proc = None
         self._remove_registry()
-        self._fail_pending_turns(reason="crash", message=f"compute host exited with code {code}")
-        self._maybe_respawn_after_crash()
-
-    def _fail_pending_turns(self, *, reason: str, message: str) -> None:
+        reason, message = self._classify_exit(code)  # KEEP: 18=orphan / 0=clean / else=crash
+        (logger.warning if reason == "crash" else logger.info)(
+            "compute host exited: code=%s reason=%s", code, reason)
+        # R5: snapshot+clear BEFORE anything else so turns submitted to a fresh host
+        # cannot be mis-failed.
         with self._lock:
             pending = self._pending_turns
             self._pending_turns = {}
+        self._notify_failed_turns(pending, reason=reason, message=message)
+
+    def _notify_failed_turns(
+        self,
+        pending: dict[str, tuple[str, Callable[[dict], None] | None]],
+        *,
+        reason: str,
+        message: str,
+    ) -> None:
+        # R5 three-pass ordering (guarantees old-turn errors precede any fresh-host
+        # frame on the WS, and no callback can stall recovery):
+        # (2) enqueue ALL old-turn error WS events FIRST — non-blocking, ahead of any
+        #     fresh-host frame in each session's relay FIFO.
         for request_id, (sid, cb) in pending.items():
-            frame = {
-                "type": "turn.error",
-                "sid": sid,
-                "request_id": request_id,
-                "reason": reason,
-                "message": message,
-            }
-            self.rpc_sink(
+            self._relay.enqueue(
+                "rpc",
                 {
-                    "jsonrpc": "2.0",
-                    "method": "event",
-                    "params": {
-                        "type": "error",
-                        "session_id": sid,
-                        "payload": {"message": message, "reason": reason},
+                    "type": "rpc",
+                    "sid": sid,
+                    "message": {
+                        "jsonrpc": "2.0",
+                        "method": "event",
+                        "params": {
+                            "type": "error",
+                            "session_id": sid,
+                            "payload": {"message": message, "reason": reason},
+                        },
                     },
-                }
+                },
             )
+        # (3) schedule respawn BEFORE any (possibly blocking) callback can matter.
+        self._maybe_respawn_after_crash()
+        # (4) invoke completion callbacks after respawn is scheduled.
+        for request_id, (sid, cb) in pending.items():
             if cb is not None:
                 try:
-                    cb(frame)
+                    cb({
+                        "type": "turn.error",
+                        "sid": sid,
+                        "request_id": request_id,
+                        "reason": reason,
+                        "message": message,
+                    })
                 except Exception:
                     logger.exception("compute host error callback failed")
+
+    def _fail_session_turns(self, sid: str, reason: str, message: str) -> None:
+        """Fail one session's pending turns (relay-driven overflow / delivery failure).
+        Serves as the RelayDelivery.fail_session sink via _SupervisorRelayDelivery."""
+        with self._lock:
+            matching = {rid: v for rid, v in self._pending_turns.items() if v[0] == sid}
+            for rid in matching:
+                self._pending_turns.pop(rid, None)
+        for request_id, (msid, cb) in matching.items():
+            if cb is not None:
+                try:
+                    cb({
+                        "type": "turn.error",
+                        "sid": msid,
+                        "request_id": request_id,
+                        "reason": reason,
+                        "message": message,
+                    })
+                except Exception:
+                    logger.exception("compute host session-fail callback failed")
 
     def _maybe_respawn_after_crash(self) -> None:
         now = time.monotonic()
@@ -549,6 +671,67 @@ class HostSupervisor:
             return
         except Exception:
             logger.debug("failed to SIGKILL compute host pid=%s", pid, exc_info=True)
+
+    def _heartbeat_watchdog_loop(self) -> None:
+        """Opt-in recovery for a host ALIVE but no longer heart-beating (half-
+        finalized interpreter: proc.wait() never returns -> crash/respawn starved).
+        Off unless HERMES_HOST_HEARTBEAT_TIMEOUT_SECS > 0 (clamped >= 3x heartbeat)."""
+        timeout = self._hb_timeout_secs
+        if timeout <= 0:
+            return
+        poll = max(1.0, min(timeout / 2.0, 10.0))
+        while not self._closing:
+            time.sleep(poll)
+            self._watchdog_check_once(timeout)
+
+    def _watchdog_check_once(self, timeout: float) -> None:
+        with self._lock:
+            proc = self._proc
+            last = self._last_hb_monotonic
+        if proc is None or proc.poll() is not None or last <= 0:
+            return
+        age = time.monotonic() - last
+        if age < timeout:
+            return
+        # Reuse-proof identity guard: we hold this Popen handle, so
+        # `self._proc is proc and proc.poll() is None` cannot be fooled by PID
+        # reuse (no command-line lookup -- /proc//ps are absent on Windows).
+        with self._lock:
+            if self._proc is not proc or proc.poll() is not None:
+                return
+            pid = proc.pid
+        logger.error(
+            "compute host heartbeat gap: no hb for %.1fs (timeout=%.1fs) pid=%s "
+            "last_progress=%s stderr_tail=%r -- killing zombie host tree",
+            age, timeout, pid, self._last_progress_counter, self._stderr_tail[-5:],
+        )
+        self._kill_process_tree(pid)      # unblocks proc.wait() -> respawn
+
+    def _kill_process_tree(self, pid: int) -> None:
+        if sys.platform == "win32":
+            try:
+                r = subprocess.run(
+                    ["taskkill", "/T", "/F", "/PID", str(pid)],
+                    check=False, capture_output=True, text=True, timeout=10,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                if r.returncode != 0:
+                    logger.warning("taskkill pid=%s rc=%s out=%r err=%r", pid, r.returncode, r.stdout, r.stderr)
+                    self._terminate_pid(pid)
+            except subprocess.TimeoutExpired:
+                logger.warning("taskkill pid=%s timed out; falling back", pid)
+                self._terminate_pid(pid)
+            except Exception:
+                logger.debug("taskkill failed for pid=%s", pid, exc_info=True)
+                self._terminate_pid(pid)
+            return
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)   # child = session leader (start_new_session=True)
+        except ProcessLookupError:
+            return
+        except Exception:
+            logger.debug("killpg failed for pid=%s", pid, exc_info=True)
+            self._terminate_pid(pid)
 
     def _terminate_process(self, proc: subprocess.Popen[str]) -> None:
         if proc.poll() is not None:

@@ -305,3 +305,190 @@ def test_shutdown_drain_sleep_never_overshoots_the_reserve(monkeypatch):
     assert events == ["finalize:idle:compute_host_sigterm"]
     assert slept, "the drain loop should have ticked at least once"
     assert sum(slept) <= drain_budget + 1e-6
+
+
+# --- Code-0 / zombie fix: parent guard + supervisor classify/watchdog ----------
+
+def test_parent_guard_exits_18_after_debounce(monkeypatch):
+    host = ComputeHost(stdout=io.StringIO(), heartbeat_secs=0)  # guard thread NOT auto-started
+    host._guard_poll_secs = 0.01
+    monkeypatch.setattr(host, "_parent_alive", lambda: False)
+    monkeypatch.setattr(host, "shutdown", lambda **_k: None)
+    seen = {}
+
+    def _fake_exit(code):
+        seen["code"] = code
+        host._closed.set()          # break the loop
+        raise SystemExit(code)      # unwind the guard thread
+
+    monkeypatch.setattr(compute_host.os, "_exit", _fake_exit)
+    t = threading.Thread(target=host._parent_guard_loop, daemon=True)
+    t.start()
+    t.join(timeout=2.0)
+    assert seen["code"] == compute_host._ORPHAN_EXIT_CODE
+    assert host._exit_code == compute_host._ORPHAN_EXIT_CODE   # set BEFORE shutdown
+
+
+def test_parent_guard_ignores_transient_dead_reading(monkeypatch):
+    host = ComputeHost(stdout=io.StringIO(), heartbeat_secs=0)
+    host._guard_poll_secs = 0.01
+    seq = iter([False, True, False, False, True])  # never 3 consecutive dead
+    monkeypatch.setattr(host, "_parent_alive", lambda: next(seq, True))
+    exited = {}
+    monkeypatch.setattr(compute_host.os, "_exit", lambda c: exited.setdefault("code", c))
+    t = threading.Thread(target=host._parent_guard_loop, daemon=True)
+    t.start()
+    time.sleep(0.15)
+    host._closed.set()
+    t.join(timeout=1.0)
+    assert "code" not in exited      # fewer than N consecutive -> no exit
+
+
+def test_classify_exit_distinguishes_orphan_clean_crash():
+    assert HostSupervisor._classify_exit(compute_host._ORPHAN_EXIT_CODE)[0] == "host_orphan_exit"
+    assert HostSupervisor._classify_exit(0)[0] == "host_exit"    # NOT "crash"
+    assert HostSupervisor._classify_exit(1)[0] == "crash"
+
+
+def test_watchdog_kills_silent_host(monkeypatch):
+    monkeypatch.setenv("HERMES_HOST_HEARTBEAT_TIMEOUT_SECS", "5")
+    sup = HostSupervisor(heartbeat_secs=1, autostart=False, rpc_sink=lambda _o: None)
+    assert sup._hb_timeout_secs == 5.0            # floor 3*1=3 -> 5 stands
+
+    class _FakeProc:
+        pid = 999999
+
+        def poll(self):
+            return None                           # alive
+
+    fake = _FakeProc()
+    with sup._lock:
+        sup._proc = fake
+        sup._last_hb_monotonic = time.monotonic() - 100.0   # long-silent
+    killed = {}
+    monkeypatch.setattr(sup, "_kill_process_tree", lambda pid: killed.setdefault("pid", pid))
+    sup._watchdog_check_once(sup._hb_timeout_secs)
+    assert killed["pid"] == fake.pid
+    sup._closing = True                           # stop the daemon watchdog loop
+    with sup._lock:
+        sup._proc = None
+
+
+def test_watchdog_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("HERMES_HOST_HEARTBEAT_TIMEOUT_SECS", raising=False)
+    sup = HostSupervisor(heartbeat_secs=1, autostart=False, rpc_sink=lambda _o: None)
+    assert sup._hb_timeout_secs == 0.0
+
+
+def test_watchdog_env_malformed_does_not_brick(monkeypatch):
+    monkeypatch.setenv("HERMES_HOST_HEARTBEAT_TIMEOUT_SECS", "not-a-number")
+    sup = HostSupervisor(heartbeat_secs=1, autostart=False, rpc_sink=lambda _o: None)
+    assert sup._hb_timeout_secs == 0.0            # construction survives
+
+
+# ── RelayBuffer integration on the supervisor (relay extraction) ───────────
+
+# #6: recovery — child exit while rpc_sink THROWS must still respawn + fail turns.
+def test_recovery_survives_throwing_sink():
+    def sink(_msg):
+        raise RuntimeError("WS down")
+
+    sup = HostSupervisor(autostart=False, rpc_sink=sink, expected_build_sha="test")
+    respawned = []
+    sup._maybe_respawn_after_crash = lambda: respawned.append(True)
+    completed = []
+    with sup._lock:
+        sup._pending_turns["req1"] = ("sX", lambda frame: completed.append(frame))
+
+    class _FakeProc:
+        def wait(self):
+            return 1
+
+    sup._proc = _FakeProc()
+    try:
+        sup._wait_for_exit(sup._proc)
+        assert respawned, "respawn was NOT initiated after child exit"
+        assert len(completed) == 1, f"pending turn not failed exactly once: {completed}"
+        assert completed[0].get("type") == "turn.error", completed[0]
+        assert sup._relay._thread.is_alive(), "relay thread died during recovery"
+    finally:
+        sup._relay.stop()
+
+
+# #24 (R4): shutdown() with proc is None still stops the relay AND removes the registry.
+def test_shutdown_stops_relay_when_proc_none(tmp_path):
+    registry = tmp_path / "reg.json"
+    registry.write_text("{}", encoding="utf-8")
+    sup = HostSupervisor(
+        registry_path=registry, autostart=False, rpc_sink=lambda _o: None, expected_build_sha="test"
+    )
+    assert sup._proc is None
+    assert sup._relay._thread.is_alive()
+    sup.shutdown()
+    assert sup._relay._stopping is True, "relay not stopped on proc-is-None shutdown"
+    assert not sup._relay._thread.is_alive(), "relay thread not joined on shutdown"
+    assert not registry.exists(), "registry not removed on proc-is-None shutdown"
+
+
+# #25 (R5): _wait_for_exit enqueues ALL old-turn errors BEFORE respawn, and every
+# completion callback fires AFTER respawn; plus code-18 classifies as orphan (Q3).
+def test_wait_for_exit_enqueues_errors_before_callbacks(monkeypatch):
+    order: list = []
+
+    class _FakeRelay:
+        def enqueue(self, kind, frame):
+            order.append(("enqueue", frame.get("sid")))
+
+        def stop(self, timeout: float = 2.0):
+            pass
+
+    sup = HostSupervisor(autostart=False, rpc_sink=lambda _o: None, expected_build_sha="test")
+    sup._relay.stop()          # retire the real relay thread
+    sup._relay = _FakeRelay()  # observe ordering deterministically
+    monkeypatch.setattr(sup, "_maybe_respawn_after_crash", lambda: order.append(("respawn", None)))
+
+    def mk_cb():
+        def cb(frame):
+            order.append(("callback", frame.get("sid")))
+        return cb
+
+    with sup._lock:
+        sup._pending_turns["r1"] = ("sA", mk_cb())
+        sup._pending_turns["r2"] = ("sB", mk_cb())
+
+    class _FakeProc:
+        def wait(self):
+            return 1
+
+    sup._proc = _FakeProc()
+    sup._wait_for_exit(sup._proc)
+
+    kinds = [o[0] for o in order]
+    assert kinds.count("enqueue") == 2 and kinds.count("callback") == 2, order
+    respawn_idx = kinds.index("respawn")
+    assert all(k == "enqueue" for k in kinds[:respawn_idx]), f"error not enqueued before respawn: {order}"
+    assert all(k == "callback" for k in kinds[respawn_idx + 1:]), f"callback ran before respawn: {order}"
+    # Q3: code-18 exit classifies as orphan, not crash.
+    assert HostSupervisor._classify_exit(18)[0] == "host_orphan_exit"
+
+
+# #26: a failing autostart must tear down the already-started relay thread — the
+# caller gets no object to shut down, so an uncaught start() would leak it.
+def test_constructor_cleans_up_relay_on_startup_failure(monkeypatch):
+    def _live_relay_threads():
+        return [t for t in threading.enumerate() if t.name == "compute-host-relay" and t.is_alive()]
+
+    before = len(_live_relay_threads())
+
+    def _boom(self):
+        raise RuntimeError("spawn failed (no hello)")
+
+    monkeypatch.setattr(HostSupervisor, "start", _boom)
+    with pytest.raises(RuntimeError, match="spawn failed"):
+        HostSupervisor(autostart=True, rpc_sink=lambda _o: None, expected_build_sha="test")
+
+    # stop() joins synchronously before the re-raise, so the relay thread is gone.
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and len(_live_relay_threads()) > before:
+        time.sleep(0.01)
+    assert len(_live_relay_threads()) == before, "relay thread leaked on failed startup"

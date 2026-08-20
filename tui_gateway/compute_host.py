@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import contextlib
+import ctypes
 import json
 import os
 import signal
@@ -132,6 +133,19 @@ def _build_sha() -> str:
 # leave the flush racing that kill and persist nothing at all.
 _FLUSH_RESERVE_SECS = 1.0
 
+_ORPHAN_EXIT_CODE = 18          # parent (gateway) gone — vs clean 0 / pipe-break 17-reserved
+_PARENT_DEAD_CONFIRMATIONS = 3  # consecutive dead readings before orphan-exit
+
+if sys.platform == "win32":
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.OpenProcess.restype = ctypes.c_void_p
+    _kernel32.OpenProcess.argtypes = (ctypes.c_uint, ctypes.c_int, ctypes.c_uint)
+    _kernel32.GetExitCodeProcess.restype = ctypes.c_int
+    _kernel32.GetExitCodeProcess.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong))
+    _kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+else:
+    _kernel32 = None
+
 
 class ComputeHost:
     def __init__(
@@ -149,6 +163,8 @@ class ComputeHost:
             thread_name_prefix="compute-host-turn",
         )
         self._closed = threading.Event()
+        self._exit_code = 0            # shared, race-free process exit code
+        self._guard_poll_secs = 1.0    # parent-guard poll interval (test override)
         self._parent_pid = os.getppid()
         self._boot_id = uuid.uuid4().hex
         self._progress_counter = 0
@@ -211,7 +227,7 @@ class ComputeHost:
         returns. It calls ``_finalize_session`` on any session still in
         ``server._sessions`` — including ones skipped here whose turn is
         still running, since ``_executor.shutdown(wait=False)`` only cancels
-        pending futures, not running ones. The orphan path (``os._exit(0)``)
+        pending futures, not running ones. The orphan path (``os._exit(18)``)
         bypasses atexit, so the skip is fully effective there. For the
         SIGTERM and stdin_closed paths the atexit handler may re-finalize
         skipped sessions; this is a pre-existing issue (the old finalize-
@@ -806,13 +822,75 @@ class ComputeHost:
                 }
             )
 
+    def _emit_stderr_diag(self, message: str) -> None:
+        """Diagnostic to the REAL stderr (separate pipe from stdout, captured by
+        HostSupervisor._drain_stderr) — survives a broken stdout."""
+        try:
+            err = sys.__stderr__
+            if err is not None:
+                print(f"[compute_host] {message}", file=err, flush=True)
+        except Exception:
+            pass
+
+    def _parent_alive(self) -> bool:
+        """Liveness of the RECORDED parent pid. Never trust os.getppid() equality
+        (transient Windows-churn misreads = the code-0 bug). Inconclusive → ALIVE
+        (under-reacting is safe; the debounce + stdin-EOF backstop catch a real
+        death); over-reacting kills a healthy host."""
+        parent = self._parent_pid
+        if not parent:
+            return True
+        if _kernel32 is not None:  # Windows
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            handle = _kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, parent)
+            if not handle:
+                err = ctypes.get_last_error()
+                # 2 FILE_NOT_FOUND / 87 INVALID_PARAMETER → pid gone → DEAD.
+                # 5 ACCESS_DENIED or anything else → exists/inconclusive → ALIVE.
+                return err not in (2, 87)
+            try:
+                STILL_ACTIVE = 259
+                code = ctypes.c_ulong()
+                if not _kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return True
+                return code.value == STILL_ACTIVE
+            finally:
+                _kernel32.CloseHandle(handle)
+        # POSIX: signal 0 probes existence without delivering a signal.
+        try:
+            os.kill(parent, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return True
+
     def _parent_guard_loop(self) -> None:
-        while not self._closed.wait(1.0):
-            ppid = os.getppid()
-            if ppid in {0, 1} or (self._parent_pid and ppid != self._parent_pid):
-                self.emit({"type": "orphan", "old_ppid": self._parent_pid, "ppid": ppid})
+        """Backstop for gateway (parent) death. The PRIMARY signal is stdin EOF
+        (run_host's reader); this loop covers a pipe that does not promptly EOF.
+        Never act on a single reading — require N consecutive confirmed-dead
+        checks, set the shared exit code BEFORE shutdown(), then exit 18 so the
+        supervisor does not misreport it as a crash."""
+        misses = 0
+        while not self._closed.wait(self._guard_poll_secs):
+            if self._parent_alive():
+                misses = 0
+                continue
+            misses += 1
+            if misses < _PARENT_DEAD_CONFIRMATIONS:
+                continue
+            self._exit_code = _ORPHAN_EXIT_CODE          # BEFORE shutdown() sets _closed
+            self._emit_stderr_diag(
+                f"parent pid={self._parent_pid} confirmed gone after {misses} "
+                f"checks; exiting code={_ORPHAN_EXIT_CODE}"
+            )
+            with contextlib.suppress(Exception):
+                self.emit({"type": "orphan", "old_ppid": self._parent_pid, "confirmations": misses})
+            with contextlib.suppress(Exception):
                 self.shutdown(reason="orphan")
-                os._exit(0)
+            os._exit(_ORPHAN_EXIT_CODE)
 
 
 def _rss_mb(pid: int) -> float:
@@ -863,7 +941,7 @@ def run_host(stdin: Any = None, stdout: Any = None) -> None:
     def _reader() -> None:
         for raw in stdin:
             if host._closed.is_set():
-                break
+                return
             try:
                 frame = json.loads(raw)
             except json.JSONDecodeError as exc:
@@ -874,9 +952,19 @@ def run_host(stdin: Any = None, stdout: Any = None) -> None:
                 continue
             host.handle_frame(frame)
             if frame.get("type") == "shutdown":
-                os._exit(0)
+                os._exit(0)                              # graceful frame → clean 0
             if host._closed.is_set():
-                break
+                return
+        # EOF without a shutdown frame and not otherwise shutting down → the
+        # parent closed our stdin → the gateway is gone → orphan exit 18,
+        # consistent with the handle-poll guard (which the EOF usually beats).
+        if not shutting_down.is_set() and not host._closed.is_set():
+            host._exit_code = _ORPHAN_EXIT_CODE          # BEFORE shutdown() sets _closed
+            host._emit_stderr_diag(
+                f"stdin EOF without shutdown frame; parent gone; exiting code={_ORPHAN_EXIT_CODE}")
+            with contextlib.suppress(Exception):
+                host.shutdown(reason="orphan")
+            os._exit(_ORPHAN_EXIT_CODE)
 
     reader = threading.Thread(target=_reader, name="compute-host-control-reader", daemon=True)
     reader.start()
@@ -885,7 +973,14 @@ def run_host(stdin: Any = None, stdout: Any = None) -> None:
             if not reader.is_alive():
                 break
     finally:
-        host.shutdown(reason="stdin_closed", wait=2.0)
+        # An orphan path set _exit_code=18 BEFORE _closed woke this thread, so
+        # label the finalize reason to match and converge on 18. A clean /
+        # SIGTERM / stdin_closed exit (_exit_code == 0) RETURNS normally so
+        # atexit (server._shutdown_sessions) still runs — upstream lifecycle intact.
+        reason = "orphan" if host._exit_code == _ORPHAN_EXIT_CODE else "stdin_closed"
+        host.shutdown(reason=reason, wait=2.0)
+        if host._exit_code:
+            os._exit(host._exit_code)
 
 
 def main(argv: list[str] | None = None) -> int:
