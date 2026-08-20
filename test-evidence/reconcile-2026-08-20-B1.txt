@@ -1,0 +1,4 @@
+Bucket 1 (code-0 + RelayBuffer) A/B on upstream b44871db0a — full tests/tui_gateway/
+BASELINE (clean upstream): 5 failed [seed_turn_interrupt, append_log O_APPEND, shutdown_drain_sleep FLAKE, entry_imports, gui_surface apply_layout]
+OURS (B1 applied):         4 failed [seed_turn_interrupt, append_log O_APPEND, entry_imports, gui_surface apply_layout]
+=> OURS strict SUBSET of baseline. NET-ZERO regressions.

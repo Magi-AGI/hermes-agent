@@ -350,6 +350,19 @@ def _eager_reconcile_own_session_db() -> None:
         )
 
 
+def _warm_local_stt_model() -> None:
+    """Pre-load the local faster-whisper model in a worker thread so the first
+    voice dictation doesn't pay the 20-60s cold model load into VRAM. No-op
+    (never raises) when local STT isn't the active provider or faster-whisper
+    isn't installed."""
+    try:
+        from tools.transcription_tools import warm_local_model
+
+        warm_local_model()
+    except Exception:
+        pass
+
+
 @asynccontextmanager
 async def _lifespan(app: "FastAPI"):
     app.state.event_channels = {}  # dict[str, set]
@@ -385,6 +398,12 @@ async def _lifespan(app: "FastAPI"):
     # run_in_executor still froze the event loop for 15-22 s, causing the
     # Desktop's 10-second WebSocket ready-probe to time out (GH-73083).
     _warm_gateway_module()
+
+    # Pre-warm the local STT model (faster-whisper) in a worker thread so the
+    # first voice dictation doesn't pay the 20-60s cold model load into VRAM.
+    # No-op when local STT isn't the active provider; never blocks/fails startup
+    # (the model load is 20-60s, so it must not run inline like the gateway warm).
+    asyncio.get_running_loop().run_in_executor(None, _warm_local_stt_model)
 
     # Desktop-spawned backends (HERMES_DESKTOP=1) fire cron jobs themselves,
     # since the app has no gateway running the scheduler. Server `hermes

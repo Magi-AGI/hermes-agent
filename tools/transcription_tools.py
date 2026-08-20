@@ -134,6 +134,11 @@ GROQ_MODELS = {"whisper-large-v3", "whisper-large-v3-turbo", "distil-whisper-lar
 # Singleton for the local model — loaded once, reused across calls
 _local_model: Optional[object] = None
 _local_model_name: Optional[str] = None
+
+# Windows CUDA DLL preload state — populated once before the first
+# faster-whisper load so ctranslate2 can dlopen cublas/cudnn from torch/lib.
+_windows_cuda_dll_handles: list = []
+_windows_cuda_dlls_prepared = False
 # Guards the check-then-load of the module-global model cache above.
 # Without it, two concurrent voice messages can both see `_local_model is
 # None` and download/load the whisper model twice (#24767).
@@ -1724,6 +1729,125 @@ def _touch_transcription_time() -> None:
     _last_transcription_time = time.monotonic()
 
 
+def _iter_windows_cuda_dll_dirs(local_cfg: Dict[str, Any]) -> list:
+    """Return candidate CUDA DLL directories for faster-whisper on Windows.
+
+    Sources, in priority order:
+
+    1. ``stt.local.cuda_dll_dirs`` from config (list, or a PATH/semicolon/
+       newline-separated string).
+    2. The ``torch/lib`` directory of an installed ``torch`` (its Windows
+       wheels bundle the cublas/cublasLt/cudart/cudnn runtime ctranslate2
+       needs), located via ``importlib.util.find_spec`` — no filesystem scan.
+    3. A **targeted** glob of sibling CPython installs under
+       ``%LOCALAPPDATA%\\Programs\\Python\\Python*\\Lib\\site-packages\\torch\\lib``.
+       Deliberately narrow: no broad home-directory or cloud-root walk.
+
+    Existing directories are resolved, deduplicated (case-insensitively), and
+    returned in priority order.
+    """
+    raw_dirs = local_cfg.get("cuda_dll_dirs") or []
+    if isinstance(raw_dirs, str):
+        # Accept either Windows PATH-style semicolons or os.pathsep/newlines.
+        pieces: list = []
+        for chunk in raw_dirs.replace("\n", os.pathsep).split(os.pathsep):
+            pieces.extend(part.strip() for part in chunk.split(";") if part.strip())
+        raw_dirs = pieces
+    elif not isinstance(raw_dirs, (list, tuple)):
+        raw_dirs = []
+
+    candidates = [Path(str(item)).expanduser() for item in raw_dirs if str(item).strip()]
+
+    # If torch is installed in the active environment, its Windows wheels carry
+    # the CUDA runtime DLLs ctranslate2 needs (cublas/cublasLt/cudart/cudnn).
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("torch")
+        if spec and spec.origin:
+            candidates.append(Path(spec.origin).resolve().parent / "lib")
+    except Exception:
+        pass
+
+    # Reuse CUDA DLLs from sibling CPython installs.  This keeps Hermes' slim
+    # venv from needing a full torch install just to satisfy ctranslate2's
+    # Windows dynamic linker requirements.  Anchored on %LOCALAPPDATA% (so
+    # redirected Windows profiles resolve correctly) with a targeted glob only
+    # — no broad home/cloud-root scan.
+    local_appdata = os.getenv("LOCALAPPDATA")
+    if local_appdata:
+        programs = Path(local_appdata) / "Programs" / "Python"
+        if programs.exists():
+            candidates.extend(programs.glob("Python*/Lib/site-packages/torch/lib"))
+
+    seen: set = set()
+    result: list = []
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        key = str(resolved).lower()
+        if key in seen or not resolved.exists():
+            continue
+        seen.add(key)
+        result.append(resolved)
+    return result
+
+
+def _prepare_windows_cuda_dlls() -> None:
+    """Preload CUDA DLLs needed by ctranslate2/faster-whisper on Windows.
+
+    PyTorch's Windows wheels bundle cublas/cublasLt/cudart/cudnn and make them
+    visible when torch is imported. Hermes' venv intentionally avoids a full
+    torch install for local STT, so ctranslate2 can see a CUDA device but fail
+    at first encode with ``cublas64_12.dll is not found``.  Preloading the DLLs
+    from configured or discovered ``torch/lib`` directories, in dependency
+    order, gives ctranslate2 the runtime it needs.
+
+    Windows-only and idempotent: a no-op on other platforms and after the first
+    successful pass.  Failures are logged at debug level and never raised — the
+    downstream CUDA→CPU fallback still covers a missing runtime.
+    """
+    global _windows_cuda_dlls_prepared
+    if os.name != "nt" or _windows_cuda_dlls_prepared:
+        return
+    _windows_cuda_dlls_prepared = True
+
+    try:
+        import ctypes
+    except Exception:
+        return
+
+    local_cfg = _load_stt_config().get("local") or {}
+    # Dependency order matters: cudart first, then cublasLt (needed by cublas),
+    # then cublas, then cudnn.
+    dll_names = (
+        "cudart64_12.dll",
+        "cublasLt64_12.dll",
+        "cublas64_12.dll",
+        "cudnn64_9.dll",
+    )
+    loaded = 0
+    for dll_dir in _iter_windows_cuda_dll_dirs(local_cfg):
+        add_dll_directory = getattr(os, "add_dll_directory", None)
+        if add_dll_directory is not None:
+            try:
+                _windows_cuda_dll_handles.append(add_dll_directory(str(dll_dir)))
+            except (FileNotFoundError, OSError):
+                pass
+        for dll_name in dll_names:
+            dll_path = dll_dir / dll_name
+            if not dll_path.exists():
+                continue
+            try:
+                ctypes.CDLL(str(dll_path))
+                loaded += 1
+            except OSError as exc:
+                logger.debug("Could not preload CUDA DLL %s: %s", dll_path, exc)
+    if loaded:
+        logger.info("Preloaded %d CUDA DLL(s) for local faster-whisper", loaded)
+
+
 def _load_local_whisper_model(model_name: str, device: str = "auto", compute_type: str = "auto"):
     """Load faster-whisper with graceful CUDA → CPU fallback.
 
@@ -1741,6 +1865,10 @@ def _load_local_whisper_model(model_name: str, device: str = "auto", compute_typ
     We try the requested config first (fast CUDA path when it works), and on
     any CUDA library load failure fall back to CPU + int8.
     """
+    # Windows: preload cublas/cudnn from torch/lib before faster-whisper imports
+    # ctranslate2, so a CUDA device that would otherwise fail its first encode
+    # with "cublas64_12.dll not found" resolves the runtime. No-op elsewhere.
+    _prepare_windows_cuda_dlls()
     force_cpu = _should_force_faster_whisper_cpu()
     if force_cpu:
         # Importing ctranslate2/faster-whisper itself can abort on some
@@ -1768,6 +1896,68 @@ def _load_local_whisper_model(model_name: str, device: str = "auto", compute_typ
             exc,
         )
         return WhisperModel(model_name, device="cpu", compute_type="int8")
+
+
+def warm_local_model() -> bool:
+    """Preload the local faster-whisper model so the FIRST dictation doesn't pay
+    the cold model-load cost (large-v3 into VRAM is 20-60s).
+
+    Safe to call at backend startup: returns False and never raises when local
+    faster-whisper isn't the active STT path (disabled, cloud provider, or the
+    per-call command CLI because faster-whisper isn't importable) or the load
+    fails — the normal per-call transcribe path still handles everything. Warms
+    the same ``_local_model`` singleton the transcribe path reuses, so once this
+    completes every dictation is fast.
+    """
+    global _local_model, _local_model_name
+
+    try:
+        if not _HAS_FASTER_WHISPER:
+            return False
+
+        stt_config = _load_stt_config()
+        if not is_stt_enabled(stt_config):
+            return False
+
+        # Only warm when the resolved provider actually uses the in-process
+        # faster-whisper path — don't load a model the user won't use.
+        if _get_provider(stt_config) != "local":
+            return False
+
+        local_cfg = stt_config.get("local") or {}
+        model_name = _normalize_local_model(local_cfg.get("model", DEFAULT_LOCAL_MODEL))
+
+        # Take the same lock the transcribe path uses so a concurrent first
+        # dictation and this pre-warm can't both load the model, and honour
+        # stt.local.device / stt.local.compute_type so we cache the SAME
+        # configuration the transcribe path would build (a defaults-only warm
+        # would cache the wrong device/compute mode and force a reload).
+        with _local_model_lock:
+            if _local_model is not None and _local_model_name == model_name:
+                return True
+            logger.info("Pre-warming local faster-whisper model '%s'...", model_name)
+            _local_model = _load_local_whisper_model(
+                model_name,
+                device=local_cfg.get("device", "auto"),
+                compute_type=local_cfg.get("compute_type", "auto"),
+            )
+            _local_model_name = model_name
+        logger.info("Local faster-whisper model '%s' pre-warmed and ready", model_name)
+
+        # A pre-warmed model must honour idle-unload too, otherwise it sits
+        # resident forever until a first transcription would have started the
+        # watcher. Touch activity so the idle clock starts now, and arm the
+        # watcher when unload-after-idle is configured.
+        _touch_transcription_time()
+        idle_timeout = _get_idle_unload_seconds(local_cfg)
+        if idle_timeout > 0:
+            _start_idle_unload_watcher(idle_timeout)
+
+        return True
+    except Exception as exc:
+        logger.info("Local STT pre-warm skipped (non-fatal): %s", exc)
+
+        return False
 
 
 # Silence-hallucination hardening defaults for local faster-whisper.
@@ -1837,6 +2027,15 @@ def build_local_transcribe_kwargs(stt_config: Optional[Dict[str, Any]] = None) -
     initial_prompt = local_cfg.get("initial_prompt")
     if isinstance(initial_prompt, str) and initial_prompt.strip():
         kwargs["initial_prompt"] = initial_prompt
+
+    # hotwords bias decoding toward the user's domain vocabulary (Magi terms,
+    # names) without switching to a paid cloud provider. Accept a list or a
+    # comma-joined string; faster-whisper takes a single string.
+    hotwords = local_cfg.get("hotwords") or None
+    if isinstance(hotwords, (list, tuple)):
+        hotwords = ", ".join(str(item) for item in hotwords if str(item).strip())
+    if isinstance(hotwords, str) and hotwords.strip():
+        kwargs["hotwords"] = hotwords
 
     return kwargs
 

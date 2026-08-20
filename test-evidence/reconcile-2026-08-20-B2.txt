@@ -1,0 +1,5 @@
+Bucket 2 (STT) on upstream b44871db0a:
+- clean-set 3-way apply (transcription_tools, test, lazy_deps, config_defaults, pyproject): no conflicts
+- web_server.py + test_web_server.py: 1 conflict each = co-location with upstream new fns/tests; kept both. Decorator intact, helper above @asynccontextmanager, executor call after _warm_gateway_module().
+- uv.lock: regenerated (uv lock), ctranslate2 4.7.1 -> 4.7.2
+GATES: transcription+STT-warm 56 passed/2 skip; full test_web_server 163 passed/4 skip; packaging+project metadata 14 passed.

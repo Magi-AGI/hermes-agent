@@ -1230,3 +1230,77 @@ class TestRunCommandSttIdleTimeout:
             )
 
         assert "starting pass 1" in (excinfo.value.stderr or "")
+
+
+class TestLocalHotwords:
+    """stt.local.hotwords biases faster-whisper decoding (Bucket C)."""
+
+    def test_hotwords_string_passed_through(self):
+        from tools.transcription_tools import build_local_transcribe_kwargs
+
+        kwargs = build_local_transcribe_kwargs({"local": {"hotwords": "Magi, Hyperon"}})
+        assert kwargs.get("hotwords") == "Magi, Hyperon"
+
+    def test_hotwords_list_is_comma_joined(self):
+        from tools.transcription_tools import build_local_transcribe_kwargs
+
+        kwargs = build_local_transcribe_kwargs({"local": {"hotwords": ["Magi", "Hyperon", "  "]}})
+        assert kwargs.get("hotwords") == "Magi, Hyperon"
+
+    def test_empty_hotwords_omitted(self):
+        from tools.transcription_tools import build_local_transcribe_kwargs
+
+        assert "hotwords" not in build_local_transcribe_kwargs({"local": {"hotwords": ""}})
+        assert "hotwords" not in build_local_transcribe_kwargs({"local": {}})
+
+
+class TestWarmLocalModel:
+    """warm_local_model() pre-loads the singleton, guarded and non-fatal (Bucket C)."""
+
+    def test_returns_false_when_provider_not_local(self):
+        import tools.transcription_tools as tt
+
+        with patch.object(tt, "_HAS_FASTER_WHISPER", True), \
+             patch.object(tt, "_load_stt_config", return_value={"enabled": True, "local": {}}), \
+             patch.object(tt, "is_stt_enabled", return_value=True), \
+             patch.object(tt, "_get_provider", return_value="groq"), \
+             patch.object(tt, "_load_local_whisper_model") as load:
+            assert tt.warm_local_model() is False
+            load.assert_not_called()
+
+    def test_warms_singleton_when_local(self):
+        import tools.transcription_tools as tt
+
+        sentinel = object()
+        with patch.object(tt, "_HAS_FASTER_WHISPER", True), \
+             patch.object(tt, "_load_stt_config",
+                          return_value={"enabled": True, "local": {"model": "base"}}), \
+             patch.object(tt, "is_stt_enabled", return_value=True), \
+             patch.object(tt, "_get_provider", return_value="local"), \
+             patch.object(tt, "_get_idle_unload_seconds", return_value=0), \
+             patch.object(tt, "_touch_transcription_time"), \
+             patch.object(tt, "_load_local_whisper_model", return_value=sentinel) as load:
+            tt._local_model = None
+            tt._local_model_name = None
+            try:
+                assert tt.warm_local_model() is True
+                assert tt._local_model is sentinel
+                # device/compute_type must be threaded from config, not defaulted away.
+                assert load.call_args.kwargs.get("device") == "auto"
+                assert load.call_args.kwargs.get("compute_type") == "auto"
+            finally:
+                tt._local_model = None
+                tt._local_model_name = None
+
+    def test_never_raises_on_load_failure(self):
+        import tools.transcription_tools as tt
+
+        with patch.object(tt, "_HAS_FASTER_WHISPER", True), \
+             patch.object(tt, "_load_stt_config",
+                          return_value={"enabled": True, "local": {"model": "base"}}), \
+             patch.object(tt, "is_stt_enabled", return_value=True), \
+             patch.object(tt, "_get_provider", return_value="local"), \
+             patch.object(tt, "_load_local_whisper_model", side_effect=RuntimeError("boom")):
+            tt._local_model = None
+            tt._local_model_name = None
+            assert tt.warm_local_model() is False

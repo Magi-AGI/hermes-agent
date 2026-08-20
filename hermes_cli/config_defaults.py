@@ -1672,6 +1672,8 @@ DEFAULT_CONFIG = {
             "model": "base",  # tiny, base, small, medium, large-v3
             "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
             "initial_prompt": "",
+            "hotwords": "",  # bias decoding toward domain terms (list, or comma-joined string)
+            "cuda_dll_dirs": [],  # Windows: extra dirs to load cublas/cudnn from (e.g. a torch/lib path)
             # Anti-hallucination hardening (faster-whisper decodes junk tokens
             # from silence/noise without these):
             "vad": True,  # Silero VAD filter — silence never reaches whisper. false = old raw behavior (music/ambient).
