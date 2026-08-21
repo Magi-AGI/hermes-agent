@@ -1,4 +1,17 @@
-"""Tests for agent.auxiliary_client resolution chain, provider overrides, and model overrides."""
+"""Tests for agent.auxiliary_client resolution chain, provider overrides, and model overrides.
+
+NOTE on ``task="compression"``: compaction is restricted to subscription routes
+(ChatGPT Codex OAuth / Anthropic Claude Max OAuth) by the route guard, and the
+guard screens the CONSTRUCTED client — a bare ``MagicMock`` on an OpenRouter or
+OpenAI base_url is a metered route no matter what provider label the test uses.
+Tests below that exercise *task-agnostic* machinery (transient retry, payment /
+auth fallback, credential-pool rotation, unhealthy cache, timeout model
+forwarding) therefore use a non-compression task label; the label was always
+incidental to what they assert. Tests whose subject genuinely IS compression use
+``_codex_oauth_client`` so they run over a real allowlisted route. Do not "fix" a
+guard rejection here by weakening the guard — see
+tests/agent/test_compression_route_guard.py.
+"""
 
 import base64
 import json
@@ -38,6 +51,23 @@ from agent.auxiliary_client import (
     _CodexCompletionsAdapter,
     _pool_runtime_base_url,
 )
+
+
+def _codex_oauth_client(create_mock):
+    """A constructed client on the allowlisted ChatGPT Codex OAuth route.
+
+    The compaction route guard classifies the CONSTRUCTED client (wrapper class +
+    endpoint host), not the provider label, so compression tests need a real
+    ``CodexAuxiliaryClient`` pointed at chatgpt.com. Only the ``chat`` shim is
+    stubbed, so call counts / kwargs stay observable.
+    """
+    inner = MagicMock()
+    inner.api_key = "codex-oauth-token"
+    inner.base_url = "https://chatgpt.com/backend-api/codex"
+    client = CodexAuxiliaryClient(inner, "gpt-5.5")
+    client.chat = MagicMock()
+    client.chat.completions.create = create_mock
+    return client
 
 
 def _jwt_with_claims(claims: dict) -> str:
@@ -1256,7 +1286,7 @@ class TestAuxiliaryPoolAwareness:
             patch("agent.auxiliary_client._resolve_nous_runtime_api", return_value=("fresh-agent-key", "https://inference-api.nousresearch.com/v1")),
         ):
             result = call_llm(
-                task="compression",
+                task="title_generation",
                 messages=[{"role": "user", "content": "hi"}],
             )
 
@@ -1603,7 +1633,7 @@ class TestCallLlmPaymentFallback:
              patch("agent.auxiliary_client._try_payment_fallback",
                    return_value=(fallback_client, "fallback-model", "openrouter")) as mock_fb:
             result = call_llm(
-                task="compression",
+                task="title_generation",
                 messages=[{"role": "user", "content": "hello"}],
             )
 
@@ -1663,7 +1693,7 @@ class TestStaleFallbackCandidateSkip:
              patch("agent.auxiliary_client._refresh_provider_credentials",
                    return_value=True) as mock_refresh:
             result = call_llm(
-                task="compression",
+                task="title_generation",
                 messages=[{"role": "user", "content": "summarize"}],
             )
 
@@ -1706,7 +1736,7 @@ class TestStaleFallbackCandidateSkip:
                    return_value=False), \
              patch("agent.auxiliary_client._mark_provider_unhealthy") as mock_mark:
             result = call_llm(
-                task="compression",
+                task="title_generation",
                 messages=[{"role": "user", "content": "summarize"}],
             )
 
@@ -1739,7 +1769,7 @@ class TestStaleFallbackCandidateSkip:
                    return_value=(broken_fb, "claude-haiku-4-5-20251001", "anthropic")):
             with pytest.raises(ValueError, match="malformed response"):
                 call_llm(
-                    task="compression",
+                    task="title_generation",
                     messages=[{"role": "user", "content": "summarize"}],
                 )
 
@@ -1837,14 +1867,14 @@ class TestAuxiliaryFallbackLayering:
              patch("agent.auxiliary_client._try_configured_fallback_chain",
                    return_value=(chain_client, "gpt-5.4-mini", "fallback_chain[0](openai-codex)")) as mock_chain:
             result = call_llm(
-                task="compression",
+                task="title_generation",
                 messages=[{"role": "user", "content": "hello"}],
             )
 
         assert chain_client.chat.completions.create.called
         assert result.choices[0].message.content == "from configured chain"
         mock_chain.assert_called_once_with(
-            "compression",
+            "title_generation",
             "ollama-cloud",
             reason="provider unavailable",
         )
@@ -2004,7 +2034,7 @@ class TestTransientTransportRetry:
         client.chat.completions.create.side_effect = _Err400("bad request")
         p1, p2, p3 = self._patches(client)
         with p1, p2, p3, pytest.raises(_Err400):
-            call_llm(task="compression", messages=[{"role": "user", "content": "hi"}])
+            call_llm(task="title_generation", messages=[{"role": "user", "content": "hi"}])
         # Non-transient: single attempt, no same-target retry.
         assert client.chat.completions.create.call_count == 1
 
@@ -2018,13 +2048,11 @@ class TestTransientTransportRetry:
             pass
         _Timeout.__name__ = "APITimeoutError"
 
-        primary = MagicMock()
-        primary.base_url = "https://openrouter.ai/api/v1"
-        primary.chat.completions.create.side_effect = _Timeout("Request timed out.")
-
-        fb_client = MagicMock()
-        fb_client.base_url = "https://api.openai.com/v1"
-        fb_client.chat.completions.create.return_value = {"fallback": True}
+        # Compaction is restricted to subscription routes, so both the primary
+        # and the fallback must be allowlisted constructed routes — a metered
+        # mock would (correctly) be refused by the route guard before egress.
+        primary = _codex_oauth_client(MagicMock(side_effect=_Timeout("Request timed out.")))
+        fb_client = _codex_oauth_client(MagicMock(return_value={"fallback": True}))
 
         p1, p2, p3 = self._patches(primary)
         with (
@@ -2035,7 +2063,7 @@ class TestTransientTransportRetry:
             ),
             patch(
                 "agent.auxiliary_client._try_main_agent_model_fallback",
-                return_value=(fb_client, "fb-model", "openai"),
+                return_value=(fb_client, "fb-model", "openai-codex"),
             ),
         ):
             result = call_llm(task="compression", messages=[{"role": "user", "content": "hi"}])
@@ -2074,7 +2102,7 @@ class TestTransientTransportRetry:
                 return_value=(None, None, ""),
             ),
         ):
-            result = call_llm(task="compression", messages=[{"role": "user", "content": "hi"}])
+            result = call_llm(task="title_generation", messages=[{"role": "user", "content": "hi"}])
         assert result == {"fallback": True}
         _, kwargs = mock_chain.call_args
         assert kwargs.get("failed_model") == "some-model", (
@@ -2638,7 +2666,7 @@ class TestAuxiliaryPoolRotationRetry:
             patch("agent.auxiliary_client._try_payment_fallback") as mock_fallback,
         ):
             resp = call_llm(
-                task="compression",
+                task="title_generation",
                 provider="openai-codex",
                 model="gpt-5.4",
                 messages=[{"role": "user", "content": "hi"}],
@@ -3589,7 +3617,7 @@ class TestAuxiliaryClientPoisonedCacheEviction:
             ):
                 with pytest.raises(ConnectionError):
                     call_llm(
-                        task="compression",
+                        task="title_generation",
                         messages=[{"role": "user", "content": "x"}],
                     )
             assert cache_key not in _client_cache, (
@@ -3916,7 +3944,7 @@ class TestAuxUnhealthyCache:
                     return_value={"model": "n-model", "messages": [{"role": "user", "content": "hi"}]}):
             assert _is_provider_unhealthy("openrouter") is False
             call_llm(
-                task="compression",
+                task="title_generation",
                 messages=[{"role": "user", "content": "hi"}],
             )
             # After the 402, OpenRouter is in the unhealthy cache.

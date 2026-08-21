@@ -707,7 +707,12 @@ class TestMicroCompaction:
         assert cc._micro_compact_rolling_summary
         assert cc._micro_compact_cursor > 0
 
-        cc.compress(msgs, force=True)
+        # Exercise the SUCCESS path: provider="test" has no live backend, so the
+        # subscription-only compaction route guard would (correctly) fail closed
+        # and abort messages-unchanged — which is not what this test is about.
+        # Stub the summary so batch compaction commits and resets micro-state.
+        with patch.object(cc, "_generate_summary", return_value="BATCH SUMMARY"):
+            cc.compress(msgs, force=True)
 
         assert cc._micro_compact_rolling_summary == ""
         assert cc._micro_compact_cursor == 0

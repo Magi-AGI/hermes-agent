@@ -247,7 +247,7 @@ class TestSyncCallEnforcesLimit:
         def make_second_call():
             second_call_started.set()
             call_llm(
-                task="compression",
+                task="title_generation",
                 messages=[{"role": "user", "content": "second"}],
             )
 
@@ -270,7 +270,7 @@ class TestSyncCallEnforcesLimit:
             ),
         ):
             stream = call_llm(
-                task="compression",
+                task="title_generation",
                 messages=[{"role": "user", "content": "first"}],
                 stream=True,
                 stream_options={"include_usage": True},
@@ -362,7 +362,7 @@ class TestAsyncCallEnforcesLimit:
         ):
             await asyncio.gather(*[
                 async_call_llm(
-                    task="compression",
+                    task="title_generation",
                     messages=[{"role": "user", "content": "hi"}],
                 )
                 for _ in range(n_callers)
@@ -398,6 +398,6 @@ class TestAsyncCallEnforcesLimit:
             for _ in range(3):
                 with pytest.raises(RuntimeError, match="boom"):
                     await async_call_llm(
-                        task="compression",
+                        task="title_generation",
                         messages=[{"role": "user", "content": "hi"}],
                     )

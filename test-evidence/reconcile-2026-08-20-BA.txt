@@ -1,0 +1,7 @@
+Bucket A (compaction route guard) on upstream b44871db0a:
+APPLY: all files 3-way applied with ZERO conflicts (anchors byte-identical, as analysis predicted).
+NEW WORK beyond replay (reviewer-required):
+  - _assert_compression_route added before BOTH sync + async structured-output retry egresses (upstream 3c675019f1 rung, absent from our old diff).
+  - new test test_anthropic_suffixed_relay_gateway_rejected: /anthropic-suffixed relay host that upstream's broadened _is_anthropic_compatible_host now TRUSTS is still REJECTED by our strict guard.
+CONFIRMED present: cache-hit screen applied AFTER _get_cached_client returns at the primary call sites (guard rejection forces client=None so a valid subscription fallback is evaluated, not a premature abort) — the helper itself does not screen; except CompressionRoutingRejected BEFORE broad except in context_compressor _generate_summary (line ~4762, with rationale comment).
+GATES: guard suites 77 passed + new aliasing test; full tests/agent/ A/B = NET-ZERO (baseline 195 fail / ours 195 fail, 0 new regressions; ours +78 passing = ported guard tests). git diff --check clean.

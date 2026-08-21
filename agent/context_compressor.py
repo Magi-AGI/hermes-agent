@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional
 
 from agent.auxiliary_client import (
     AuxiliaryExplicitCancellation,
+    CompressionRoutingRejected,
     _is_connection_error,
     aux_interrupt_protection,
     call_llm,
@@ -3029,6 +3030,17 @@ class ContextCompressor(ContextEngine):
         # strictly better than discarding context for a transient blip
         # (#29559, #25585). Independent of abort_on_summary_failure.
         self._last_summary_network_failure: bool = False
+        # Set when summary generation was refused by the subscription-only
+        # compaction route guard (CompressionRoutingRejected): no allowed route
+        # existed, so no summary was sent to a metered provider. compress()
+        # ABORTS messages-unchanged — a routing refusal is NOT a provider fault
+        # to route around, so (unlike auth/network) it arms no cooldown and never
+        # retries on the main model (that would be a second routing escape).
+        self._last_summary_routing_rejected: bool = False
+        # The refusal message (distinct + actionable) so gateway / CLI callers
+        # can surface it instead of a bare "unknown error". Deliberately NOT
+        # stored in _last_summary_error (a routing refusal is not a summary fault).
+        self._last_summary_routing_message: Optional[str] = None
         # retrying on the main model, record the failure so gateway /
         # CLI callers can still warn the user even though compression
         # succeeded.  Silent recovery would hide the broken config.
@@ -4744,7 +4756,28 @@ This compaction should PRIORITISE preserving all information related to the focu
             self._last_summary_error = None
             self._last_summary_auth_failure = False
             self._last_summary_network_failure = False
+            self._last_summary_routing_rejected = False
+            self._last_summary_routing_message = None
             return self._with_summary_prefix(summary)
+        except CompressionRoutingRejected as _routing_exc:
+            # MUST be the first handler — ahead of the broad ``except Exception``
+            # below, which would otherwise (a) classify this as a generic summary
+            # failure and hand the middle window to the static-placeholder path,
+            # or (b) worse, retry the summary on the MAIN model — a second
+            # routing escape that could send the same business-sensitive content
+            # to a metered main-agent route.
+            #
+            # A routing refusal is not a provider fault to route around, so it is
+            # deliberately NOT recorded as a summary failure: no _last_summary_error,
+            # no failure cooldown. Re-raise for compress() to abort on.
+            self._last_summary_routing_rejected = True
+            self._last_summary_routing_message = str(_routing_exc)
+            logger.error(
+                "Context compression refused: no allowed subscription route for "
+                "compaction. The conversation is preserved unchanged — no context "
+                "was lost and no summary was sent to a metered provider."
+            )
+            raise
         except Exception as e:
             # ``call_llm`` raises ``RuntimeError`` for two very different cases:
             #   1. No provider configured ("No LLM provider configured ...") —
@@ -6928,6 +6961,15 @@ This compaction should PRIORITISE preserving all information related to the focu
         self._last_aux_model_failure_model = None
         self._last_compress_aborted = False
         self._last_compression_made_progress = False
+        # Safe to reset eagerly (unlike the auth/network flags below): a routing
+        # refusal arms no cooldown, so _generate_summary re-raises deterministically
+        # rather than early-returning None from a cooldown.
+        self._last_summary_routing_rejected = False
+        self._last_summary_routing_message = None
+        # Snapshot the caller's list so a routing refusal can return it verbatim
+        # (messages-unchanged abort — no context is lost when compaction is
+        # refused for lack of an allowed subscription route).
+        original_messages = messages
         # NOTE: do NOT reset _last_summary_auth_failure or
         # _last_summary_network_failure here.  These flags are set by
         # _generate_summary() on a terminal failure and are already cleared on
@@ -7291,6 +7333,27 @@ This compaction should PRIORITISE preserving all information related to the focu
                 self._previous_summary = _previous_summary_before_scan
                 self._summary_has_user_turn = _summary_has_user_turn_before_scan
                 raise
+            except CompressionRoutingRejected:
+                # The compaction route guard refused every route — no summary was
+                # sent to a metered provider. ABORT messages-unchanged: return the
+                # caller's ORIGINAL list (not the Phase-1 pruned one) so a routing
+                # refusal loses zero context, and rotate NOTHING. Roll back the
+                # self-heal rehydration so the next attempt re-runs cleanly.
+                self._previous_summary = _previous_summary_before_scan
+                self._summary_has_user_turn = _summary_has_user_turn_before_scan
+                self._last_compress_aborted = True
+                self._last_summary_routing_rejected = True
+                telemetry["failure_class"] = "summary_routing_rejected"
+                if not self.quiet_mode:
+                    logger.warning(
+                        "Compression aborted: no allowed subscription route for "
+                        "compaction. %d message(s) preserved unchanged; the session "
+                        "was NOT rotated. Authenticate a subscription route "
+                        "(`hermes auth codex` or `claude setup-token`) and retry "
+                        "with /compress.",
+                        len(original_messages),
+                    )
+                return original_messages
 
         # If summary generation failed, behavior splits on
         # ``abort_on_summary_failure`` (config: compression.abort_on_summary_failure):
