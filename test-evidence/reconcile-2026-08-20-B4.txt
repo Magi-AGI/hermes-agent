@@ -1,0 +1,6 @@
+Bucket B (desktop) verification on upstream b44871db0a (post npm ci with temp node 22.22):
+- 3-tsconfig typecheck (base/electron/e2e): ALL CLEAN (exit 0). Earlier driver.js/blobatar errors were stale-node_modules artifacts, gone post npm ci.
+- vitest electron: OUR session-windows.test.ts + window-state.test.ts = 47/47 pass. 26 suite failures all pre-existing environmental (ssh-connection/windows-hermes-path/stage-native-deps = SSH/POSIX/darwin on Windows).
+- vitest ui focused: i18n/runtime.test.ts + session-actions-menu.test.tsx = 13/13 pass (locale completeness + disableRename gate).
+- vitest ui FULL A/B: BASELINE(B3) 14 failed/4997 passed vs OURS(B4) 13 failed/4998 passed => NET-NEGATIVE (one fewer). Failing files identical pre-existing flaky-ordering set (messaging/skills/session-unread-tile/gateway-settings), none in Bucket B surface. 3 files pass IN ISOLATION on both baseline+B4 (21) => full-suite fails are ordering artifacts.
+PENDING (needs Hermes closed): desktop repack (electron-builder) + Codex reopen-many-windows smoke test + venv rebuild/CUDA + deploy swap + phone contract-6 check.
