@@ -7,6 +7,13 @@ import type { VoiceActivityState, VoiceStatus } from '../types'
 
 import { useMicRecorder } from './use-mic-recorder'
 
+// A silent capture (mic held in exclusive mode by another app, or a wrong/muted
+// default input device) produces a header-only webm of a few hundred bytes with
+// no audio frames — the backend can then only fail it at the ffmpeg stage with an
+// opaque EBML error. A real ~1s opus recording is several KB, so anything below
+// this is treated as "no audio captured" and reported legibly instead of shipped.
+const MIN_TRANSCRIBABLE_AUDIO_BYTES = 1024
+
 interface VoiceRecorderOptions {
   maxRecordingSeconds: number
   onTranscribeAudio?: (audio: Blob) => Promise<string>
@@ -55,6 +62,18 @@ export function useVoiceRecorder({
 
     if (!onTranscribeAudio) {
       setVoiceStatus('idle')
+
+      return
+    }
+
+    // Empty/silent capture: report what to check rather than shipping an
+    // unusable header-only file to the transcriber. Byte-size (not heardSpeech)
+    // is the signal — plain push-to-talk dictation never arms the meter's
+    // speech threshold, so heardSpeech stays false even for real speech.
+    if (result.audio.size < MIN_TRANSCRIBABLE_AUDIO_BYTES) {
+      notify({ kind: 'warning', title: voiceCopy.noSpeechDetected, message: voiceCopy.noAudioCaptured })
+      setVoiceStatus('idle')
+      focusInput()
 
       return
     }

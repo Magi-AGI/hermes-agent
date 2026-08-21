@@ -83,6 +83,20 @@ export function isWatchWindow(): boolean {
 // keystroke into N prompts, and a HUD is the last place to paint onboarding.
 export const isAuxiliaryWindow = (): boolean => isSecondaryWindow() || isHudWindow()
 
+// Shared "does this window show the ChatHeader" predicate — the single source of
+// truth consumed by both ChatHeader (the title chip/menu) and ThreadMessageList
+// (the top-gap + sticky-offset + drag-mask it only needs when there's no header
+// to serve that role). An auxiliary window is headerless exactly while it has no
+// resolvable session: a HUD (always sessionless → stays chrome-free), or a
+// still-blank secondary pop-out. Once a session exists — the window opened
+// already keyed to one, or a draft just created one — it gets a header, live
+// rename updates, and a real document.title, matching how the primary window has
+// always worked. (Gated on isAuxiliaryWindow, not isSecondaryWindow, so HUD
+// keeps its upstream chrome-free behavior.)
+export function isHeaderlessSecondaryWindow(hasSession: boolean): boolean {
+  return isAuxiliaryWindow() && !hasSession
+}
+
 // The profile a helper window (the HUD) was asked to boot against, carried in
 // the query string by the main process (see hudUrl). The HUD is a full app
 // renderer that otherwise adopts the PRIMARY backend's profile — wrong the
@@ -172,4 +186,24 @@ export async function openSessionInTerminal(
     () => window.hermesDesktop.openSessionInTerminal(sessionId, opts),
     'Could not open chat in a terminal'
   )
+}
+
+// Close every live session pop-out (including watch/spectator windows). No-op
+// outside Electron.
+export async function closeAllSessionWindows(): Promise<void> {
+  if (!canOpenSessionWindow() || typeof window.hermesDesktop.closeAllSessionWindows !== 'function') {
+    return
+  }
+
+  await runWindowOpen(() => window.hermesDesktop.closeAllSessionWindows(), 'Could not close session windows')
+}
+
+// Explicit-action restore of the last-closed (non-watch) session windows, at
+// their saved positions. Never runs automatically — only via this call.
+export async function reopenSessionWindows(): Promise<void> {
+  if (!canOpenSessionWindow() || typeof window.hermesDesktop.reopenSessionWindows !== 'function') {
+    return
+  }
+
+  await runWindowOpen(() => window.hermesDesktop.reopenSessionWindows(), 'Could not reopen session windows')
 }

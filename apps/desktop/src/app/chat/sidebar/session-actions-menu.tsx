@@ -105,6 +105,10 @@ export async function renameSessionPreferringRpc(
 interface SessionActions {
   sessionId: string
   title: string
+  /** Read-only surfaces (watch/spectator pop-out windows) hide the rename item —
+   *  a spectator must not mutate the session's title. Reconcile delta (Bucket B)
+   *  layered onto upstream's otherwise-unconditional rename. */
+  disableRename?: boolean
   pinned?: boolean
   /** Backend-derived read state — drives the Mark as unread/read label. */
   unread?: boolean
@@ -202,7 +206,8 @@ function useSessionActions({
   onClose,
   onHideTabBar,
   surface = 'row',
-  tabPaneId
+  tabPaneId,
+  disableRename = false
 }: SessionActions) {
   const { t } = useI18n()
   const r = t.sidebar.row
@@ -290,17 +295,23 @@ function useSessionActions({
 
   // IDENTITY — name/mark/reference the session.
   const identityItems: ActionItemSpec[] = [
-    spec({
-      disabled: !sessionId,
-      icon: 'edit',
-      label: r.rename,
-      onSelect: () => {
-        triggerHaptic('selection')
-        // Keep focus off the row trigger so it lands in the dialog input.
-        suppressCloseFocusRef.current = true
-        setRenameOpen(true)
-      }
-    }),
+    // Bucket B reconcile: gate upstream's (unconditional) rename behind
+    // disableRename so read-only watch/spectator pop-outs can't mutate the title.
+    ...(disableRename
+      ? []
+      : [
+          spec({
+            disabled: !sessionId,
+            icon: 'edit',
+            label: r.rename,
+            onSelect: () => {
+              triggerHaptic('selection')
+              // Keep focus off the row trigger so it lands in the dialog input.
+              suppressCloseFocusRef.current = true
+              setRenameOpen(true)
+            }
+          })
+        ]),
     spec({
       disabled: !onPin,
       icon: 'pin',

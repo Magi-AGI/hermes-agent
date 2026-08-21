@@ -59,6 +59,12 @@ declare global {
         sessionId: string,
         opts?: { cwd?: string; profile?: string }
       ) => Promise<{ ok: boolean; error?: string }>
+      // Close every live session pop-out (including watch/spectator windows).
+      // Never touches the primary window, pet overlay, or hidden windows.
+      closeAllSessionWindows: () => Promise<{ ok: boolean; error?: string }>
+      // Explicit-action restore of the last-closed session windows' positions
+      // (never automatic on launch). Watch windows are never included.
+      reopenSessionWindows: () => Promise<{ ok: boolean; error?: string }>
       // Open a new full-chrome app window — a peer instance of the primary that
       // renders the complete app against the shared backend, so the user can run
       // multiple GUI windows at once.
@@ -396,6 +402,7 @@ declare global {
         repo?: string
         force?: boolean
       }) => Promise<{ ok: boolean; pluginName?: string; path?: string; error?: string }>
+      signalSessionGatewayReady?: () => void
       onWindowStateChanged?: (callback: (payload: HermesWindowState) => void) => () => void
       onFocusSession?: (callback: (sessionId: string) => void) => () => void
       onNotificationAction?: (callback: (payload: { actionId: string; sessionId?: string }) => void) => () => void

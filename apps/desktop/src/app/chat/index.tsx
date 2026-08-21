@@ -45,7 +45,7 @@ import {
 } from '@/store/session'
 import { sessionTileDelegate } from '@/store/session-states'
 import { $transcriptTailBySessionId } from '@/store/transcript-tail'
-import { isAuxiliaryWindow, isWatchWindow } from '@/store/windows'
+import { isAuxiliaryWindow, isHeaderlessSecondaryWindow, isSecondaryWindow, isWatchWindow } from '@/store/windows'
 import type { ModelOptionsResponse } from '@/types/hermes'
 
 import { primaryRouteSelectedSessionId, routeSessionId } from '../routes'
@@ -141,10 +141,32 @@ function ChatHeader({
       ? pinnedSessionIds.includes(selectedSessionId)
       : false
 
-  // Secondary windows (new-session scratch, subagent watch, cmd-click pop-out)
-  // are compact side panels — they drop the session-actions header + border
-  // entirely. A brand-new draft has nothing to pin/delete/rename either.
-  if (isAuxiliaryWindow() || (!selectedSessionId && !activeSessionId && !isRoutedSessionView)) {
+  const hasSession = Boolean(selectedSessionId || activeSessionId || isRoutedSessionView)
+  // Watch (spectator) windows show the title for identification but are
+  // read-only: no pin/delete/rename. Unlike pin/delete (gated by handler
+  // props below), rename needs the explicit disableRename prop.
+  const readOnly = isWatchWindow()
+
+  // Native OS/taskbar/Alt-Tab identification for secondary windows. Nothing
+  // intercepts 'page-title-updated' for chat windows (see spawnSecondaryWindow
+  // in electron/main.ts), so Electron's default title sync propagates this to
+  // the BrowserWindow automatically — no IPC round-trip needed. The main
+  // window's native title stays the fixed 'Hermes' set at construction; this
+  // effect only runs for secondary windows (not the HUD, which is chrome-free).
+  useEffect(() => {
+    if (!isSecondaryWindow()) {
+      return
+    }
+
+    document.title = hasSession ? title : 'Hermes'
+  }, [hasSession, title])
+
+  // Secondary windows (subagent watch, cmd-click pop-out) are compact side
+  // panels — they drop the session-actions header + border entirely while
+  // headerless. Once they have a real session — a keyed pop-out has one
+  // immediately — they get the same header the main window shows. The HUD is
+  // sessionless, so isHeaderlessSecondaryWindow keeps it chrome-free (D2).
+  if (isHeaderlessSecondaryWindow(hasSession) || (!selectedSessionId && !activeSessionId && !isRoutedSessionView)) {
     return null
   }
 
@@ -160,8 +182,9 @@ function ChatHeader({
         {showProfileTag && <ProfileTag className="pointer-events-auto mr-1.5" profile={activeStoredSession?.profile} />}
         <SessionActionsMenu
           align="start"
-          onDelete={selectedSessionId ? onDeleteSelectedSession : undefined}
-          onPin={selectedSessionId ? onToggleSelectedPin : undefined}
+          disableRename={readOnly}
+          onDelete={!readOnly && selectedSessionId ? onDeleteSelectedSession : undefined}
+          onPin={!readOnly && selectedSessionId ? onToggleSelectedPin : undefined}
           pinned={selectedIsPinned}
           sessionId={selectedSessionId || activeSessionId || ''}
           sideOffset={8}
