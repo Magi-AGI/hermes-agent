@@ -316,6 +316,7 @@ export interface Translations {
       microphoneStartFailed: string
       microphoneUnsupported: string
       noMicrophone: string
+      noAudioCaptured: string
       noSpeechDetected: string
       playbackFailed: string
       recordingFailed: string
@@ -1833,6 +1834,8 @@ export interface Translations {
     sharedGatewayRestarted: (count: number) => string
     updateHermes: string
     reloadWindow: string
+    closeAllSessionWindows: string
+    reopenSessionWindows: string
     actionRunning: string
     actionDone: string
     actionFailed: string
@@ -3803,6 +3806,7 @@ export interface Translations {
     editFailed: string
     editTurnUnavailable: string
     resumeFailed: string
+    resumeSucceeded: string
     readOnlyTranscriptTitle: string
     readOnlyTranscriptBody: string
     readOnlyTranscriptSendBlocked: string

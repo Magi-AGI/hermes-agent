@@ -31,14 +31,20 @@ interface SanitizedWindowState {
 
 // Parse raw JSON → clean state, or null if garbage. width/height are required
 // and floored; x/y survive only as a finite pair; isMaximized is strict.
-function sanitizeWindowState(raw?: any): SanitizedWindowState | null {
+// `minWidth`/`minHeight` default to the main window's floor; callers restoring
+// a different window kind (e.g. the compact secondary session windows, whose
+// minimums are larger — see session-windows.ts) pass their own.
+function sanitizeWindowState(
+  raw?: any,
+  { minWidth = MIN_WIDTH, minHeight = MIN_HEIGHT }: { minWidth?: number; minHeight?: number } = {}
+): SanitizedWindowState | null {
   if (!raw || typeof raw !== 'object' || !finite(raw.width) || !finite(raw.height)) {
     return null
   }
 
   const state: SanitizedWindowState = {
-    width: Math.max(MIN_WIDTH, Math.round(raw.width)),
-    height: Math.max(MIN_HEIGHT, Math.round(raw.height)),
+    width: Math.max(minWidth, Math.round(raw.width)),
+    height: Math.max(minHeight, Math.round(raw.height)),
     isMaximized: raw.isMaximized === true
   }
 
@@ -96,8 +102,13 @@ interface WindowOptions {
 // width/height, capped to the largest current display so a size saved on a
 // since-disconnected bigger monitor can't exceed every screen the user now has.
 // A trusted saved position is then capped and clamped to the work area it
-// meaningfully overlaps; otherwise Electron centers the window.
-function computeWindowOptions(state, displays): WindowOptions {
+// meaningfully overlaps; otherwise Electron centers the window. `minWidth`/`minHeight`
+// default to the main window's floor (Magi: secondary session windows pass their own).
+function computeWindowOptions(
+  state,
+  displays,
+  { minWidth = MIN_WIDTH, minHeight = MIN_HEIGHT }: { minWidth?: number; minHeight?: number } = {}
+): WindowOptions {
   const opts: WindowOptions = {
     width: finite(state?.width) ? state.width : DEFAULT_WIDTH,
     height: finite(state?.height) ? state.height : DEFAULT_HEIGHT
@@ -112,16 +123,16 @@ function computeWindowOptions(state, displays): WindowOptions {
   )
 
   if (cap.width && cap.height) {
-    opts.width = clamp(opts.width, MIN_WIDTH, cap.width)
-    opts.height = clamp(opts.height, MIN_HEIGHT, cap.height)
+    opts.width = clamp(opts.width, minWidth, cap.width)
+    opts.height = clamp(opts.height, minHeight, cap.height)
   }
 
   if (state && finite(state.x) && finite(state.y)) {
     const workArea = matchingWorkArea({ x: state.x, y: state.y, width: opts.width, height: opts.height }, displays)
 
     if (workArea) {
-      opts.width = clamp(opts.width, MIN_WIDTH, workArea.width)
-      opts.height = clamp(opts.height, MIN_HEIGHT, workArea.height)
+      opts.width = clamp(opts.width, minWidth, workArea.width)
+      opts.height = clamp(opts.height, minHeight, workArea.height)
       opts.x = clamp(state.x, workArea.x, workArea.x + workArea.width - opts.width)
       opts.y = clamp(state.y, workArea.y, workArea.y + workArea.height - opts.height)
     }
@@ -183,5 +194,7 @@ export {
   MIN_HEIGHT,
   MIN_VISIBLE,
   MIN_WIDTH,
-  sanitizeWindowState
+  sanitizeWindowState,
+  type SanitizedWindowState,
+  type WindowOptions
 }

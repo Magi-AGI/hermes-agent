@@ -80,6 +80,12 @@ declare global {
         sessionId: string,
         opts?: { cwd?: string; profile?: string }
       ) => Promise<{ ok: boolean; error?: string }>
+      // Close every live session pop-out (including watch/spectator windows).
+      // Never touches the primary window, pet overlay, or hidden windows.
+      closeAllSessionWindows: () => Promise<{ ok: boolean; error?: string }>
+      // Explicit-action restore of the last-closed session windows' positions
+      // (never automatic on launch). Watch windows are never included.
+      reopenSessionWindows: () => Promise<{ ok: boolean; error?: string }>
       // Open a new full-chrome app window — a peer instance of the primary that
       // renders the complete app on an explicit connection/profile, or inherits
       // the calling window's route when no options are supplied.
@@ -546,6 +552,7 @@ declare global {
       /** Delete a STANDALONE desktop plugin folder (`<desktop-plugins root>/<name>`);
        *  Electron re-checks containment and refuses unified-package halves. */
       removeDesktopPlugin?: (payload: { name: string }) => Promise<{ ok: boolean; path?: string; error?: string }>
+      signalSessionGatewayReady?: () => void
       onWindowStateChanged?: (callback: (payload: HermesWindowState) => void) => () => void
       onFocusSession?: (callback: (sessionId: string) => void) => () => void
       onNotificationAction?: (callback: (payload: { actionId: string; sessionId?: string }) => void) => () => void

@@ -22,6 +22,7 @@ import { requestPluginCatalogInstallFromDeepLink } from '@/store/plugin-catalog-
 import { openPluginInstallRequest } from '@/store/plugin-install-request'
 import { openFolderAsProject } from '@/store/projects'
 import {
+  $activeSessionId,
   $selectedStoredSessionId,
   getRememberedRoute,
   getRememberedSessionId,
@@ -33,7 +34,7 @@ import {
 import { $botChatScopes, $sessionTiles, storedSessionIdForRuntimeId } from '@/store/session-states'
 import { onSessionsChanged } from '@/store/session-sync'
 import { openUpdatesWindow, startUpdatePoller, stopUpdatePoller } from '@/store/updates'
-import { isBrowserWindow, isHudWindow, isSecondaryWindow } from '@/store/windows'
+import { isBrowserWindow, isHeaderlessSecondaryWindow, isHudWindow } from '@/store/windows'
 import type { SessionInfo } from '@/types/hermes'
 
 import { requestComposerFocus, requestComposerInsert } from '../../chat/composer/focus'
@@ -421,9 +422,17 @@ export function useDesktopIntegrations({
     return () => unsubscribe?.()
   }, [])
 
-  // Another window mutated the shared session list -> re-pull the sidebar.
+  // Another window mutated the shared session list (a chat started in a pop-out,
+  // or a rename from another window). Re-pull so the sidebar — or a header-
+  // visible secondary window's title chip / document.title — reflects it. A
+  // still-headerless window (HUD / a blank pop-out with no session, nothing to
+  // keep in sync) keeps skipping this, and a Browser window skips unconditionally
+  // (it has no session concept at all, regardless of what the global session-id
+  // stores happen to hold). Non-reactive read: a keyed pop-out has a stable
+  // session for its lifetime and drafts no longer exist, so the gate can't need
+  // to flip after mount.
   useEffect(() => {
-    if (isSecondaryWindow() || isBrowserWindow()) {
+    if (isHeaderlessSecondaryWindow(Boolean($selectedStoredSessionId.get() || $activeSessionId.get())) || isBrowserWindow()) {
       return
     }
 
