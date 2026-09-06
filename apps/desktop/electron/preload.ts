@@ -34,6 +34,8 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   getAgentRoster: () => ipcRenderer.invoke('hermes:agents:roster'),
   openSessionWindow: (sessionId, opts) => ipcRenderer.invoke('hermes:window:openSession', sessionId, opts),
   openSessionInTerminal: (sessionId, opts) => ipcRenderer.invoke('hermes:window:openInTerminal', sessionId, opts),
+  closeAllSessionWindows: () => ipcRenderer.invoke('hermes:window:closeAllSessionWindows'),
+  reopenSessionWindows: () => ipcRenderer.invoke('hermes:window:reopenSessionWindows'),
   openWindow: () => ipcRenderer.invoke('hermes:window:openInstance'),
   openBrowserWindow: tabId => ipcRenderer.invoke('hermes:window:openBrowser', tabId),
   onBrowserPopoutClosed: callback => {
@@ -411,6 +413,9 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   signalDeepLinkReady: () => ipcRenderer.invoke('hermes:deep-link-ready'),
   probePluginRepo: payload => ipcRenderer.invoke('hermes:plugin:probe', payload),
   installDesktopPlugin: payload => ipcRenderer.invoke('hermes:plugin:installDesktop', payload),
+  // Fire-and-forget: tells main this window's gateway finished connecting, so the
+  // reopen queue can release the next saved window (see reopenSessionWindows).
+  signalSessionGatewayReady: () => ipcRenderer.send('hermes:window:gateway-ready'),
   onWindowStateChanged: callback => {
     const listener = (_event, payload) => callback(payload)
     ipcRenderer.on('hermes:window-state-changed', listener)

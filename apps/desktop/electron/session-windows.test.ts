@@ -7,7 +7,8 @@ import {
   buildSessionWindowUrl,
   chatWindowWebPreferences,
   createSessionWindowRegistry,
-  instanceWindowBounds
+  instanceWindowBounds,
+  sanitizeSessionWindowEntry
 } from './session-windows'
 
 // A minimal fake BrowserWindow: tracks listeners + destroyed state and lets a
@@ -209,6 +210,74 @@ test('registry trims the session id before keying', () => {
   registry.openOrFocus('  s1  ', () => win)
 
   assert.equal(registry.has('s1'), true)
+})
+
+test('registry carries the owning profile through entries() for reopen/persistence (#82768/#61286)', () => {
+  // Regression: "Reopen Saved Session Windows" reads entries() to persist
+  // session-windows-state.json. A non-primary-profile session that loses its
+  // profile here silently reopens against the primary backend on the next
+  // launch, reproducing the exact bug upstream's dfa74b5815 fixed for direct
+  // opens.
+  const registry = createSessionWindowRegistry()
+  const win = makeFakeWindow()
+
+  registry.openOrFocus('s1', () => win, { profile: 'work' })
+
+  const [entry] = registry.entries()
+
+  assert.equal(entry.profile, 'work')
+})
+
+test('registry defaults profile to null when none is given', () => {
+  const registry = createSessionWindowRegistry()
+  const win = makeFakeWindow()
+
+  registry.openOrFocus('s1', () => win)
+
+  const [entry] = registry.entries()
+
+  assert.equal(entry.profile, null)
+})
+
+test('sanitizeSessionWindowEntry preserves a saved non-primary profile on reopen', () => {
+  const entry = sanitizeSessionWindowEntry({
+    sessionId: 's1',
+    x: 10,
+    y: 20,
+    width: 900,
+    height: 700,
+    profile: 'work'
+  })
+
+  assert.equal(entry.profile, 'work')
+})
+
+test('sanitizeSessionWindowEntry trims a saved profile and normalizes a blank one to null', () => {
+  const trimmed = sanitizeSessionWindowEntry({
+    sessionId: 's1',
+    width: 900,
+    height: 700,
+    profile: '  work  '
+  })
+
+  assert.equal(trimmed.profile, 'work')
+
+  const blank = sanitizeSessionWindowEntry({
+    sessionId: 's1',
+    width: 900,
+    height: 700,
+    profile: '   '
+  })
+
+  assert.equal(blank.profile, null)
+
+  const missing = sanitizeSessionWindowEntry({
+    sessionId: 's1',
+    width: 900,
+    height: 700
+  })
+
+  assert.equal(missing.profile, null)
 })
 
 test('chatWindowWebPreferences leaves background throttling to the runtime stream dial', () => {
