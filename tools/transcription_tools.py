@@ -319,6 +319,67 @@ def _touch_transcription_time() -> None:
     _last_transcription_time = time.monotonic()
 
 
+def warm_local_model() -> bool:
+    """Preload the local faster-whisper model so the FIRST dictation doesn't pay
+    the cold model-load cost (large-v3 into VRAM is 20-60s).
+
+    Safe to call at backend startup: returns False and never raises when local
+    faster-whisper isn't the active STT path (disabled, cloud provider, or the
+    per-call command CLI because faster-whisper isn't importable) or the load
+    fails — the normal per-call transcribe path still handles everything. Warms
+    the same ``_local_model`` singleton the transcribe path reuses, so once this
+    completes every dictation is fast.
+    """
+    global _local_model, _local_model_name
+
+    try:
+        if not _HAS_FASTER_WHISPER:
+            return False
+
+        stt_config = _load_stt_config()
+        if not is_stt_enabled(stt_config):
+            return False
+
+        # Only warm when the resolved provider actually uses the in-process
+        # faster-whisper path — don't load a model the user won't use.
+        if _get_provider(stt_config) != "local":
+            return False
+
+        local_cfg = stt_config.get("local") or {}
+        model_name = _normalize_local_model(local_cfg.get("model", DEFAULT_LOCAL_MODEL))
+
+        # Take the same lock the transcribe path uses so a concurrent first
+        # dictation and this pre-warm can't both load the model, and honour
+        # stt.local.device / stt.local.compute_type so we cache the SAME
+        # configuration the transcribe path would build (a defaults-only warm
+        # would cache the wrong device/compute mode and force a reload).
+        with _local_model_lock:
+            if _local_model is not None and _local_model_name == model_name:
+                return True
+            logger.info("Pre-warming local faster-whisper model '%s'...", model_name)
+            _local_model = _load_local_whisper_model(
+                model_name,
+                device=local_cfg.get("device", "auto"),
+                compute_type=local_cfg.get("compute_type", "auto"),
+            )
+            _local_model_name = model_name
+        logger.info("Local faster-whisper model '%s' pre-warmed and ready", model_name)
+
+        # A pre-warmed model must honour idle-unload too, otherwise it sits
+        # resident forever until a first transcription would have started the
+        # watcher. Touch activity so the idle clock starts now, and arm the
+        # watcher when unload-after-idle is configured.
+        _touch_transcription_time()
+        idle_timeout = _get_idle_unload_seconds(local_cfg)
+        if idle_timeout > 0:
+            _start_idle_unload_watcher(idle_timeout)
+
+        return True
+    except Exception as exc:
+        logger.info("Local STT pre-warm skipped (non-fatal): %s", exc)
+        return False
+
+
 def _get_or_load_local_model(model_name: str, local_cfg: Dict[str, Any]):
     """Cached faster-whisper model, (re)loaded under a double-checked lock when needed. The returned
     strong reference stays valid even if the idle watcher nulls the global mid-transcription."""

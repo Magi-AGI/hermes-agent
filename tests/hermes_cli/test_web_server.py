@@ -5410,3 +5410,27 @@ def test_mount_spa_dynamic_web_dist_recheck(tmp_path, monkeypatch):
     res2 = client.get("/")
     assert res2.status_code == 200
     assert "Test" in res2.text
+
+
+class TestWarmLocalSttModel:
+    """_warm_local_stt_model is a plain sync helper (regression: it was once
+    accidentally decorated with @asynccontextmanager, so it constructed a
+    context manager instead of warming STT)."""
+
+    def test_calls_warm_local_model_and_returns_none(self):
+        from hermes_cli import web_server as ws
+
+        with patch("tools.transcription_tools.warm_local_model") as spy:
+            result = ws._warm_local_stt_model()
+
+        assert result is None
+        assert not hasattr(result, "__aenter__")
+        spy.assert_called_once()
+
+    def test_never_raises_when_warm_fails(self):
+        from hermes_cli import web_server as ws
+
+        with patch("tools.transcription_tools.warm_local_model",
+                   side_effect=RuntimeError("boom")):
+            # Must swallow — pre-warm is best-effort and never blocks/fails startup.
+            assert ws._warm_local_stt_model() is None
