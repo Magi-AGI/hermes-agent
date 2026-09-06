@@ -1,8 +1,37 @@
-"""Contract tests for the opt-in non-reasoning compression fast lane."""
+"""Contract tests for the opt-in non-reasoning compression fast lane.
+
+NOTE on task="compression": the subscription-only compaction route guard (see
+tests/agent/test_compression_route_guard.py) screens the CONSTRUCTED client on
+every call_llm(task="compression", ...) in this file. Tests that exercise the
+fast-lane CERTIFICATION gate itself (which only activates for
+task="compression") therefore route through a real, allowlisted
+CodexAuxiliaryClient via ``_codex_oauth_client`` instead of a bare
+OpenAI-shaped mock on a metered host — the certification logic matches on
+provider/model NAME, not host, so this doesn't change what's under test.
+Tests that only exercise generic latency-hook plumbing (not the certification
+gate) use a non-compression task instead, since that plumbing is task-agnostic.
+"""
 
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+from agent.auxiliary_client import CodexAuxiliaryClient
+
+
+def _codex_oauth_client(create_side_effect=None, create_return=None):
+    """A constructed client on the allowlisted ChatGPT Codex OAuth route (see
+    test_auxiliary_client.py's identical helper)."""
+    inner = MagicMock()
+    inner.api_key = "codex-oauth-token"
+    inner.base_url = "https://chatgpt.com/backend-api/codex"
+    client = CodexAuxiliaryClient(inner, "gpt-5.5")
+    client.chat = MagicMock()
+    if create_side_effect is not None:
+        client.chat.completions.create.side_effect = create_side_effect
+    else:
+        client.chat.completions.create.return_value = create_return
+    return client
 
 
 def _resolve(config, *, provider="ollama", model="qwen3:8b", requested_model=None):
@@ -143,8 +172,13 @@ def test_compression_latency_records_delayed_first_provider_chunk():
         patch("agent.auxiliary_client._acquire_sync_aux_semaphore", return_value=_DelayedSemaphore()),
         patch("agent.auxiliary_client._get_cached_client", side_effect=_resolve_client),
     ):
+        # Generic latency-hook plumbing (queue_wait_ms / provider_dispatch_ms /
+        # time_to_first_progress_ms / summary_generation_ms) is wired
+        # unconditionally in call_llm for every task, not just compression — use
+        # a non-compression task so this metered Ollama-shaped mock doesn't trip
+        # the compaction route guard (irrelevant to what this test exercises).
         response = call_llm(
-            task="compression",
+            task="title_generation",
             messages=[{"role": "user", "content": "summary request"}],
             latency_info=timings,
         )
@@ -161,18 +195,18 @@ def test_certified_fast_lane_sends_the_configured_cap_to_its_provider():
     from agent.auxiliary_client import call_llm
 
     config = {
-        "provider": "ollama",
+        "provider": "openai-codex",
         "model": "qwen3:8b",
         "reasoning_effort": "none",
         "max_output_tokens": 1400,
     }
-    client = MagicMock()
-    client.base_url = "http://127.0.0.1:11434/v1"
     response = object()
-    client.chat.completions.create.return_value = response
+    client = _codex_oauth_client(create_return=response)
 
     with (
         patch("agent.auxiliary_client._get_auxiliary_task_config", return_value=config),
+        patch("agent.auxiliary_client._resolve_task_provider_model",
+              return_value=("openai-codex", "qwen3:8b", None, None, None)),
         patch("agent.auxiliary_client._get_cached_client", return_value=(client, "qwen3:8b")),
         patch("agent.auxiliary_client._validate_llm_response", return_value=response),
     ):
@@ -190,18 +224,18 @@ def test_uncertified_effective_primary_route_does_not_receive_fast_cap():
     from agent.auxiliary_client import call_llm
 
     config = {
-        "provider": "ollama",
+        "provider": "openai-codex",
         "model": "qwen3:8b",
         "reasoning_effort": "none",
         "max_output_tokens": 1400,
     }
-    client = MagicMock()
-    client.base_url = "http://127.0.0.1:11434/v1"
     response = object()
-    client.chat.completions.create.return_value = response
+    client = _codex_oauth_client(create_return=response)
 
     with (
         patch("agent.auxiliary_client._get_auxiliary_task_config", return_value=config),
+        patch("agent.auxiliary_client._resolve_task_provider_model",
+              return_value=("openai-codex", "server-selected-model", None, None, None)),
         patch(
             "agent.auxiliary_client._get_cached_client",
             return_value=(client, "server-selected-model"),
@@ -223,18 +257,18 @@ def test_boolean_cap_drift_stays_uncapped_and_preserves_existing_reasoning():
     from agent.auxiliary_client import call_llm
 
     config = {
-        "provider": "ollama",
+        "provider": "openai-codex",
         "model": "qwen3:8b",
         "reasoning_effort": "none",
         "max_output_tokens": True,
     }
-    client = MagicMock()
-    client.base_url = "http://127.0.0.1:11434/v1"
     response = object()
-    client.chat.completions.create.return_value = response
+    client = _codex_oauth_client(create_return=response)
 
     with (
         patch("agent.auxiliary_client._get_auxiliary_task_config", return_value=config),
+        patch("agent.auxiliary_client._resolve_task_provider_model",
+              return_value=("openai-codex", "server-selected-model", None, None, None)),
         patch(
             "agent.auxiliary_client._get_cached_client",
             return_value=(client, "server-selected-model"),
@@ -284,8 +318,13 @@ def test_bedrock_converse_ttfp_waits_for_the_nonstreaming_response():
         ),
         patch("agent.bedrock_adapter.call_converse", side_effect=_delayed_converse),
     ):
+        # Generic TTFP latency-hook plumbing for the Bedrock Converse dispatch
+        # path, not the fast-lane certification gate (config is deliberately
+        # uncertified: max_output_tokens=0) — use a non-compression task so
+        # Bedrock (never a subscription-capable provider under the compaction
+        # route guard) doesn't trip it. See the module docstring.
         assert call_llm(
-            task="compression",
+            task="title_generation",
             messages=[{"role": "user", "content": "summary request"}],
             latency_info=timings,
         ) is response
@@ -299,18 +338,18 @@ def test_summary_model_override_cap_uses_the_actual_primary_request():
     from agent.auxiliary_client import call_llm
 
     config = {
-        "provider": "ollama",
+        "provider": "openai-codex",
         "model": "qwen3:8b",
         "reasoning_effort": "none",
         "max_output_tokens": 1400,
     }
-    client = MagicMock()
-    client.base_url = "http://127.0.0.1:11434/v1"
     response = object()
-    client.chat.completions.create.return_value = response
+    client = _codex_oauth_client(create_return=response)
 
     with (
         patch("agent.auxiliary_client._get_auxiliary_task_config", return_value=config),
+        patch("agent.auxiliary_client._resolve_task_provider_model",
+              return_value=("openai-codex", "qwen3:14b", None, None, None)),
         patch("agent.auxiliary_client._get_cached_client", return_value=(client, "qwen3:14b")),
         patch("agent.auxiliary_client._validate_llm_response", return_value=response),
     ):
@@ -456,13 +495,13 @@ def test_explicit_caller_max_tokens_keeps_provider_quirk_handling():
     from agent.auxiliary_client import call_llm
 
     config = {"provider": "auto", "model": "", "max_output_tokens": 0}
-    client = MagicMock()
-    client.base_url = "http://127.0.0.1:11434/v1"
     response = object()
-    client.chat.completions.create.return_value = response
+    client = _codex_oauth_client(create_return=response)
 
     with (
         patch("agent.auxiliary_client._get_auxiliary_task_config", return_value=config),
+        patch("agent.auxiliary_client._resolve_task_provider_model",
+              return_value=("openai-codex", "qwen3:8b", None, None, None)),
         patch("agent.auxiliary_client._get_cached_client", return_value=(client, "qwen3:8b")),
         patch("agent.auxiliary_client._validate_llm_response", return_value=response),
     ):

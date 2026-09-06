@@ -58,7 +58,12 @@ def test_call_llm_auto_provider_evicts_stale_client_end_to_end(monkeypatch):
     divergent key, the stale expired-credential client survives, and the
     stale-absence assertion fails.
     """
-    task = "compression"
+    # The compaction route guard restricts task="compression" to subscription
+    # routes (see tests/agent/test_compression_route_guard.py); this test is
+    # about the task-dimension cache key (#58894), not compaction, so any
+    # non-compression task label proves the same thing without tripping the
+    # guard on this metered Nous mock.
+    task = "title_generation"
     stale = _nous_mock_client(async_mode=False, raises=_Auth401("stale creds"))
     fresh = _nous_mock_client(async_mode=False, returns={"ok": True})
 

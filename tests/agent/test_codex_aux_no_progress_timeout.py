@@ -27,7 +27,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent.auxiliary_client import _CodexCompletionsAdapter, call_llm
+from agent.auxiliary_client import CodexAuxiliaryClient, _CodexCompletionsAdapter, call_llm
 
 
 def _content_event(text="tok"):
@@ -204,8 +204,17 @@ class TestCompressionRetryGate:
     """First-token failures retry same-provider; stalls skip to fallback."""
 
     def _run_call_llm(self, primary_error, second_response=None):
-        primary_client = MagicMock()
-        primary_client.base_url = "https://chatgpt.com/backend-api/codex"
+        # The compaction route guard screens the CONSTRUCTED client (class +
+        # host), not just base_url on a bare mock — wrap both primary and
+        # fallback as real CodexAuxiliaryClient instances on the allowlisted
+        # chatgpt.com host, matching test_auxiliary_client.py's
+        # _codex_oauth_client pattern, so this retry/fallback-gating test
+        # doesn't trip the guard. See test_compression_route_guard.py.
+        primary_inner = MagicMock()
+        primary_inner.api_key = "codex-oauth-token"
+        primary_inner.base_url = "https://chatgpt.com/backend-api/codex"
+        primary_client = CodexAuxiliaryClient(primary_inner, "gpt-5.6-sol")
+        primary_client.chat = MagicMock()
         if second_response is not None:
             primary_client.chat.completions.create.side_effect = [
                 primary_error, second_response,
@@ -213,7 +222,11 @@ class TestCompressionRetryGate:
         else:
             primary_client.chat.completions.create.side_effect = primary_error
 
-        fallback_client = MagicMock()
+        fallback_inner = MagicMock()
+        fallback_inner.api_key = "codex-oauth-token"
+        fallback_inner.base_url = "https://chatgpt.com/backend-api/codex"
+        fallback_client = CodexAuxiliaryClient(fallback_inner, "fb")
+        fallback_client.chat = MagicMock()
         fallback_client.chat.completions.create.return_value = SimpleNamespace(
             choices=[SimpleNamespace(
                 index=0,
@@ -233,7 +246,7 @@ class TestCompressionRetryGate:
             patch("agent.auxiliary_client._try_main_fallback_chain",
                   return_value=(None, None, "")),
             patch("agent.auxiliary_client._try_payment_fallback",
-                  return_value=(fallback_client, "fb", "openrouter")) as mock_fb,
+                  return_value=(fallback_client, "fb", "openai-codex")) as mock_fb,
             patch("agent.auxiliary_client._TRANSIENT_RETRY_BACKOFF_BASE", 0.0),
         ):
             result = call_llm(
