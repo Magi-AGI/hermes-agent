@@ -1141,6 +1141,8 @@ DEFAULT_CONFIG = {
             "model": "base",  # tiny, base, small, medium, large-v3
             "language": "",  # auto-detect; set "en", "es", ... to force
             "initial_prompt": "",
+            "hotwords": "",  # bias decoding toward domain terms (list, or comma-joined string)
+            "cuda_dll_dirs": [],  # Windows: extra dirs to load cublas/cudnn from (e.g. a torch/lib path)
             # Anti-hallucination (faster-whisper decodes junk from silence). vad: Silero filter
             # (false = raw audio, for music/ambient). A segment is dropped only if no_speech_prob
             # ABOVE no_speech_prob_threshold AND avg_logprob BELOW logprob_threshold.

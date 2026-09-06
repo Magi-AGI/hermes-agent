@@ -139,6 +139,19 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
 _DESKTOP_MCP_DISCOVERY_DELAY_S = 1.0
 
 
+def _warm_local_stt_model() -> None:
+    """Pre-load the local faster-whisper model in a worker thread so the first
+    voice dictation doesn't pay the 20-60s cold model load into VRAM. No-op
+    (never raises) when local STT isn't the active provider or faster-whisper
+    isn't installed."""
+    try:
+        from tools.transcription_tools import warm_local_model
+
+        warm_local_model()
+    except Exception:
+        pass
+
+
 @asynccontextmanager
 async def _lifespan(app: "FastAPI"):
     app.state.event_channels = {}  # dict[str, set]
@@ -169,6 +182,12 @@ async def _lifespan(app: "FastAPI"):
     # import holds the GIL, so run_in_executor still froze the loop 15-22s and
     # the Desktop's 10s ready-probe timed out (GH-73083).
     _warm_gateway_module()
+
+    # Pre-warm the local STT model (faster-whisper) in a worker thread so the
+    # first voice dictation doesn't pay the 20-60s cold model load into VRAM.
+    # No-op when local STT isn't the active provider; never blocks/fails startup
+    # (the model load is 20-60s, so it must not run inline like the gateway warm).
+    asyncio.get_running_loop().run_in_executor(None, _warm_local_stt_model)
 
     # Snapshot the checkout revision so lazy-import paths (model picker) can
     # refuse with "restart required" after `hermes update` replaced the code
