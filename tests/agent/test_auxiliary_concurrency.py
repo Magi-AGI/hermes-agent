@@ -247,7 +247,11 @@ class TestSyncCallEnforcesLimit:
         def make_second_call():
             second_call_started.set()
             call_llm(
-                task="compression",
+                # Any non-compression task: the compaction route guard restricts
+                # task="compression" to subscription routes (see
+                # test_compression_route_guard.py), which this openrouter mock is
+                # not — irrelevant to what this test (permit-holding) exercises.
+                task="title_generation",
                 messages=[{"role": "user", "content": "second"}],
             )
 
@@ -270,7 +274,7 @@ class TestSyncCallEnforcesLimit:
             ),
         ):
             stream = call_llm(
-                task="compression",
+                task="title_generation",
                 messages=[{"role": "user", "content": "first"}],
                 stream=True,
                 stream_options={"include_usage": True},
@@ -362,7 +366,8 @@ class TestAsyncCallEnforcesLimit:
         ):
             await asyncio.gather(*[
                 async_call_llm(
-                    task="compression",
+                    # Any non-compression task — see the sync test's note above.
+                    task="title_generation",
                     messages=[{"role": "user", "content": "hi"}],
                 )
                 for _ in range(n_callers)
@@ -398,6 +403,6 @@ class TestAsyncCallEnforcesLimit:
             for _ in range(3):
                 with pytest.raises(RuntimeError, match="boom"):
                     await async_call_llm(
-                        task="compression",
+                        task="title_generation",
                         messages=[{"role": "user", "content": "hi"}],
                     )

@@ -22,13 +22,13 @@ def test_aux_ladder_names_registry_remedy_for_explicit_provider(tmp_path, monkey
         monkeypatch.delenv(var, raising=False)
     (tmp_path / "config.yaml").write_text(yaml.safe_dump({
         "model": {"provider": provider, "default": "test-model"},
-        "auxiliary": {"compression": {"provider": provider, "model": "test-model"}},
+        "auxiliary": {"title_generation": {"provider": provider, "model": "test-model"}},  # task-agnostic plumbing; task="compression" would trip this fork's compaction route guard
     }), encoding="utf-8")
     from agent.auxiliary_client import call_llm
     from agent.auxiliary_unavailable import AuxiliaryClientUnavailable
 
     with pytest.raises(AuxiliaryClientUnavailable) as excinfo:
-        call_llm(task="compression", messages=[{"role": "user", "content": "hi"}], max_tokens=5)
+        call_llm(task="title_generation", messages=[{"role": "user", "content": "hi"}], max_tokens=5)
     assert expected in str(excinfo.value)
     assert forbidden not in str(excinfo.value)
 
@@ -87,7 +87,7 @@ def test_exhausted_oauth_pool_reports_cooldown_not_missing_credentials(tmp_path,
     _write_exhausted_codex_pool(tmp_path, count=2, reset_at=reset_at)
     (tmp_path / "config.yaml").write_text(yaml.safe_dump({
         "model": {"provider": "openai-codex", "default": "test-model"},
-        "auxiliary": {"compression": {"provider": "openai-codex", "model": "test-model"}},
+        "auxiliary": {"title_generation": {"provider": "openai-codex", "model": "test-model"}},  # task-agnostic plumbing; task="compression" would trip this fork's compaction route guard
     }), encoding="utf-8")
     expected_time = time.strftime("%Y-%m-%d %H:%M", time.localtime(reset_at))
 
@@ -104,7 +104,7 @@ def test_exhausted_oauth_pool_reports_cooldown_not_missing_credentials(tmp_path,
     from agent.auxiliary_unavailable import AuxiliaryClientUnavailable
 
     with pytest.raises(AuxiliaryClientUnavailable) as aux_exc:
-        call_llm(task="compression", messages=[{"role": "user", "content": "hi"}], max_tokens=5)
+        call_llm(task="title_generation", messages=[{"role": "user", "content": "hi"}], max_tokens=5)
     assert "cooling down" in str(aux_exc.value)
     assert "no credentials were found" not in str(aux_exc.value)
 

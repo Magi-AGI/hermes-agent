@@ -345,7 +345,7 @@ def test_auth_refresh_retry_failure_reaches_the_configured_chain_over_http(
         "model": {"provider": "nous", "default": AUX_MODEL},
         "providers": {"aux-fb": {"base_url": local_url + "/v1", "key_env": "AUX_FB_KEY"}},
         "auxiliary": {
-            "compression": {
+            "title_generation": {  # task-agnostic plumbing; task="compression" would trip this fork's compaction route guard
                 "provider": "custom",
                 "model": AUX_MODEL,
                 "base_url": host_url + "/v1",
@@ -366,7 +366,7 @@ def test_auth_refresh_retry_failure_reaches_the_configured_chain_over_http(
     )
 
     response = aux.call_llm(
-        task="compression",
+        task="title_generation",
         messages=[{"role": "user", "content": "Summarize the conversation so far."}],
         timeout=20,
     )

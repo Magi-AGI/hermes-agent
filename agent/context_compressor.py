@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from agent.image_eviction_policy import outbound_image_retire_count
 from agent.auxiliary_client import (
     AuxiliaryExplicitCancellation,
+    CompressionRoutingRejected,
     _is_connection_error,
     aux_interrupt_protection,
     call_llm,
@@ -2666,6 +2667,21 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         # must ABORT and preserve the session regardless of abort_on_summary_failure (see _TERMINAL_SUMMARY_FAILURES).
         for flag, _class, _msg in _TERMINAL_SUMMARY_FAILURES:
             setattr(self, flag, False)
+        # Set when summary generation was refused by the subscription-only
+        # compaction route guard (CompressionRoutingRejected): no allowed route
+        # existed, so no summary was sent to a metered provider. compress()
+        # ABORTS messages-unchanged — a routing refusal is NOT a provider fault
+        # to route around, so (unlike auth/network) it arms no cooldown and never
+        # retries on the main model (that would be a second routing escape).
+        # Deliberately NOT in _TERMINAL_SUMMARY_FAILURES: that table drives
+        # compress()'s return-None/abort protocol, but a routing rejection RAISES
+        # from _generate_summary (to skip _on_summary_failure's main-model retry
+        # entirely) and is caught explicitly in compress() instead.
+        self._last_summary_routing_rejected: bool = False
+        # The refusal message (distinct + actionable) so gateway / CLI callers
+        # can surface it instead of a bare "unknown error". Deliberately NOT
+        # stored in _last_summary_error (a routing refusal is not a summary fault).
+        self._last_summary_routing_message: Optional[str] = None
 
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""
@@ -3661,7 +3677,27 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             self._last_summary_error = None
             for flag, _class, _msg in _TERMINAL_SUMMARY_FAILURES:
                 setattr(self, flag, False)
+            self._last_summary_routing_rejected = False
+            self._last_summary_routing_message = None
             return self._with_summary_prefix(summary)
+        except CompressionRoutingRejected as _routing_exc:
+            # MUST be caught here, ahead of the broad ``except Exception`` below,
+            # which would otherwise hand this to ``_on_summary_failure`` — and
+            # that function's very first move for a distinct summary_model is a
+            # RETRY ON THE MAIN MODEL, which would be a second routing escape
+            # sending the same business-sensitive content to a metered
+            # main-agent route. A routing refusal is not a provider fault to
+            # route around, so it is deliberately NOT recorded as a summary
+            # failure: no _last_summary_error, no failure cooldown. Re-raise for
+            # compress() to catch and abort on.
+            self._last_summary_routing_rejected = True
+            self._last_summary_routing_message = str(_routing_exc)
+            logger.error(
+                "Context compression refused: no allowed subscription route for "
+                "compaction. The conversation is preserved unchanged — no context "
+                "was lost and no summary was sent to a metered provider."
+            )
+            raise
         except Exception as e:
             return self._on_summary_failure(e, turns_to_summarize, focus_topic, memory_context)
 
@@ -4752,6 +4788,11 @@ Write only the summary body. Do not include any preamble or prefix."""
         self._last_compress_aborted = False
         self._last_compress_refused_would_grow = False
         self._last_compression_made_progress = False
+        # Safe to reset eagerly (unlike the auth/network flags below): a routing
+        # refusal arms no cooldown, so _generate_summary re-raises deterministically
+        # rather than early-returning None from a cooldown.
+        self._last_summary_routing_rejected = False
+        self._last_summary_routing_message = None
         # Do NOT reset the *_failure flags: the cooldown early-return doesn't re-assert them, so a
         # reset would fall through to the destructive static fallback (#29559). Success clears them.
         telemetry = self._begin_compression_telemetry(current_tokens=current_tokens)
@@ -5058,6 +5099,11 @@ Write only the summary body. Do not include any preamble or prefix."""
 
         _raise_if_stale_attempt(self)
         telemetry = self._begin_compress_attempt(current_tokens, force)
+        # Snapshot the caller's list so a routing refusal can return it verbatim
+        # (messages-unchanged abort — no context is lost when compaction is
+        # refused for lack of an allowed subscription route), before any of the
+        # phases below reassign the local ``messages`` name.
+        original_messages = messages
         n_messages = len(messages)
         # Only need head + 3 tail messages minimum (token budget decides the real tail size)
         _min_for_compress = self._protect_head_size(messages) + 3 + 1
@@ -5119,9 +5165,31 @@ Write only the summary body. Do not include any preamble or prefix."""
         feasibility_skip = not force and self._feasibility_skip(telemetry, turns_to_summarize, compress_start, compress_end)
         summary = None  # feasibility skip: no LLM call; Phase 4 inserts the deterministic fallback
         if not feasibility_skip:
-            summary = self._summarize_window(
-                messages, turns_to_summarize, scan, focus_topic, memory_context, bypass_cooldown,
-            )
+            try:
+                summary = self._summarize_window(
+                    messages, turns_to_summarize, scan, focus_topic, memory_context, bypass_cooldown,
+                )
+            except CompressionRoutingRejected:
+                # The compaction route guard refused every route — no summary was
+                # sent to a metered provider. ABORT messages-unchanged: return the
+                # caller's ORIGINAL list (not the Phase-1 pruned one) so a routing
+                # refusal loses zero context, and rotate NOTHING. Roll back the
+                # self-heal rehydration so the next attempt re-runs cleanly.
+                self._previous_summary = scan.previous_summary_before
+                self._summary_has_user_turn = scan.has_user_turn_before
+                self._last_compress_aborted = True
+                self._last_summary_routing_rejected = True
+                telemetry["failure_class"] = "summary_routing_rejected"
+                if not self.quiet_mode:
+                    logger.warning(
+                        "Compression aborted: no allowed subscription route for "
+                        "compaction. %d message(s) preserved unchanged; the session "
+                        "was NOT rotated. Authenticate a subscription route "
+                        "(`hermes auth codex` or `claude setup-token`) and retry "
+                        "with /compress.",
+                        len(original_messages),
+                    )
+                return original_messages
             if not summary and self._abort_on_summary_failure(
                 telemetry, compress_end - compress_start, scan.previous_summary_before,
             ):

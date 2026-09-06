@@ -201,10 +201,13 @@ def test_actual_background_tasks_reach_chat_completions(
         config_context_length=32768,
         quiet_mode=True,
     )
-    assert (
+    # Fork policy (subscription-only compaction route guard): compaction content may only run on
+    # the Codex / Claude OAuth routes, so the metered Actual route is REFUSED for compression and no
+    # compaction request reaches the endpoint. Title and session-search routing stay as upstream's.
+    from agent.auxiliary_client import CompressionRoutingRejected
+
+    with pytest.raises(CompressionRoutingRejected):
         compressor._call_summary_llm("Summarize this conversation.", time.monotonic())
-        == "The task is complete."
-    )
     response = asyncio.run(
         async_call_llm(
             task="session_search",
@@ -214,10 +217,10 @@ def test_actual_background_tasks_reach_chat_completions(
         )
     )
     assert response.choices[0].message.content == "The task is complete."
-    assert len(requests) == 3
+    assert len(requests) == 2, "title + session_search only: the refused compaction never egressed"
     assert [(path, payload["model"]) for path, payload in requests] == [
         ("/v1/chat/completions", aux_model)
-    ] * 3
+    ] * 2
 
 
 @pytest.mark.parametrize(

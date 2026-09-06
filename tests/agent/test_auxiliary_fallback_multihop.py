@@ -108,7 +108,8 @@ async def test_async_walk_exhausts_every_configured_lane_once_then_raises_primar
     with patches[0], patches[1], patches[2], patches[3] as main_chain, patches[4] as discovery, \
             patch("agent.auxiliary_client._to_async_client", side_effect=lambda c, m, **kw: (c, m)):
         with pytest.raises(Exception, match="'lane': 'A'"):
-            await async_call_llm(task="compression", messages=[{"role": "user", "content": "summarize"}])
+            # task-agnostic plumbing; task="compression" would trip this fork's compaction route guard
+            await async_call_llm(task="title_generation", messages=[{"role": "user", "content": "summarize"}])
 
     assert lane_b.chat.completions.create.call_count == 1
     assert lane_c.chat.completions.create.call_count == 1
