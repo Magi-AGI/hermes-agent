@@ -34,7 +34,7 @@ import {
 import { $botChatScopes, $sessionTiles, storedSessionIdForRuntimeId } from '@/store/session-states'
 import { onSessionsChanged } from '@/store/session-sync'
 import { openUpdatesWindow, startUpdatePoller, stopUpdatePoller } from '@/store/updates'
-import { isBrowserWindow, isHeaderlessSecondaryWindow, isHudWindow } from '@/store/windows'
+import { isBrowserWindow, isHeaderlessSecondaryWindow, isHudWindow, isPeerInstanceWindow } from '@/store/windows'
 import type { SessionInfo } from '@/types/hermes'
 
 import { requestComposerFocus, requestComposerInsert } from '../../chat/composer/focus'
@@ -120,6 +120,21 @@ export function useDesktopIntegrations({
     }
 
     if (!restoredRef.current) {
+      // A peer instance window (a full extra app window, e.g. Ctrl+Shift+N) boots
+      // at NEW_CHAT_ROUTE just like a genuinely fresh window, but it is not a
+      // genuine navigation to '/' — falling into the restore logic below would
+      // silently re-home it onto the profile's last-viewed session, and falling
+      // through to the remember-writes at the bottom of this effect would then
+      // clobber that remembered session/route with the peer's own cold-boot '/'
+      // before the user has done anything in it. One-time skip: latch the ref so
+      // real navigation inside the peer window (a session opened, a route
+      // followed) is remembered normally from the very next render on.
+      if (isPeerInstanceWindow()) {
+        restoredRef.current = true
+
+        return
+      }
+
       // Only cold-start navigation at the default route is replaceable; a deep
       // link or hidden-then-shown window keeps its explicit destination.
       if (locationPathname === NEW_CHAT_ROUTE) {
