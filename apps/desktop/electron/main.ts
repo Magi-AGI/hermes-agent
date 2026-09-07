@@ -426,6 +426,10 @@ import {
   SESSION_WINDOW_MIN_HEIGHT,
   SESSION_WINDOW_MIN_WIDTH
 } from './session-windows'
+import {
+  REOPEN_WINDOW_SETTLE_MS,
+  waitForSessionWindowFunctionallyReady
+} from './session-reopen-gate'
 import { ensureLoginShellPath } from './shell-path'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
 import { collectSshConfigHosts, parseSshGOutput } from './ssh-config'
@@ -14182,83 +14186,141 @@ function closeAllSessionWindows() {
 // boot-failure -> reset loop. Neither a fixed timer stagger nor gating on the
 // renderer's page-load (did-finish-load) was enough: page-load fires BEFORE the
 // gateway WebSocket connects, so the actual contended step — the ws upgrade +
-// ready frame — still happened in overlapping bursts (crash-recovery reopen of
-// many sessions produced a wall of "couldn't connect to gateway").
+// ready frame — still happened in overlapping bursts.
 //
-// This is a proper QUEUE: open one window, then wait until THAT window's gateway
-// actually reaches 'open' (the renderer emits 'hermes:window:gateway-ready' from
-// reportPrimaryGatewayState) before opening the next. Connections happen strictly
-// one at a time, so the backend never faces a burst. Correlated by webContents id
-// so another window's signal can't release the queue early. A per-window timeout
-// keeps a slow/stuck/never-connecting window from stalling the whole queue, and
-// an already-open (focused) window that re-fires 'open' resolves it immediately.
-const REOPEN_WINDOW_GATEWAY_TIMEOUT_MS = 20_000
-const REOPEN_WINDOW_SETTLE_MS = 400
+// This is a proper QUEUE: open one window, then wait until it proves it's
+// actually FUNCTIONAL (see session-reopen-gate.ts) before opening the next.
+// The previous version of this gate resolved on the gateway WebSocket merely
+// reaching 'open' — which proved the transport connected, not that the window
+// could do anything useful — and its 20s timeout gave up and opened the next
+// window regardless, i.e. it failed OPEN under exactly the condition (an
+// already-struggling shared backend) it existed to protect against. Replaced
+// 2026-09-07 after a live, evidenced full-process freeze recurred repeatedly
+// during reopen bursts even with the old gate active — see
+// DESIGN-SESSION-WINDOW-SEQUENTIAL-GATING-2026-09-07.md for the full
+// diagnosis, triad review, and design.
+//
+// A window that fails to become functional halts the REMAINING queue (does
+// not silently continue into an unhealthy backend) and is kept for a later
+// resumeReopenSessionWindows() call — see notifyReopenHalted below.
+let pendingReopenEntries: any[] | null = null
 
-function waitForSessionWindowGatewayReady(win: BrowserWindow): Promise<void> {
-  return new Promise(resolve => {
-    // Already-open window that "reopen" merely focused: it's finished loading and
-    // its gateway is already connected, so it won't re-emit 'open' — don't wait
-    // the full timeout, just proceed to the next entry.
-    if (win.isDestroyed() || !win.webContents.isLoading()) {
-      resolve()
+// v1 scope: profile-only lookup. session-windows-state.json persists
+// sessionId/geometry/profile only (see persistSessionWindowsState) — there is
+// no connectionId/registry-scoped routing in the persisted surface today, so
+// a window whose real target isn't the plain per-profile route (e.g. a
+// registry-scoped/remote connection) is NOT covered by this health probe.
+// Documented limitation, not a bug — see design doc §7.2.
+//
+// Routes through ensureBackend() — the SAME connection-resolution path the
+// renderer's own boot sequence uses (via desktop.getConnection) — rather than
+// reading backendPool directly. Triad review round 2 caught that a
+// backendPool-only lookup silently skips the PRIMARY profile entirely: an
+// active primary routes through startHermes(), never through backendPool
+// (see ensureBackend's route.backend === 'primary' branch), so the most
+// likely real failure case (the primary profile's backend frozen) would have
+// gotten zero independent health verification. ensureBackend returns
+// immediately for an already-running backend (cached connection/promise on
+// both the pooled and primary paths) — it does not itself re-probe health —
+// so this stays bounded by the explicit waitForHermes() call below, not by
+// however long a cold spawn might take.
+async function probeProfileBackendHealth(profile: string | null, signal: AbortSignal): Promise<void> {
+  const connection = await ensureBackend(profile)
 
-      return
-    }
-
-    const wcId = win.webContents.id
-    let settled = false
-
-    const finish = () => {
-      if (settled) {
-        return
-      }
-
-      settled = true
-      clearTimeout(timer)
-      ipcMain.removeListener('hermes:window:gateway-ready', onReady)
-      resolve()
-    }
-
-    const onReady = (event: Electron.IpcMainEvent) => {
-      // Only the window we just opened releases the queue — a background
-      // reconnect on some other window must not advance it early.
-      if (event.sender.id === wcId) {
-        finish()
-      }
-    }
-
-    const timer = setTimeout(finish, REOPEN_WINDOW_GATEWAY_TIMEOUT_MS)
-
-    ipcMain.on('hermes:window:gateway-ready', onReady)
-    // Failsafe releases: a window that fails to load or is closed will never emit
-    // gateway-ready, so don't wait the full timeout for it.
-    win.webContents.once('did-fail-load', (_event, _code, _desc, _url, isMainFrame) => {
-      if (isMainFrame) {
-        finish()
-      }
-    })
-    win.once('closed', finish)
-  })
+  await waitForHermes(connection.baseUrl, connection.token, signal, connection.authMode, connection.headers)
 }
 
-async function reopenSessionWindows() {
-  const displays = screen.getAllDisplays()
-  const entries = readSessionWindowsState()
+function notifyReopenHalted(payload: {
+  restoredCount: number
+  totalCount: number
+  profile: string | null
+  reason?: string
+}) {
+  mainWindow?.webContents?.send('hermes:window:reopen-halted', payload)
+}
 
-  for (const entry of entries) {
+// Explicit-action entry point: "Reopen Saved Session Windows" always starts
+// fresh from the current disk state, discarding any halted queue left over
+// from a previous attempt (that's what resumeReopenSessionWindows is for).
+async function reopenSessionWindows() {
+  pendingReopenEntries = null
+  await runReopenQueue(readSessionWindowsState())
+}
+
+// Continues a queue a previous reopenSessionWindows() call halted partway
+// through (see notifyReopenHalted). A no-op if there's nothing pending.
+async function resumeReopenSessionWindows(): Promise<{ ok: boolean; error?: string }> {
+  if (!pendingReopenEntries || pendingReopenEntries.length === 0) {
+    return { ok: false, error: 'nothing to resume' }
+  }
+
+  const entries = pendingReopenEntries
+
+  pendingReopenEntries = null
+  await runReopenQueue(entries)
+
+  return { ok: true }
+}
+
+async function runReopenQueue(entries: any[]) {
+  const displays = screen.getAllDisplays()
+
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i]
     const bounds = computeSessionWindowOptions(entry, displays)
-    const win = createSessionWindow(entry.sessionId, {
+    // A missing/null profile on the SAVED ENTRY does not mean the window
+    // boots against "default" — createSessionWindow's URL-building (below)
+    // correctly leaves it unset so the window adopts whatever the PRIMARY
+    // profile currently is (session-windows.ts: buildSessionWindowUrl's own
+    // doc comment; use-gateway-boot.ts: adoptPrimaryProfile). The gate/probe
+    // need that SAME resolved value, not a hardcoded "default" — triad
+    // review round 3, Codex finding: for a user whose primary profile isn't
+    // literally "default" (e.g. claudetriad), every entry with no stored
+    // profile would otherwise fail validation and get destroyed.
+    const expectedProfile = entry.profile ?? primaryProfileKey()
+    const { win, created } = createSessionWindow(entry.sessionId, {
       watch: false,
       bounds,
       isMaximized: entry.isMaximized === true,
       profile: entry.profile ?? null
     })
 
-    if (win && !win.isDestroyed()) {
-      await waitForSessionWindowGatewayReady(win)
-      await new Promise(resolve => setTimeout(resolve, REOPEN_WINDOW_SETTLE_MS))
+    if (!win || win.isDestroyed()) {
+      continue
     }
+
+    const result = await waitForSessionWindowFunctionallyReady(
+      win,
+      { created, profile: expectedProfile },
+      { ipcMain, probeBackendHealth: probeProfileBackendHealth }
+    )
+
+    if (!result.ok) {
+      const totalCount = entries.length
+
+      rememberLog(
+        `[session-windows] reopen halted at ${i + 1}/${totalCount} (profile "${expectedProfile}"): ${result.reason}`
+      )
+
+      // Destroy the failed window before retaining its entry for retry: this
+      // window never proved itself functional, and leaving it open would let
+      // a retry's createSessionWindow() find it still registered and focus it
+      // (created: false) — which skips verification entirely via the exact
+      // fast-path this whole redesign exists to gate correctly (triad review
+      // round 2, Codex finding #2). Destroying it guarantees a retry always
+      // re-creates it fresh (created: true) and is genuinely re-verified, at
+      // the cost of a rare in-flight-but-about-to-succeed load being restarted.
+      if (!win.isDestroyed()) {
+        win.destroy()
+      }
+
+      pendingReopenEntries = entries.slice(i)
+      notifyReopenHalted({ restoredCount: i, totalCount, profile: expectedProfile, reason: result.reason })
+
+      return
+    }
+
+    await new Promise(resolve => setTimeout(resolve, REOPEN_WINDOW_SETTLE_MS))
   }
 }
 
@@ -15892,6 +15954,17 @@ ipcMain.handle('hermes:window:reopenSessionWindows', async () => {
   )
 
   return { ok: true }
+})
+// Continues a reopen queue that halted because a window failed to become
+// functionally ready (see notifyReopenHalted / hermes:window:reopen-halted).
+ipcMain.handle('hermes:window:resumeReopenSessionWindows', async () => {
+  try {
+    return await resumeReopenSessionWindows()
+  } catch (err) {
+    rememberLog(`[session-windows] resumed reopen failed: ${err instanceof Error ? err.message : err}`)
+
+    return { ok: false, error: err instanceof Error ? err.message : String(err) }
+  }
 })
 ipcMain.handle('hermes:window:openInstance', async (event, options) => {
   createInstanceWindow(options, BrowserWindow.fromWebContents(event.sender))

@@ -159,6 +159,16 @@ function instanceWindowBounds(
 function createSessionWindowRegistry() {
   const windows = new Map()
 
+  // Returns { win, created } — `created` distinguishes "focused an existing
+  // live window" from "factory actually spawned a new one". Callers that need
+  // to know whether a window is brand-new (e.g. the reopen queue: a fast-path
+  // readiness check is only valid for a window that isn't going to redo its
+  // boot sequence — see session-reopen-gate.ts) must use `created`, never
+  // BrowserWindow.webContents.isLoading() as a proxy for it: Electron gives no
+  // synchronous guarantee that a just-constructed window's isLoading() reads
+  // true before its navigation actually starts (a just-created window can read
+  // isLoading() === false for a tick), so that check can spuriously fire for a
+  // NEW window too, not just a genuinely-focused existing one.
   function openOrFocus(
     sessionId,
     factory,
@@ -167,7 +177,7 @@ function createSessionWindowRegistry() {
     const key = typeof sessionId === 'string' ? sessionId.trim() : ''
 
     if (!key) {
-      return null
+      return { win: null, created: false }
     }
 
     const existing = windows.get(key)
@@ -184,13 +194,13 @@ function createSessionWindowRegistry() {
 
       existing.win.focus?.()
 
-      return existing.win
+      return { win: existing.win, created: false }
     }
 
     const win = factory(key)
 
     if (!win) {
-      return null
+      return { win: null, created: false }
     }
 
     windows.set(key, { win, watch: Boolean(watch), profile: profile || null })
@@ -202,7 +212,7 @@ function createSessionWindowRegistry() {
       }
     })
 
-    return win
+    return { win, created: true }
   }
 
   return {

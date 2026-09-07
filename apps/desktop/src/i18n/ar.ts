@@ -134,7 +134,11 @@ export const ar = defineLocale({
       gatewayConnectionLostDetail:
         'Still retrying in the background. You can keep reading and drafting — open Gateway settings if this persists.',
       gatewaySignInRequired: 'تسجيل الدخول للبوابة مطلوب',
-      ipcBridgeUnavailable: 'جسر IPC لسطح المكتب غير متاح.'
+      ipcBridgeUnavailable: 'جسر IPC لسطح المكتب غير متاح.',
+      reopenHaltedTitle: 'تم إيقاف إعادة فتح النوافذ مؤقتاً',
+      reopenHaltedMessage: (restored, total, profile) =>
+        `تمت استعادة ${restored} من ${total} نوافذ. توقفت خلفية "${profile}" عن الاستجابة، لذا تم إيقاف إعادة الفتح مؤقتاً لتجنب زيادة التحميل عليها.`,
+      reopenHaltedRetry: 'إعادة محاولة النوافذ المتبقية'
     },
     failure: {
       title: 'تعذر تشغيل Hermes',

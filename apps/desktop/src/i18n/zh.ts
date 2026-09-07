@@ -151,7 +151,11 @@ export const zh = defineLocale({
       gatewayConnectionLostDetail:
         'Still retrying in the background. You can keep reading and drafting — open Gateway settings if this persists.',
       gatewaySignInRequired: '需要登录网关',
-      ipcBridgeUnavailable: '桌面 IPC 桥不可用。'
+      ipcBridgeUnavailable: '桌面 IPC 桥不可用。',
+      reopenHaltedTitle: '重新打开窗口已暂停',
+      reopenHaltedMessage: (restored, total, profile) =>
+        `已恢复 ${total} 个窗口中的 ${restored} 个。"${profile}" 后端已停止响应，为避免过载已暂停重新打开。`,
+      reopenHaltedRetry: '重试剩余窗口'
     },
     failure: {
       title: 'Hermes 无法启动',

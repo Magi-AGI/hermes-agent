@@ -499,6 +499,19 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   // Fire-and-forget: tells main this window's gateway finished connecting, so the
   // reopen queue can release the next saved window (see reopenSessionWindows).
   signalSessionGatewayReady: () => ipcRenderer.send('hermes:window:gateway-ready'),
+  // Fire-and-forget: reports whether THIS window actually became usable after
+  // connecting (not just that its transport opened) — the reopen queue's real
+  // gate. See session-reopen-gate.ts / DESIGN-SESSION-WINDOW-SEQUENTIAL-GATING-2026-09-07.md.
+  signalSessionFunctionalReady: payload => ipcRenderer.send('hermes:window:functional-ready', payload),
+  // Fired when the reopen queue halts because a window failed to become
+  // functionally ready — the shared backend it depends on is unhealthy.
+  onSessionReopenHalted: callback => {
+    const listener = (_event, payload) => callback(payload)
+    ipcRenderer.on('hermes:window:reopen-halted', listener)
+
+    return () => ipcRenderer.removeListener('hermes:window:reopen-halted', listener)
+  },
+  resumeReopenSessionWindows: () => ipcRenderer.invoke('hermes:window:resumeReopenSessionWindows'),
   onWindowStateChanged: callback => {
     const listener = (_event, payload) => callback(payload)
     ipcRenderer.on('hermes:window-state-changed', listener)

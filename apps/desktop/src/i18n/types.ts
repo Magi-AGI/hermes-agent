@@ -214,6 +214,9 @@ export interface Translations {
       gatewaySignInRequiredDetail: string
       signInAgain: string
       ipcBridgeUnavailable: string
+      reopenHaltedTitle: string
+      reopenHaltedMessage: (restored: number, total: number, profile: string) => string
+      reopenHaltedRetry: string
     }
     causes: {
       exitedEarly: string

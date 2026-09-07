@@ -119,7 +119,11 @@ export const ja = defineLocale({
       gatewayConnectionLostDetail:
         'Still retrying in the background. You can keep reading and drafting — open Gateway settings if this persists.',
       gatewaySignInRequired: 'ゲートウェイへのサインインが必要です',
-      ipcBridgeUnavailable: 'デスクトップ IPC ブリッジが利用できません。'
+      ipcBridgeUnavailable: 'デスクトップ IPC ブリッジが利用できません。',
+      reopenHaltedTitle: 'ウィンドウの再オープンを一時停止しました',
+      reopenHaltedMessage: (restored, total, profile) =>
+        `${total} 個中 ${restored} 個のウィンドウを復元しました。バックエンド「${profile}」が応答しなくなったため、負荷を避けるため再オープンを一時停止しました。`,
+      reopenHaltedRetry: '残りのウィンドウを再試行'
     },
     failure: {
       title: 'Hermes を起動できませんでした',

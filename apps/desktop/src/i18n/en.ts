@@ -153,6 +153,10 @@ export const en: Translations = {
       restartHermes: 'Restart Hermes',
       openLogs: 'Open logs',
       desktopBootFailed: "Hermes couldn't start",
+      reopenHaltedTitle: 'Reopening windows paused',
+      reopenHaltedMessage: (restored, total, profile) =>
+        `Restored ${restored} of ${total} windows. The "${profile}" backend stopped responding, so reopening paused to avoid overloading it.`,
+      reopenHaltedRetry: 'Retry remaining windows',
       gatewayConnectionLost: 'Hermes lost its connection',
       gatewayConnectionLostDetail:
         'Still trying to reconnect. You can keep reading and drafting. If this keeps up, reconnect now or check your connection settings.',

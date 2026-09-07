@@ -1286,6 +1286,32 @@ export function useGatewayBoot({
       })
     })
 
+    // The reopen queue (main.ts: runReopenQueue) halts when a window fails to
+    // become functionally ready, rather than silently spawning more windows
+    // into an unhealthy backend. Surface that as a persistent, non-modal
+    // warning with a manual retry — never a blocking dialog, which would
+    // freeze every OTHER already-open window's renderer too.
+    const offReopenHalted = desktop.onSessionReopenHalted?.(payload => {
+      notify({
+        kind: 'warning',
+        title: translateNow('boot.errors.reopenHaltedTitle'),
+        message: translateNow(
+          'boot.errors.reopenHaltedMessage',
+          payload.restoredCount,
+          payload.totalCount,
+          payload.profile || 'default'
+        ),
+        detail: payload.reason,
+        durationMs: 0,
+        action: {
+          label: translateNow('boot.errors.reopenHaltedRetry'),
+          onClick: () => {
+            void desktop.resumeReopenSessionWindows?.()
+          }
+        }
+      })
+    })
+
     async function boot() {
       // Where this boot attempt got to — a historical fact, not a late read of
       // gateway.connectionState. A socket can close after a successful dial;
@@ -1384,9 +1410,33 @@ export function useGatewayBoot({
           // app usable with an empty sidebar (the reconnect/turn refreshes
           // retry it), not brick boot behind the "Hermes couldn't start"
           // overlay. Matches the reconnect + softSwitch call sites.
-          callbacksRef.current.refreshSessions().catch(() => {
-            setSessionsLoading(false)
-          })
+          //
+          // The reopen-queue functional-ready signal (harmless no-op for
+          // every other window — main only listens per-window during
+          // runReopenQueue) fires the MOMENT this settles, not after the
+          // sibling calls above or completeDesktopBoot() below: the target
+          // session is renderable as soon as its data arrives, and the reopen
+          // queue shouldn't wait on unrelated global boot refreshes (config
+          // sync, cwd seed) to find that out. A failed load is still reported
+          // (ok: false) rather than treated as ready — see design doc §7.1.
+          callbacksRef.current
+            .refreshSessions()
+            .then(() => {
+              window.hermesDesktop?.signalSessionFunctionalReady?.({
+                ok: true,
+                phase: 'sessions',
+                profile: $activeGatewayProfile.get()
+              })
+            })
+            .catch(err => {
+              setSessionsLoading(false)
+              window.hermesDesktop?.signalSessionFunctionalReady?.({
+                ok: false,
+                phase: 'sessions',
+                profile: $activeGatewayProfile.get(),
+                error: err instanceof Error ? err.message : String(err)
+              })
+            })
         ])
 
         if (cancelled) {
@@ -1431,6 +1481,12 @@ export function useGatewayBoot({
           failDesktopBoot(message)
           notifyError(err, translateNow('boot.errors.desktopBootFailed'))
           setSessionsLoading(false)
+          window.hermesDesktop?.signalSessionFunctionalReady?.({
+            ok: false,
+            phase: 'boot',
+            profile: $activeGatewayProfile.get(),
+            error: message
+          })
         }
       }
     }
@@ -1509,6 +1565,7 @@ export function useGatewayBoot({
       offEvent()
       offRequest()
       offExit()
+      offReopenHalted?.()
       offWindowState?.()
       offBootProgress()
 

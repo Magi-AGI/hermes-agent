@@ -553,6 +553,17 @@ declare global {
        *  Electron re-checks containment and refuses unified-package halves. */
       removeDesktopPlugin?: (payload: { name: string }) => Promise<{ ok: boolean; path?: string; error?: string }>
       signalSessionGatewayReady?: () => void
+      signalSessionFunctionalReady?: (payload: {
+        ok: boolean
+        phase?: string
+        profile?: string | null
+        sessionId?: string | null
+        error?: string
+      }) => void
+      onSessionReopenHalted?: (
+        callback: (payload: { restoredCount: number; totalCount: number; profile: string | null; reason?: string }) => void
+      ) => () => void
+      resumeReopenSessionWindows?: () => Promise<{ ok: boolean; error?: string }>
       onWindowStateChanged?: (callback: (payload: HermesWindowState) => void) => () => void
       onFocusSession?: (callback: (sessionId: string) => void) => () => void
       onNotificationAction?: (callback: (payload: { actionId: string; sessionId?: string }) => void) => () => void

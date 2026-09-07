@@ -160,7 +160,9 @@ test('registry opens one window per session and focuses on re-open', () => {
   const second = registry.openOrFocus('s1', factory)
 
   assert.equal(built, 1, 'factory runs once for the same session')
-  assert.equal(first, second)
+  assert.equal(first.win, second.win)
+  assert.equal(first.created, true, 'the first open actually created the window')
+  assert.equal(second.created, false, 'the second open only focused the existing window')
   assert.equal(registry.size, 1)
   assert.equal(win.calls.focus, 1, 'second open focuses the existing window')
 })
@@ -207,7 +209,8 @@ test('registry rebuilds a fresh window after the previous one was destroyed', ()
   })
 
   assert.equal(built, 1, 'a destroyed window is replaced, not focused')
-  assert.equal(result, second)
+  assert.equal(result.win, second)
+  assert.equal(result.created, true, 'a rebuilt window counts as created, not focused')
 })
 
 test('registry ignores empty / non-string session ids', () => {
@@ -220,10 +223,10 @@ test('registry ignores empty / non-string session ids', () => {
     return makeFakeWindow()
   }
 
-  assert.equal(registry.openOrFocus('', factory), null)
-  assert.equal(registry.openOrFocus('   ', factory), null)
-  assert.equal(registry.openOrFocus(null, factory), null)
-  assert.equal(registry.openOrFocus(42, factory), null)
+  assert.deepEqual(registry.openOrFocus('', factory), { win: null, created: false })
+  assert.deepEqual(registry.openOrFocus('   ', factory), { win: null, created: false })
+  assert.deepEqual(registry.openOrFocus(null, factory), { win: null, created: false })
+  assert.deepEqual(registry.openOrFocus(42, factory), { win: null, created: false })
   assert.equal(built, 0)
   assert.equal(registry.size, 0)
 })
