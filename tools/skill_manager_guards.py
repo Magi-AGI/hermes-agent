@@ -238,6 +238,91 @@ def _background_review_preflight(action: str, name: str) -> Optional[Dict[str, A
     return _background_review_write_guard(name, existing["path"], action) if existing else None
 
 
+_MUTATING_ACTIONS = frozenset({"create", "edit", "patch", "delete", "write_file", "remove_file"})
+
+
+def _curator_dry_run_mutation_guard(action: str) -> Optional[Dict[str, Any]]:
+    """Mechanically refuse EVERY mutating skill_manage call during a curator preview pass —
+    checked before any other dispatch logic, covering `create` too (the narrower
+    ``_background_review_preflight`` above does not). The prompt banner tells the model not to
+    call these; this is what actually stops it if it tries anyway."""
+    from tools.skill_provenance import is_curator_dry_run
+    if action not in _MUTATING_ACTIONS or not is_curator_dry_run():
+        return None
+    return _refusal(
+        f"Refusing '{action}' during a curator dry-run preview: this pass is report-only and "
+        f"cannot mutate the skill library. Describe the change you would make in the summary "
+        f"instead of calling skill_manage with a mutating action.")
+
+
+def _skill_dir_size_and_ref_count(skill_dir: Path) -> tuple[int, int]:
+    """(SKILL.md bytes, references/ file count) for the ceiling check. Missing/unreadable pieces
+    count as 0 rather than raising — a measurement failure must not itself block a write. Counts
+    recursively: write_file allows nested paths under references/ (e.g. references/sub/x.md), and
+    a direct-children-only count would silently exempt anything nested from the ceiling."""
+    size_bytes = 0
+    with suppress(Exception):
+        size_bytes = (skill_dir / "SKILL.md").stat().st_size
+    ref_count = 0
+    with suppress(Exception):
+        ref_count = sum(1 for p in (skill_dir / "references").rglob("*") if p.is_file())
+    return size_bytes, ref_count
+
+
+def _is_new_reference_file(skill_dir: Path, target: Path) -> bool:
+    """True when *target* is a not-yet-existing file anywhere under skill_dir/references/ —
+    checked against the full relative path, not just the direct parent's name, so a nested
+    write_file (references/sub/x.md) is recognized too."""
+    with suppress(Exception):
+        parts = target.relative_to(skill_dir).parts
+        return bool(parts) and parts[0] == "references"
+    return False
+
+
+def _background_review_size_ceiling_guard(
+    name: str, skill_dir: Path, target: Path, action: str, content: str,
+    original: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Block the ROUTINE self-improvement pass (not the curator's own consolidation fork — see
+    tools.skill_provenance.is_routine_background_review) from growing an already-oversized skill
+    further. Only fires on genuinely additive writes: a brand-new references/ file, or a
+    patch/write_file to an existing file that makes it bigger. Shrinking edits and deletions are
+    always allowed, even over the ceiling — that's the direction this guard wants to encourage."""
+    from tools.skill_provenance import is_routine_background_review
+    if not is_routine_background_review():
+        return None
+    is_new_file = original is None
+    is_growth = is_new_file or (isinstance(content, str) and len(content) > len(original or ""))
+    if not is_growth:
+        return None
+    try:
+        from agent import curator as _curator
+    except Exception:
+        logger.debug("curator import failed for size-ceiling guard on %s", name, exc_info=True)
+        return None
+    size_bytes, ref_count = _skill_dir_size_and_ref_count(skill_dir)
+    # A brand-new references/ file (nested or not) adds one to the count actually written to disk
+    # after this call succeeds; check against the post-write count so the file that WOULD tip it
+    # over is itself refused, not just the one after.
+    effective_ref_count = ref_count + 1 if (is_new_file and _is_new_reference_file(skill_dir, target)) else ref_count
+    max_kb, max_refs = _curator.get_max_skill_size_kb(), _curator.get_max_reference_files()
+    over_size, over_refs = size_bytes > max_kb * 1024, effective_ref_count > max_refs
+    if not (over_size or over_refs):
+        return None
+    with suppress(Exception):
+        _curator.flag_consolidation_recommended(name, size_bytes=size_bytes, ref_count=effective_ref_count)
+    reason = ", ".join(
+        r for r, cond in ((f"SKILL.md is {size_bytes / 1024:.1f}KB (ceiling {max_kb}KB)", over_size),
+                          (f"references/ has {effective_ref_count} files (ceiling {max_refs})", over_refs)) if cond)
+    return _refusal(
+        f"Refusing background review {action} for skill '{name}': {reason}, and this write "
+        f"would grow it further. This skill needs consolidation, not another addition — a "
+        f"preview will be generated on the next scheduled curator pass "
+        f"(`hermes curator run --dry-run --consolidate` to check now — plain `--dry-run` stays "
+        f"prune-only unless curator.consolidate: true is set), and `hermes curator run --consolidate` "
+        f"applies it. If the lesson is genuinely new and load-bearing, state it plainly in this "
+        f"turn's summary instead of writing it to the skill.")
+
+
 def _curator_consolidation_delete_guard(
     name: str, absorbed_into: Optional[str]) -> Optional[Dict[str, Any]]:
     """Fail closed on unverified deletes during the curator consolidation pass. The fork's only

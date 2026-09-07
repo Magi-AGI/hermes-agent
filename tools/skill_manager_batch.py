@@ -84,7 +84,7 @@ def _op_shape_error(action: str, args: dict):
 
 def _validate_batch_ops(operations, default_name, tool_error):
     """Shape checks with no side effects. Returns (names, None) or (None, error_json)."""
-    from tools.skill_manager_guards import _background_review_preflight
+    from tools.skill_manager_guards import _background_review_preflight, _curator_dry_run_mutation_guard
     def fail(i, msg):
         return None, tool_error(f"operations[{i}]{msg}", success=False)
     names = []
@@ -105,6 +105,8 @@ def _validate_batch_ops(operations, default_name, tool_error):
         names.append(nm)
         if act == "create" and nm in names[:-1]:
             return fail(i, f": create for '{nm}' must precede that skill's other ops.")
+        if (dry_run_guard := _curator_dry_run_mutation_guard(act)) is not None:
+            return None, json.dumps(dry_run_guard, ensure_ascii=False)
         if (preflight := _background_review_preflight(act, nm)) is not None:
             return None, json.dumps(preflight, ensure_ascii=False)
     # Clobber guard: a DESTRUCTIVE op (create/write_file/remove_file/full rewrite) on

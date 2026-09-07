@@ -6,7 +6,16 @@ AIAgent._memory_write_origin: ``token = set_current_write_origin(...)`` / ``rese
 import contextvars
 
 _write_origin: contextvars.ContextVar[str] = contextvars.ContextVar("skill_write_origin", default="foreground")
-BACKGROUND_REVIEW = "background_review"  # sentinel used by run_agent._spawn_background_review
+BACKGROUND_REVIEW = "background_review"  # sentinel used by run_agent._spawn_background_review (routine per-session pass)
+CURATOR_CONSOLIDATION_DRY_RUN = "curator_consolidation_dry_run"  # curator.py preview fork (report-only)
+CURATOR_CONSOLIDATION = "curator_consolidation"  # curator.py live-apply fork (hermes curator run --consolidate)
+
+# Every autonomous (no-user-in-the-loop) actor. All three get the existing pinned/external/
+# bundled/hub/user-owned and read-before-write guards. They are NOT interchangeable beyond
+# that: only BACKGROUND_REVIEW is subject to the size-ceiling guard (the curator's own
+# consolidation pass is the intended REMEDY for an oversized skill, not another contributor to
+# the problem), and only CURATOR_CONSOLIDATION_DRY_RUN is subject to the blanket mutation guard.
+_AUTONOMOUS_ORIGINS = frozenset({BACKGROUND_REVIEW, CURATOR_CONSOLIDATION_DRY_RUN, CURATOR_CONSOLIDATION})
 
 
 def set_current_write_origin(origin: str) -> contextvars.Token[str]:
@@ -18,11 +27,21 @@ def reset_current_write_origin(token: contextvars.Token[str]) -> None:
 
 
 def get_current_write_origin() -> str:
-    """"foreground" for any regular agent (CLI, gateway, cron, subagent); "background_review" for the review fork."""
+    """"foreground" for any regular agent (CLI, gateway, cron, subagent); one of the autonomous
+    sentinels above for a review/curator fork."""
     return _write_origin.get()
 
 
 def is_background_review() -> bool:
+    """True for ANY autonomous actor (routine self-improvement pass or either curator fork) —
+    the existing pinned/external/bundled/hub/user-owned/read-before-write guards apply to all of
+    them alike. Use the narrower predicates below when a guard must distinguish which one."""
+    return get_current_write_origin() in _AUTONOMOUS_ORIGINS
+
+
+def is_routine_background_review() -> bool:
+    """True only for the routine per-session self-improvement pass — the actor the size-ceiling
+    guard exists to restrain."""
     return get_current_write_origin() == BACKGROUND_REVIEW
 
 
@@ -42,3 +61,9 @@ def reset_review_attended(token: contextvars.Token[bool]) -> None:
 
 def is_unattended_review() -> bool:
     return is_background_review() and not _review_attended.get()
+
+
+def is_curator_dry_run() -> bool:
+    """True only inside a curator preview (report-only) fork — every mutating skill_manage call
+    must be mechanically refused here, not merely discouraged by the prompt."""
+    return get_current_write_origin() == CURATOR_CONSOLIDATION_DRY_RUN

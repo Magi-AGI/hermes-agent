@@ -1,7 +1,10 @@
 """Behavior tests for the skill review / combined review prompts.
 
-The review prompts steer the background review agent toward actively updating
-the skill library after most sessions, with a strong bias toward:
+The review prompts steer the background review agent toward being SELECTIVE about updating the
+skill library — 'Nothing to save.' is the default, healthy outcome for a routine session (see
+DESIGN-SKILL-CURATOR-ANTI-BLOAT-2026-09-06.md; the prior 'Be ACTIVE' framing was half the root
+cause of unchecked skill-library growth). WHEN a genuine signal does fire, the preference order
+is still:
   1. Patching currently-loaded skills first,
   2. Patching existing umbrellas next,
   3. Adding references/ files under an existing umbrella,
@@ -21,15 +24,36 @@ from run_agent import AIAgent
 # _SKILL_REVIEW_PROMPT
 # ---------------------------------------------------------------------------
 
-def test_skill_review_prompt_biases_toward_active_updates():
-    """Prompt must frame updating as the default stance, not something rare."""
+def test_skill_review_prompt_biases_toward_selective_updates():
+    """2026-09-06 anti-bloat fix: the prompt must frame 'Nothing to save.' as the DEFAULT,
+    healthy outcome for routine sessions, not something to avoid reaching for. The prior
+    'Be ACTIVE' framing was half the root cause of unchecked skill-library growth (see
+    DESIGN-SKILL-CURATOR-ANTI-BLOAT-2026-09-06.md) — a session-count-driven additive bias with
+    no counterbalancing consolidation running automatically."""
     prompt = AIAgent._SKILL_REVIEW_PROMPT
-    assert "ACTIVE" in prompt or "active" in prompt.lower(), (
-        "must tell the reviewer to be active"
+    assert "SELECTIVE" in prompt or "selective" in prompt.lower(), (
+        "must tell the reviewer to be selective, not to default toward acting"
     )
-    # "missed learning opportunity" or equivalent framing for not acting
-    assert "missed" in prompt.lower() or "opportunity" in prompt.lower(), (
-        "must frame inaction as a miss, not a neutral outcome"
+    assert "nothing to save" in prompt.lower() and "default" in prompt.lower(), (
+        "must frame 'Nothing to save.' as the default outcome for routine sessions"
+    )
+    assert "ACTIVE" not in prompt, (
+        "the old 'Be ACTIVE' additive-bias framing must not survive the fix"
+    )
+
+
+def test_skill_review_prompt_names_narrow_update_triggers():
+    """The three narrow signals that DO warrant a skill update must be explicit and bounded —
+    a vague 'capture non-trivial techniques' bar re-creates the same unbounded bias in different
+    words."""
+    prompt = AIAgent._SKILL_REVIEW_PROMPT
+    lower = prompt.lower()
+    assert "provably wrong" in lower or "provably" in lower, (
+        "must require the existing-rule-is-wrong trigger to be provable, not just suspected"
+    )
+    assert "whole class" in lower, (
+        "must require a genuinely reusable pattern to generalize to a whole class of tasks, "
+        "not a single incident"
     )
 
 
@@ -74,6 +98,16 @@ def test_combined_review_prompt_has_memory_section():
     prompt = AIAgent._COMBINED_REVIEW_PROMPT
     assert "**Memory**" in prompt
     assert "memory tool" in prompt
+
+
+def test_combined_review_prompt_biases_toward_selective_skill_updates():
+    """The combined prompt's skills half needed the identical 2026-09-06 fix as the standalone
+    skill-review prompt — Codex's review caught that only one of the two call sites had been
+    updated in the first implementation pass. Memory saving stays independent/unaffected."""
+    prompt = AIAgent._COMBINED_REVIEW_PROMPT
+    assert "SELECTIVE" in prompt or "selective" in prompt.lower()
+    assert "nothing to save" in prompt.lower() and "default" in prompt.lower()
+    assert "Be ACTIVE" not in prompt
 
 
 

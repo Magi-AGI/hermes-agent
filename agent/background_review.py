@@ -415,9 +415,13 @@ _DO_NOT_CAPTURE_BLOCK = (
 )
 
 _SKILL_REVIEW_PROMPT = (
-    "Review the conversation above and update the skill library. Be ACTIVE — most sessions produce "
-    "at least one skill update, even if small. A pass that does nothing is a missed learning "
-    "opportunity, not a neutral outcome.\n\n"
+    "Review the conversation above and update the skill library. Be SELECTIVE — most routine "
+    "sessions should conclude 'Nothing to save.' for skills, and that is the expected, healthy "
+    "outcome, not a missed opportunity. Update a skill only if: (1) the user explicitly corrected "
+    "your approach, style, or complained about friction/ceremony, (2) an existing skill rule was "
+    "provably wrong, missing, or outdated, or (3) a genuinely novel, reusable pattern emerged that "
+    "applies to a whole class of future tasks — not a single incident's debugging steps or a "
+    "temporary workaround.\n\n"
     "Target shape of the library: CLASS-LEVEL skills, each with a SKILL.md of always-on rules and a "
     "small `references/` set of topical depth. Not a flat list of narrow one-session skills, and "
     "not an umbrella hoarding a references/ file per session. This shapes HOW you update, not "
@@ -430,8 +434,9 @@ _SKILL_REVIEW_PROMPT = (
     "skill(s) to embed the preference so the next session starts already knowing.\n"
     "  • User corrected your workflow, approach, or sequence of steps. Encode the correction as a "
     "pitfall or explicit step in the skill that governs that class of task.\n"
-    "  • Non-trivial technique, fix, workaround, debugging path, or tool-usage pattern emerged "
-    "that a future session would benefit from. Capture it.\n"
+    "  • A technique, fix, workaround, debugging path, or tool-usage pattern emerged that "
+    "genuinely generalizes to a WHOLE CLASS of future tasks, not just today's specific incident. "
+    "Capture the rule, not the incident.\n"
     "  • A skill that got loaded or consulted this session turned out to be wrong, missing a step, "
     "or outdated. Patch it NOW.\n\n"
     "Preference order — prefer the earliest action that fits, but do pick one when a signal above "
@@ -495,17 +500,19 @@ _SKILL_REVIEW_PROMPT = (
     "If the only skills that need updating are protected, say\n"
     "'Nothing to save.' and stop.\n\n"
     "Do NOT capture" + _DO_NOT_CAPTURE_BLOCK +
-    "'Nothing to save.' is a real option but should NOT be the default. If the session ran "
-    "smoothly with no corrections and produced no new technique, just say 'Nothing to save.' and "
-    "stop. Otherwise, act."
+    "'Nothing to save.' IS the default — reach for it whenever none of the three signals above "
+    "fired. Only act when one genuinely did."
 )
 
 _COMBINED_REVIEW_PROMPT = (
     "Review the conversation above and update two things:\n\n"
     "**Memory**: " + _MEMORY_ROUTING_BLOCK +
-    "**Skills**: how to do this class of task. Be ACTIVE — most sessions produce at least one "
-    "skill update. A pass that does nothing is a missed learning opportunity, not a neutral "
-    "outcome.\n\n"
+    "**Skills**: how to do this class of task. Be SELECTIVE — most routine sessions should "
+    "conclude 'Nothing to save.' for skills, and that is the expected, healthy outcome. Update a "
+    "skill only if: (1) the user explicitly corrected your approach, style, or complained about "
+    "friction/ceremony, (2) an existing skill rule was provably wrong, missing, or outdated, or "
+    "(3) a genuinely novel, reusable pattern emerged that applies to a whole class of future "
+    "tasks — not a single incident's debugging steps or a temporary workaround.\n\n"
     "Target shape of the skill library: CLASS-LEVEL skills with a SKILL.md of always-on rules and a "
     "small `references/` set of topical depth — not narrow one-session skills, and not an umbrella "
     "hoarding a references/ file per session.\n\n" + _LESSON_LAYER_BLOCK +
@@ -514,7 +521,8 @@ _COMBINED_REVIEW_PROMPT = (
     "is a FIRST-CLASS skill signal, not just a memory signal. 'stop doing X', 'don't format like "
     "this', 'I hate when you Y' — embed the lesson in the skill that governs that task so the next "
     "session starts fixed.\n"
-    "  • Non-trivial technique, fix, workaround, or debugging path emerged.\n"
+    "  • A technique, fix, workaround, or debugging path emerged that genuinely generalizes to a "
+    "WHOLE CLASS of future tasks, not just today's specific incident.\n"
     "  • A skill that was loaded or consulted turned out wrong, missing, or outdated — patch it "
     "now.\n\n"
     "Preference order for skills — pick the earliest that fits:\n"
@@ -562,8 +570,9 @@ _COMBINED_REVIEW_PROMPT = (
     "If the only skills that need updating are protected, say\n"
     "'Nothing to save.' and stop.\n\n"
     "Do NOT capture as skills" + _DO_NOT_CAPTURE_BLOCK +
-    "Act on whichever of the two dimensions has real signal. If genuinely nothing stands out on "
-    "either, say 'Nothing to save.' and stop — but don't reach for that conclusion as a default."
+    "Memory and skills are independent: still save memory facts even when skills conclude "
+    "'Nothing to save.' — for skills specifically, 'Nothing to save.' IS the default whenever "
+    "none of the three signals above fired for that dimension."
 )
 
 
