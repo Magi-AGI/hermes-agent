@@ -28,7 +28,7 @@ def curator_env(tmp_path, monkeypatch):
     importlib.reload(curator)
 
     # Neutralize the real LLM pass by default — tests opt in per-case.
-    monkeypatch.setattr(curator, "_run_llm_review", lambda prompt: "llm-stub")
+    monkeypatch.setattr(curator, "_run_llm_review", lambda prompt, **_kw: "llm-stub")
 
     # Default: no config file → curator defaults. Tests can override.
     monkeypatch.setattr(curator, "_load_config", lambda: {})
@@ -416,7 +416,7 @@ def test_dry_run_injects_report_only_banner(curator_env, monkeypatch):
     u.mark_agent_created("a")
 
     captured = {}
-    def _stub(prompt):
+    def _stub(prompt, **_kw):
         captured["prompt"] = prompt
         return {"final": "", "summary": "s", "model": "", "provider": "",
                 "tool_calls": [], "error": None}
@@ -437,7 +437,7 @@ def test_run_review_synchronous_invokes_llm_stub(curator_env, monkeypatch):
     u.mark_agent_created("a")
 
     calls = []
-    def _stub(prompt):
+    def _stub(prompt, **_kw):
         calls.append(prompt)
         return {
             "final": "stubbed-summary",
@@ -552,7 +552,7 @@ def test_review_prompt_tells_reviewer_to_read_before_writing(curator_env, monkey
     u.mark_agent_created("a")
 
     captured = {}
-    def _stub(prompt):
+    def _stub(prompt, **_kw):
         captured["prompt"] = prompt
         return {"final": "", "summary": "s", "model": "", "provider": "",
                 "tool_calls": [], "error": None}
@@ -950,3 +950,250 @@ def test_review_prompt_does_not_steer_terminal_writes():
             "write_file/remove_file instead"
         )
         assert "&& mv" not in text
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-06 anti-bloat design: mechanical dry-run tagging + size-ceiling
+# marker/fingerprint bookkeeping + event-triggered preview
+# ---------------------------------------------------------------------------
+
+
+def test_run_llm_review_tags_dry_run_with_the_mechanically_blocked_origin(curator_env, monkeypatch):
+    """Codex's required amendment #1: dry-run must be enforced by a real write-origin tag
+    skill_manage's guards mechanically refuse, not just prompt wording. This proves the fork
+    is tagged with CURATOR_CONSOLIDATION_DRY_RUN when dry_run=True, and CURATOR_CONSOLIDATION
+    (a DIFFERENT, non-blocked origin) when dry_run=False."""
+    curator = curator_env["curator"]
+    import importlib
+    importlib.reload(curator)
+
+    class _StubAgent:
+        def __init__(self, *args, **kwargs):
+            self._memory_nudge_interval = 0
+            self._skill_nudge_interval = 0
+            self._session_messages = []
+
+        def run_conversation(self, user_message=None, **kwargs):
+            return {"final_response": "no change"}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("run_agent.AIAgent", _StubAgent)
+    # _memory_write_origin is assigned as a plain attribute after construction — read it back
+    # off the constructed instance rather than trying to intercept the assignment itself.
+    orig_init = _StubAgent.__init__
+    instances = []
+
+    def _tracking_init(self, *a, **k):
+        orig_init(self, *a, **k)
+        instances.append(self)
+
+    _StubAgent.__init__ = _tracking_init
+
+    from tools.skill_provenance import CURATOR_CONSOLIDATION, CURATOR_CONSOLIDATION_DRY_RUN
+
+    curator._run_llm_review("prompt", dry_run=True)
+    assert instances[-1]._memory_write_origin == CURATOR_CONSOLIDATION_DRY_RUN
+
+    curator._run_llm_review("prompt", dry_run=False)
+    assert instances[-1]._memory_write_origin == CURATOR_CONSOLIDATION
+
+
+def test_size_ceiling_marker_roundtrip(curator_env):
+    """flag -> needs-preview -> mark-previewed -> no-longer-needs-preview, at a stable size."""
+    curator = curator_env["curator"]
+    assert curator.skills_needing_consolidation_preview() == []
+
+    curator.flag_consolidation_recommended("big-skill", size_bytes=50_000, ref_count=3)
+    assert curator.skills_needing_consolidation_preview() == ["big-skill"]
+
+    curator.mark_consolidation_previewed("big-skill")
+    assert curator.skills_needing_consolidation_preview() == []
+
+    # Re-flagging at the SAME fingerprint must not re-arm the preview — this is what stops a
+    # skill the user deliberately keeps large from generating a report every idle cycle.
+    curator.flag_consolidation_recommended("big-skill", size_bytes=50_000, ref_count=3)
+    assert curator.skills_needing_consolidation_preview() == []
+
+
+def test_size_ceiling_marker_rearms_on_further_growth(curator_env):
+    """Growing PAST the already-previewed fingerprint must re-arm the preview — Codex's and
+    Antigravity's converged fingerprint requirement."""
+    curator = curator_env["curator"]
+    curator.flag_consolidation_recommended("big-skill", size_bytes=50_000, ref_count=3)
+    curator.mark_consolidation_previewed("big-skill")
+    assert curator.skills_needing_consolidation_preview() == []
+
+    curator.flag_consolidation_recommended("big-skill", size_bytes=60_000, ref_count=3)
+    assert curator.skills_needing_consolidation_preview() == ["big-skill"]
+
+
+def test_clear_consolidation_flag_removes_the_marker_entirely(curator_env):
+    curator = curator_env["curator"]
+    curator.flag_consolidation_recommended("big-skill", size_bytes=50_000, ref_count=3)
+    curator.clear_consolidation_flag("big-skill")
+    assert curator.skills_needing_consolidation_preview() == []
+    # A subsequent flag at the same size must count as new (no stale fingerprint survived).
+    curator.flag_consolidation_recommended("big-skill", size_bytes=50_000, ref_count=3)
+    assert curator.skills_needing_consolidation_preview() == ["big-skill"]
+
+
+def test_maybe_run_curator_triggers_a_preview_only_pass_when_a_skill_is_flagged(curator_env, monkeypatch):
+    """The scheduled path: consolidate is OFF by default, but a flagged skill must still get
+    exactly one preview-only consolidation fork — never a live apply."""
+    curator = curator_env["curator"]
+    curator.flag_consolidation_recommended("big-skill", size_bytes=50_000, ref_count=3)
+
+    captured = {}
+
+    def _fake_run_curator_review(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(curator, "should_run_now", lambda: True)
+    monkeypatch.setattr(curator, "run_curator_review", _fake_run_curator_review)
+
+    result = curator.maybe_run_curator()
+
+    assert result == {"ok": True}
+    assert captured.get("consolidate") is True
+    assert captured.get("llm_dry_run") is True
+    # The flagged names are handed to run_curator_review to mark previewed itself, ONLY after
+    # its own fork actually completes and writes a report (see the race-condition test below) —
+    # maybe_run_curator must not mark them the moment the pass merely STARTS.
+    assert captured.get("mark_previewed_on_success") == ["big-skill"]
+    assert curator.skills_needing_consolidation_preview() == ["big-skill"]
+
+
+def test_maybe_run_curator_does_not_fork_at_all_when_nothing_is_flagged(curator_env, monkeypatch):
+    """A profile with no oversized skills must pay zero added cost from this mechanism —
+    unchanged from before the anti-bloat design existed."""
+    curator = curator_env["curator"]
+    captured = {}
+
+    def _fake_run_curator_review(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(curator, "should_run_now", lambda: True)
+    monkeypatch.setattr(curator, "run_curator_review", _fake_run_curator_review)
+
+    curator.maybe_run_curator()
+
+    assert captured.get("consolidate") is None
+    assert captured.get("llm_dry_run") is None
+
+
+def test_maybe_run_curator_does_not_override_an_explicit_consolidate_opt_in(curator_env, monkeypatch):
+    """A user who already set curator.consolidate: true keeps their existing full-auto
+    behavior unchanged — the event trigger only fires when consolidate is otherwise OFF."""
+    curator = curator_env["curator"]
+    monkeypatch.setattr(curator, "get_consolidate", lambda: True)
+    curator.flag_consolidation_recommended("big-skill", size_bytes=50_000, ref_count=3)
+
+    captured = {}
+
+    def _fake_run_curator_review(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(curator, "should_run_now", lambda: True)
+    monkeypatch.setattr(curator, "run_curator_review", _fake_run_curator_review)
+
+    curator.maybe_run_curator()
+
+    # consolidate/llm_dry_run stay None here (i.e. "use the caller's normal default"), since
+    # this profile already opted into full consolidation — the event trigger did not need to,
+    # and must not, force a dry run on top of that deliberate choice.
+    assert captured.get("consolidate") is None
+    assert captured.get("llm_dry_run") is None
+
+
+def test_preview_only_marks_previewed_after_a_real_report_is_written(curator_env, monkeypatch):
+    """Codex's required amendment #2: the marker must not flip until the report a human would
+    actually read exists — proves the happy path lands correctly, the crash-safety cases below
+    prove the failure paths correctly do NOT."""
+    curator = curator_env["curator"]
+    curator.flag_consolidation_recommended("big-skill", size_bytes=50_000, ref_count=3)
+
+    monkeypatch.setattr(curator, "_run_llm_review", lambda prompt, **_kw: {
+        "final": "no change", "summary": "no change", "model": "", "provider": "",
+        "tool_calls": [], "error": None})
+    monkeypatch.setattr(curator, "should_run_now", lambda: True)
+
+    curator.maybe_run_curator()
+
+    # run_curator_review defaults to the async (daemon-thread) path; join it before asserting.
+    import threading
+    for t in threading.enumerate():
+        if t.name == "curator-review" and t.is_alive():
+            t.join(timeout=10.0)
+
+    assert curator.skills_needing_consolidation_preview() == []
+
+
+def test_preview_only_leaves_the_flag_armed_if_the_llm_fork_errors(curator_env, monkeypatch):
+    """A fork that comes back with an error must NOT be treated as a successful preview — the
+    flag stays armed so the next scheduled pass retries instead of silently giving up."""
+    curator = curator_env["curator"]
+    curator.flag_consolidation_recommended("big-skill", size_bytes=50_000, ref_count=3)
+
+    monkeypatch.setattr(curator, "_run_llm_review", lambda prompt, **_kw: {
+        "final": "", "summary": "error: boom", "model": "", "provider": "",
+        "tool_calls": [], "error": "boom"})
+    monkeypatch.setattr(curator, "should_run_now", lambda: True)
+
+    curator.maybe_run_curator()
+
+    import threading
+    for t in threading.enumerate():
+        if t.name == "curator-review" and t.is_alive():
+            t.join(timeout=10.0)
+
+    assert curator.skills_needing_consolidation_preview() == ["big-skill"]
+
+
+def test_preview_only_leaves_the_flag_armed_if_the_report_write_fails(curator_env, monkeypatch):
+    """The exact race Codex flagged: if the process were to die (simulated here by the report
+    writer raising) before a report exists, the flag must still be armed for the next cycle —
+    proving the marking is NOT optimistic at call time."""
+    curator = curator_env["curator"]
+    curator.flag_consolidation_recommended("big-skill", size_bytes=50_000, ref_count=3)
+
+    monkeypatch.setattr(curator, "_run_llm_review", lambda prompt, **_kw: {
+        "final": "no change", "summary": "no change", "model": "", "provider": "",
+        "tool_calls": [], "error": None})
+    monkeypatch.setattr(curator, "_write_run_report", lambda **kwargs: (_ for _ in ()).throw(OSError("disk full")))
+    monkeypatch.setattr(curator, "should_run_now", lambda: True)
+
+    curator.maybe_run_curator()
+
+    import threading
+    for t in threading.enumerate():
+        if t.name == "curator-review" and t.is_alive():
+            t.join(timeout=10.0)
+
+    assert curator.skills_needing_consolidation_preview() == ["big-skill"]
+
+
+def test_llm_dry_run_skips_only_the_llm_fork_not_the_deterministic_prune(curator_env, monkeypatch):
+    """run_curator_review's llm_dry_run must NOT also suppress apply_automatic_transitions —
+    that's the whole reason it's a separate parameter from dry_run (see the docstring)."""
+    curator = curator_env["curator"]
+    calls = {"transitions": 0}
+
+    def _fake_transitions(**kwargs):
+        calls["transitions"] += 1
+        return {"marked_stale": 0, "archived": 0, "reactivated": 0}
+
+    monkeypatch.setattr(curator, "apply_automatic_transitions", _fake_transitions)
+    monkeypatch.setattr(curator, "_run_llm_review", lambda prompt, **_kw: {
+        "final": "", "summary": "s", "model": "", "provider": "", "tool_calls": [], "error": None})
+
+    curator.run_curator_review(synchronous=True, consolidate=True, llm_dry_run=True, dry_run=False)
+
+    assert calls["transitions"] == 1, (
+        "llm_dry_run=True incorrectly suppressed the real deterministic prune — an "
+        "event-triggered preview must not cost the profile a cycle of stale/archive handling"
+    )

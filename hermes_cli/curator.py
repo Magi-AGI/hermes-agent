@@ -99,6 +99,13 @@ def _print_curator_config(curator) -> None:
     print(
         f"  consolidate:    {'on' if consolidate else 'off'}"
         f"{'' if consolidate else ' (prune-only; LLM merge pass opt-in)'}")
+    print(f"  size ceiling:   {curator.get_max_skill_size_kb()}KB / "
+          f"{curator.get_max_reference_files()} reference files (routine self-improvement pass only)")
+    flagged = curator.skills_needing_consolidation_preview()
+    if flagged:
+        print(f"  over ceiling:   {', '.join(sorted(flagged))} — preview due next scheduled pass "
+              f"(or `hermes curator run --dry-run --consolidate` now); "
+              f"`hermes curator run --consolidate` applies")
 
 
 def _cmd_status(args) -> int:
@@ -179,10 +186,12 @@ def _cmd_run(args) -> int:
     if dry:
         print(
             "dry-run: no changes applied. Read the report with "
-            "`hermes curator status` and run `hermes curator run` (no flag) to apply."
+            "`hermes curator status` and run `hermes curator run --consolidate` to apply "
+            "(plain `hermes curator run` stays prune-only unless curator.consolidate: true is set)."
             if synchronous else
             "dry-run: no changes applied. When the report lands, read it with "
-            "`hermes curator status` and run `hermes curator run` (no flag) to apply.")
+            "`hermes curator status` and run `hermes curator run --consolidate` to apply "
+            "(plain `hermes curator run` stays prune-only unless curator.consolidate: true is set).")
     return 0
 
 

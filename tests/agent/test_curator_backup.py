@@ -208,8 +208,8 @@ def test_real_run_takes_pre_snapshot(backup_env, monkeypatch):
     # snapshot side-effect.
     monkeypatch.setattr(
         curator, "_run_llm_review",
-        lambda p: {"final": "", "summary": "s", "model": "", "provider": "",
-                   "tool_calls": [], "error": None},
+        lambda p, **_kw: {"final": "", "summary": "s", "model": "", "provider": "",
+                          "tool_calls": [], "error": None},
     )
     monkeypatch.setattr(
         curator, "apply_automatic_transitions",

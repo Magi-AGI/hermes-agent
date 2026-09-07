@@ -30,6 +30,10 @@ DEFAULT_STALE_AFTER_DAYS, DEFAULT_ARCHIVE_AFTER_DAYS = 30, 90
 # The LLM consolidation fork is opt-in; the deterministic inactivity prune
 # (apply_automatic_transitions) always runs when the curator is enabled.
 DEFAULT_CONSOLIDATE = False
+# Size ceiling on the routine per-session self-improvement pass (NOT the curator's own
+# consolidation fork — that pass's job is to shrink an over-ceiling skill, so it is exempt).
+# Starting defaults per triad review 2026-09-06; tune in config once live behavior is observed.
+DEFAULT_MAX_SKILL_SIZE_KB, DEFAULT_MAX_REFERENCE_FILES = 40, 10
 
 
 # --- .curator_state — persistent scheduler + status ---
@@ -67,6 +71,59 @@ def set_paused(paused: bool) -> None:
 
 def is_paused() -> bool:
     return bool(load_state().get("paused"))
+
+
+# --- Size-ceiling marker (Part B/C of the 2026-09-06 anti-bloat design) ---
+#
+# ``_ceiling_flags`` (an ``_`` prefix so load_state()'s allowlist merge in the base dict below
+# would otherwise drop it — it starts with "_" so the existing `k.startswith("_")` passthrough
+# picks it up) maps skill name -> {"fingerprint": [size_bytes, ref_count], "previewed": bool}.
+# The routine self-improvement pass's write guard SETS an entry (fingerprint = the size that
+# tripped the ceiling) whenever it refuses an additive write. The scheduled curator pass reads
+# this to decide whether a preview run is owed, and marks ``previewed`` true once one runs —
+# it does NOT delete the entry, so a skill that stays at the same size only gets previewed once,
+# but growing PAST the previewed fingerprint re-arms it (previewed reset to false) automatically,
+# since the write guard overwrites the fingerprint on every refusal.
+
+def _ceiling_flags() -> Dict[str, Dict[str, Any]]:
+    flags = load_state().get("_ceiling_flags")
+    return flags if isinstance(flags, dict) else {}
+
+
+def flag_consolidation_recommended(name: str, *, size_bytes: int, ref_count: int) -> None:
+    """Called by the routine-pass size-ceiling guard on every refusal. Overwriting the
+    fingerprint on each call is what re-arms ``previewed`` after further growth: a fresh
+    fingerprint no longer matches whatever was already previewed."""
+    flags = _ceiling_flags()
+    existing = flags.get(name) or {}
+    fingerprint = [int(size_bytes), int(ref_count)]
+    if existing.get("fingerprint") == fingerprint:
+        return  # unchanged since last flag/preview — do not clear a previewed=True marker
+    flags[name] = {"fingerprint": fingerprint, "previewed": False}
+    save_state({**load_state(), "_ceiling_flags": flags})
+
+
+def skills_needing_consolidation_preview() -> List[str]:
+    """Skills flagged by the size-ceiling guard that have not yet had a preview generated for
+    their CURRENT fingerprint."""
+    return [name for name, entry in _ceiling_flags().items() if not entry.get("previewed")]
+
+
+def mark_consolidation_previewed(name: str) -> None:
+    """Record that a preview now exists for this skill's current fingerprint — suppresses
+    re-notifying on every idle cycle until the skill grows further."""
+    flags = _ceiling_flags()
+    if name in flags:
+        flags[name]["previewed"] = True
+        save_state({**load_state(), "_ceiling_flags": flags})
+
+
+def clear_consolidation_flag(name: str) -> None:
+    """Called after a real ``--consolidate`` apply actually changes the skill — the ceiling
+    guard will re-flag it from scratch if it's ever oversized again."""
+    flags = _ceiling_flags()
+    if flags.pop(name, None) is not None:
+        save_state({**load_state(), "_ceiling_flags": flags})
 
 
 # --- Config access ---
@@ -128,6 +185,18 @@ def get_prune_builtins() -> bool:
 def get_consolidate() -> bool:
     """LLM consolidation pass — OFF by default (prune only, no aux-model fork); ``hermes curator run --consolidate`` overrides per invocation."""
     return bool(_load_config().get("consolidate", DEFAULT_CONSOLIDATE))
+
+
+def get_max_skill_size_kb() -> int:
+    """Ceiling on a curator-managed skill's SKILL.md size before the routine self-improvement
+    pass is mechanically refused further additive writes to it. Foreground (user-directed) edits
+    are never affected; only the autonomous per-session review is capped."""
+    return _config_number("max_skill_size_kb", DEFAULT_MAX_SKILL_SIZE_KB, int)
+
+
+def get_max_reference_files() -> int:
+    """Ceiling on a curator-managed skill's references/ file count, same scope as above."""
+    return _config_number("max_reference_files", DEFAULT_MAX_REFERENCE_FILES, int)
 
 
 # --- Idle / interval check ---
@@ -255,10 +324,11 @@ CURATOR_DRY_RUN_BANNER = (
     "produce on a live run — but describe the actions you WOULD take, "
     "not actions you took. A downstream reviewer will read the report "
     "and decide whether to approve a live run with "
-    "`hermes curator run` (no flag).\n"
+    "`hermes curator run --consolidate`.\n"
     "\n"
-    "If you accidentally take a mutating action, say so explicitly in "
-    "the summary so the reviewer can revert it.\n"
+    "Any mutating skill_manage call is mechanically refused during this "
+    "pass — attempting one will just come back as an error, not a "
+    "silent success. If that happens, note it in the summary and move on.\n"
     "═══════════════════════════════════════════════════════════════"
 )
 
@@ -856,7 +926,7 @@ def _consolidation_pass(prefix: str, auto_summary: str, dry_run: bool, before_na
             prompt = f"{CURATOR_REVIEW_PROMPT}{CURATOR_PRUNE_BUILTINS_NOTE if get_prune_builtins() else ''}\n\n{candidate_list}"
             if dry_run:
                 prompt = f"{CURATOR_DRY_RUN_BANNER}\n\n{prompt}"
-            llm_meta = _run_llm_review(prompt)
+            llm_meta = _run_llm_review(prompt, dry_run=dry_run)
             final_summary = f"{prefix}{auto_summary}; llm: {llm_meta.get('summary', 'no change')}"
     except Exception as e:
         logger.debug("Curator LLM pass failed: %s", e, exc_info=True)
@@ -876,15 +946,25 @@ def _consolidation_pass(prefix: str, auto_summary: str, dry_run: bool, before_na
 
 def run_curator_review(
     on_summary: Optional[Callable[[str], None]] = None, synchronous: bool = False,
-    dry_run: bool = False, consolidate: Optional[bool] = None,
+    dry_run: bool = False, consolidate: Optional[bool] = None, llm_dry_run: Optional[bool] = None,
+    mark_previewed_on_success: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Execute a single curator review pass: (1) automatic state transitions (no LLM); (2) if *consolidate* and there are
     candidates, fork an AIAgent on the review prompt; (3) update .curator_state; (4) call *on_summary*.
     *synchronous* runs the LLM review in the calling thread (default: daemon thread). *consolidate* ``None`` reads
     ``curator.consolidate`` (OFF by default); when off only the deterministic prune runs — no fork, no aux cost.
     *dry_run* SKIPS the stale/archive transitions and instructs the fork to report only; REPORT.md is still written and
-    recorded in ``state.last_report_path`` so users can read what WOULD have happened."""
+    recorded in ``state.last_report_path`` so users can read what WOULD have happened. *llm_dry_run* (default: same as
+    *dry_run*) independently controls only whether the LLM fork itself runs report-only — this lets an event-triggered
+    size-ceiling preview (see ``maybe_run_curator``) request a preview-only consolidation fork for THIS cycle without
+    also skipping this cycle's real deterministic stale/archive prune, which *dry_run* alone would do.
+    *mark_previewed_on_success* is the exact list of size-ceiling-flagged skill names this pass is
+    previewing on their caller's behalf; each is only marked ``mark_consolidation_previewed`` AFTER
+    the LLM fork completes without error AND the report actually wrote — never optimistically at
+    call time, since this runs on a daemon thread by default and a crash/process-exit before that
+    point must leave the flag armed for the next cycle to retry, not silently suppressed."""
     consolidate = get_consolidate() if consolidate is None else consolidate
+    llm_dry_run = dry_run if llm_dry_run is None else llm_dry_run
     start = datetime.now(timezone.utc)
     if dry_run:  # count candidates without mutating state
         counts = {"checked": len(_safe_curated_report()), "marked_stale": 0, "archived": 0, "reactivated": 0}
@@ -906,7 +986,12 @@ def run_curator_review(
     # Persist before the LLM pass so a crash mid-review still records the run.
     # Dry-run does NOT bump last_run_at/run_count (a preview must not push the
     # next real pass out) but still records a summary for `hermes curator status`.
-    prefix = "dry-run auto: " if dry_run else "auto: "
+    if dry_run:
+        prefix = "dry-run auto: "
+    elif llm_dry_run and consolidate:
+        prefix = "auto (llm preview only): "
+    else:
+        prefix = "auto: "
     state = {**load_state(), "last_run_summary": f"{prefix}{auto_summary}"}
     if not dry_run:
         state.update(last_run_at=start.isoformat(), run_count=int(state.get("run_count", 0)) + 1)
@@ -917,7 +1002,7 @@ def run_curator_review(
         before_report = _safe_curated_report()
         before_names = set(_by_name(before_report))
         if consolidate:
-            final_summary, llm_meta = _consolidation_pass(prefix, auto_summary, dry_run, before_names)
+            final_summary, llm_meta = _consolidation_pass(prefix, auto_summary, llm_dry_run, before_names)
         else:
             # Prune-only run: record it and write a report, but never fork.
             final_summary = f"{prefix}{auto_summary}; llm: skipped (consolidation off)"
@@ -925,6 +1010,7 @@ def run_curator_review(
         elapsed = (datetime.now(timezone.utc) - start).total_seconds()
         state2 = {**load_state(), "last_run_duration_seconds": elapsed, "last_run_summary": final_summary}
         # Per-run report, best-effort; path recorded for `hermes curator status`.
+        report_path = None
         try:
             report_path = _write_run_report(
                 started_at=start, elapsed_seconds=elapsed, auto_counts=counts, auto_summary=auto_summary,
@@ -935,6 +1021,13 @@ def run_curator_review(
         except Exception as e:
             logger.debug("Curator report write failed: %s", e, exc_info=True)
         save_state(state2)
+        # Only mark previewed once the report the human is meant to read actually exists — a
+        # thread crash or process exit before this point must leave the flag armed so the next
+        # scheduled pass retries, not silently drop the preview.
+        if mark_previewed_on_success and report_path is not None and not llm_meta.get("error"):
+            for _name in mark_previewed_on_success:
+                with contextlib.suppress(Exception):
+                    mark_consolidation_previewed(_name)
         _notify(on_summary, f"curator: {final_summary}")
 
     if synchronous:
@@ -1010,9 +1103,12 @@ def _resolve_review_provider() -> tuple:
     return rp, model_name, provider, overrides
 
 
-def _run_llm_review(prompt: str) -> Dict[str, Any]:
+def _run_llm_review(prompt: str, dry_run: bool = False) -> Dict[str, Any]:
     """Spawn an AIAgent fork on the review prompt. Returns ``final`` (untruncated response), ``summary`` (240-char cap),
-    ``model``/``provider`` (what ran), ``tool_calls`` ([{name, arguments}], truncated) and ``error``. Never raises."""
+    ``model``/``provider`` (what ran), ``tool_calls`` ([{name, arguments}], truncated) and ``error``. Never raises.
+    *dry_run* tags the fork with a write-origin that skill_manage's guards mechanically refuse to
+    mutate through (see tools/skill_provenance.CURATOR_CONSOLIDATION_DRY_RUN) — the prompt banner
+    alone is advisory, this is the actual backstop."""
     result_meta: Dict[str, Any] = _llm_meta("")
     try:
         from run_agent import AIAgent
@@ -1043,10 +1139,14 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
         # Disable recursive nudges — the curator must never spawn its own review.
         review_agent._memory_nudge_interval = 0
         review_agent._skill_nudge_interval = 0
-        # Tag as autonomous background curation so skill_manage's background-review
-        # write guards (external/bundled/hub) fire; turn_context binds this onto
-        # the write-origin ContextVar at turn start.
-        review_agent._memory_write_origin = "background_review"
+        # Tag as autonomous curation so skill_manage's background-review write guards
+        # (external/bundled/hub) fire; turn_context binds this onto the write-origin
+        # ContextVar at turn start. The dry-run/live distinction matters: only the
+        # dry-run origin is mechanically blocked from every mutating call, and only
+        # the live-apply origin is exempt from the routine-pass size ceiling (this
+        # fork's whole job on a live run is to shrink an oversized skill).
+        from tools.skill_provenance import CURATOR_CONSOLIDATION, CURATOR_CONSOLIDATION_DRY_RUN
+        review_agent._memory_write_origin = CURATOR_CONSOLIDATION_DRY_RUN if dry_run else CURATOR_CONSOLIDATION
         # Silence the fork's tool-call chatter (CLI synchronous foreground runs).
         with open(os.devnull, "w", encoding="utf-8") as devnull, \
              contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
@@ -1073,12 +1173,29 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
 # --- Public entrypoint for the session-start hook ---
 
 def maybe_run_curator(*, idle_for_seconds: Optional[float] = None, on_summary: Optional[Callable[[str], None]] = None) -> Optional[Dict[str, Any]]:
-    """Best-effort: run a curator pass if all gates pass. Returns the result dict if a pass was started, else None. Never raises."""
+    """Best-effort: run a curator pass if all gates pass. Returns the result dict if a pass was started, else None. Never
+    raises. When ``curator.consolidate`` is off (the default) but the size-ceiling guard has flagged one or more
+    skills as over their configured limit, this cycle forks ONE preview-only consolidation pass on their behalf
+    (never applies) rather than staying silent — that's the mechanism that closes the "nobody noticed for months" gap
+    the 2026-09-06 anti-bloat design was written to fix. A profile with nothing flagged pays no added cost, ever.
+    NOTE: the fork still previews the FULL candidate library, not just the flagged skill(s) — narrowing the LLM's
+    candidate list would hide the cross-skill context a real consolidation decision needs (is there already an
+    umbrella this oversized skill's content belongs under? does another skill cover overlapping ground?). The flagged
+    skill(s) are simply what TRIGGERED this cycle's preview to run at all.
+    The flagged skills are only marked previewed by run_curator_review ITSELF, after its (possibly
+    async, daemon-thread) fork actually completes and writes a report — never here at call time,
+    since this function returns as soon as the pass is merely STARTED."""
     try:
         # Idle gating: only enforce when the caller provided a measurement.
         if not should_run_now() or (idle_for_seconds is not None and idle_for_seconds < get_min_idle_hours() * 3600.0):
             return None
-        return run_curator_review(on_summary=on_summary)
+        consolidate, llm_dry_run, mark_previewed = None, None, None
+        pending = skills_needing_consolidation_preview() if not get_consolidate() else []
+        if pending:
+            consolidate, llm_dry_run, mark_previewed = True, True, pending
+        return run_curator_review(
+            on_summary=on_summary, consolidate=consolidate, llm_dry_run=llm_dry_run,
+            mark_previewed_on_success=mark_previewed)
     except Exception as e:
         logger.debug("maybe_run_curator failed: %s", e, exc_info=True)
         return None

@@ -104,6 +104,25 @@ def test_adopt_subcommand_is_registered():
     assert named.all_unmanaged is False
 
 
+def test_status_shows_size_ceiling_config_and_flagged_skills(curator_status_env):
+    """`hermes curator status` surfaces both the ceiling config and any skill currently over
+    it — the human-visible half of the 2026-09-06 anti-bloat mechanism, so a flagged skill
+    doesn't only show up buried in a background report nobody reads."""
+    env = curator_status_env
+    out_clean = _capture_status(env["curator_cli"])
+    assert "size ceiling:" in out_clean
+    assert "40KB" in out_clean and "10 reference files" in out_clean
+    assert "over ceiling:" not in out_clean
+
+    from agent import curator as curator_module
+    curator_module.flag_consolidation_recommended(
+        "big-skill", size_bytes=50_000, ref_count=3)
+    out_flagged = _capture_status(env["curator_cli"])
+    assert "over ceiling:" in out_flagged
+    assert "big-skill" in out_flagged
+    assert "--consolidate" in out_flagged
+
+
 def test_list_unmanaged_itemizes_and_explains(curator_status_env):
     """`status` gives the count; this gives the names plus WHY each is
     unmanaged, so the user can decide what to adopt."""

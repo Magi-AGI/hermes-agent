@@ -28,8 +28,10 @@ from agent.skill_utils import (
     parse_frontmatter as _parse_frontmatter,
     SKILL_PROMPT_DESC_LIMIT)
 from tools.skill_manager_guards import (
-    _background_review_preflight, _background_review_read_before_write_guard, _background_review_write_guard,
-    _containing_skills_root, _curator_consolidation_delete_guard, _maybe_auto_propose_org_edit,
+    _background_review_preflight, _background_review_read_before_write_guard,
+    _background_review_size_ceiling_guard, _background_review_write_guard,
+    _containing_skills_root, _curator_consolidation_delete_guard, _curator_dry_run_mutation_guard,
+    _maybe_auto_propose_org_edit,
     _org_mirror_write_guard, _pinned_guard, _validate_delete_target, _is_background_review, _refusal as _err)
 from tools.skill_manager_batch import _skill_manage_batch
 from tools.skills_guard import scan_skill, should_allow_install, format_scan_report
@@ -332,13 +334,16 @@ def _locate_for_write(name: str, action: str, not_found_suffix: str = "", *,
 
 def _guarded_write(name: str, skill_dir: Path, target: Path, action: str, label: str,
                    content: str) -> Optional[Dict[str, Any]]:
-    """Read-before-write guard (existing targets only), atomic write, then the security scan;
-    a blocked scan restores the original (or unlinks a new file). Error dict or None."""
+    """Read-before-write guard (existing targets only), size-ceiling guard (routine self-improvement
+    pass only), atomic write, then the security scan; a blocked scan restores the original (or
+    unlinks a new file). Error dict or None."""
     original = None
     if target.exists():
         if read_guard := _background_review_read_before_write_guard(name, target, action, label):
             return read_guard
         original = target.read_text(encoding="utf-8")
+    if ceiling_guard := _background_review_size_ceiling_guard(name, skill_dir, target, action, content, original):
+        return ceiling_guard
     target.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(target, content, preserve_mode=True, create_mode=0o644)
     scan_error = _security_scan_skill(skill_dir)
@@ -730,6 +735,16 @@ def _record_success(action, name, result, *, file_path, absorbed_into, task_id,
     # Only AFTER the write gate passed (staged writes returned early): never push un-reviewed content.
     with suppress(Exception):
         _maybe_debounced_sync_push(name)
+    # A real (non-dry-run) curator consolidation mutation is the intended fix for an over-ceiling
+    # skill — clear its flag so the next scheduled pass doesn't keep proposing a preview for a
+    # skill that's already been shrunk. The routine self-improvement pass never reaches here for
+    # an over-ceiling skill (the size-ceiling guard would have refused it first), so this only
+    # ever fires for the consolidation-apply origin.
+    with suppress(Exception):
+        from tools.skill_provenance import CURATOR_CONSOLIDATION, get_current_write_origin
+        if get_current_write_origin() == CURATOR_CONSOLIDATION:
+            from agent import curator as _curator
+            _curator.clear_consolidation_flag(name)
 
 
 def skill_manage(
@@ -742,6 +757,8 @@ def skill_manage(
     if operations is not None:
         return _skill_manage_batch(
             operations, default_name=name or None, task_id=task_id, session_id=session_id)
+    if (dry_run_guard := _curator_dry_run_mutation_guard(action)) is not None:
+        return json.dumps(dry_run_guard, ensure_ascii=False)
     if (preflight := _background_review_preflight(action, name)) is not None:
         return json.dumps(preflight, ensure_ascii=False)
     # Approval gate: skills are too large to review inline, so they always stage regardless
