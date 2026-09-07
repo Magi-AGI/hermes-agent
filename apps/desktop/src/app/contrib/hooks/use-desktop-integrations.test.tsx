@@ -13,7 +13,10 @@ import { useDesktopIntegrations } from './use-desktop-integrations'
 // Mutable HUD-window flag so the restore tests can flip the window kind the
 // hook believes it runs in. Default false keeps the pre-existing restore
 // coverage exercising the real main-window path.
-const { hudWindowMock } = vi.hoisted(() => ({ hudWindowMock: vi.fn(() => false) }))
+const { hudWindowMock, peerWindowMock } = vi.hoisted(() => ({
+  hudWindowMock: vi.fn(() => false),
+  peerWindowMock: vi.fn(() => false)
+}))
 
 vi.mock('@/store/mcp-deeplink-install', () => ({
   requestMcpInstallFromDeepLink: vi.fn()
@@ -24,7 +27,8 @@ vi.mock('@/store/windows', async importOriginal => {
 
   return {
     ...actual,
-    isHudWindow: () => hudWindowMock()
+    isHudWindow: () => hudWindowMock(),
+    isPeerInstanceWindow: () => peerWindowMock()
   }
 })
 
@@ -48,8 +52,9 @@ describe('useDesktopIntegrations', () => {
     _resetLegacyDiscardForTests()
     vi.mocked(requestMcpInstallFromDeepLink).mockClear()
     navigate = vi.fn()
-    // Every test starts as a main window; only the HUD describe flips this.
+    // Every test starts as a main window; only the HUD/peer describes flip these.
     hudWindowMock.mockReturnValue(false)
+    peerWindowMock.mockReturnValue(false)
 
     // Stub the desktop bridge so the hook's useEffect callbacks don't try to
     // reach real Electron IPC. The established desktop-test pattern assigns a
@@ -335,6 +340,58 @@ describe('useDesktopIntegrations', () => {
       render({ profileReady: true, sessions: [session({ id: 'remembered-session', profile: 'default' })] })
 
       expect(navigate).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('peer instance window (?peer=1, #101450)', () => {
+    beforeEach(() => {
+      peerWindowMock.mockReturnValue(true)
+    })
+
+    it('does NOT resume the last-active session on cold boot at the fresh-chat route', () => {
+      window.localStorage.setItem('hermes.desktop.lastSessionId.profile.default', 'remembered-session')
+      window.localStorage.setItem('hermes.desktop.lastRoute.profile.default', '/remembered-session')
+
+      // A new instance window (Ctrl+Shift+N) must stay on the fresh chat it
+      // opened with, not silently re-home onto the profile's last session.
+      render({ profileReady: true, sessions: [session({ id: 'remembered-session', profile: 'default' })] })
+
+      expect(navigate).not.toHaveBeenCalled()
+    })
+
+    it('does NOT clobber the remembered route with its own cold-boot "/" before the user acts', () => {
+      window.localStorage.setItem('hermes.desktop.lastSessionId.profile.default', 'remembered-session')
+      window.localStorage.setItem('hermes.desktop.lastRoute.profile.default', '/remembered-session')
+
+      // If the write-logic ran on this first render, it would overwrite the
+      // primary window's remembered session/route with the peer's own blank
+      // '/', stranding the next cold start on a fresh chat instead of resuming.
+      render({ profileReady: true, sessions: [session({ id: 'remembered-session', profile: 'default' })] })
+
+      expect(window.localStorage.getItem('hermes.desktop.lastSessionId.profile.default')).toBe('remembered-session')
+      expect(window.localStorage.getItem('hermes.desktop.lastRoute.profile.default')).toBe('/remembered-session')
+    })
+
+    it('remembers real navigation inside the peer window from the next render on', () => {
+      const sessions = [session({ id: 'live', profile: 'default' })]
+      const result = render({ profileReady: true, sessions })
+
+      // Cold boot: the one-time latch skips restore + the write-logic below it.
+      expect(navigate).not.toHaveBeenCalled()
+
+      // The user opens a real session inside this peer window.
+      result.rerender({
+        activeProfile: 'default',
+        locationPathname: '/live',
+        profileReady: true,
+        resumeExhaustedSessionId: null,
+        resumeLastSession: true,
+        routedSessionId: 'live',
+        sessions
+      })
+
+      expect(window.localStorage.getItem('hermes.desktop.lastSessionId.profile.default')).toBe('live')
+      expect(window.localStorage.getItem('hermes.desktop.lastRoute.profile.default')).toBe('/live')
     })
   })
 
