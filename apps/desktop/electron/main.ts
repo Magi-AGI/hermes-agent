@@ -430,6 +430,7 @@ import {
   REOPEN_WINDOW_SETTLE_MS,
   waitForSessionWindowFunctionallyReady
 } from './session-reopen-gate'
+import { shouldSkipShrinkingSessionWindowsWrite } from './session-windows-persist-guard'
 import { ensureLoginShellPath } from './shell-path'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
 import { collectSshConfigHosts, parseSshGOutput } from './ssh-config'
@@ -3255,6 +3256,24 @@ function persistSessionWindowsState() {
     // is unaffected. (Trade-off: closing pop-outs individually down to zero no
     // longer auto-clears the saved set.)
     if (entries.length === 0) {
+      return
+    }
+
+    // Refuse a write that drops more than one entry from what's currently saved
+    // — see session-windows-persist-guard.ts for the full rationale.
+    // closeAllSessionWindows() itself is unaffected: it flushes its own
+    // full-state snapshot BEFORE closing anything (never shrinks), then
+    // suppresses every window's individual 'closed' handler so none of them
+    // reach this function again during the sweep.
+    const previousEntries = readSessionWindowsState()
+
+    if (shouldSkipShrinkingSessionWindowsWrite(previousEntries.length, entries.length)) {
+      rememberLog(
+        `[session-windows-state] refusing to shrink saved set from ${previousEntries.length} to ` +
+          `${entries.length} in one write (more than one window disappeared outside Close All) — ` +
+          'keeping the larger saved snapshot'
+      )
+
       return
     }
 
