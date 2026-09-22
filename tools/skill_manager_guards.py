@@ -286,9 +286,10 @@ def _background_review_size_ceiling_guard(
     tools.skill_provenance.is_routine_background_review) from growing an already-oversized skill
     further. Only fires on genuinely additive writes: a brand-new references/ file, or a
     patch/write_file to an existing file that makes it bigger. Shrinking edits and deletions are
-    always allowed, even over the ceiling — that's the direction this guard wants to encourage."""
-    from tools.skill_provenance import is_routine_background_review
-    if not is_routine_background_review():
+    always allowed, even over the ceiling — that's the direction this guard wants to encourage.
+    Magi: foreground sessions are bound too (a fix may land, growth may not)."""
+    from tools.skill_provenance import is_foreground, is_size_ceiling_bound
+    if not is_size_ceiling_bound():
         return None
     is_new_file = original is None
     is_growth = is_new_file or (isinstance(content, str) and len(content) > len(original or ""))
@@ -313,6 +314,13 @@ def _background_review_size_ceiling_guard(
     reason = ", ".join(
         r for r, cond in ((f"SKILL.md is {size_bytes / 1024:.1f}KB (ceiling {max_kb}KB)", over_size),
                           (f"references/ has {effective_ref_count} files (ceiling {max_refs})", over_refs)) if cond)
+    if is_foreground():
+        return _refusal(
+            f"Refusing {action} for skill '{name}': {reason}, and this write would grow it further. "
+            f"Over-ceiling skills may be corrected or condensed but not enlarged: make the edit "
+            f"replace or shorten existing text so the file does not get bigger, or fold the new "
+            f"file into an existing reference. Do not work around this with other file tools; if the "
+            f"addition is essential, tell the user the skill needs consolidation.")
     return _refusal(
         f"Refusing background review {action} for skill '{name}': {reason}, and this write "
         f"would grow it further. This skill needs consolidation, not another addition — a "

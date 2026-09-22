@@ -223,16 +223,25 @@ class TestSizeCeilingGuard:
                 raw = skill_manage(action="remove_file", name="big-skill", file_path="references/r0.md")
         assert json.loads(raw)["success"] is True
 
-    def test_foreground_writes_are_never_capped_by_the_ceiling(self, tmp_path, monkeypatch):
-        """Antigravity's actor-scope requirement: a user-directed session must be able to keep
-        extending a large skill it explicitly asked for — only the autonomous routine pass is
-        capped."""
+    def test_foreground_growth_of_an_oversized_skill_is_refused(self, tmp_path, monkeypatch):
+        """Magi 2026-09-22 (Lake): foreground sessions were the growth vector once the routine
+        pass was capped (supersedes the earlier foreground-exempt actor scope)."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
         with _skill_dir(tmp_path):
             _oversized_skill(tmp_path)
             raw = skill_manage(
                 action="patch", name="big-skill",
                 old_string="Do the thing.", new_string="Do the new thing, and here's a whole extra sentence.")
+        result = json.loads(raw)
+        assert result["success"] is False
+        assert "may be corrected or condensed but not enlarged" in json.dumps(result)
+
+    def test_foreground_non_growing_fix_to_an_oversized_skill_is_allowed(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        with _skill_dir(tmp_path):
+            _oversized_skill(tmp_path)
+            raw = skill_manage(action="patch", name="big-skill",
+                               old_string="Do the thing.", new_string="Do a thing.")
         assert json.loads(raw)["success"] is True
 
     def test_curator_live_consolidation_apply_is_never_capped_by_the_ceiling(self, tmp_path, monkeypatch):

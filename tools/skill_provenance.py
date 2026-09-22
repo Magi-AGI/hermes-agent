@@ -63,6 +63,17 @@ def is_unattended_review() -> bool:
     return is_background_review() and not _review_attended.get()
 
 
+def is_foreground() -> bool:
+    return get_current_write_origin() == "foreground"
+
+
+def is_size_ceiling_bound() -> bool:
+    """True for writers the size ceiling restrains: the routine self-improvement pass and (Magi)
+    foreground sessions, which were the actual growth vector once the routine pass was capped.
+    The curator's consolidation forks stay exempt — they are the remedy for an oversized skill."""
+    return is_routine_background_review() or is_foreground()
+
+
 def is_curator_dry_run() -> bool:
     """True only inside a curator preview (report-only) fork — every mutating skill_manage call
     must be mechanically refused here, not merely discouraged by the prompt."""
