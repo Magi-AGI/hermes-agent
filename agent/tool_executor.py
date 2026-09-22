@@ -125,6 +125,10 @@ _MAX_TOOL_WORKERS = 8  # concurrent worker threads per batch
 _DEFAULT_IMAGE_PARALLEL_REQUESTS = 4
 # Generous: slow-but-valid tool work must never be preempted by the batch guard.
 _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S = 420.0
+# How long a batch may sit with unresolved futures while NOTHING executes them (no future running,
+# no worker inside run_worker) before those slots are failed as orphaned. Keyed on idleness, not
+# elapsed tool time, so a legitimately long tool (terminal, delegated claude/codex) is never cut.
+_DEFAULT_ORPHANED_FUTURE_GRACE_S = 30.0
 # Long enough for an approval round-trip, short enough that one wedged dispatch can't starve the batch.
 _START_ORDER_GATE_TIMEOUT_S = 120.0
 # Fallback only; the effective bound derives from approvals.timeout (_authorization_gate_lock_timeout).
@@ -185,6 +189,20 @@ def _resolve_concurrent_tool_timeout() -> float | None:
         default=_DEFAULT_CONCURRENT_TOOL_TIMEOUT_S,
         env_var="HERMES_CONCURRENT_TOOL_TIMEOUT_S",
     )
+
+
+def _resolve_orphaned_future_grace() -> float | None:
+    """Idle window before unresolved futures count as orphaned: ``HERMES_TOOL_ORPHAN_GRACE_S``
+    overrides the default; ``0``/negative disables detection."""
+    raw = os.environ.get("HERMES_TOOL_ORPHAN_GRACE_S")
+    if raw is None or not raw.strip():
+        return _DEFAULT_ORPHANED_FUTURE_GRACE_S
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("ignoring invalid HERMES_TOOL_ORPHAN_GRACE_S=%r", raw)
+        return _DEFAULT_ORPHANED_FUTURE_GRACE_S
+    return value if value > 0 else None
 
 
 def _flush_session_db_after_tool_progress(agent, messages: list, *, stage: str) -> bool:
@@ -1247,6 +1265,8 @@ class _ConcurrentBatch:
     """Shared state of one concurrent tool batch: per-slot results, the start-order and
     authorization gates, and the deadline bookkeeping the wait loop needs."""
 
+    poll_interval_s = 5.0  # wait-loop tick: heartbeats, interrupt checks, orphan detection
+
     def __init__(self, agent, messages: list, effective_task_id: str, parsed_calls: list[_ParsedCall], timeout_s: float | None) -> None:
         self.agent = agent
         self.messages = messages
@@ -1260,6 +1280,11 @@ class _ConcurrentBatch:
         self.gate = _StartOrderGate(_start_order_gate_timeout(timeout_s))
         self.authorization_gate = _ConcurrentToolAuthorizationGate()
         self.timed_out_indices: set[int] = set()
+        self.orphaned_indices: set[int] = set()
+        self.orphan_grace_s = _resolve_orphaned_future_grace()
+        # Workers currently inside run_worker (including gate-parked / awaiting approval).
+        self._inflight_lock = threading.Lock()
+        self._inflight_workers = 0
 
     def _dispatch_worker(self, index: int, ref: _ToolCallRef, scope_block, start_gate: _WorkerStartOnce) -> Optional[_ToolOutcome]:
         """Run one call through the middleware and synthesize its slot outcome; ``None`` when
@@ -1317,6 +1342,19 @@ class _ConcurrentBatch:
 
     def run_worker(self, index: int, start_order: int) -> None:
         """Worker function executed in a thread."""
+        with self._inflight_lock:
+            self._inflight_workers += 1
+        try:
+            self._run_worker_body(index, start_order)
+        finally:
+            with self._inflight_lock:
+                self._inflight_workers -= 1
+
+    def inflight_workers(self) -> int:
+        with self._inflight_lock:
+            return self._inflight_workers
+
+    def _run_worker_body(self, index: int, start_order: int) -> None:
         agent, pc = self.agent, self.parsed_calls[index]
         with _registered_tool_worker(agent) as _worker_tid:
             # An interrupt may have fanned out before our registration; apply it to our tid.
@@ -1361,13 +1399,25 @@ class _ConcurrentBatch:
     def _running_names(self, not_done, future_to_index) -> list[str]:
         return [self.parsed_calls[future_to_index[f]].name for f in not_done if f in future_to_index]
 
+    def _nothing_executing(self, not_done) -> bool:
+        """True when unresolved futures exist but none is running and no worker is inside
+        run_worker — i.e. nothing will ever resolve them (lost submit / lost wakeup)."""
+        return bool(not_done) and self.inflight_workers() == 0 and not any(f.running() for f in not_done)
+
+    def _orphaned(self, not_done, idle_since: float | None) -> bool:
+        if self.orphan_grace_s is None or idle_since is None:
+            return False
+        # Re-check now: the idle observation must still hold at decision time.
+        return self._nothing_executing(not_done) and time.monotonic() - idle_since >= self.orphan_grace_s
+
     def await_completion(self, futures, future_to_index, deadline: float | None) -> bool:
         """Wait with periodic heartbeats and interrupt checks; True when the batch was
         abandoned (deadline or interrupt) and the executor must not join its workers."""
         agent = self.agent
         _conc_start = time.time()
+        idle_since: float | None = None
         while True:
-            wait_timeout = 5.0
+            wait_timeout = self.poll_interval_s
             if deadline is not None:
                 remaining = deadline + self.authorization_gate.excluded_seconds() - time.monotonic()
                 if remaining <= 0:
@@ -1395,7 +1445,20 @@ class _ConcurrentBatch:
                     f"{agent.log_prefix}⚡ Interrupt: cancelling {len(not_done)} pending concurrent tool(s)",
                     force=True,
                 )
+            elif self._orphaned(not_done, idle_since):
+                self.orphaned_indices = {future_to_index[f] for f in not_done if f in future_to_index}
+                logger.error(
+                    "concurrent tool batch has %d unresolved future(s) with no worker executing them "
+                    "for %.0fs; failing them as orphaned: %s",
+                    len(self.orphaned_indices), self.orphan_grace_s,
+                    ", ".join(self._running_names(not_done, future_to_index)[:5]),
+                )
             else:
+                if self.orphan_grace_s is not None and self._nothing_executing(not_done):
+                    if idle_since is None:
+                        idle_since = time.monotonic()
+                else:
+                    idle_since = None
                 _conc_elapsed = int(time.time() - _conc_start)
                 # Heartbeat every ~30s (6 × 5s poll intervals)
                 if _conc_elapsed > 0 and _conc_elapsed % 30 < 6:
@@ -1441,7 +1504,7 @@ class _ConcurrentBatch:
             executor.shutdown(wait=not abandon_executor, cancel_futures=abandon_executor)
 
 
-def _unfinished_tool_result(agent, ref: _ToolCallRef, *, timed_out: bool, timeout_s: float | None) -> tuple[str, float, Optional[str]]:
+def _unfinished_tool_result(agent, ref: _ToolCallRef, *, timed_out: bool, timeout_s: float | None, orphaned: bool = False) -> tuple[str, float, Optional[str]]:
     """Synthesize the result for a slot no worker filled (deadline, interrupt, or a thread
     that never returned), emit its terminal post_tool_call, and return
     ``(function_result, tool_duration, effect_disposition)``."""
@@ -1450,6 +1513,13 @@ def _unfinished_tool_result(agent, ref: _ToolCallRef, *, timed_out: bool, timeou
         function_result = f"Error executing tool '{ref.name}': timed out after {suffix}"
         outcome = dict(duration_ms=int((timeout_s or 0.0) * 1000), status="timeout", error_type="tool_timeout", error_message=function_result)
         tool_duration, effect_disposition = float(timeout_s or 0.0), "unknown"
+    elif orphaned:
+        function_result = (
+            f"Error executing tool '{ref.name}': the tool call was never executed "
+            "(no worker picked it up; orphaned future). It is safe to retry this call."
+        )
+        outcome = dict(status="error", error_type="tool_orphaned_future", error_message=function_result)
+        tool_duration, effect_disposition = 0.0, "none"
     elif agent._interrupt_requested:
         function_result = f"[Tool execution cancelled — {ref.name} was skipped due to user interrupt]"
         outcome = dict(status="cancelled", error_type="keyboard_interrupt", error_message="Tool execution cancelled by user interrupt")
@@ -1473,6 +1543,7 @@ def _append_batch_results(agent, messages: list, effective_task_id: str, batch: 
             ref, is_error, blocked = pc.ref(effective_task_id), True, False
             function_result, tool_duration, effect_disposition = _unfinished_tool_result(
                 agent, ref, timed_out=i in batch.timed_out_indices, timeout_s=batch.timeout_s,
+                orphaned=i in batch.orphaned_indices,
             )
         else:
             ref, function_result, tool_duration, is_error, blocked = r.ref, r.result, r.duration, r.is_error, r.blocked
