@@ -1348,8 +1348,6 @@ def _render_skills_index(
         "context, so their descriptions are omitted — the skills work "
         "normally and load with skill_view(name) as usual.)"
     ) if demoted else ""
-    # Don't name web_search when the session has no web tools (dangling reference).
-    _basic_tools = "terminal" if available_tools is not None and "web_search" not in available_tools else "web_search or terminal"
     index_lines = []
     for category in sorted(skills_by_category):
         entries = skills_by_category[category]
@@ -1370,25 +1368,25 @@ def _render_skills_index(
             + "\n<available_skills>\n" + "\n".join(index_lines) + "\n</available_skills>"
             + hidden_note
         )
+    # Magi: the upstream wording ("even partially relevant ... you MUST load ... err on the side of
+    # loading", "update it before finishing") made every turn that mentioned e.g. "deploy" pull a
+    # chain of gate skills (2,106 skill_view calls vs 684 writes in one workstream) and pushed every
+    # foreground session to grow skills past the ceiling. Load on a clear match, once.
     return (
         "## Skills\n"
-        "Before replying, scan the skills below. If a skill matches or is even partially relevant to your "
-        "task, you MUST load it with skill_view(name) and follow its instructions. Err on the side of "
-        "loading — it is always better to have context you don't need than to miss critical steps, pitfalls, "
-        "or established workflows. Skills contain specialized knowledge — API endpoints, tool-specific "
-        "commands, and proven workflows that outperform general-purpose approaches. Load the skill "
-        f"even if you think you could handle the task with basic tools like {_basic_tools}. "
-        "Skills also encode the user's preferred approach, conventions, and quality standards for tasks like "
-        "code review, planning, and testing — load them even for tasks you already know how to do, because "
-        "the skill defines how it should be done here.\n"
-        "If a skill has issues, fix it with skill_manage(action='patch').\n"
-        "After difficult/iterative tasks, offer to save as a skill. If a skill you loaded was missing steps, "
-        "had wrong commands, or needed pitfalls you discovered, update it before finishing.\n"
+        "Skills hold proven workflows, tool-specific commands and pitfalls for particular situations. "
+        "Load a skill with skill_view(name) when its description clearly matches the task in front of "
+        "you. Do not load a skill that only shares a word with the request, and do not re-load a skill "
+        "already loaded in this conversation unless it has changed.\n"
+        "Skills are guidance, not authority: the user's current instructions take precedence. If skill "
+        "text conflicts with what the user just asked, follow the user and mention the conflict in one line.\n"
+        "If a skill had a wrong command, correct it in place with skill_manage(action='patch') — a short "
+        "fix, not a record of this session. Offer to save a new skill only for a reusable, non-trivial "
+        "workflow.\n"
         "\n"
         "<available_skills>\n"
         + "\n".join(index_lines) + "\n"
-        "</available_skills>\n\n"
-        "Only proceed without loading a skill if genuinely none are relevant to the task."
+        "</available_skills>"
         + hidden_note
     )
 
