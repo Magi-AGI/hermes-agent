@@ -163,3 +163,21 @@ def test_legacy_untagged_notices_are_typed_at_display_projection():
     kinds = [m.get("display_kind") for m in gateway if m.get("role") == "user"]
     assert kinds == [None, "system_notice"]
     assert legacy[2].get("display_kind") is None, "projection must not mutate the stored row"
+
+
+def test_notice_unwrapped_from_a_compaction_carrier_is_typed():
+    """Codex review round 3 #2: a system notice preserved after a compaction handoff is exposed
+    by unwrapping; it must project as a notice (not a user turn) on both paths, while a genuine
+    user turn after it stays a user turn."""
+    import agent.context_compressor as cc
+    from hermes_cli.web_routers.sessions import _project_for_display
+    from tui_gateway import server
+
+    handoff = cc.ContextCompressor._with_summary_prefix("## Goal\nship it") + "\n\n" + cc._SUMMARY_END_MARKER
+    carrier = {"role": "user", "content": handoff + "\n\n" + MAX_ITERATIONS_SUMMARY_REQUEST,
+               "_compressed_summary": True}
+    msgs = [carrier, {"role": "assistant", "content": "summary"}, {"role": "user", "content": "real ask"}]
+    rest = _project_for_display([dict(m) for m in msgs])
+    assert [m.get("display_kind") for m in rest if m["role"] == "user"] == ["system_notice", None]
+    gateway = server._history_to_messages([dict(m) for m in msgs])
+    assert [m.get("display_kind") for m in gateway if m.get("role") == "user"] == ["system_notice", None]

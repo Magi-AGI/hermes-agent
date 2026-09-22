@@ -66,10 +66,11 @@ def project_compaction_message_for_display(message: Dict[str, Any]) -> Optional[
     """
     if not isinstance(message, dict):
         return None
+    from agent.system_turn_display import tag_system_injected_user_turn
+
     if not is_compaction_summary_message(message):
         projected = message.copy()
         # Rows written before write-time tagging: type them here so display and rewind counting agree.
-        from agent.system_turn_display import tag_system_injected_user_turn
         tag_system_injected_user_turn(projected)
         return mark_restated_request(projected)
 
@@ -81,4 +82,6 @@ def project_compaction_message_for_display(message: Dict[str, Any]) -> Optional[
     for key in _COMPACTION_INTERNAL_FIELDS:
         projected.pop(key, None)
     projected.pop("display_kind", None)
+    # A system notice preserved inside the carrier is still a notice once unwrapped.
+    tag_system_injected_user_turn(projected)
     return mark_restated_request(projected)

@@ -542,7 +542,10 @@ def _project_for_display(messages: list) -> list:
             # wrapper must not hide a successfully recovered live ask.
             projected["display_content"] = display_view.get("content")
             projected.pop("display_kind", None)
-            if (display_view.get("display_metadata") or {}).get(RESTATED_REQUEST_DISPLAY_KEY):
+            if display_view.get("display_kind"):  # an unwrapped system notice keeps its type
+                projected["display_kind"] = display_view["display_kind"]
+                projected["display_metadata"] = display_view.get("display_metadata")
+            elif (display_view.get("display_metadata") or {}).get(RESTATED_REQUEST_DISPLAY_KEY):
                 projected["display_metadata"] = display_view["display_metadata"]
         projected_messages.append(projected)
     return projected_messages
