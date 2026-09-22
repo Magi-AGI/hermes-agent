@@ -16,6 +16,15 @@ from tools import mcp_tool_sampling as _sampling
 logger = logging.getLogger("tools.mcp_tool")
 
 
+def _pin_background_oauth() -> None:
+    """Best-effort :func:`tools.mcp_oauth.enter_background_oauth_mode` (OAuth module optional)."""
+    try:
+        from tools.mcp_oauth import enter_background_oauth_mode
+    except Exception:  # pragma: no cover - OAuth support unavailable
+        return
+    enter_background_oauth_mode()
+
+
 @dataclass
 class _RetryBudget:
     """Per-run() retry counters (``_reconnect_retries`` stays on the task: handlers/tests read it)."""
@@ -334,7 +343,15 @@ class MCPServerRunMixin:
         self._reconnect_retries = 0
         budget = _RetryBudget()
         rebuild = False
+        first_attempt = True
         while True:
+            if not first_attempt:
+                # Reconnects/revivals are background work: never an interactive OAuth flow, whatever
+                # context created this task (a login's forced-interactive/dashboard context would
+                # otherwise park each reconnect in the 300 s callback wait). The first connect keeps
+                # the creator's context so `hermes mcp login` / dashboard auth still work.
+                _pin_background_oauth()
+            first_attempt = False
             try:
                 if rebuild:
                     config = self._refresh_remote_config(config)

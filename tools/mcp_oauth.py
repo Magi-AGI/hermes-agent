@@ -373,6 +373,26 @@ def suppress_interactive_oauth():
     return _contextvar_set(_oauth_interactive_enabled, False)
 
 
+def enter_background_oauth_mode() -> None:
+    """Pin the CURRENT context to non-interactive OAuth, with no dashboard flow, for its remaining life.
+
+    For long-lived MCP server tasks: a task copies its creator's context, so one created inside a
+    login (``force_interactive_oauth`` / ``dashboard_oauth_flow``) would otherwise run every later
+    keepalive reconnect as an interactive authorization-code flow and park the reconnect in the 300 s
+    callback wait (live: 2026-09-16 08:31:33 -> 08:35:35). Deliberately not reset: a task's context
+    is private, so this cannot leak back to the caller that created the task."""
+    from tools.mcp_dashboard_oauth import _current_dashboard_flow
+
+    _oauth_interactive_enabled.set(False)
+    _oauth_interactive_forced.set(False)
+    _current_dashboard_flow.set(None)
+
+
+def _active_dashboard_flow():
+    """The dashboard flow, unless interactive OAuth is suppressed (suppression always wins)."""
+    return get_dashboard_oauth_flow() if _oauth_interactive_enabled.get() else None
+
+
 def _can_open_browser() -> bool:
     """True if opening a browser is likely to work."""
     if os.environ.get("SSH_CLIENT") or os.environ.get("SSH_TTY"):
@@ -791,7 +811,7 @@ def _make_redirect_handler(port: int, redirect_uri: str | None = None, redirect_
     when multiple MCP servers run OAuth concurrently (fixes #44588).
     """
     async def _redirect_handler(authorization_url: str) -> None:
-        dashboard_flow = get_dashboard_oauth_flow()
+        dashboard_flow = _active_dashboard_flow()
         if dashboard_flow is not None:
             await dashboard_flow.publish_authorization_url(authorization_url)
             return
@@ -863,7 +883,7 @@ def _make_callback_waiter(port: int, cimd_url: str | None = None, timeout: float
     redirect-handler fix).
     """
     async def _wait():
-        dashboard_flow = get_dashboard_oauth_flow()
+        dashboard_flow = _active_dashboard_flow()
         if dashboard_flow is not None and not port:
             # Dashboard flow speaks the legacy tuple; normalize to one shape. A pinned loopback port
             # (pre-registered client) listens locally instead; the dashboard only shows the URL.
