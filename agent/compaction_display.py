@@ -67,7 +67,11 @@ def project_compaction_message_for_display(message: Dict[str, Any]) -> Optional[
     if not isinstance(message, dict):
         return None
     if not is_compaction_summary_message(message):
-        return mark_restated_request(message.copy())
+        projected = message.copy()
+        # Rows written before write-time tagging: type them here so display and rewind counting agree.
+        from agent.system_turn_display import tag_system_injected_user_turn
+        tag_system_injected_user_turn(projected)
+        return mark_restated_request(projected)
 
     projected = ContextCompressor._strip_context_summary_handoff_message(message)
     if projected is None:

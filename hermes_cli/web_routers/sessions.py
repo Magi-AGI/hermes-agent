@@ -516,10 +516,15 @@ def _project_for_display(messages: list) -> list:
         RESTATED_REQUEST_DISPLAY_KEY, mark_restated_request, project_compaction_message_for_display,
     )
     from agent.context_compressor import is_compaction_summary_message
+    from agent.system_turn_display import classify_system_injected_user_turn
 
     projected_messages = []
     for message in messages:
         if not is_compaction_summary_message(message):
+            # Rows written before write-time tagging: type them at projection time (copy, not the row).
+            if (legacy := classify_system_injected_user_turn(message)) is not None:
+                message = {**message, "display_kind": legacy["display_kind"],
+                           "display_metadata": message.get("display_metadata") or legacy["display_metadata"]}
             marked = mark_restated_request(message)
             if marked is not message:  # standalone in-flight replay row: flag it, keep physical content
                 marked = {**message, "display_content": marked["content"],

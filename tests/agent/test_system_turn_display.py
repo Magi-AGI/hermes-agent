@@ -147,3 +147,19 @@ def test_backfill_hides_pure_handoffs_but_leaves_restated_request_carriers_addre
     rows = db.get_messages_as_conversation("s1")
     db.close()
     assert [r.get("display_kind") for r in rows] == ["hidden", None, None]
+
+
+def test_legacy_untagged_notices_are_typed_at_display_projection():
+    """Codex review #13: rows written before write-time tagging must still project as system
+    notices on both display paths, so desktop and backend rewind counting agree without a backfill."""
+    from hermes_cli.web_routers.sessions import _project_for_display
+    from tui_gateway import server
+
+    legacy = [{"role": "user", "content": "real ask"}, {"role": "assistant", "content": "ok"},
+              {"role": "user", "content": MAX_ITERATIONS_SUMMARY_REQUEST}]
+    rest = _project_for_display([dict(m) for m in legacy])
+    assert [m.get("display_kind") for m in rest] == [None, None, "system_notice"]
+    gateway = server._history_to_messages([dict(m) for m in legacy])
+    kinds = [m.get("display_kind") for m in gateway if m.get("role") == "user"]
+    assert kinds == [None, "system_notice"]
+    assert legacy[2].get("display_kind") is None, "projection must not mutate the stored row"
