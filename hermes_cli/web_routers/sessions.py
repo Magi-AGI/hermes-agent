@@ -512,13 +512,19 @@ async def get_session_latest_descendant(session_id: str, profile: Optional[str] 
 
 def _project_for_display(messages: list) -> list:
     """Replace compaction summaries with their display-only projection."""
-    from agent.compaction_display import project_compaction_message_for_display
+    from agent.compaction_display import (
+        RESTATED_REQUEST_DISPLAY_KEY, mark_restated_request, project_compaction_message_for_display,
+    )
     from agent.context_compressor import is_compaction_summary_message
 
     projected_messages = []
     for message in messages:
         if not is_compaction_summary_message(message):
-            projected_messages.append(message)
+            marked = mark_restated_request(message)
+            if marked is not message:  # standalone in-flight replay row: flag it, keep physical content
+                marked = {**message, "display_content": marked["content"],
+                          "display_metadata": marked["display_metadata"]}
+            projected_messages.append(marked)
             continue
         display_view = project_compaction_message_for_display(message)
         projected = message.copy()
@@ -531,6 +537,8 @@ def _project_for_display(messages: list) -> list:
             # wrapper must not hide a successfully recovered live ask.
             projected["display_content"] = display_view.get("content")
             projected.pop("display_kind", None)
+            if (display_view.get("display_metadata") or {}).get(RESTATED_REQUEST_DISPLAY_KEY):
+                projected["display_metadata"] = display_view["display_metadata"]
         projected_messages.append(projected)
     return projected_messages
 

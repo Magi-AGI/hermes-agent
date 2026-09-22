@@ -599,6 +599,7 @@ export type TimelineDisplayMetadata =
   | { display_text: string }
   | { reactions: MessageReaction[] }
   | { notice: string }
+  | { compaction_restated: true; reactions?: MessageReaction[] }
 
 /** One emoji reaction on a message. One per author, iOS-Tapback style. */
 export interface MessageReaction {

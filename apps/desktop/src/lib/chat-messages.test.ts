@@ -488,6 +488,26 @@ describe('toChatMessages', () => {
     ])
   })
 
+  // Mid-turn compaction restates the unfinished request after the handoff. It
+  // must stay a user turn (rewind ordinals) but never look freshly re-sent.
+  it('labels a compaction-restated request instead of presenting it as new input', () => {
+    const messages = toChatMessages([
+      { role: 'user', content: 'Continue with C2-2.', timestamp: 1 },
+      { role: 'assistant', content: 'working', timestamp: 2 },
+      {
+        role: 'user',
+        content: '[CONTEXT COMPACTION — REFERENCE ONLY] …opaque carrier…',
+        display_content: 'Continue with C2-2.',
+        display_metadata: { compaction_restated: true },
+        timestamp: 3
+      }
+    ])
+
+    expect(messages.map(message => message.role)).toEqual(['user', 'assistant', 'system', 'user'])
+    expect(chatMessageText(messages[2])).toBe('context compacted; unfinished request restated')
+    expect(chatMessageText(messages[3])).toBe('Continue with C2-2.')
+  })
+
   // A backend older than this app serves display_metadata as unparsed JSON
   // text. Indexing into that string used to throw and fail the whole resume.
   it.each([

@@ -30,18 +30,44 @@ _COMPACTION_INTERNAL_FIELDS = (
 )
 
 
+RESTATED_REQUEST_DISPLAY_KEY = "compaction_restated"
+
+
+def mark_restated_request(message: Dict[str, Any]) -> Dict[str, Any]:
+    """Flag a compaction in-flight replay (#100818) so it never reads as newly typed input.
+
+    Compaction mid-turn restates the unfinished request after the handoff, headed by
+    ``_INFLIGHT_TASK_REPLAY_HEADER`` (merged onto the carrier, or as its own row). It stays a user
+    turn for the model and for rewind ordinals (``user_originated_turn_view``), so the row keeps its
+    role; the display copy drops the scaffold header and carries ``display_metadata.compaction_restated``
+    so clients can say it was restated, not sent again. Returns a new dict only when it changes.
+    """
+    from agent.context_compressor import _INFLIGHT_TASK_REPLAY_HEADER
+    content = message.get("content")
+    if message.get("role") != "user" or not isinstance(content, str):
+        return message
+    stripped = content.lstrip()
+    if not stripped.startswith(_INFLIGHT_TASK_REPLAY_HEADER):
+        return message
+    marked = message.copy()
+    marked["content"] = stripped[len(_INFLIGHT_TASK_REPLAY_HEADER):].strip()
+    metadata = message.get("display_metadata")
+    marked["display_metadata"] = {**(metadata if isinstance(metadata, dict) else {}), RESTATED_REQUEST_DISPLAY_KEY: True}
+    return marked
+
+
 def project_compaction_message_for_display(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Return authentic transcript content, or ``None`` for a pure handoff.
 
     Model-facing recovery history retains the complete carrier. Display
     projections instead remove the handoff, inherited tool state, and internal
     reasoning while preserving any real prior-tail content or live user ask
-    embedded in the carrier.
+    embedded in the carrier; an in-flight replay is flagged as restated.
     """
     if not isinstance(message, dict):
         return None
     if not is_compaction_summary_message(message):
-        return message.copy()
+        return mark_restated_request(message.copy())
 
     projected = ContextCompressor._strip_context_summary_handoff_message(message)
     if projected is None:
@@ -51,4 +77,4 @@ def project_compaction_message_for_display(message: Dict[str, Any]) -> Optional[
     for key in _COMPACTION_INTERNAL_FIELDS:
         projected.pop(key, None)
     projected.pop("display_kind", None)
-    return projected
+    return mark_restated_request(projected)

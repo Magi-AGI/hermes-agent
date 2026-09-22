@@ -472,6 +472,17 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       flushPendingTools(index)
     }
 
+    // A compaction in-flight replay stays a user turn (the backend counts it for rewind ordinals),
+    // but it is the unfinished request restated, not something the user just sent again.
+    if (displayRole === 'user' && parseDisplayMetadata(message.display_metadata)?.compaction_restated === true) {
+      result.push({
+        id: `${message.timestamp || Date.now()}-${index}-restated`,
+        role: 'system',
+        parts: [textPart('context compacted; unfinished request restated', message.timestamp)],
+        timestamp: message.timestamp
+      })
+    }
+
     const reactions = messageReactions(message.display_metadata)
     // Gateway resume names the durable row id `row_id`; the REST transcript
     // prefetch ships the same messages.id as a numeric `id`. Either one lets

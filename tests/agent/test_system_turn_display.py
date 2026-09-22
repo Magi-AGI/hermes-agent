@@ -117,3 +117,33 @@ def test_backfill_types_legacy_rows_idempotently_and_dry_runs_by_default(tmp_pat
     db.close()
     assert [r.get("display_kind") for r in rows] == [None, None, "system_notice", "system_notice"]
     assert [r["content"] for r in rows] == ["real ask", "ok", BACKGROUND_NOTICE, MAX_ITERATIONS_SUMMARY_REQUEST]
+
+
+def test_backfill_hides_pure_handoffs_but_leaves_restated_request_carriers_addressable(tmp_path):
+    """Only a handoff with no live view gets the "hidden" live writes give it; a #100818 replay carrier is a
+    user turn for rewind ordinals and must stay untyped."""
+    import importlib.util
+
+    import agent.context_compressor as cc
+
+    spec = importlib.util.spec_from_file_location(
+        "backfill_system_notice_display_kind",
+        Path(__file__).resolve().parents[2] / "scripts" / "backfill_system_notice_display_kind.py")
+    backfill = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(backfill)
+
+    handoff = cc.ContextCompressor._with_summary_prefix("## Goal\n" + "x" * 9000) + "\n\n" + cc._SUMMARY_END_MARKER
+    carrier = handoff + "\n\n" + cc._INFLIGHT_TASK_REPLAY_HEADER + "\n\nContinue with C2-2."
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path)
+    db.create_session(session_id="s1", source="desktop", model="m")
+    db.append_message("s1", role="user", content=handoff, _compressed_summary=True)
+    db.append_message("s1", role="assistant", content="ok")
+    db.append_message("s1", role="user", content=carrier, _compressed_summary=True)
+    db.close()
+
+    assert backfill.backfill(db_path, apply=True) == {"compaction_handoff": 1}
+    db = SessionDB(db_path)
+    rows = db.get_messages_as_conversation("s1")
+    db.close()
+    assert [r.get("display_kind") for r in rows] == ["hidden", None, None]

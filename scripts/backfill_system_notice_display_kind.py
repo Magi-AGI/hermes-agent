@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Opt-in backfill: type historical system-injected user rows as ``display_kind='system_notice'``.
+"""Opt-in backfill: type historical system-injected user rows (``system_notice``) and pure compaction handoffs (``hidden``).
 
 Rows written before ``agent/system_turn_display.py`` existed carry ``display_kind=NULL``, so the
 desktop still paints old max-iterations requests, background-process notices and todo snapshots as
@@ -36,10 +36,20 @@ _HEAD_CHARS = 8192
 _BATCH = 500
 
 
-def _classify(raw: str):
+def _classify(raw: str, compressed_summary: bool):
+    """``(display_kind, display_metadata, count_label)`` for a row live writes would have typed, else None."""
+    from agent.context_compressor import COMPRESSED_SUMMARY_METADATA_KEY, user_originated_turn_view
     from agent.system_turn_display import classify_system_injected_user_turn
     from hermes_state import SessionDB
-    return classify_system_injected_user_turn({"role": "user", "content": SessionDB._decode_content(raw)})
+    msg = {"role": "user", "content": SessionDB._decode_content(raw)}
+    if compressed_summary:
+        # A PURE handoff is persisted "hidden" by live writes (_summary_display_kind). A carrier with a live
+        # view (e.g. the #100818 in-flight replay) stays untyped: any kind would drop it from the user-turn
+        # ordinals rewind addresses; display projections flag it instead (compaction_restated).
+        msg[COMPRESSED_SUMMARY_METADATA_KEY] = True
+        return ("hidden", None, "compaction_handoff") if user_originated_turn_view(msg) is None else None
+    tag = classify_system_injected_user_turn(msg)
+    return None if tag is None else (tag["display_kind"], tag["display_metadata"], tag["display_metadata"]["notice"])
 
 
 def backfill(db_path: Path, *, apply: bool, session_id: str | None = None) -> collections.Counter:
@@ -47,24 +57,26 @@ def backfill(db_path: Path, *, apply: bool, session_id: str | None = None) -> co
     conn = sqlite3.connect(str(db_path), timeout=30)
     try:
         conn.execute("PRAGMA busy_timeout = 30000")
-        sql = ("SELECT id, length(content), substr(content, 1, ?) FROM messages "
+        sql = ("SELECT id, length(content), substr(content, 1, ?), _compressed_summary FROM messages "
                "WHERE role = 'user' AND (display_kind IS NULL OR display_kind = '') AND content IS NOT NULL")
         params: list = [_HEAD_CHARS]
         if session_id:
             sql += " AND session_id = ?"
             params.append(session_id)
         from hermes_state import SessionDB
-        pending: list[tuple[str, str, int]] = []
+        pending: list[tuple[str, str | None, int]] = []
         counts: collections.Counter = collections.Counter()
-        for row_id, length, head in conn.execute(sql, params):  # streamed: state.db can hold GBs of rows
+        for row_id, length, head, compressed in conn.execute(sql, params):  # streamed: state.db can be GBs
             raw = head
-            if length > _HEAD_CHARS and head.startswith(SessionDB._CONTENT_JSON_PREFIX):  # JSON parts need it whole
+            # Handoffs need the whole body (the live view follows the final end marker); so do JSON parts.
+            if length > _HEAD_CHARS and (compressed or head.startswith(SessionDB._CONTENT_JSON_PREFIX)):
                 raw = conn.execute("SELECT content FROM messages WHERE id = ?", (row_id,)).fetchone()[0]
-            tag = _classify(raw)
+            tag = _classify(raw, bool(compressed))
             if tag is None:
                 continue
-            counts[tag["display_metadata"]["notice"]] += 1
-            pending.append((tag["display_kind"], json.dumps(tag["display_metadata"]), row_id))
+            kind, metadata, label = tag
+            counts[label] += 1
+            pending.append((kind, None if metadata is None else json.dumps(metadata), row_id))
         if apply:
             for start in range(0, len(pending), _BATCH):
                 with conn:
