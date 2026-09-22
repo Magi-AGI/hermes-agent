@@ -44,13 +44,30 @@ def mark_restated_request(message: Dict[str, Any]) -> Dict[str, Any]:
     """
     from agent.context_compressor import _INFLIGHT_TASK_REPLAY_HEADER
     content = message.get("content")
-    if message.get("role") != "user" or not isinstance(content, str):
+    if message.get("role") != "user":
         return message
-    stripped = content.lstrip()
-    if not stripped.startswith(_INFLIGHT_TASK_REPLAY_HEADER):
+    if isinstance(content, str):
+        stripped = content.lstrip()
+        if not stripped.startswith(_INFLIGHT_TASK_REPLAY_HEADER):
+            return message
+        new_content: Any = stripped[len(_INFLIGHT_TASK_REPLAY_HEADER):].strip()
+    elif isinstance(content, list):
+        # Multimodal replay: the header leads the first text block; media blocks pass through.
+        idx = next((i for i, b in enumerate(content)
+                    if isinstance(b, dict) and b.get("type") == "text"), None)
+        text = content[idx].get("text") if idx is not None else None
+        if not isinstance(text, str) or not text.lstrip().startswith(_INFLIGHT_TASK_REPLAY_HEADER):
+            return message
+        rest = text.lstrip()[len(_INFLIGHT_TASK_REPLAY_HEADER):].strip()
+        new_content = list(content)
+        if rest:
+            new_content[idx] = {**content[idx], "text": rest}
+        else:
+            del new_content[idx]
+    else:
         return message
     marked = message.copy()
-    marked["content"] = stripped[len(_INFLIGHT_TASK_REPLAY_HEADER):].strip()
+    marked["content"] = new_content
     metadata = message.get("display_metadata")
     marked["display_metadata"] = {**(metadata if isinstance(metadata, dict) else {}), RESTATED_REQUEST_DISPLAY_KEY: True}
     return marked

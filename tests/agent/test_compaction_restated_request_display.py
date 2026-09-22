@@ -38,3 +38,19 @@ def test_tui_history_flags_the_restated_request_and_keeps_real_turns_plain():
     assert "display_metadata" not in out[0]
     assert out[2]["text"] == TASK
     assert out[2]["display_metadata"][RESTATED_REQUEST_DISPLAY_KEY] is True
+
+
+def test_multimodal_restated_request_is_flagged_and_keeps_media():
+    """Codex review round 3 #4: replay messages can carry content blocks (text + image)."""
+    from agent.compaction_display import RESTATED_REQUEST_DISPLAY_KEY, mark_restated_request
+    from agent.context_compressor import _INFLIGHT_TASK_REPLAY_HEADER
+
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+    msg = {"role": "user", "content": [{"type": "text", "text": _INFLIGHT_TASK_REPLAY_HEADER + "\n\nWhat's in this?"}, image]}
+    out = mark_restated_request(msg)
+    assert out["content"] == [{"type": "text", "text": "What's in this?"}, image]
+    assert out["display_metadata"][RESTATED_REQUEST_DISPLAY_KEY] is True
+    assert msg["content"][0]["text"].startswith(_INFLIGHT_TASK_REPLAY_HEADER), "model-facing row must be unchanged"
+
+    header_only = {"role": "user", "content": [{"type": "text", "text": _INFLIGHT_TASK_REPLAY_HEADER}, image]}
+    assert mark_restated_request(header_only)["content"] == [image]
