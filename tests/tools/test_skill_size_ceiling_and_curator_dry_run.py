@@ -236,6 +236,30 @@ class TestSizeCeilingGuard:
         assert result["success"] is False
         assert "may be corrected or condensed but not enlarged" in json.dumps(result)
 
+    def test_oversized_skill_md_does_not_freeze_small_reference_fixes(self, tmp_path, monkeypatch):
+        """Antigravity review: dimensions are decoupled; SKILL.md size binds SKILL.md growth only."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        with _skill_dir(tmp_path):
+            _oversized_skill(tmp_path)
+            ref = tmp_path / "big-skill" / "references" / "small.md"
+            ref.parent.mkdir(exist_ok=True)
+            ref.write_text("Run the tool.", encoding="utf-8")
+            raw = skill_manage(action="patch", name="big-skill", file_path="references/small.md",
+                               old_string="Run the tool.", new_string="Run the tool with --safe.")
+        assert json.loads(raw)["success"] is True
+
+    def test_crowded_references_do_not_freeze_existing_file_edits(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        with _skill_dir(tmp_path):
+            _oversized_skill(tmp_path, ref_files=12)
+            raw = skill_manage(action="patch", name="big-skill", file_path="references/r0.md",
+                               old_string=(tmp_path / "big-skill" / "references" / "r0.md").read_text(encoding="utf-8"),
+                               new_string="reference zero, now with one more clarifying sentence.")
+            new_ref = skill_manage(action="write_file", name="big-skill", file_path="references/r99.md",
+                                   file_content="another one")
+        assert json.loads(raw)["success"] is True
+        assert json.loads(new_ref)["success"] is False
+
     def test_foreground_non_growing_fix_to_an_oversized_skill_is_allowed(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
         with _skill_dir(tmp_path):
