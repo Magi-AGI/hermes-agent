@@ -5,6 +5,7 @@ import type { Translations } from '@/i18n'
 import { type ChatMessage, textPart } from '@/lib/chat-messages'
 import { optimisticAttachmentRef } from '@/lib/chat-runtime'
 import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
+import { nextSubmitTraceId, submitTrace } from '@/lib/submit-trace'
 import { setMutableRef } from '@/lib/mutable-ref'
 import {
   isVoicePlaybackActive,
@@ -121,6 +122,28 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
   return useCallback(
     async (rawText: string, options?: SubmitTextOptions) => {
+      // Same id as the composer's entry trace when there is one; queue drains,
+      // pet and quick-entry submits start a fresh one here.
+      const traceId = options?.submitTraceId ?? nextSubmitTraceId()
+
+      submitTrace('submit.enter', {
+        traceId,
+        chars: rawText.length,
+        fromQueue: Boolean(options?.fromQueue),
+        optionSessionId: options?.sessionId ?? null,
+        optionStoredSessionId: options?.storedSessionId ?? null,
+        activeSessionId: activeSessionIdRef.current,
+        selectedStoredSessionId: selectedStoredSessionIdRef.current
+      })
+
+      // Every abandon names its reason, so a prompt that never reaches the
+      // gateway is attributable from desktop.log alone.
+      const bail = (reason: string, extra?: Record<string, unknown>): false => {
+        submitTrace('submit.abandoned', { traceId, reason, ...extra })
+
+        return false
+      }
+
       const visibleText = sanitizeComposerInput(rawText).trim()
       const usingComposerAttachments = !options?.attachments
 
@@ -176,11 +199,12 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
       const guardSessionId = options?.sessionId ?? activeSessionIdRef.current
 
-      if (
-        !hasSendable ||
-        (!options?.fromQueue && isTargetSessionBusy($sessionStates.get(), guardSessionId, busyRef.current))
-      ) {
-        return false
+      if (!hasSendable) {
+        return bail('nothing-sendable')
+      }
+
+      if (!options?.fromQueue && isTargetSessionBusy($sessionStates.get(), guardSessionId, busyRef.current)) {
+        return bail('target-session-busy', { guardSessionId })
       }
 
       // Typing barge-in: a new send silences any in-flight spoken reply.
@@ -202,7 +226,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         if (deferredCredentialWarning) {
           requestDesktopOnboarding(deferredCredentialWarning)
 
-          return false
+          return bail('deferred-credential-warning')
         }
       }
 
@@ -222,7 +246,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       if (isStoredTranscriptReadOnly(targetStoredSessionId)) {
         notify({ kind: 'info', message: copy.readOnlyTranscriptSendBlocked })
 
-        return false
+        return bail('read-only-transcript', { targetStoredSessionId })
       }
 
       let targetStartedInCurrentView =
@@ -351,7 +375,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       const submitLockKey = targetStoredSessionId || sessionId || startingActiveSessionId || '__pending_new__'
 
       if (!acquireSubmitInFlight(submitLockKey)) {
-        return false
+        return bail('submit-already-in-flight', { submitLockKey })
       }
 
       let submitLockReleased = false
@@ -485,7 +509,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         dropOptimistic(optimisticSessionId)
         releaseBusy()
 
-        return false
+        return bail('session-switch-drift', { sessionId: optimisticSessionId })
       }
 
       // Foreground-only state: a background queue drain must never write the
@@ -672,7 +696,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             notifyError(err, copy.sessionUnavailable)
           }
 
-          return false
+          return bail('create-session-threw', { error: String((err as Error | undefined)?.message ?? err).slice(0, 200) })
         }
 
         if (!sessionId) {
@@ -694,7 +718,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             notify({ kind: 'error', title: copy.sessionUnavailable, message: copy.createSessionFailed })
           }
 
-          return false
+          return bail('create-session-null')
         }
 
         // A successful create re-homes selection + route to the chat it just
@@ -797,9 +821,11 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             sessionId,
             recoverStoredSessionId,
             liveId =>
-              withSessionBusyRetry(() =>
-                requestGateway('prompt.submit', submitParams(liveId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
-              ),
+              withSessionBusyRetry(() => {
+                submitTrace('submit.rpc', { traceId, sessionId: liveId, storedSessionId: recoverStoredSessionId })
+
+                return requestGateway('prompt.submit', submitParams(liveId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+              }),
             {
               requestGateway,
               driftReason: sessionDriftReason,
@@ -852,6 +878,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         // Submit landed — the turn now runs (busy stays true), but the submit
         // window is closed, so release the lock for the next (sequential) send.
         releaseSubmitLock()
+        submitTrace('submit.accepted', { traceId, sessionId: liveSessionId })
 
         return true
       } catch (err) {
@@ -861,8 +888,14 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         // "session busy" (4009). Don't surface an error bubble/toast — the entry
         // stays queued and the composer's bounded auto-drain retries when idle.
         if (options?.fromQueue && isSessionBusyError(err)) {
-          return false
+          return bail('queued-drain-session-busy')
         }
+
+        submitTrace('submit.failed', {
+          traceId,
+          sessionId,
+          error: String((err as Error | undefined)?.message ?? err).slice(0, 200)
+        })
 
         const message = inlineErrorMessage(err, copy.promptFailed)
         const occurredAt = Date.now() / 1000

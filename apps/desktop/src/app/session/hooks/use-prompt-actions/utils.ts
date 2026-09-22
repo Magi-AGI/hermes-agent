@@ -737,4 +737,8 @@ export interface SubmitTextOptions {
   /** Stable stored session id for optimistic/cache updates and stale-runtime
    *  recovery. Distinct from the runtime session id minted by the gateway. */
   storedSessionId?: string | null
+  /** Trace id minted at the composer's input handler (src/lib/submit-trace.ts)
+   *  so the whole submit shares one id in desktop.log. Callers without one
+   *  (queue drains, pet, quick entry) get a fresh id at pipeline entry. */
+  submitTraceId?: string
 }

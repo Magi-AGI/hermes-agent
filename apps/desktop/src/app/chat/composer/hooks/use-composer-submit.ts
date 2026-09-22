@@ -9,6 +9,7 @@ import { resetBrowseState } from '@/store/composer-input-history'
 import { enqueueQueuedPrompt, type QueuedPromptEntry } from '@/store/composer-queue'
 import { hasConnectionRequest, skipConnectionRequest } from '@/store/connection-request'
 import { hasBlockingPromptRequest } from '@/store/prompts'
+import { nextSubmitTraceId, submitTrace } from '@/lib/submit-trace'
 
 import { cloneAttachments, type QueueEditState } from '../composer-utils'
 import { onComposerSubmitRequest } from '../focus'
@@ -85,9 +86,15 @@ export function useComposerSubmit({
 
   // Shared send primitive: fire onSubmit, and if the gateway rejects (accepted
   // === false) or throws, re-load + re-stash the draft so the words survive.
-  const dispatchSubmit = (text: string, attachments?: ComposerAttachment[], displayKind?: 'hidden') => {
+  const dispatchSubmit = (
+    text: string,
+    attachments?: ComposerAttachment[],
+    displayKind?: 'hidden',
+    traceId: string = nextSubmitTraceId()
+  ) => {
     const submittedScope = activeQueueSessionKeyRef.current
     const submittedAttachments = attachments ?? []
+    const traceOpts = { submitTraceId: traceId }
 
     const restore = () => {
       loadIntoComposer(text, submittedAttachments)
@@ -104,11 +111,31 @@ export function useComposerSubmit({
 
     void Promise.resolve(
       attachments
-        ? onSubmit(text, { attachments, composerScope: submittedScope, ...(displayKind ? { displayKind } : {}) })
-        : onSubmit(text, { composerScope: submittedScope, ...(displayKind ? { displayKind } : {}) })
+        ? onSubmit(text, {
+            attachments,
+            composerScope: submittedScope,
+            ...traceOpts,
+            ...(displayKind ? { displayKind } : {})
+          })
+        : onSubmit(text, { composerScope: submittedScope, ...traceOpts, ...(displayKind ? { displayKind } : {}) })
     )
-      .then(accepted => void (accepted === false ? rejected() : clearSessionDraft(submittedScope)))
-      .catch(rejected)
+      .then(accepted => {
+        submitTrace('composer.result', {
+          traceId,
+          accepted: accepted !== false,
+          restoredDraft: accepted === false && !displayKind
+        })
+        void (accepted === false ? rejected() : clearSessionDraft(submittedScope))
+      })
+      .catch(err => {
+        submitTrace('composer.result', {
+          traceId,
+          accepted: false,
+          restoredDraft: !displayKind,
+          threw: String((err as Error | undefined)?.message ?? err).slice(0, 200)
+        })
+        rejected()
+      })
   }
 
   // External "submit this prompt" requests (e.g. the review pane's agent-ship
@@ -136,9 +163,11 @@ export function useComposerSubmit({
           !inputDisabled
         ) {
           const current = externalSubmitRef.current
+          const traceId = nextSubmitTraceId()
+          submitTrace('composer.enter', { traceId, source: 'external-request', sessionId, chars: text.length })
 
           if (!current.busy) {
-            current.dispatchSubmit(text, undefined, displayKind)
+            current.dispatchSubmit(text, undefined, displayKind, traceId)
 
             return
           }
@@ -190,7 +219,30 @@ export function useComposerSubmit({
   )
 
   const submitDraft = () => {
+    // Unconditional entry trace, BEFORE any guard or session resolution — the
+    // only record of a submit that is lost before reaching the gateway.
+    const traceId = nextSubmitTraceId()
+    const entryEditor = editorRef.current
+
+    submitTrace('composer.enter', {
+      traceId,
+      source: 'composer',
+      sessionId: sessionId ?? null,
+      queueKey: activeQueueSessionKeyRef.current ?? null,
+      chars: (entryEditor ? composerPlainText(entryEditor) : draftRef.current).length,
+      attachments: attachments.length,
+      busy,
+      disabled,
+      compacting,
+      queueEdit: Boolean(queueEdit),
+      queued: queuedPrompts.length
+    })
+
+    const route = (to: string) => submitTrace('composer.route', { traceId, route: to })
+
     if (disabled) {
+      route('abandoned:composer-disabled')
+
       return
     }
 
@@ -249,6 +301,7 @@ export function useComposerSubmit({
     const blockingPrompt = !queueEdit && hasBlockingPromptRequest(sessionId)
 
     if (queueEdit) {
+      route('queue-edit-save')
       exitQueuedEdit('save')
     } else if (busy) {
       // Slash commands should execute immediately even while the agent is
@@ -259,35 +312,43 @@ export function useComposerSubmit({
       // /send directives).  Queuing them would make every slash command wait
       // for the current turn to finish, which is how the TUI never behaves.
       if (!attachments.length && SLASH_COMMAND_RE.test(text.trim())) {
+        route('slash-while-busy')
         triggerHaptic('submit')
         clearDraft()
-        dispatchSubmit(text)
+        dispatchSubmit(text, undefined, undefined, traceId)
       } else if (!compacting && !blockingPrompt && !attachments.length && text.trim()) {
         // Cursor-style stop-and-correct: interrupt the live turn and redirect
         // it with this text. redirect() preserves the shown reasoning/work; if
         // the turn already ended, steerDraft re-queues so nothing is lost.
-        steerDraft()
+        route('steer-live-turn')
+        steerDraft(traceId)
       } else if (payloadPresent) {
         // Attachments can't ride a redirect (no tool-result image carriage) —
         // queue the whole payload for the next turn. Same for a turn parked on
         // an approval/sudo/secret prompt: a steer can't reach the model while
         // the tool batch is blocked, so the message runs as the next turn.
+        route(compacting ? 'queued:compacting' : blockingPrompt ? 'queued:blocking-prompt' : 'queued:attachments')
         queueCurrentDraft()
       } else {
+        route('stop-button')
         // Stop button (the only way to reach here while busy with an empty
         // composer — empty Enter is short-circuited in the keydown handler).
         triggerHaptic('cancel')
         void Promise.resolve(onCancel())
       }
     } else if (!payloadPresent && queuedPrompts.length > 0) {
+      route('drain-queued')
       void drainNextQueued()
     } else if (payloadPresent) {
+      route('send')
       const submittedAttachments = cloneAttachments(attachments)
       triggerHaptic('submit')
       resetBrowseState(sessionId)
       clearDraft()
       scope.attachments.clear()
-      dispatchSubmit(text, submittedAttachments)
+      dispatchSubmit(text, submittedAttachments, undefined, traceId)
+    } else {
+      route('abandoned:empty-payload')
     }
 
     focusInput()
@@ -296,23 +357,51 @@ export function useComposerSubmit({
   // Redirect the live turn with a correction. The gateway either restarts the
   // active model request with its displayed context or waits for the current
   // tool boundary. If the turn already ended, queue the words instead.
-  const steerDraft = () => {
+  const steerDraft = (traceId: string = nextSubmitTraceId()) => {
     const text = draftRef.current.trim()
 
     // Guard on live editor state, not the render-lagged `canSteer`: a redirect
     // fired on a fast Enter must not be dropped because state hasn't synced.
     if (!onSteer || !text || attachments.length > 0 || SLASH_COMMAND_RE.test(text)) {
+      submitTrace('steer.result', { traceId, abandoned: onSteer ? 'not-steerable' : 'no-steer-handler' })
+
       return
     }
 
     triggerHaptic('submit')
     clearDraft()
 
-    void Promise.resolve(onSteer(text)).then(accepted => {
-      if (!accepted && activeQueueSessionKey) {
-        enqueueQueuedPrompt(activeQueueSessionKey, { text, attachments: [] })
+    void Promise.resolve(onSteer(text)).then(
+      accepted => {
+        const requeued = Boolean(!accepted && activeQueueSessionKey)
+        submitTrace('steer.result', {
+          traceId,
+          accepted: Boolean(accepted),
+          requeued,
+          // Rejected with no queue key: the words are gone from the composer
+          // AND not queued — the one steer outcome that loses input.
+          ...(!accepted && !activeQueueSessionKey ? { lost: 'no-queue-key' } : {})
+        })
+
+        if (requeued && activeQueueSessionKey) {
+          enqueueQueuedPrompt(activeQueueSessionKey, { text, attachments: [] })
+        }
+      },
+      err => {
+        // A thrown steer used to be an unhandled rejection that dropped the
+        // words; requeue them like a rejected steer.
+        submitTrace('steer.result', {
+          traceId,
+          accepted: false,
+          requeued: Boolean(activeQueueSessionKey),
+          threw: String((err as Error | undefined)?.message ?? err).slice(0, 200)
+        })
+
+        if (activeQueueSessionKey) {
+          enqueueQueuedPrompt(activeQueueSessionKey, { text, attachments: [] })
+        }
       }
-    })
+    )
   }
 
   const queueDraft = () => {

@@ -46,11 +46,17 @@ export function formatRendererConsoleLine(
 
   const level = details ? details.level : detailsOrLevel
 
-  if (level !== 3) {
+  const text = details ? details.message : message
+
+  // The prompt-submit trace (src/lib/submit-trace.ts) is the only record of a submit lost before it
+  // reaches the gateway, so it passes the error-only filter. It carries ids and char counts, never
+  // prompt text.
+  const isSubmitTrace = typeof text === 'string' && text.startsWith('[submit-trace] ')
+
+  if (level !== 3 && !isSubmitTrace) {
     return null
   }
 
-  const text = details ? details.message : message
   const src = details ? details.sourceUrl : sourceId
   const lineNo = details ? details.lineNumber : line
 

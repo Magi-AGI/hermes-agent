@@ -24,6 +24,15 @@ describe('formatRendererConsoleLine', () => {
     expect(formatRendererConsoleLine('main', { level: 1, message: 'x', sourceUrl: 's', lineNumber: 1 })).toBeNull()
     expect(formatRendererConsoleLine('main', 2, 'warn', 1, 's')).toBeNull()
   })
+
+  it('passes the prompt-submit trace at info level, and nothing merely containing the prefix', () => {
+    const msg = '[submit-trace] composer.enter {"traceId":"ab12-1","chars":19}'
+
+    expect(formatRendererConsoleLine('session-window', { level: 1, message: msg, sourceUrl: 's', lineNumber: 1 })).toBe(
+      `[renderer console:session-window] ${msg} (s:1)`
+    )
+    expect(formatRendererConsoleLine('main', 1, `x ${msg}`, 1, 's')).toBeNull()
+  })
 })
 
 describe('attachRendererConsoleCapture', () => {
