@@ -67,10 +67,6 @@ def get_cached_entry(server_name: str, fingerprint: str) -> Optional[dict]:
         return None
     ttl_ms = entry.get("ttl_ms")
     written_at = entry.get("written_at")
-    if ttl_ms == 0 and entry.get("ttl_source") != "wire":
-        # Pre-fix entries recorded the mcp 2.x SDK default (0 = immediately stale) for servers
-        # that sent no hint, so none could ever be served. Treat them as TTL-less.
-        ttl_ms = None
     expired = (isinstance(ttl_ms, (int, float)) and isinstance(written_at, (int, float))
                and (time.time() - written_at) * 1000.0 >= float(ttl_ms))
     return None if expired else entry
@@ -84,7 +80,6 @@ def write_cache_entry(server_name: str, fingerprint: str, *, tools: List[dict],
     entry = {"fingerprint": fingerprint, "tools": tools, "utility_tools": utility_tools or []}
     if isinstance(ttl_ms, (int, float)):
         entry["ttl_ms"] = ttl_ms
-        entry["ttl_source"] = "wire"
         entry["written_at"] = time.time()
     if cache_scope:
         entry["cache_scope"] = cache_scope

@@ -51,11 +51,13 @@ def test_cache_scope_round_trips():
     assert sc.get_cached_entry("srv", "fp")["cache_scope"] == "private"
 
 
-def test_legacy_sdk_default_zero_ttl_is_served():
-    # Pre-fix entries stored the mcp 2.x SDK default ttl_ms=0 for servers that sent no hint;
-    # they must be served (TTL-less), or lazy registration can never hit.
+def test_legacy_zero_ttl_is_a_miss_until_rewritten():
+    # A pre-fix ttl_ms=0 is ambiguous (SDK default vs an explicit wire 0), so it stays a miss;
+    # the next live connect rewrites it without the SDK default and later reads hit.
     sc._save_all({"srv": {"fingerprint": "fp", "tools": [{"name": "t"}], "ttl_ms": 0,
                           "written_at": time.time() - 3600}})
+    assert sc.get_cached_entry("srv", "fp") is None
+    sc.write_cache_entry("srv", "fp", tools=[{"name": "t"}])
     assert sc.get_cached_entry("srv", "fp") is not None
 
 
