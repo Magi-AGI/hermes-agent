@@ -457,6 +457,37 @@ describe('toChatMessages', () => {
     ])
   })
 
+  // Scaffolding the backend rides on role=user (wrap-up requests, process
+  // notices) must never read as the user's own words, nor count as a user turn.
+  it('renders system notices as timeline notes, not user bubbles', () => {
+    const messages = toChatMessages([
+      { role: 'user', content: 'real user turn', timestamp: 1 },
+      { role: 'assistant', content: 'working', timestamp: 2 },
+      {
+        role: 'user',
+        content: "You've reached the maximum number of tool-calling iterations allowed.",
+        display_kind: 'system_notice',
+        display_metadata: { notice: 'max_iterations' },
+        timestamp: 3
+      },
+      {
+        role: 'user',
+        content: '[IMPORTANT: Background process proc_1 completed (exit code 0).]',
+        display_kind: 'system_notice',
+        display_metadata: JSON.stringify({ notice: 'background_process' }),
+        timestamp: 4
+      },
+      { role: 'user', content: 'opaque gateway notice', display_kind: 'internal_notification', timestamp: 5 }
+    ])
+
+    expect(messages.map(message => message.role)).toEqual(['user', 'assistant', 'system', 'system', 'system'])
+    expect(messages.slice(2).map(chatMessageText)).toEqual([
+      'tool-call limit reached; asked for a wrap-up',
+      'background process update',
+      'system notice'
+    ])
+  })
+
   // A backend older than this app serves display_metadata as unparsed JSON
   // text. Indexing into that string used to throw and fail the whole resume.
   it.each([

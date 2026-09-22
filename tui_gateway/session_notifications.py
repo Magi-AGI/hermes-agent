@@ -469,8 +469,12 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None
         # from the reaper, keeps its lease, and never reaches its bot mailbox again.
         _notif_release_turn(session)
         return
-    kwargs = ({"display_kind": "async_delegation_complete", "display_metadata": _async_delegation_display_metadata(evt)}
-              if evt.get("type") == "async_delegation" else {})
+    from agent.system_turn_display import classify_system_injected_user_turn
+    if evt.get("type") == "async_delegation":
+        kwargs = {"display_kind": "async_delegation_complete", "display_metadata": _async_delegation_display_metadata(evt)}
+    else:
+        # Background-process notices ride role=user; type them so the window shows a notice, not a user bubble.
+        kwargs = classify_system_injected_user_turn({"role": "user", "content": text}) or {}
     from agent.notification_presentation import diagnostic_process_event
     if diagnostic_process_event(evt):
         kwargs.setdefault("display_metadata", {})["notification_category"] = "diagnostic"

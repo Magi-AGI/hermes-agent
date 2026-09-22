@@ -207,6 +207,23 @@ function asyncResultBody(content: string): string | undefined {
   )
 }
 
+// Backend `agent/system_turn_display.py` notice names. Scaffolding the model
+// needs on role=user (wrap-up requests, process notices, re-injected todos) —
+// never the user's own words, so it renders as a one-line timeline note.
+const SYSTEM_NOTICE_LABELS: Record<string, string> = {
+  background_process: 'background process update',
+  compaction_continuation: 'continued after context compaction',
+  max_iterations: 'tool-call limit reached; asked for a wrap-up',
+  recovery_nudge: 'automatic recovery prompt',
+  todo_snapshot: 'task list restored after context compaction'
+}
+
+function systemNoticeLabel(metadata: SessionMessage['display_metadata']): string {
+  const notice = parseDisplayMetadata(metadata)?.notice
+
+  return (typeof notice === 'string' && SYSTEM_NOTICE_LABELS[notice]) || 'system notice'
+}
+
 function timelineDisplayContent(message: SessionMessage, content: string): string {
   if (message.display_kind === 'model_switch') {
     return 'model changed'
@@ -233,6 +250,10 @@ function timelineDisplayContent(message: SessionMessage, content: string): strin
 
   if (message.display_kind === 'process_complete') {
     return timelineDisplayText(message.display_metadata) ?? 'background process finished'
+  }
+
+  if (message.display_kind === 'system_notice' || message.display_kind === 'internal_notification') {
+    return timelineDisplayText(message.display_metadata) ?? systemNoticeLabel(message.display_metadata)
   }
 
   return content
@@ -344,7 +365,9 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       message.display_kind === 'async_delegation_complete' ||
       message.display_kind === 'process_complete' ||
       message.display_kind === 'auto_continue' ||
-      message.display_kind === 'personality_switch'
+      message.display_kind === 'personality_switch' ||
+      message.display_kind === 'system_notice' ||
+      message.display_kind === 'internal_notification'
         ? 'system'
         : message.role
 

@@ -19,7 +19,7 @@ from agent.context_compressor import (
 )
 from agent.lazy_forward import forward as _forward, forward_static as _forward_static
 from agent.memory_manager import sanitize_context
-
+from agent.system_turn_display import tag_system_injected_user_turn
 from agent.tool_dispatch_helpers import _is_multimodal_tool_result, _multimodal_text_summary
 from agent.trajectory import save_trajectory as _save_trajectory_to_file
 from agent.transcript_repair import sync_flushed_message_markers
@@ -190,6 +190,8 @@ def _db_flush_scan_start(agent, messages: List[Dict]) -> int:
 def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any]:
     """Build the session-db row for ``msg``, applying the persist override to THIS row only."""
     role = msg.get("role", "unknown")
+    # Tag in memory too, not just the row: live/durable display markers must agree for rewind healing.
+    tag_system_injected_user_turn(msg)
     content = msg.get("content")
     # api_content sidecar: exact bytes sent to the API when they differ from clean content (replay parity).
     api_content = msg.get("api_content") if isinstance(msg.get("api_content"), str) else None
