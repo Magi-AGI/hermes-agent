@@ -168,3 +168,30 @@ def test_future_that_starts_during_cancel_is_not_reported_orphaned(monkeypatch, 
     assert sum("failed as orphaned" in r.message for r in caplog.records) == 1
     assert batch.orphaned_indices == {1}
     assert racing.result(timeout=2) == "done"
+
+
+def test_cancelled_call_does_not_hold_up_the_start_order_gate(monkeypatch):
+    """Codex review round 3 #1: a cancelled earlier call never advances the start-order gate;
+    a surviving later call must not wait out the gate timeout behind it."""
+    batch = _batch(monkeypatch, n=2, grace="0.1")
+    batch.gate = te._StartOrderGate(5.0)
+    waited = {}
+
+    class _StartsThenGates(concurrent.futures.Future):
+        def cancel(self):
+            self.set_running_or_notify_cancel()
+
+            def _work():
+                start = time.monotonic()
+                batch.gate.begin_in_order(1, tool_name="survivor")
+                waited["s"] = time.monotonic() - start
+                self.set_result("done")
+
+            threading.Thread(target=_work, daemon=True).start()
+            return False
+
+    lost, survivor = concurrent.futures.Future(), _StartsThenGates()
+    batch.future_order = {lost: 0, survivor: 1}
+    assert _await(batch, [lost, survivor]) is False
+    assert batch.orphaned_indices == {0}
+    assert waited["s"] < 1.0, f"survivor waited {waited['s']:.1f}s behind a cancelled call"

@@ -1213,8 +1213,21 @@ class _StartOrderGate:
     def __init__(self, timeout: float) -> None:
         self._condition = threading.Condition()
         self._next_order = 0
+        self._skipped: set[int] = set()
         self._timeout = timeout
         self.abandoned = threading.Event()
+
+    def _skip_past_holes_locked(self) -> None:
+        while self._next_order in self._skipped:
+            self._next_order += 1
+
+    def skip(self, orders) -> None:
+        """Mark submit orders that will never dispatch (cancelled before starting) so later
+        workers don't wait out the gate timeout behind them."""
+        with self._condition:
+            self._skipped.update(orders)
+            self._skip_past_holes_locked()
+            self._condition.notify_all()
 
     def abandon(self) -> None:
         self.abandoned.set()
@@ -1242,6 +1255,7 @@ class _StartOrderGate:
                     callback()
             finally:
                 self._next_order = max(self._next_order, order + 1)
+                self._skip_past_holes_locked()
                 self._condition.notify_all()
         return True
 
@@ -1281,6 +1295,7 @@ class _ConcurrentBatch:
         self.authorization_gate = _ConcurrentToolAuthorizationGate()
         self.timed_out_indices: set[int] = set()
         self.orphaned_indices: set[int] = set()
+        self.future_order: dict = {}
         self.orphan_grace_s = _resolve_orphaned_future_grace()
         # Workers currently inside run_worker (including gate-parked / awaiting approval).
         self._inflight_lock = threading.Lock()
@@ -1376,6 +1391,7 @@ class _ConcurrentBatch:
         carries turn ContextVars and thread-local approval/sudo callbacks into the worker."""
         futures = []
         future_to_index = {}
+        self.future_order = {}
         for submit_index, i in enumerate(runnable):
             try:
                 f = executor.submit(propagate_context_to_thread(self.run_worker), i, submit_index)
@@ -1394,6 +1410,7 @@ class _ConcurrentBatch:
                 break
             futures.append(f)
             future_to_index[f] = i
+            self.future_order[f] = submit_index
         return futures, future_to_index
 
     def _running_names(self, not_done, future_to_index) -> list[str]:
@@ -1450,6 +1467,9 @@ class _ConcurrentBatch:
                 # worker can pick a future up between the idle check and here.
                 cancelled = {f for f in not_done if f.cancel()}
                 self.orphaned_indices |= {future_to_index[f] for f in cancelled if f in future_to_index}
+                # Cancelled calls never reach the start-order gate; don't let survivors wait on them.
+                future_order = getattr(self, "future_order", {})
+                self.gate.skip({future_order[f] for f in cancelled if f in future_order})
                 logger.error(
                     "concurrent tool batch had %d unresolved future(s) with no worker executing them "
                     "for %.0fs; cancelled and failed as orphaned: %s",
