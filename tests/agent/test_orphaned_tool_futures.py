@@ -148,3 +148,23 @@ def test_run_worker_tracks_inflight(monkeypatch):
     with pytest.raises(RuntimeError):
         batch.run_worker(0, 0)
     assert batch.inflight_workers() == 0
+
+
+class _StartsOnCancel(concurrent.futures.Future):
+    """A future a worker picks up in the window between the idle check and cancel()."""
+
+    def cancel(self):
+        self.set_running_or_notify_cancel()
+        threading.Timer(0.2, lambda: self.set_result("done")).start()
+        return False
+
+
+def test_future_that_starts_during_cancel_is_not_reported_orphaned(monkeypatch, caplog):
+    """Codex review #3: only a successful cancel proves a call never ran ("safe to retry")."""
+    batch = _batch(monkeypatch, n=2, grace="0.1")
+    racing, lost = _StartsOnCancel(), concurrent.futures.Future()
+    with caplog.at_level("ERROR", logger="agent.tool_executor"):
+        assert _await(batch, [racing, lost]) is False  # the racing call finished normally
+    assert sum("failed as orphaned" in r.message for r in caplog.records) == 1
+    assert batch.orphaned_indices == {1}
+    assert racing.result(timeout=2) == "done"

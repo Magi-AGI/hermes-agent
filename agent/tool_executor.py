@@ -1446,13 +1446,22 @@ class _ConcurrentBatch:
                     force=True,
                 )
             elif self._orphaned(not_done, idle_since):
-                self.orphaned_indices = {future_to_index[f] for f in not_done if f in future_to_index}
+                # Only a successful cancel proves the call never ran (so "safe to retry" is true); a
+                # worker can pick a future up between the idle check and here.
+                cancelled = {f for f in not_done if f.cancel()}
+                self.orphaned_indices |= {future_to_index[f] for f in cancelled if f in future_to_index}
                 logger.error(
-                    "concurrent tool batch has %d unresolved future(s) with no worker executing them "
-                    "for %.0fs; failing them as orphaned: %s",
-                    len(self.orphaned_indices), self.orphan_grace_s,
-                    ", ".join(self._running_names(not_done, future_to_index)[:5]),
+                    "concurrent tool batch had %d unresolved future(s) with no worker executing them "
+                    "for %.0fs; cancelled and failed as orphaned: %s",
+                    len(cancelled), self.orphan_grace_s,
+                    ", ".join(self._running_names(cancelled, future_to_index)[:5]),
                 )
+                if not_done - cancelled:
+                    # A worker started one: keep tracking it as a running call. Stop waiting on the
+                    # cancelled ones — wait() never counts a never-notified CANCELLED future as done.
+                    futures = [f for f in futures if f not in cancelled]
+                    idle_since = None
+                    continue
             else:
                 if self.orphan_grace_s is not None and self._nothing_executing(not_done):
                     if idle_since is None:
