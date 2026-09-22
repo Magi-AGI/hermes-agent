@@ -287,7 +287,12 @@ async def _paginate_full_list(list_method, items_attr: str, server_name: str,
             else:
                 result = await list_method(cursor=cursor)
         if cache_meta_out is not None and not items:
+            # mcp 2.x fills ttl_ms=0 / cache_scope="private" when the server sends neither, and a
+            # recorded 0 is "immediately stale" — every lazy lookup missed. Only wire values count.
+            fields_set = getattr(result, "model_fields_set", None)
             for key, snake, camel in (("ttl_ms", "ttl_ms", "ttlMs"), ("cache_scope", "cache_scope", "cacheScope")):
+                if isinstance(fields_set, (set, frozenset)) and not {snake, camel} & fields_set:
+                    continue
                 hint = mcp_field(result, snake, camel)
                 if hint is not None:
                     cache_meta_out[key] = hint

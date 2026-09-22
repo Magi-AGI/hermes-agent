@@ -49,3 +49,36 @@ def test_cache_scope_round_trips():
         "srv", "fp", tools=[{"name": "t"}], ttl_ms=60_000, cache_scope="private"
     )
     assert sc.get_cached_entry("srv", "fp")["cache_scope"] == "private"
+
+
+def test_legacy_sdk_default_zero_ttl_is_served():
+    # Pre-fix entries stored the mcp 2.x SDK default ttl_ms=0 for servers that sent no hint;
+    # they must be served (TTL-less), or lazy registration can never hit.
+    sc._save_all({"srv": {"fingerprint": "fp", "tools": [{"name": "t"}], "ttl_ms": 0,
+                          "written_at": time.time() - 3600}})
+    assert sc.get_cached_entry("srv", "fp") is not None
+
+
+def test_explicit_wire_zero_ttl_is_immediately_stale():
+    sc.write_cache_entry("srv", "fp", tools=[{"name": "t"}], ttl_ms=0)
+    assert sc.get_cached_entry("srv", "fp") is None
+
+
+def test_sdk_default_hints_are_not_recorded():
+    import asyncio
+    import mcp.types as types
+    from tools.mcp_tool import _paginate_full_list
+
+    async def _list(**_kw):
+        return types.ListToolsResult(tools=[])
+
+    meta: dict = {}
+    asyncio.run(_paginate_full_list(_list, "tools", "srv", cache_meta_out=meta))
+    assert meta == {}
+
+    async def _list_hinted(**_kw):
+        return types.ListToolsResult.model_validate({"tools": [], "ttlMs": 60000})
+
+    meta = {}
+    asyncio.run(_paginate_full_list(_list_hinted, "tools", "srv", cache_meta_out=meta))
+    assert meta == {"ttl_ms": 60000}
