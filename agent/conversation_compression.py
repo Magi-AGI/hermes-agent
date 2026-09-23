@@ -3347,15 +3347,15 @@ def _publish_rotated_compaction(
     _foreign_tail_ceiling = None
     with contextlib.suppress(Exception):
         _foreign_tail_ceiling = agent._session_db.get_active_message_watermark(agent.session_id)
-    # Best-effort for ordinary DB errors, but a lost turn lease stops publication: the successor owns
-    # the conversation now (Magi sync, bucket C; the publish below re-checks it in its own txn too).
+    # Best-effort for ordinary DB errors (the flush reports them as False), but a lost turn lease stops
+    # publication: the successor owns the conversation now. The flush records the loss on the agent
+    # (agent/session_persistence.py); the publish below also re-checks the lease in its own txn.
     from hermes_state_errors import SessionTurnLeaseLostError
-    try:
+    with contextlib.suppress(Exception):
         agent._flush_messages_to_session_db(messages, conversation_history=persisted_history)
-    except SessionTurnLeaseLostError:
-        raise
-    except Exception as exc:
-        logger.warning("Pre-publication flush failed; publishing the handoff anyway: %s", exc)
+    if getattr(agent, "_turn_lease_lost_holder", None):
+        raise SessionTurnLeaseLostError(
+            f"Session turn lease lost before compression publication: {old_session_id}")
     # Publish closure + child + handoff in one transaction so no reader sees an
     # empty child. Child stays on the parent's profile ("default" persists as NULL);
     # publish also COALESCEs from the parent row for threads lacking HERMES_HOME.

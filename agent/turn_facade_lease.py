@@ -286,6 +286,8 @@ def admit_durable_turn_lease(
     lease = DurableTurnLease(agent, db, session_id, holder)
     agent._active_session_turn_lease_holder = holder
     agent._active_session_turn_lease_ttl_seconds = LEASE_TTL_SECONDS
+    # A freshly admitted lease ends the sticky ownership-loss fence (agent/session_persistence.py).
+    agent._turn_lease_lost_holder = None
     try:
         if waited:
             agent._emit_status("Session is free; loading the latest transcript...")

@@ -258,15 +258,29 @@ def _db_flush_collect(agent, messages: List[Dict], conversation_history: Optiona
 
 
 def _db_flush_write(agent, batch_rows: List[Dict[str, Any]], batch_msgs: List[Dict], messages: List[Dict]) -> None:
-    """One transaction for the turn's new rows: on failure nothing lands and no markers are stamped."""
+    """One transaction for the turn's new rows: on failure nothing lands and no markers are stamped.
+
+    Ownership loss is sticky (Magi sync, bucket C): once a flush is refused for turn-lease loss, every
+    holder-less flush (the shutdown flush after turn cleanup cleared the active holder) is fenced by
+    the LOST holder until a new lease is admitted, so the database keeps refusing it. Clearing the
+    active-turn field never authorizes a late retry. Re-admission under a NEW lease may persist the
+    pending rows (upstream's contract; admission reloads the transcript after a wait)."""
+    from hermes_state_errors import SessionTurnLeaseLostError
     if not batch_rows:
         return
-    agent._session_db.append_messages_batch(
-        session_id=agent.session_id, messages=batch_rows,
-        compression_lock_holder=getattr(agent, "_active_compression_lock_holder", None),
-        turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
-        turn_lease_ttl_seconds=getattr(agent, "_active_session_turn_lease_ttl_seconds", 300.0) or 300.0,
-    )
+    holder = getattr(agent, "_active_session_turn_lease_holder", None) or getattr(
+        agent, "_turn_lease_lost_holder", None)
+    try:
+        agent._session_db.append_messages_batch(
+            session_id=agent.session_id, messages=batch_rows,
+            compression_lock_holder=getattr(agent, "_active_compression_lock_holder", None),
+            turn_lease_holder=holder,
+            turn_lease_ttl_seconds=getattr(agent, "_active_session_turn_lease_ttl_seconds", 300.0) or 300.0,
+        )
+    except SessionTurnLeaseLostError:
+        if holder:
+            agent._turn_lease_lost_holder = holder
+        raise
     sync_flushed_message_markers(batch_msgs, batch_rows)
     if _newest_checkpoint_carrier(batch_msgs, "codex_reasoning_items") >= 0:
         # The insert already rewrote the older rows (SessionDB._drop_shadowed_checkpoint_rows); mirror it on
