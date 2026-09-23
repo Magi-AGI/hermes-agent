@@ -70,7 +70,7 @@ export interface ReopenGateDeps {
 // a brand-new window too, not just a genuinely pre-existing one.
 export function waitForSessionWindowFunctionallyReady(
   win: ReopenGateWindow,
-  { created, profile }: { created: boolean; profile: string | null },
+  { created, profile, sessionId }: { created: boolean; profile: string | null; sessionId?: null | string },
   deps: ReopenGateDeps
 ): Promise<ReopenGateResult> {
   if (!created) {
@@ -153,6 +153,18 @@ export function waitForSessionWindowFunctionallyReady(
         finish({
           ok: false,
           reason: `window reported ready for profile "${reportedProfile}", expected "${expectedProfile}"`
+        })
+
+        return
+      }
+
+      // The window must have come up on the session it was asked to open
+      // (Codex A4 #3): a window that silently fell back to another session is
+      // not a successful restore.
+      if (sessionId !== undefined && (payload.sessionId ?? null) !== (sessionId ?? null)) {
+        finish({
+          ok: false,
+          reason: `window reported ready on session "${payload.sessionId ?? 'none'}", expected "${sessionId ?? 'none'}"`
         })
 
         return

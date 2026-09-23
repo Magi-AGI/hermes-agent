@@ -71,6 +71,7 @@ function neverSettles() {
 function makeControllable() {
   let resolve!: () => void
   let reject!: (err: Error) => void
+
   const promise = new Promise<void>((res, rej) => {
     resolve = res
     reject = rej
@@ -435,4 +436,39 @@ test('an already-destroyed window resolves immediately without registering any l
 
   assert.deepEqual(result, { ok: true })
   assert.equal(ipcMain.listenerCount('hermes:window:functional-ready'), 0)
+})
+
+test('ok:true on a DIFFERENT session than the one the window was asked to open fails (Codex A4 #3)', async () => {
+  const ipcMain = makeFakeIpcMain()
+  const win = makeFakeWindow()
+
+  const pending = waitForSessionWindowFunctionallyReady(
+    win as any,
+    { created: true, profile: 'default', sessionId: 's-target' },
+    { ipcMain, probeBackendHealth: () => Promise.resolve(), timeoutMs: 500 }
+  )
+
+  await new Promise(resolve => setTimeout(resolve, 5))
+  ipcMain.emit('hermes:window:functional-ready', { sender: { id: 1 } }, { ok: true, profile: 'default', sessionId: 's-other' })
+
+  const result = await pending
+
+  assert.equal(result.ok, false)
+  assert.match(result.reason ?? '', /expected "s-target"/)
+})
+
+test('ok:true on the expected session releases the queue', async () => {
+  const ipcMain = makeFakeIpcMain()
+  const win = makeFakeWindow()
+
+  const pending = waitForSessionWindowFunctionallyReady(
+    win as any,
+    { created: true, profile: 'default', sessionId: 's-target' },
+    { ipcMain, probeBackendHealth: () => Promise.resolve(), timeoutMs: 500 }
+  )
+
+  await new Promise(resolve => setTimeout(resolve, 5))
+  ipcMain.emit('hermes:window:functional-ready', { sender: { id: 1 } }, { ok: true, profile: 'default', sessionId: 's-target' })
+
+  assert.equal((await pending).ok, true)
 })

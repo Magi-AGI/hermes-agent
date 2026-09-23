@@ -1411,32 +1411,12 @@ export function useGatewayBoot({
           // retry it), not brick boot behind the "Hermes couldn't start"
           // overlay. Matches the reconnect + softSwitch call sites.
           //
-          // The reopen-queue functional-ready signal (harmless no-op for
-          // every other window — main only listens per-window during
-          // runReopenQueue) fires the MOMENT this settles, not after the
-          // sibling calls above or completeDesktopBoot() below: the target
-          // session is renderable as soon as its data arrives, and the reopen
-          // queue shouldn't wait on unrelated global boot refreshes (config
-          // sync, cwd seed) to find that out. A failed load is still reported
-          // (ok: false) rather than treated as ready — see design doc §7.1.
-          callbacksRef.current
-            .refreshSessions()
-            .then(() => {
-              window.hermesDesktop?.signalSessionFunctionalReady?.({
-                ok: true,
-                phase: 'sessions',
-                profile: $activeGatewayProfile.get()
-              })
-            })
-            .catch(err => {
-              setSessionsLoading(false)
-              window.hermesDesktop?.signalSessionFunctionalReady?.({
-                ok: false,
-                phase: 'sessions',
-                profile: $activeGatewayProfile.get(),
-                error: err instanceof Error ? err.message : String(err)
-              })
-            })
+          // The reopen queue's functional-ready signal is NOT sent from here:
+          // it needs every required boot op (incl. the config fetch) AND the
+          // window's target session to have loaded — see useReopenReadySignal.
+          callbacksRef.current.refreshSessions().catch(() => {
+            setSessionsLoading(false)
+          })
         ])
 
         if (cancelled) {
@@ -1481,12 +1461,6 @@ export function useGatewayBoot({
           failDesktopBoot(message)
           notifyError(err, translateNow('boot.errors.desktopBootFailed'))
           setSessionsLoading(false)
-          window.hermesDesktop?.signalSessionFunctionalReady?.({
-            ok: false,
-            phase: 'boot',
-            profile: $activeGatewayProfile.get(),
-            error: message
-          })
         }
       }
     }

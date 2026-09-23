@@ -40,6 +40,8 @@ import type { SessionInfo } from '@/types/hermes'
 import { requestComposerFocus, requestComposerInsert } from '../../chat/composer/focus'
 import { appViewForPath, isOverlayView, NEW_CHAT_ROUTE, routeSessionId, sessionRoute } from '../../routes'
 
+import { useReopenReadySignal } from './use-reopen-ready-signal'
+
 type RememberedSession = Pick<SessionInfo, '_lineage_root_id' | 'id' | 'profile'>
 
 interface DesktopIntegrationsParams {
@@ -105,6 +107,8 @@ export function useDesktopIntegrations({
   useEffect(() => {
     window.hermesDesktop?.setPreviewShortcutActive?.(true)
   }, [])
+
+  useReopenReadySignal(routedSessionId)
 
   // A peer window (Ctrl+Shift+N) is part of the saved window layout; tell main
   // which session it is showing so "Reopen Saved Windows" restores it there.

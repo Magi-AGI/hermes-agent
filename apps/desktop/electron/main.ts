@@ -14323,7 +14323,7 @@ async function runReopenQueue(entries: any[]) {
 
     const result = await waitForSessionWindowFunctionallyReady(
       win,
-      { created, profile: expectedProfile },
+      { created, profile: expectedProfile, sessionId: entry.sessionId ?? null },
       { ipcMain, probeBackendHealth: probeProfileBackendHealth }
     )
 
