@@ -480,3 +480,32 @@ def test_late_control_handler_drained_on_every_exit_reason(monkeypatch, exit_cod
     assert late_frames[0]["type"] == "control.error"
     assert late_frames[0]["request_id"] == "late-req"
     assert late_frames[0]["reason"] == expected_reason
+
+
+def test_throwing_rpc_sink_still_completes_every_turn_drains_and_respawns(monkeypatch):
+    """A sink that raises (broken client transport) must not strand the rest of crash recovery:
+    every pending turn still gets its error callback, late control waiters are drained, and the
+    host respawns (review: Codex/Antigravity, sync bucket A1)."""
+    def _raising_sink(_obj):
+        raise BrokenPipeError("client gone")
+
+    sup = HostSupervisor(autostart=False, rpc_sink=_raising_sink, expected_build_sha="test")
+    respawns: list[bool] = []
+    monkeypatch.setattr(sup, "_maybe_respawn_after_crash", lambda: respawns.append(True))
+
+    completed: list[dict] = []
+    sup._pending_turns = {"r1": ("s1", completed.append), "r2": ("s2", completed.append)}
+    late_frames: list[dict] = []
+    sup._late_control_handlers["late-req"] = (time.monotonic(), late_frames.append)
+
+    class _FakeProc:
+        def wait(self):
+            return 1
+
+    sup._proc = _FakeProc()
+    sup._wait_for_exit(sup._proc)
+
+    assert sorted(f["request_id"] for f in completed) == ["r1", "r2"]
+    assert all(f["type"] == "turn.error" and f["reason"] == "crash" for f in completed)
+    assert len(late_frames) == 1 and late_frames[0]["type"] == "control.error"
+    assert respawns == [True]

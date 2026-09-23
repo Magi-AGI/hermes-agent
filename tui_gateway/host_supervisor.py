@@ -471,8 +471,11 @@ class HostSupervisor:
             "compute host exited: code=%s reason=%s", code, reason)
         # _fail_pending_turns also drains late control handlers: the host is gone whatever
         # the reason, so no late ack can arrive for host_exit / host_orphan_exit either.
-        self._fail_pending_turns(reason=reason, message=message)
-        self._maybe_respawn_after_crash()
+        try:
+            self._fail_pending_turns(reason=reason, message=message)
+        finally:
+            # Failure reporting is best-effort; recovery is not.
+            self._maybe_respawn_after_crash()
 
     def _fail_pending_turns(self, *, reason: str, message: str) -> None:
         with self._lock:
@@ -480,8 +483,11 @@ class HostSupervisor:
             self._pending_turns = {}
         failure = {"reason": reason, "message": message}
         for request_id, (sid, cb) in pending.items():
-            self.rpc_sink({"jsonrpc": "2.0", "method": "event",
-                           "params": {"type": "error", "session_id": sid, "payload": dict(failure)}})
+            # A raising sink (e.g. a broken client transport) must not strand the remaining turns,
+            # the late-control drain or the respawn: the pending map is already emptied.
+            _call_logged(self.rpc_sink, {"jsonrpc": "2.0", "method": "event",
+                                         "params": {"type": "error", "session_id": sid, "payload": dict(failure)}},
+                         "compute host error event delivery failed")
             if cb is not None:
                 frame = {"type": "turn.error", "sid": sid, "request_id": request_id, **failure}
                 _call_logged(cb, frame, "compute host error callback failed")
