@@ -3,13 +3,13 @@ import { type RefObject, useLayoutEffect, useRef } from 'react'
 
 import { usePaneVisible } from '@/components/pane-shell/pane-visibility'
 import { triggerHaptic } from '@/lib/haptics'
+import { nextSubmitTraceId, submitTrace } from '@/lib/submit-trace'
 import { hasClarifyRequest, skipClarifyRequest } from '@/store/clarify'
 import { clearSessionDraft, type ComposerAttachment } from '@/store/composer'
 import { resetBrowseState } from '@/store/composer-input-history'
 import { enqueueQueuedPrompt, type QueuedPromptEntry } from '@/store/composer-queue'
 import { hasConnectionRequest, skipConnectionRequest } from '@/store/connection-request'
 import { hasBlockingPromptRequest } from '@/store/prompts'
-import { nextSubmitTraceId, submitTrace } from '@/lib/submit-trace'
 
 import { cloneAttachments, type QueueEditState } from '../composer-utils'
 import { onComposerSubmitRequest } from '../focus'
@@ -166,7 +166,19 @@ export function useComposerSubmit({
           const traceId = nextSubmitTraceId()
           submitTrace('composer.enter', { traceId, source: 'external-request', sessionId, chars: text.length })
 
+          // Route + outcome records keep a busy external request correlated end to end (review: Codex).
+          const route = (to: string) => submitTrace('composer.route', { traceId, route: to })
+
+          const steerResult = (accepted: boolean, err?: unknown) =>
+            submitTrace('steer.result', {
+              traceId,
+              accepted,
+              requeued: !accepted,
+              ...(err === undefined ? {} : { threw: String((err as Error | undefined)?.message ?? err).slice(0, 200) })
+            })
+
           if (!current.busy) {
+            route('send')
             current.dispatchSubmit(text, undefined, displayKind, traceId)
 
             return
@@ -178,18 +190,28 @@ export function useComposerSubmit({
           const enqueue = () =>
             void enqueueQueuedPrompt(queueKey, { text, attachments: [], ...(displayKind ? { displayKind } : {}) })
 
+          const steerOrQueue = (steer: (text: string) => unknown) =>
+            void Promise.resolve(steer(text))
+              .then(accepted => {
+                steerResult(Boolean(accepted))
+
+                if (!accepted) {
+                  enqueue()
+                }
+              })
+              .catch(err => {
+                steerResult(false, err)
+                enqueue()
+              })
+
           // A hidden note never becomes a user turn: it rides session.steer into
           // the model's next tool result, and keeps its kind if it has to queue.
           if (displayKind) {
             if (current.onSteerHidden) {
-              void Promise.resolve(current.onSteerHidden(text))
-                .then(accepted => {
-                  if (!accepted) {
-                    enqueue()
-                  }
-                })
-                .catch(enqueue)
+              route('steer-hidden')
+              steerOrQueue(current.onSteerHidden)
             } else {
+              route('queue')
               enqueue()
             }
 
@@ -203,14 +225,10 @@ export function useComposerSubmit({
             text.trim() &&
             !SLASH_COMMAND_RE.test(text.trim())
           ) {
-            void Promise.resolve(current.onSteer(text))
-              .then(accepted => {
-                if (!accepted) {
-                  enqueue()
-                }
-              })
-              .catch(enqueue)
+            route('steer-live-turn')
+            steerOrQueue(current.onSteer)
           } else {
+            route('queue')
             enqueue()
           }
         }

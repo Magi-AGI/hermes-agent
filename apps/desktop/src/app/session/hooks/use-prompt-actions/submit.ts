@@ -5,8 +5,8 @@ import type { Translations } from '@/i18n'
 import { type ChatMessage, textPart } from '@/lib/chat-messages'
 import { optimisticAttachmentRef } from '@/lib/chat-runtime'
 import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
-import { nextSubmitTraceId, submitTrace } from '@/lib/submit-trace'
 import { setMutableRef } from '@/lib/mutable-ref'
+import { nextSubmitTraceId, submitTrace } from '@/lib/submit-trace'
 import {
   isVoicePlaybackActive,
   markVoicePlaybackInterrupted,
