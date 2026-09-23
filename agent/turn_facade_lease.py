@@ -248,13 +248,20 @@ def on_turn_lease_lost(agent, holder: Optional[str], message: str = _LEASE_LOST_
     """A transcript/compression write was refused for turn-lease loss: record the token it presented
     (so late writers stay fenced) and stop the turn, like the refresher does.
 
-    Both are immediate. A refusal detected INSIDE a compression commit used to deadlock here: the
-    hard interrupt waits out an in-flight commit's fence, which that very thread holds. The wait is
-    now owner-aware at the point it would block (interrupt_control._fence_cancel_before_commit), so
-    no deferral/handoff exists to race with overlapping attempts (review: Codex, sync bucket C)."""
+    The record is always immediate. The interrupt is immediate too, EXCEPT on a thread that is inside
+    a compression commit: there, interrupt() could deadlock two ways (its fence wait on the lock this
+    thread holds; and _pending_redirect_lock, which an external hard cancel may hold while it waits on
+    this thread's fence). That thread parks the interrupt on ITS OWN fence (found thread-locally, not
+    through the agent's shared slot) and delivers it right after its own finish_commit (review:
+    Codex, sync bucket C)."""
     if agent is None:
         return
     record_turn_lease_loss(agent, holder)
+    from agent.conversation_compression import current_thread_commit_fence
+    fence = current_thread_commit_fence()
+    if fence is not None:
+        fence.park_owner_interrupt(message)
+        return
     _hard_interrupt_for_lease_loss(agent, message)
 
 

@@ -443,6 +443,17 @@ def _capture_authoritative_cooldown_under_lease(
     return True, copy.deepcopy(durable_state)
 
 
+# The fence (if any) whose commit THIS thread is inside, set by begin_commit and cleared by
+# finish_commit. Thread-local, so code on the committing thread knows its own fence exactly, with no
+# shared slot to race (review: Codex, sync bucket C).
+_COMMIT_THREAD = threading.local()
+
+
+def current_thread_commit_fence() -> Optional["CompressionCommitFence"]:
+    """The fence whose commit the calling thread is inside, else None."""
+    return getattr(_COMMIT_THREAD, "fence", None)
+
+
 class CompressionCommitFence:
     """Fence timeout cancellation against post-summary session mutation.
     The sync worker thread cannot be killed; the fence makes the commit boundary deterministic: cancellation
@@ -453,6 +464,7 @@ class CompressionCommitFence:
         self._cancelled = False
         self._commit_started = False
         self._commit_owner: Optional[int] = None  # thread ident inside begin_commit..finish_commit
+        self._owner_interrupt: Optional[str] = None  # hard interrupt parked by that thread
         # Readable WITHOUT the lock (begin_commit holds it until finish_commit): hosts see a hung commit.
         # Lock-free commit-phase marker (#76354 review F1). ``begin_commit`` RETAINS ``self._lock`` until
         # ``finish_commit``, so any host-side observation that needs the lock (``try_cancel_before_commit``)
@@ -555,9 +567,12 @@ class CompressionCommitFence:
                 self.release_cancelled_compression_lock()
             return False
         self._commit_started = True
-        # The committing thread (Magi sync, bucket C): a hard interrupt it raises itself must not wait
-        # on this non-reentrant lock (interrupt_control._fence_cancel_before_commit is owner-aware).
+        # The committing thread (Magi sync, bucket C) must never call interrupt() inside its own commit:
+        # interrupt() takes _pending_redirect_lock, which an external hard cancel may hold while it waits
+        # on THIS fence (lock inversion). It parks instead (park_owner_interrupt) and delivers after
+        # finish_commit. The owner-aware wait (interrupt_control) is the backstop.
         self._commit_owner = threading.get_ident()
+        _COMMIT_THREAD.fence = self
         # Set under the fence lock so commit_in_flight is never True for a commit that lost to cancellation.
         self._commit_phase.set()
         return True
@@ -566,9 +581,19 @@ class CompressionCommitFence:
         """True only on the thread currently inside this fence's commit (begin_commit..finish_commit)."""
         return getattr(self, "_commit_owner", None) == threading.get_ident()
 
+    def park_owner_interrupt(self, message: str) -> None:
+        """Park a hard interrupt raised BY the committing thread (on this, its own fence)."""
+        self._owner_interrupt = message
+
+    def take_owner_interrupt(self) -> Optional[str]:
+        message, self._owner_interrupt = self._owner_interrupt, None
+        return message
+
     def finish_commit(self) -> None:
         """Leave a commit boundary entered by :meth:`begin_commit`."""
         self._commit_owner = None
+        if getattr(_COMMIT_THREAD, "fence", None) is self:
+            _COMMIT_THREAD.fence = None
         self._commit_phase.clear()
         self._lock.release()
         if self._admission_revoked:
@@ -3322,6 +3347,13 @@ def _carry_session_state_to_child(agent: Any, old_session_id: str, old_title: An
             agent._session_db.set_session_title_source(agent.session_id, _src)
 
 
+def _deliver_owner_interrupt(agent: Any, commit_fence: Any) -> None:
+    message = commit_fence.take_owner_interrupt()
+    if message:
+        from agent.turn_facade_lease import _hard_interrupt_for_lease_loss
+        _hard_interrupt_for_lease_loss(agent, message)
+
+
 def _effective_turn_lease_holder(agent: Any) -> Optional[str]:
     """Every compression writer presents the same ownership token as transcript flushes: the active
     holder, else a recorded lost holder (review: Codex, sync bucket C)."""
@@ -3959,6 +3991,7 @@ def _route_codex_compaction(
     finally:
         if commit_fence is not None:
             commit_fence.finish_commit()
+            _deliver_owner_interrupt(agent, commit_fence)
 
 
 def _announce_compression_start(
@@ -4173,6 +4206,9 @@ def compress_context(
         finally:
             if _commit_fence_entered:
                 commit_fence.finish_commit()
+                # A lease loss this thread detected inside its commit parked its hard interrupt on
+                # this fence; the fence (and any external cancel waiting on it) is released now.
+                _deliver_owner_interrupt(agent, commit_fence)
 
 
 def _codex_compaction_cooldown_remaining(agent: Any) -> float:

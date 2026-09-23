@@ -249,10 +249,21 @@ def _run_in_thread(fn, timeout=10.0):
     return box.get("result")
 
 
-def test_the_committing_thread_interrupts_itself_without_waiting_on_its_own_fence(agent_db):
-    """Real CompressionCommitFence + real AIAgent.interrupt(): a refusal detected inside the commit
-    records the loss and publishes the hard interrupt at once; the owner-aware fence wait does not
-    wait on the lock this thread holds. (Pre-cc24078df1 this waited on itself.)"""
+def _commit_bracket(agent, fence, body):
+    """What both production brackets do: begin, body, finish, then deliver a parked interrupt."""
+    from agent.conversation_compression import _deliver_owner_interrupt
+    assert fence.begin_commit()
+    try:
+        return body()
+    finally:
+        fence.finish_commit()
+        _deliver_owner_interrupt(agent, fence)
+
+
+def test_the_committing_thread_parks_its_interrupt_and_delivers_after_finish(agent_db):
+    """Real CompressionCommitFence + real AIAgent.interrupt(): inside its own commit the thread records
+    the loss at once and parks the interrupt on its own fence (found thread-locally); it is delivered
+    right after finish_commit. (Pre-cc24078df1 this waited on itself.)"""
     from agent.conversation_compression import CompressionCommitFence
     from agent.turn_facade_lease import on_turn_lease_lost
     agent, _db = agent_db
@@ -260,45 +271,80 @@ def test_the_committing_thread_interrupts_itself_without_waiting_on_its_own_fenc
     agent._active_compression_commit_fence = fence
     seen = {}
 
-    def _commit():
-        assert fence.begin_commit()
-        try:
-            on_turn_lease_lost(agent, "old-executor")       # the commit's except handler
-            seen["recorded"] = agent._turn_lease_lost_holder
-            seen["interrupted"] = bool(getattr(agent, "_interrupt_requested", False))
-        finally:
-            fence.finish_commit()
+    def _body():
+        on_turn_lease_lost(agent, "old-executor")
+        seen["recorded"] = agent._turn_lease_lost_holder
+        seen["interrupted_inside"] = bool(getattr(agent, "_interrupt_requested", False))
 
-    _run_in_thread(_commit)
-    assert seen == {"recorded": "old-executor", "interrupted": True}
+    _run_in_thread(lambda: _commit_bracket(agent, fence, _body))
+    assert seen == {"recorded": "old-executor", "interrupted_inside": False}
+    assert agent._interrupt_requested is True
+    assert fence.take_owner_interrupt() is None, "delivered exactly once"
 
 
-def test_a_swapped_fence_slot_cannot_make_the_owner_wait_on_itself(agent_db):
-    """Codex's A/B registration interleaving: the slot may name the owner's OWN in-flight fence (A) or
-    an overlapping attempt's pending fence (B) at the instant the interrupt reads it. Ownership is
-    decided at the wait itself, so neither blocks: A is skipped (its commit is the caller), a pending
-    B is cancelled as upstream does."""
+def test_the_shared_fence_slot_is_irrelevant_to_the_owner(agent_db):
+    """Codex's A/B registration interleaving: whatever the agent's shared slot names (an overlapping
+    attempt's B, or the restored A), the committing thread finds ITS OWN fence thread-locally."""
     from agent.conversation_compression import CompressionCommitFence
     from agent.turn_facade_lease import on_turn_lease_lost
     agent, _db = agent_db
     fence_a, fence_b = CompressionCommitFence(), CompressionCommitFence()
-    seen = {}
 
-    def _commit_a():
-        assert fence_a.begin_commit()
-        try:
-            agent._active_compression_commit_fence = fence_b     # B registered meanwhile
-            on_turn_lease_lost(agent, "old-executor")
-            seen["b_cancelled"] = fence_b.is_cancelled
-            agent._interrupt_requested = False
-            agent._active_compression_commit_fence = fence_a     # B's cleanup restored A
-            on_turn_lease_lost(agent, "old-executor")
-            seen["interrupted_under_a"] = bool(agent._interrupt_requested)
-        finally:
-            fence_a.finish_commit()
+    def _body():
+        agent._active_compression_commit_fence = fence_b
+        on_turn_lease_lost(agent, "old-executor")
+        agent._active_compression_commit_fence = fence_a
+        return fence_a._owner_interrupt, fence_b._owner_interrupt
 
-    _run_in_thread(_commit_a)
-    assert seen == {"b_cancelled": True, "interrupted_under_a": True}
+    parked_a, parked_b = _run_in_thread(lambda: _commit_bracket(agent, fence_a, _body))
+    assert parked_a and parked_b is None
+    assert agent._interrupt_requested is True and not fence_b.is_cancelled
+
+
+@pytest.mark.parametrize("external", ["user_stop", "lease_refresher"])
+def test_an_external_cancel_already_waiting_does_not_deadlock_the_owner(agent_db, external):
+    """Codex round 6: an external hard cancel holds _pending_redirect_lock while it waits on the
+    owner's fence; the owner then detects lease loss. Calling interrupt() inside the commit would
+    need that lock (lock inversion). The owner parks instead; both complete."""
+    import threading
+    from agent.conversation_compression import CompressionCommitFence
+    from agent.turn_facade_lease import on_turn_lease_lost
+    agent, db = agent_db
+    fence = CompressionCommitFence()
+    agent._active_compression_commit_fence = fence
+    in_commit, external_waiting = threading.Event(), threading.Event()
+    done = {}
+
+    def _owner():
+        def _body():
+            in_commit.set()
+            assert external_waiting.wait(10)
+            import time as _t
+            _t.sleep(0.3)  # let the external cancel reach its fence wait (redirect lock held)
+            on_turn_lease_lost(agent, "old-executor")
+        _commit_bracket(agent, fence, _body)
+        done["owner"] = True
+
+    def _external():
+        assert in_commit.wait(10)
+        external_waiting.set()
+        if external == "user_stop":
+            agent.interrupt("stop", hard_cancel=True)
+        else:
+            lease = DurableTurnLease(agent, db, SID, "old-executor")
+            lease.turn_active = True
+            lease._interrupt_turn("Session turn lease lost; stopping to protect the transcript.")
+        done["external"] = True
+
+    ext = threading.Thread(target=_external, daemon=True)
+    own = threading.Thread(target=_owner, daemon=True)
+    ext.start()
+    own.start()
+    own.join(15)
+    ext.join(15)
+    assert done == {"owner": True, "external": True}, "deadlocked"
+    assert agent._interrupt_requested is True
+    assert agent._turn_lease_lost_holder == "old-executor"
 
 
 def test_another_thread_still_waits_out_an_in_flight_commit(agent_db):
