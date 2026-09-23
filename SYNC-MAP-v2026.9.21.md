@@ -90,11 +90,12 @@ model-options/listing never wait on probes (cdacc2bcf1, cb24121a8e).
 | A2 | d5fb8ebae4 | approved |
 | B | 30d3fa1599 (48bb63b8d6) + 3982518f82 (curator preview bookkeeping, Codex #4-#6); ca86781a91 residual: afc54d5e6a reverted (75df8f6ce5), replaced by 9bcc841ff1 (model.save_key + recommended-default cache-only, bounded single-provider wait) | round 2 in triad |
 | D | 42c5344382..5cafcfff1d (16 picks + sync adaptations; ccb1168f23 split: ceiling part 42398eca41, EOF nit in 0e1b43f781, auth markers deferred to 2b) | in triad |
-| C | NOT ported as commits: BUCKET-C-SUPERSESSION-v2026.9.21.md recommends adopting upstream's ownership model + salvaging tests + slimmed telemetry + gap fixes G1-G3 | awaiting Lake |
+| C | DECIDED 2026-09-22 (Lake; Codex + Antigravity agree): adopt upstream's ownership model, do not port the 19 commits. G1-G4 are RELEASE GATES. Codex's bar: G2 = new id owned before any continuation write, failure stops the turn; G3 = takeover waits for / fences the old executor. Implementation in progress | in progress |
 
 ## Order
 0 → A1, A2 → B (48bb63b8d6; ca86781a91 residual only) → D → A3 → A4 (+ window fixes) → C (analysis
 started early) → phase 2b auth redesign → Group 2. Each bucket: triad before the next.
 
 ## Environment notes
-- v2026.9.21 requires Node ^22.22 / npm <11.10 or >=11.17; this machine has Node 22.18 / npm 11.5.2. Sync-repo `npm ci` ran with --engine-strict=false for typecheck/tests only; the deploy build needs a Node upgrade (Lake's call).
+- v2026.9.21 requires Node ^22.22 / ^24.11 / >=26 and npm <11.10 or >=11.17; the machine has Node 22.18 / npm 11.5.2 (unchanged).
+- DECIDED (Lake): project-local pinned toolchain, no machine-wide change. Pinned Node v26.10.0 / npm 11.19.1 (win-x64), matching upstream's .nvmrc (26) and every JS CI workflow (node-version: 26). Location: `.tools/node-v26.10.0-win-x64/` in the sync repo (git-excluded via .git/info/exclude), sha256 verified against the release SHASUMS256.txt. Use it by prepending that dir to PATH; validate with engine-strict on.
