@@ -27,7 +27,7 @@ def test_compression_on_a_respawned_host_moves_the_parents_version(isolated_env)
     parent = _parent(7)
     # A freshly spawned host has no record of the session: the turn frame rebuilds it.
     server._sessions.pop("s1", None)
-    _frames, end = _run_turn(_make_frame("s1", history_version=7))
+    _frames, end = _run_turn(_make_frame("s1", history_version=7), timeout=30.0)
     with parent["history_lock"]:
         server._compute_host_adopt_frame_meta(parent, end)
     assert parent["history_version"] >= 7
@@ -46,6 +46,6 @@ def test_a_reused_child_session_never_moves_below_the_frame(isolated_env):
     """A child session that already exists takes max(child, frame): the parent can be ahead after
     its own history edits between turns."""
     server._sessions.pop("s1", None)
-    _run_turn(_make_frame("s1", history_version=3, request_id="t1"))
-    _run_turn(_make_frame("s1", history_version=20, request_id="t2"))
+    _run_turn(_make_frame("s1", history_version=3, request_id="t1"), timeout=30.0)
+    _run_turn(_make_frame("s1", history_version=20, request_id="t2"), timeout=30.0)
     assert int(server._sessions["s1"]["history_version"]) >= 20

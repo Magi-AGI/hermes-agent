@@ -16976,10 +16976,14 @@ def test_model_save_key_uses_credential_lifecycle_and_picker_context(monkeypatch
     assert resp["result"]["provider"] == {**provider, "authenticated": True}
     save_credential.assert_called_once_with(env_var, fake_key)
     picker_context.assert_called_once_with(agent)
+    # Cache-only read: this runs on a tui-rpc worker (Magi sync bucket B, 9bcc841ff1). The row is
+    # warm here, so there is exactly one build and no wait.
     build_payload.assert_called_once_with(
         picker_ctx,
         picker_hints=True,
         max_models=50,
+        non_blocking_catalogs=True,
+        probe_custom_providers=False,
     )
 
 
@@ -18967,7 +18971,7 @@ def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
     turns = []
     emitted = []
 
-    def _fake_run_prompt_submit(rid, sid, session, text):
+    def _fake_run_prompt_submit(rid, sid, session, text, **_display):  # Magi: notices now carry display_kind
         turns.append(text)
         with session["history_lock"]:
             session["running"] = False
