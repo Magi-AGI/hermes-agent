@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -71,6 +72,9 @@ def test_typed_rows_never_reach_the_wire(agent_db):
     from agent.turn_context import build_api_messages
 
     agent, _db, _sid = agent_db
+    # build_api_messages reads the turn clock the per-turn prologue stamps (upstream fails loudly
+    # when it is skipped); stamp it like upstream's own replay tests do.
+    agent._current_turn_timestamp = time.time()
     messages = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"},
                 {"role": "user", "content": MAX_ITERATIONS_SUMMARY_REQUEST}]
     untyped = [dict(m) for m in messages]
@@ -81,8 +85,11 @@ def test_typed_rows_never_reach_the_wire(agent_db):
         api_messages, _system = build_api_messages(
             agent, msgs, current_turn_user_idx=-1, ext_prefetch_cache=None, plugin_user_context=None,
             moa_config=None, active_system_prompt="SYSTEM")
-        # Underscore keys (the flush's persistence marker) are transport-stripped bookkeeping.
-        return [{k: v for k, v in m.items() if not k.startswith("_")} for m in api_messages]
+        # Underscore keys (the flush's persistence marker) are transport-stripped bookkeeping, and
+        # upstream's flush stamps ``timestamp`` on every flushed row, typed or not — neither is
+        # what this test is about.
+        return [{k: v for k, v in m.items() if not k.startswith("_") and k != "timestamp"} for m in api_messages]
+    assert not any(k.startswith("display_") for m in wire(messages) for k in m)
     assert wire(messages) == wire(untyped)
 
 
