@@ -433,7 +433,7 @@ import {
   sessionWindowIdForOpen,
   toSavedWindowEntry
 } from './session-windows'
-import { shouldSkipShrinkingSessionWindowsWrite } from './session-windows-persist-guard'
+import { mergeSavedWindows } from './session-windows-persist-guard'
 import { ensureLoginShellPath } from './shell-path'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
 import { collectSshConfigHosts, parseSshGOutput } from './ssh-config'
@@ -3226,52 +3226,49 @@ function readSessionWindowsState() {
   }
 }
 
-// Snapshots every live, non-watch, keyed session window's bounds. Re-derived
-// from the registry each call (not an incremental patch) so a closed window
-// simply falls out of the next write — watch windows are excluded here (the
-// subagent run they spectate may not exist after a restart), not at read time,
-// so the persisted file's meaning stays unambiguous: everything in it is safe
-// to reopen.
+// Window ids closed INDIVIDUALLY since the last write (see
+// wireSessionWindowPersistence). One debounce batch with more than one close is
+// a cascade, not a deliberate close, and mergeSavedWindows refuses its removals.
+const pendingClosedWindowIds = new Set<string>()
+
+// Merges the live, non-watch restorable windows (session pop-outs and peers)
+// into the saved layout — see session-windows-persist-guard.ts. The saved list
+// is never re-derived from the live set: a window that is simply not open
+// (quit, crash, never reopened) keeps its entry; only an explicit individual
+// close removes one; new windows are always recorded. Watch windows are never
+// saved (the subagent run they spectate may not exist after a restart).
 function persistSessionWindowsState() {
+  const closed = Array.from(pendingClosedWindowIds)
+
+  pendingClosedWindowIds.clear()
+
   try {
-    const entries = sessionWindows
+    const live = sessionWindows
       .entries()
       .filter(({ watch }) => !watch)
-      .map(entry => (entry.win.isDestroyed() ? null : toSavedWindowEntry(entry, entry.win.getNormalBounds(), entry.win.isMaximized())))
+      .map(entry =>
+        entry.win.isDestroyed() ? null : toSavedWindowEntry(entry, entry.win.getNormalBounds(), entry.win.isMaximized())
+      )
       .filter(Boolean)
 
-    // Never let an empty live set clobber a non-empty saved snapshot. The state
-    // is re-derived from the live windows each call, so a stray save fired while
-    // no session windows are open (a crash-loop / rollback relaunch, or after the
-    // last pop-out closes) would otherwise wipe a real "Close All" snapshot to [].
-    // Skip the empty write so the saved set stays durable until it is replaced by
-    // a non-empty layout — close-all snapshots while windows are still open, so it
-    // is unaffected. (Trade-off: closing pop-outs individually down to zero no
-    // longer auto-clears the saved set.)
-    if (entries.length === 0) {
-      return
+    const saved = readSessionWindowsState()
+    const { entries, refusedRemovals } = mergeSavedWindows(saved, live, closed)
+
+    if (refusedRemovals.length > 0) {
+      rememberLog(
+        `[session-windows-state] ${refusedRemovals.length} windows closed in one batch (a cascade, not a ` +
+          'deliberate close) — keeping their saved entries'
+      )
     }
 
-    // Refuse a write that drops more than one entry from what's currently saved
-    // — see session-windows-persist-guard.ts for the full rationale.
-    // closeAllSessionWindows() itself is unaffected: it flushes its own
-    // full-state snapshot BEFORE closing anything (never shrinks), then
-    // suppresses every window's individual 'closed' handler so none of them
-    // reach this function again during the sweep.
-    const previousEntries = readSessionWindowsState()
+    const next = JSON.stringify(entries, null, 2)
 
-    if (shouldSkipShrinkingSessionWindowsWrite(previousEntries.length, entries.length)) {
-      rememberLog(
-        `[session-windows-state] refusing to shrink saved set from ${previousEntries.length} to ` +
-          `${entries.length} in one write (more than one window disappeared outside Close All) — ` +
-          'keeping the larger saved snapshot'
-      )
-
+    if (next === JSON.stringify(saved, null, 2)) {
       return
     }
 
     fs.mkdirSync(path.dirname(SESSION_WINDOWS_STATE_PATH), { recursive: true })
-    writeFileAtomic(SESSION_WINDOWS_STATE_PATH, JSON.stringify(entries, null, 2))
+    writeFileAtomic(SESSION_WINDOWS_STATE_PATH, next)
   } catch (err) {
     rememberLog(`[session-windows-state] persist failed: ${err?.message || err}`)
   }
@@ -3303,7 +3300,7 @@ let appIsQuitting = false
 // window's resize/move/maximize debounce pattern, and additionally persists on
 // SHOW so a freshly-opened window enters the saved set immediately (crash-safe:
 // the set stays complete even if the window is never moved before a crash).
-function wireSessionWindowPersistence(win) {
+function wireSessionWindowPersistence(win, windowId: string) {
   win.once('show', schedulePersistSessionWindowsState)
   win.on('resized', schedulePersistSessionWindowsState)
   win.on('moved', schedulePersistSessionWindowsState)
@@ -3319,16 +3316,11 @@ function wireSessionWindowPersistence(win) {
       return
     }
 
-    // SCHEDULE (debounced), never flush. This is what distinguishes a deliberate
-    // single close from a bulk close-all without needing to detect intent:
-    //  - Lone close (app keeps running): the debounce settles with N-1 live
-    //    windows and correctly drops the closed session from the set.
-    //  - Bulk close-all (taskbar/system tray, not via the app's snapshot path):
-    //    every window closes within the debounce window, so the single trailing
-    //    persist re-derives a live set of 0 — which persistSessionWindowsState's
-    //    empty-guard refuses to write, preserving the full snapshot. (A previous
-    //    `.flush()` here fired per-window and shrank the file step-by-step to
-    //    whatever closed last — the bug that lost the user's layout on crash.)
+    // Record the explicit close and SCHEDULE (debounced), never flush: closes that
+    // land in one debounce batch are judged together, so a lone close removes
+    // its entry while a bulk close (taskbar/system tray, not via Close All)
+    // records more than one and mergeSavedWindows keeps them all.
+    pendingClosedWindowIds.add(windowId)
     schedulePersistSessionWindowsState()
   })
 }
@@ -14153,7 +14145,7 @@ function createSessionWindow(sessionId, { profile = null, watch = false, bounds,
 
   return sessionWindows.openOrFocus(
     id,
-    () => {
+    createdId => {
       const win = spawnSecondaryWindow({ sessionId: key, profile, watch, bounds, isMaximized })
 
       // Only keyed, non-watch windows are eligible for "reopen saved windows" —
@@ -14161,7 +14153,7 @@ function createSessionWindow(sessionId, { profile = null, watch = false, bounds,
       // created (openOrFocus skips the factory when it just focuses an
       // existing one, so this never double-wires).
       if (!watch) {
-        wireSessionWindowPersistence(win)
+        wireSessionWindowPersistence(win, createdId)
       }
 
       return win
@@ -14527,7 +14519,7 @@ function openInstanceWindow(
 
   return sessionWindows.openOrFocus(
     restore?.windowId || newWindowId(),
-    () => spawnInstanceWindow(route, source, restore),
+    createdId => spawnInstanceWindow(createdId, route, source, restore),
     {
       kind: 'peer',
       sessionId: restore?.sessionId ?? null,
@@ -14539,6 +14531,7 @@ function openInstanceWindow(
 }
 
 function spawnInstanceWindow(
+  windowId: string,
   route: ReturnType<typeof resolveDesktopWindowLaunch>,
   source: BrowserWindow | null,
   restore?: { sessionId: null | string; bounds?: { width: number; height: number; x?: number; y?: number }; isMaximized?: boolean }
@@ -14569,7 +14562,7 @@ function spawnInstanceWindow(
   // Close All reaches peers too (they are part of the saved layout).
   secondaryWindows.add(win)
   win.on('closed', () => secondaryWindows.delete(win))
-  wireSessionWindowPersistence(win)
+  wireSessionWindowPersistence(win, windowId)
 
   // Chat-surface registration: see applyWindowTranslucency.
   translucencyBackedWindows.add(win)
