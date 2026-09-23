@@ -23,6 +23,18 @@ import hermes_cli.auth_codex as auth_codex
 CODEX = {"access_token": "fake-access-1", "refresh_token": "fake-refresh-1"}
 
 
+@pytest.fixture(autouse=True)
+def _no_network_no_real_codex_cli(monkeypatch):
+    """No test here may reach the token endpoint or read the real ~/.codex/auth.json: every refresh
+    is a fake unless a test installs its own, and CLI-token recovery finds nothing."""
+    def _refuse(*_a, **_k):
+        raise AssertionError("a real Codex token refresh was attempted")
+
+    for module in (auth, auth_codex):
+        monkeypatch.setattr(module, "refresh_codex_oauth_pure", _refuse, raising=False)
+        monkeypatch.setattr(module, "_import_codex_cli_tokens", lambda: None, raising=False)
+
+
 def _seed(tokens=CODEX):
     auth._save_auth_store({"providers": {"openai-codex": {"tokens": dict(tokens), "auth_mode": "chatgpt"}}})
     return auth._auth_file_path()
@@ -107,3 +119,93 @@ def test_corrupt_copies_never_overwrite_an_earlier_one():
     auth._load_auth_store()
     copies = sorted(p.read_text(encoding="utf-8") for p in path.parent.glob("auth.json.corrupt*"))
     assert "{first corrupt" in copies and "{second corrupt" in copies
+
+
+# --- post-rotation save failure (Codex's required regression) -----------------------------------------
+
+def _rotating_refresh(calls):
+    def _refresh(access_token, refresh_token, **_k):
+        calls.append(refresh_token)
+        n = len(calls) + 1
+        return {"access_token": f"fake-access-{n}", "refresh_token": f"fake-refresh-{n}"}
+    return _refresh
+
+
+def test_a_save_failing_after_rotation_keeps_the_new_token_and_never_replays_the_consumed_one(monkeypatch):
+    """Guarantee: the provider rotated fake-refresh-1 -> fake-refresh-2, then every save failed.
+    (1) the caller still receives the NEW pair (in-memory retention for this process);
+    (2) the new pair is written to a separate rescue file;
+    (3) the next refresh ADOPTS the rescued pair (it is fresh) instead of replaying the consumed
+        fake-refresh-1, persists it, and removes the rescue once that save succeeds."""
+    _seed()
+    calls = []
+    monkeypatch.setattr(auth_codex, "refresh_codex_oauth_pure", _rotating_refresh(calls))
+    monkeypatch.setattr(auth, "refresh_codex_oauth_pure", _rotating_refresh(calls), raising=False)
+    real_save = auth._save_auth_store
+
+    def _failing_save(*_a, **_k):
+        raise OSError(5, "Access is denied")
+
+    monkeypatch.setattr(auth, "_save_auth_store", _failing_save)
+    out = auth_codex._refresh_codex_auth_tokens(dict(CODEX), 5.0)
+    assert out["refresh_token"] == "fake-refresh-2"
+    assert calls == ["fake-refresh-1"]
+    assert _codex_tokens_on_disk()["refresh_token"] == "fake-refresh-1"     # the store write failed
+    rescue = auth_codex._codex_rotation_rescue_path()
+    assert json.loads(rescue.read_text(encoding="utf-8"))["entries"]["singleton"]["refresh_token"] == "fake-refresh-2"
+
+    monkeypatch.setattr(auth, "_save_auth_store", real_save)
+    out2 = auth_codex._refresh_codex_auth_tokens(dict(CODEX), 5.0)          # caller still holds the stale pair
+    assert calls == ["fake-refresh-1"], "the consumed token was replayed"
+    assert out2["refresh_token"] == "fake-refresh-2"
+    assert _codex_tokens_on_disk()["refresh_token"] == "fake-refresh-2"
+    assert not rescue.exists()
+
+
+def test_a_rescue_is_adopted_before_any_refresh_even_without_a_new_rotation(monkeypatch):
+    _seed()
+    auth_codex._write_codex_rotation_rescue({"access_token": "fake-access-2", "refresh_token": "fake-refresh-2"})
+    tokens = auth_codex._adopt_codex_rotation_rescue()
+    assert tokens["refresh_token"] == "fake-refresh-2"
+    assert _codex_tokens_on_disk()["refresh_token"] == "fake-refresh-2"
+    assert not auth_codex._codex_rotation_rescue_path().exists()
+
+
+def test_if_the_rescue_write_also_fails_the_error_is_surfaced(monkeypatch):
+    _seed()
+    calls = []
+    monkeypatch.setattr(auth_codex, "refresh_codex_oauth_pure", _rotating_refresh(calls))
+    monkeypatch.setattr(auth, "refresh_codex_oauth_pure", _rotating_refresh(calls), raising=False)
+    monkeypatch.setattr(auth, "_save_auth_store", lambda *a, **k: (_ for _ in ()).throw(OSError(5, "denied")))
+    monkeypatch.setattr(auth_codex, "_write_codex_rotation_rescue",
+                        lambda *_a, **_k: (_ for _ in ()).throw(OSError(28, "No space left")))
+    with pytest.raises(auth.AuthError) as info:
+        auth_codex._refresh_codex_auth_tokens(dict(CODEX), 5.0)
+    assert info.value.code == "codex_rotation_persist_failed"
+
+
+def test_a_pool_entry_rotation_that_cannot_be_saved_is_rescued_and_adopted(monkeypatch):
+    """The quota-probe path rotates an expired POOL entry's token; a failed persist used to be
+    swallowed at debug level, losing the only copy of the new refresh token."""
+    auth._save_auth_store({"providers": {}, "credential_pool": {"openai-codex": [
+        {"id": "p1", "access_token": "fake-pool-access-1", "refresh_token": "fake-pool-refresh-1"}]}})
+    calls = []
+    monkeypatch.setattr(auth_codex, "_codex_access_token_is_expiring", lambda *_a, **_k: True)
+    monkeypatch.setattr(auth_codex, "refresh_codex_oauth_pure",
+                        lambda a, r, **_k: calls.append(r) or {"access_token": "fake-pool-access-2",
+                                                               "refresh_token": "fake-pool-refresh-2"})
+    monkeypatch.setattr(auth_codex, "_probe_codex_quota_restored", lambda *_a, **_k: None)
+    real_save = auth._save_auth_store
+    monkeypatch.setattr(auth, "_save_auth_store", lambda *a, **k: (_ for _ in ()).throw(OSError(5, "denied")))
+    entry = {"id": "p1", "access_token": "fake-pool-access-1", "refresh_token": "fake-pool-refresh-1"}
+    auth_codex._probe_codex_pool_entry_quota_restored(dict(entry))
+    rescued = json.loads(auth_codex._codex_rotation_rescue_path().read_text(encoding="utf-8"))["entries"]
+    assert rescued["pool:p1"]["refresh_token"] == "fake-pool-refresh-2"
+
+    monkeypatch.setattr(auth, "_save_auth_store", real_save)
+    monkeypatch.setattr(auth_codex, "_codex_access_token_is_expiring", lambda *_a, **_k: False)
+    auth_codex._probe_codex_pool_entry_quota_restored(dict(entry))       # caller still holds the stale entry
+    assert calls == ["fake-pool-refresh-1"], "the consumed pool token was replayed"
+    pool = json.loads(auth._auth_file_path().read_text(encoding="utf-8"))["credential_pool"]["openai-codex"]
+    assert pool[0]["refresh_token"] == "fake-pool-refresh-2"
+    assert not auth_codex._codex_rotation_rescue_path().exists()
