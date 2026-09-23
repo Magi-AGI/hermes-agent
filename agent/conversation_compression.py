@@ -3727,6 +3727,12 @@ def _commit_compaction(
                 agent._flushed_db_message_session_id = agent.session_id
             session_commit_succeeded = True
         except Exception as e:
+            from hermes_state_errors import SessionTurnLeaseLostError
+            if isinstance(e, SessionTurnLeaseLostError):
+                # The commit presented the effective token and was refused: keep late writers fenced
+                # and stop the turn (review: Codex, sync bucket C).
+                from agent.turn_facade_lease import on_turn_lease_lost
+                on_turn_lease_lost(agent, _effective_turn_lease_holder(agent))
             # Rotation: atomic publication failed (including lease loss) — keep the parent live and discard the stale
             # compacted snapshot. In-place: archive_and_compact is atomic so old rows stay active, but marker-swept
             # `compressed` would re-INSERT on top of them (doubling each try); gate on split_status (set right after

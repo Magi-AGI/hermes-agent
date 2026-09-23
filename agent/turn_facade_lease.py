@@ -114,10 +114,17 @@ class DurableTurnLease:
 
     def _interrupt_turn(self, message: str) -> None:
         """Lease-loss interrupts fire UNCONDITIONALLY (no generation claim): a lost lease means
-        this process no longer owns the session. Only the watchdog's stalls can be spuriously stale."""
+        this process no longer owns the session. Only the watchdog's stalls can be spuriously stale.
+
+        The loss is recorded HERE, under the same lock and after the same stop/turn_active check
+        that turn shutdown (``stop_refresher``) takes: a late refresher callback that outlived its
+        turn can never re-instate an obsolete fence after the next turn was admitted (review: Codex,
+        sync bucket C). A miss and a refresh error both record: ownership is unproven, and a holder
+        that still owns the lease is admitted as before."""
         with self._lock:
             if self.stop.is_set() or not self.turn_active:
                 return
+            record_turn_lease_loss(self.agent, self.holder)
             self.interrupt_message = message
             try:
                 self.agent.interrupt(message, hard_cancel=True, tool_reason=_REASON_LEASE_LOST)
@@ -196,7 +203,6 @@ class DurableTurnLease:
             logger.error(
                 "Lost session turn lease while turn is active: %s", self._current_session_id()
             )
-            record_turn_lease_loss(self.agent, self.holder)
             self._interrupt_turn("Session turn lease lost; stopping to protect the transcript.")
         except Exception:
             if self.stop.is_set():
@@ -204,9 +210,6 @@ class DurableTurnLease:
             logger.warning(
                 "Failed to refresh session turn lease: %s", self._current_session_id(), exc_info=True,
             )
-            # Ownership is now unproven: fence late writers with this holder (a still-valid lease
-            # admits it; a successor's does not).
-            record_turn_lease_loss(self.agent, self.holder)
             self._interrupt_turn(
                 "Session turn lease could not be refreshed; stopping to protect the transcript."
             )
@@ -227,6 +230,21 @@ def record_turn_lease_loss(agent, holder: Optional[str]) -> None:
     writer presenting a holder that still owns the lease is admitted as before."""
     if holder:
         agent._turn_lease_lost_holder = holder
+
+
+def on_turn_lease_lost(agent, holder: Optional[str],
+                       message: str = "Session turn lease lost; stopping to protect the transcript.") -> None:
+    """A transcript/compression write was refused for turn-lease loss: record the token it presented
+    (so late writers stay fenced) and stop the turn, like the refresher does."""
+    if agent is None:
+        return
+    record_turn_lease_loss(agent, holder)
+    try:
+        agent.interrupt(message, hard_cancel=True, tool_reason=_REASON_LEASE_LOST)
+    except Exception:
+        agent._interrupt_requested = True
+        agent._interrupt_message = message
+        agent._tool_interrupt_reason = _REASON_LEASE_LOST
 
 
 @dataclass

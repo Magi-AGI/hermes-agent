@@ -169,3 +169,60 @@ def test_a_successful_readmission_ends_the_fence():
     assert admission.lease is not None
     assert agent._turn_lease_lost_holder is None
     assert effective_turn_lease_holder(agent) == agent._active_session_turn_lease_holder
+
+
+# --- review round 3 (Codex) ------------------------------------------------------------------------
+
+def test_a_refused_compressor_commit_records_the_loss_and_stops_the_turn(agent_db):
+    """Micro-compaction's DB sync is refused for lease loss: the token it presented stays fenced
+    and the owning turn is interrupted, exactly like a refresher-detected loss."""
+    from hermes_state_errors import SessionTurnLeaseLostError
+    agent, _db = agent_db
+    agent._active_session_turn_lease_holder = "old-executor"
+    compressor = agent.context_compressor
+
+    class _RefusingDb:
+        def archive_and_compact(self, *_a, **_k):
+            raise SessionTurnLeaseLostError("taken over")
+
+    compressor._session_db = _RefusingDb()
+    compressor._session_id = SID
+    compressor._sync_micro_compact_to_db([{"role": "assistant", "content": "summary"}])
+    agent._active_session_turn_lease_holder = None  # turn cleanup
+    assert agent._turn_lease_lost_holder == "old-executor"
+    assert getattr(agent, "_interrupt_requested", False) is True
+
+
+def test_the_turn_level_compression_handler_records_and_interrupts(agent_db):
+    from agent.turn_facade_lease import on_turn_lease_lost
+    agent, _db = agent_db
+    on_turn_lease_lost(agent, "old-executor")
+    assert agent._turn_lease_lost_holder == "old-executor"
+    assert getattr(agent, "_interrupt_requested", False) is True
+
+
+def test_a_refresher_that_outlived_its_turn_cannot_reinstate_an_old_fence(agent_db, monkeypatch):
+    """Codex's interleaving: the refresher passes its stop check, pauses while logging the miss, the
+    old turn ends and the next one is fully admitted, then the refresher resumes. Recording under
+    the lifecycle lock (after the same stop check shutdown takes) means it records nothing, so the
+    newer turn's clean release is not refused later."""
+    agent, db = agent_db
+    _expire_and_take_over(db)
+    lease = DurableTurnLease(agent, db, SID, "old-executor")
+    lease.turn_active = True
+
+    def _log_then_turn_ends(*_a, **_k):
+        lease.stop_refresher()               # old turn ends while the callback is paused here
+        agent._turn_lease_lost_holder = None  # next turn fully admitted
+
+    monkeypatch.setattr(turn_facade_lease.logger, "error", _log_then_turn_ends)
+    assert lease.refresh_tick() is False
+    assert getattr(agent, "_turn_lease_lost_holder", None) is None
+
+
+def test_a_live_refresher_still_records_the_loss(agent_db):
+    agent, _db = agent_db
+    lease = DurableTurnLease(agent, _db, SID, "old-executor")
+    lease.turn_active = True
+    lease._interrupt_turn("Session turn lease lost; stopping to protect the transcript.")
+    assert agent._turn_lease_lost_holder == "old-executor"

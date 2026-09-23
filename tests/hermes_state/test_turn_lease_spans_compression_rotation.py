@@ -32,7 +32,8 @@ def rotated(tmp_path):
     assert db.try_acquire_compression_lock("A", compression_holder)
     db.publish_compression_child(
         parent_session_id="A", child_session_id="B", source="desktop",
-        messages=[{"role": "user", "content": "compacted handoff"}], compression_lock_holder=compression_holder)
+        messages=[{"role": "user", "content": "compacted handoff"}], compression_lock_holder=compression_holder,
+        turn_lease_holder=turn_holder)  # the running turn publishes (compression commits are lease-fenced)
     try:
         yield db, turn_holder
     finally:

@@ -1961,6 +1961,9 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
         _agent_ref = weakref.ref(agent)
         agent.context_compressor._turn_lease_holder_source = (
             lambda: _effective_turn_lease_holder(_agent_ref()))
+        from agent.turn_facade_lease import on_turn_lease_lost as _on_turn_lease_lost
+        agent.context_compressor._turn_lease_loss_sink = (
+            lambda holder: _on_turn_lease_lost(_agent_ref(), holder))
     agent.compression_enabled = cs.enabled
     agent.compression_in_place = cs.in_place
     _cc = agent.context_compressor

@@ -2151,6 +2151,17 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         source = self._turn_lease_holder_source
         return source() if callable(source) else None
 
+    def _report_turn_lease_loss(self, exc: BaseException, holder: Optional[str]) -> None:
+        """A compressor commit refused for turn-lease loss records the token it presented and stops
+        the owning turn (bound by agent_init via a weak reference)."""
+        from hermes_state_errors import SessionTurnLeaseLostError
+        sink = getattr(self, "_turn_lease_loss_sink", None)
+        if isinstance(exc, SessionTurnLeaseLostError) and callable(sink):
+            try:
+                sink(holder)
+            except Exception:
+                logger.debug("turn-lease loss sink failed", exc_info=True)
+
     def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
         """Bind the current session row so durable cooldowns can round-trip."""
         self._session_db = session_db
@@ -3225,13 +3236,15 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         runway = max(reclaimed, self.proactive_prune_tokens, self.proactive_prune_min_reclaim_tokens)
         next_rearm_tokens = after + runway
         if session_db and session_id:
+            prune_holder = self._current_turn_lease_holder()
             try:
                 session_db.archive_and_compact(
                     session_id, pruned_msgs,
                     model_config_patch={PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: next_rearm_tokens},
-                    turn_lease_holder=self._current_turn_lease_holder(),
+                    turn_lease_holder=prune_holder,
                 )
             except Exception as exc:
+                self._report_turn_lease_loss(exc, prune_holder)
                 logger.warning("Proactive tool-result prune DB commit failed; keeping the original transcript: %s", exc)
                 return messages, 0
             # Shared post-commit stamp site with the in-place commit and micro-compaction sync.

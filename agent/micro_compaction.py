@@ -347,16 +347,20 @@ class MicroCompactionMixin:
         session_db, session_id = getattr(self, "_session_db", None), getattr(self, "_session_id", "")
         if not session_db or not session_id:
             return
+        holder_fn = getattr(self, "_current_turn_lease_holder", None)
+        holder = holder_fn() if callable(holder_fn) else None
         try:
             # Every row except the marker is a carried-forward original: archive rewind-style.
-            holder_fn = getattr(self, "_current_turn_lease_holder", None)
             session_db.archive_and_compact(
                 session_id, compacted_messages, tail_count=max(0, len(compacted_messages) - 1),
-                turn_lease_holder=holder_fn() if callable(holder_fn) else None)
+                turn_lease_holder=holder)
             # Shared post-commit stamp site with batch commit and proactive prune.
             # See #98450.
             _cc().stamp_db_persisted_markers(compacted_messages)
-        except Exception:
+        except Exception as exc:
+            report = getattr(self, "_report_turn_lease_loss", None)
+            if callable(report):
+                report(exc, holder)
             logger.info(
                 "Micro-compaction DB sync failed — resume will double-load "
                 "compacted messages until the next batch compression"
