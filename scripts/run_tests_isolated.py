@@ -41,8 +41,11 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 LEAK_MARKERS = re.compile(r"pytest-of-|hermes_test|hermes-test-home-|isolated-run-")
-_FORWARD = ("PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "USERPROFILE",
-            "HOMEDRIVE", "HOMEPATH", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE")
+# USERPROFILE / HOME / HOMEDRIVE / HOMEPATH are NOT forwarded: they are pointed into the sandbox, so
+# Path.home() in a test can never reach the real ~/.codex, ~/.claude, ~/.hermes, ... (Magi phase 2b: a
+# test that did not mock the home read the real ~/.codex/auth.json).
+_FORWARD = ("PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC",
+            "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE")
 _FORWARD_PREFIX = ("HERMES_TEST_",)  # the runner's own documented knobs (workers, paths, timeouts)
 _DETERMINISTIC = {"TZ": "UTC", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PYTHONHASHSEED": "0"}
 
@@ -72,13 +75,16 @@ LIVE_ROOT = LIVE_ROOTS[0]
 
 def _sandbox_env(box: Path) -> dict:
     env = {k: v for k, v in os.environ.items() if k in _FORWARD or k.startswith(_FORWARD_PREFIX)}
-    for name in ("home", "localappdata", "appdata", "tmp"):
+    for name in ("home", "userhome", "localappdata", "appdata", "tmp"):
         (box / name).mkdir(parents=True, exist_ok=True)
+    userhome = box / "userhome"
     env.update(_DETERMINISTIC)
     env.update(HERMES_HOME=str(box / "home"), LOCALAPPDATA=str(box / "localappdata"),
                APPDATA=str(box / "appdata"), TEMP=str(box / "tmp"), TMP=str(box / "tmp"),
                HERMES_TEST_LIVE_ROOTS=os.pathsep.join(str(r) for r in LIVE_ROOTS),
-               PYTHONUTF8="1", PYTHONDONTWRITEBYTECODE="1")
+               PYTHONUTF8="1", PYTHONDONTWRITEBYTECODE="1",
+               USERPROFILE=str(userhome), HOME=str(userhome),
+               HOMEDRIVE=userhome.drive or "", HOMEPATH=str(userhome)[len(userhome.drive):])
     return env
 
 

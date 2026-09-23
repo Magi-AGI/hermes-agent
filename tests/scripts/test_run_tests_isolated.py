@@ -159,3 +159,17 @@ def test_pending_interrupt_is_handled_during_an_untimed_wait(tmp_path):
         assert time.monotonic() - start < 3.0
     finally:
         job.close()
+
+
+def test_the_user_home_is_sandboxed_too(tmp_path, monkeypatch):
+    """Magi phase 2b: USERPROFILE was forwarded, so Path.home() in a test that did not mock it was the
+    REAL home (~/.codex/auth.json was read). The child's home now lives in the sandbox."""
+    real_home = Path.home()
+    box = tmp_path / "box"
+    env = rti._sandbox_env(box)
+    for key in ("USERPROFILE", "HOME"):
+        assert Path(env[key]).is_relative_to(box), key
+    child_home = subprocess.run(
+        [sys.executable, "-c", "from pathlib import Path; print(Path.home())"],
+        env=env, capture_output=True, text=True, check=True).stdout.strip()
+    assert Path(child_home).is_relative_to(box) and Path(child_home) != real_home
