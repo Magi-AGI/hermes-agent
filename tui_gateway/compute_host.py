@@ -312,6 +312,7 @@ class ComputeHost:
     def _ensure_server_session(self, server: Any, frame: dict[str, Any]) -> dict:
         sid = str(frame.get("sid") or "")
         session = server._sessions.get(sid)
+        frame_version = int(frame.get("history_version") or 0)
         if session is not None:
             session["transport"] = self._transport
             if frame.get("cols") is not None:
@@ -319,6 +320,9 @@ class ComputeHost:
             for key in ("cwd", "profile_home"):
                 if frame.get(key):
                     session[key] = str(frame[key])
+            # The parent may be ahead (its own history edits between turns): never below it.
+            with session.get("history_lock") or contextlib.nullcontext():
+                session["history_version"] = max(int(session.get("history_version", 0)), frame_version)
         else:
             session = self._build_server_session(server, frame, sid)
         if isinstance(frame.get("attached_images"), list):
@@ -375,7 +379,9 @@ class ComputeHost:
                     source=frame.get("source"))
             finally:
                 reset_transport(token)
+            built_at_zero = True
         except Exception:
+            built_at_zero = False
             # _init_session's side machinery (slash worker, approval notify) unavailable: keep a
             # minimal host-owned session rather than failing after the expensive agent build.
             server._sessions[sid] = {
@@ -391,6 +397,15 @@ class ComputeHost:
                 "source": server._sanitize_client_source(frame.get("source")),
                 "transport": self._transport}
         session = server._sessions[sid]
+        if built_at_zero:
+            # _init_session starts at version 0, but the parent is at the frame's version and adopts
+            # max(parent, frame): a respawned host's bumps would stay masked below it (bucket C G4).
+            # Continue from the parent's value, keeping any bump a callback already made since the
+            # session was registered (offset, not overwrite). The fallback record above is already
+            # seeded from the frame.
+            with session.get("history_lock") or contextlib.nullcontext():
+                session["history_version"] = (
+                    int(frame.get("history_version") or 0) + int(session.get("history_version", 0)))
         session["transport"] = self._transport
         # The host pipe names no login; the record carries the one the gateway stamped at creation.
         session["auth_user_id"] = frame.get("auth_user_id")
