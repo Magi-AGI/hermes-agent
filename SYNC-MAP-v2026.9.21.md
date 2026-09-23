@@ -82,6 +82,14 @@ Item 7 paging (49e6d661a0, 43bd5db429); MCP discovery lock budget (ef50bb344c, d
 OAuth refresh (20d80bb36f); shared credential writer (2be8e6147a); test isolation fixes (#112692, ca16cafee4);
 model-options/listing never wait on probes (cdacc2bcf1, cb24121a8e).
 
+## Progress (sync branch)
+| bucket | commit | status |
+|---|---|---|
+| 0 | 86bc926241 | approved |
+| A1 | 2436ad4e24 + 6f01d7ef32 superseded by 8fa5ab0dbf (re-port WITHOUT RelayBuffer, Lake's call) | in triad |
+| A2 | d5fb8ebae4 | approved |
+| B | 30d3fa1599 (48bb63b8d6) + afc54d5e6a (ca86781a91 residual: two blocking callers remain, methods_complete.py:377 and web_routers/models.py:165) | in triad |
+
 ## Order
 0 → A1, A2 → B (48bb63b8d6; ca86781a91 residual only) → D → A3 → A4 (+ window fixes) → C (analysis
 started early) → phase 2b auth redesign → Group 2. Each bucket: triad before the next.
