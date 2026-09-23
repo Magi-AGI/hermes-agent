@@ -151,3 +151,62 @@ compared separately. Proposed fix: after `_init_session` on the normal path, see
 `session["history_version"]` from the frame, as the fallback already does. Failing-first test:
 respawn the host, compress, and assert the parent's version increases. Belongs with the bucket C
 gap fixes (G1-G3), in the same order and under the same decision.
+
+## Implementation status (sync branch, bucket C)
+
+| gap | commit | status |
+|---|---|---|
+| telemetry | 9f96207120 | ported slimmed: refusal names claimant + incumbent; child setup_logging() |
+| G1 | 110d09031e | FIXED, red-first (child ended the parent's row for all 4 shutdown reasons) |
+| G4 | 9d48f8e528 | FIXED, red-first (parent stayed at 7 after a respawned host compressed) |
+| G2 | see below | write-level guarantee already provided upstream (pinned by tests); registry-level residual is a DESIGN CHOICE, not implemented |
+| G3 | see below | same: write-level guarantee provided upstream (pinned); residuals listed |
+
+## G2 / G3 against Codex's bar: what upstream already guarantees (found while implementing)
+
+The earlier G2/G3 rows reasoned about the **advisory** active-session registry
+(`runtime/active_sessions.json`). Transcript writes are fenced by a different, durable mechanism
+that the analysis did not account for: the **session turn lease** in state.db
+(`session_turn_leases`, `agent/turn_facade_lease.py`, `hermes_state_compression.py`).
+
+- It is keyed by the compression **lineage root** (`_session_turn_lease_key_on_conn`), so A and its
+  continuation B share ONE lease row from the moment `publish_compression_child` links them, in the
+  same transaction as the rotation. There is no instant at which B exists un-owned.
+- Every turn write re-checks its holder **inside the write transaction**
+  (`hermes_state_messages.py` ~228-245): a holder mismatch raises `SessionTurnLeaseLostError`, and the
+  refresher (`DurableTurnLease.refresh_tick`, every 60s, TTL 300s) hard-interrupts the turn when the
+  lease is lost. Failure stops the writer; it does not just log.
+- In an isolated turn the CHILD's agent admits that lease (`admit_durable_turn_lease`, holder
+  `pid=<child>`), so a successor after parent death cannot take the session while the child executor
+  lives; once the child is gone its lease is reclaimable by the dead-pid rule, and a stalled child
+  whose lease expired and was reclaimed is fenced on its next write.
+
+So Codex's G2 bar ("ownership of B established before any continuation write; failure stops
+execution") and G3 bar ("takeover waits for the previous executor to stop, or the previous executor
+is fenced") hold at the **transcript-write** level on v2026.9.21. Pinned by
+`tests/hermes_state/test_turn_lease_spans_compression_rotation.py` (4 tests; negative-checked by
+disabling lineage keying and dead-holder detection). Read from code, not reproduced end-to-end
+through a live compute host.
+
+### Residuals (open choices for Lake + reviewers)
+
+- **R1: registry lag after a mid-turn rotation (UI ownership, not data).** Until `turn.end`, the parent's
+  registry lease stays on A. A second window can claim B in the registry; its turn then WAITS on the
+  DB lease ("Another Hermes process is using this session", up to 30 min) and runs afterwards. When
+  the child's `turn.end` arrives, the parent's A->B re-anchor fails (B is held) and only logs, so two
+  windows end up live on one conversation, taking turns serially. No transcript corruption.
+  Options: (a) child emits a rotation frame at the rotation point and the parent re-anchors on the
+  drain thread immediately (small-medium; narrows but cannot close the window, since the frame is
+  asynchronous); (b) a synchronous child->parent handoff request that blocks the continuation until
+  the parent confirms (medium-large; new request/ack frame pair on the host pipe, timeout policy, and
+  it would duplicate a guarantee the DB lease already gives); (c) accept, documented.
+  Recommendation: (c) or (a). (b) buys no data safety.
+- **R2: non-turn transcript mutations.** Writes outside a turn (rewind, edits, archive) are fenced
+  against an active turn lease only when the caller opts in (`reject_active_turn_lease`). Not audited
+  here; worth one pass to confirm every user-initiated mutation path opts in.
+- **R3: first turn of a brand-new session.** `admit_durable_turn_lease` skips the lease when no durable
+  row exists yet ("a fresh session id has no durable transcript to race over"). Two runtimes racing
+  the very first turn of the same new session are not serialized by it. Pre-existing upstream design.
+- **R4: G3 detection latency** (parent-guard 3 confirmations + orphan drain up to 10s) still exists, but
+  it bounds only how long an orphaned child keeps running, not whether its writes can interleave with
+  a successor's (they cannot, per above).
