@@ -302,7 +302,7 @@ def test_the_shared_fence_slot_is_irrelevant_to_the_owner(agent_db):
 
 
 @pytest.mark.parametrize("external", ["user_stop", "lease_refresher"])
-def test_an_external_cancel_already_waiting_does_not_deadlock_the_owner(agent_db, external):
+def test_an_external_cancel_already_waiting_does_not_deadlock_the_owner(agent_db, external, monkeypatch):
     """Codex round 6: an external hard cancel holds _pending_redirect_lock while it waits on the
     owner's fence; the owner then detects lease loss. Calling interrupt() inside the commit would
     need that lock (lock inversion). The owner parks instead; both complete."""
@@ -314,20 +314,27 @@ def test_an_external_cancel_already_waiting_does_not_deadlock_the_owner(agent_db
     agent._active_compression_commit_fence = fence
     in_commit, external_waiting = threading.Event(), threading.Event()
     done = {}
+    # Deterministic (Codex nit): signal from the external cancel's ACTUAL fence wait, i.e. with
+    # _pending_redirect_lock held and about to block on this fence, instead of sleeping.
+    real_cancel = CompressionCommitFence.cancel_before_commit
+
+    def _cancel_entry(self, *a, **k):
+        if self is fence:
+            external_waiting.set()
+        return real_cancel(self, *a, **k)
+
+    monkeypatch.setattr(CompressionCommitFence, "cancel_before_commit", _cancel_entry)
 
     def _owner():
         def _body():
             in_commit.set()
-            assert external_waiting.wait(10)
-            import time as _t
-            _t.sleep(0.3)  # let the external cancel reach its fence wait (redirect lock held)
+            assert external_waiting.wait(10), "the external cancel never reached its fence wait"
             on_turn_lease_lost(agent, "old-executor")
         _commit_bracket(agent, fence, _body)
         done["owner"] = True
 
     def _external():
         assert in_commit.wait(10)
-        external_waiting.set()
         if external == "user_stop":
             agent.interrupt("stop", hard_cancel=True)
         else:
