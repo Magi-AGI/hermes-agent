@@ -19,7 +19,9 @@ reviewed runner + guard extension onto:
 - the sync branch (`magi/sync-v2026.9.21`), and
 - a clean comparison branch `magi/tag-baseline-v2026.9.21` = tag + the same bucket-0 commits only.
 A/B runs execute each checkout's OWN `scripts/run_tests_isolated.py` from that checkout's root, and every
-test report records both revisions (sync HEAD and baseline HEAD). Upstream's conftest already carries the
+test report records both revisions (sync HEAD and baseline HEAD). Comparisons against the OLD fork base
+(6afa0cecac) also get the runner overlay first — never a direct pytest run with HERMES_HOME cleared
+(Codex: that is not equivalent, and clean logs cannot prove containment). Upstream's conftest already carries the
 Windows-root fix (#112692) and the gateway-spawn guard (`ca16cafee4`); bucket 0 ports only our additive
 HERMES_TEST_LIVE_ROOTS deny roots onto upstream's conftest/hermes_state, adapting to their current shape.
 
