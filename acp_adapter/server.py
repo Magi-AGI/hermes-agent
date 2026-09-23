@@ -355,7 +355,8 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         # Assign only after the rebuild succeeded so a failed switch leaves the session on its
         # working model instead of a model/agent mismatch that persists via save_session.
         state.agent, state.model = agent, new_model
-        self.session_manager.save_session(state.session_id)
+        # Metadata only: the replacement agent's history may be stale (another client can be mid-turn).
+        self.session_manager.save_session(state.session_id, transcript=False)
         return current_provider, target_provider, new_model
 
     @staticmethod
@@ -1060,7 +1061,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         if normalized_mode not in self._MODES:
             normalized_mode = self._MODE_DEFAULT
         state.mode = normalized_mode
-        self.session_manager.save_session(session_id)
+        self.session_manager.save_session(session_id, transcript=False)
         logger.info("Session %s: mode switched to %s", session_id, normalized_mode)
         return SetSessionModeResponse()
 
@@ -1081,7 +1082,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 options = {}
             options[str(config_id)] = value
             state.config_options = options
-        self.session_manager.save_session(session_id)
+        self.session_manager.save_session(session_id, transcript=False)
         logger.info("Session %s: config option %s updated", session_id, config_id)
         return SetSessionConfigOptionResponse(config_options=[])
 

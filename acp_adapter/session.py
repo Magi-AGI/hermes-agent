@@ -257,7 +257,7 @@ class SessionManager:
             return None
         state.cwd = cwd
         _register_task_cwd(session_id, cwd)
-        self._persist(state)
+        self._persist(state, transcript=False)
         # Promote the authoritative column and claim an ordering generation, the
         # same contract tui_gateway/session_workdir.py uses: a git probe may only
         # publish while its generation is still current, so a slow probe for a
@@ -265,13 +265,14 @@ class SessionManager:
         self._schedule_git_metadata(state, self._claim_cwd_generation(state))
         return state
 
-    def save_session(self, session_id: str) -> None:
+    def save_session(self, session_id: str, *, transcript: bool = True) -> None:
         """Persist a session; called by the server after prompt completion,
-        history-mutating slash commands, and model switches."""
+        history-mutating slash commands, and model switches. ``transcript=False`` is a
+        metadata-only save (model / mode / config / cwd): it never rewrites messages."""
         with self._lock:
             state = self._sessions.get(session_id)
         if state is not None:
-            self._persist(state)
+            self._persist(state, transcript=transcript)
 
     # ---- persistence via SessionDB ------------------------------------------
 
@@ -311,8 +312,14 @@ class SessionManager:
                 logger.debug("ACP session cwd backfill failed", exc_info=True)
         return self._db_instance
 
-    def _persist(self, state: SessionState) -> None:
-        """Create/update the session record, then sync the live message set."""
+    def _persist(self, state: SessionState, *, transcript: bool = True) -> None:
+        """Create/update the session record, then (``transcript``) sync the live message set.
+
+        Magi sync, bucket C: a metadata-only save never touches messages once the row exists, and a
+        transcript sync from a non-owning agent is refused while another turn holds the
+        conversation and archives (never deletes) the rows it replaces. A second client that
+        restored this session and switched model used to replace the active set from its stale
+        history, deleting the live owner's new rows."""
         db = self._get_db()
         if db is None:
             return
@@ -360,6 +367,8 @@ class SessionManager:
             # a mid-rewrite failure so the previously persisted conversation survives (salvaged from
             # #13675).
             agent = state.agent
+            if not transcript:
+                return
             if getattr(agent, "_session_db", None) is db and getattr(agent, "_session_db_created", False):
                 return
             # A non-owning agent (model switch, /restore: fresh agent, _session_db_created=False)
@@ -367,7 +376,8 @@ class SessionManager:
             # create/fork every row is active (== full replace), and archived rows survive.
             # Unconditional because an existence probe would fail OPEN on DB error and can
             # race a concurrent archive_and_compact. Still rolls back on mid-rewrite failure.
-            db.replace_messages(state.session_id, state.history, active_only=True)
+            db.replace_messages(state.session_id, state.history, archive_dropped=True,
+                                reject_active_turn_lease=True)
         except Exception:
             logger.warning("Failed to persist ACP session %s", state.session_id, exc_info=True)
 

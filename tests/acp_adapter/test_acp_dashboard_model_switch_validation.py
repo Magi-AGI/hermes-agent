@@ -27,7 +27,7 @@ def _acp_agent():
             made.update(kw)
             return types.SimpleNamespace(provider=kw.get("requested_provider"), model=kw.get("model"))
 
-        def save_session(self, sid):
+        def save_session(self, sid, *, transcript=True):  # Magi: model switch saves metadata only
             pass
 
     return HermesACPAgent(session_manager=_SM()), made
