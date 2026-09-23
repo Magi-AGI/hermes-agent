@@ -553,6 +553,7 @@ declare global {
        *  Electron re-checks containment and refuses unified-package halves. */
       removeDesktopPlugin?: (payload: { name: string }) => Promise<{ ok: boolean; path?: string; error?: string }>
       signalSessionGatewayReady?: () => void
+      reportWindowSession?: (sessionId: null | string) => void
       signalSessionFunctionalReady?: (payload: {
         ok: boolean
         phase?: string

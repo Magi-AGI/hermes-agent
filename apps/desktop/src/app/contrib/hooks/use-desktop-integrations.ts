@@ -106,6 +106,14 @@ export function useDesktopIntegrations({
     window.hermesDesktop?.setPreviewShortcutActive?.(true)
   }, [])
 
+  // A peer window (Ctrl+Shift+N) is part of the saved window layout; tell main
+  // which session it is showing so "Reopen Saved Windows" restores it there.
+  useEffect(() => {
+    if (isPeerInstanceWindow()) {
+      window.hermesDesktop?.reportWindowSession?.(routedSessionId ?? null)
+    }
+  }, [routedSessionId])
+
   const restoredRef = useRef(false)
   const diskPluginsScanPending = useStore($diskPluginsScanPending)
 

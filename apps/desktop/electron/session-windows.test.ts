@@ -8,7 +8,10 @@ import {
   chatWindowWebPreferences,
   createSessionWindowRegistry,
   instanceWindowBounds,
-  sanitizeSessionWindowEntry
+  readSavedWindowEntries,
+  sanitizeSessionWindowEntry,
+  sessionWindowIdForOpen,
+  toSavedWindowEntry
 } from './session-windows'
 
 // A minimal fake BrowserWindow: tracks listeners + destroyed state and lets a
@@ -352,4 +355,97 @@ test('chatWindowWebPreferences allows autoplay so wake-started voice speaks its 
   const prefs = chatWindowWebPreferences('/tmp/preload.cjs')
 
   assert.equal(prefs.autoplayPolicy, 'no-user-gesture-required')
+})
+
+// ─── Magi sync A4: per-window saved layout (criteria 2 and 3, migration) ──────
+
+const BOUNDS = { x: 10, y: 20, width: 900, height: 700 }
+
+test('two pop-outs on one session are two windows and two saved entries (criterion 2)', () => {
+  const registry = createSessionWindowRegistry()
+  const a = makeFakeWindow()
+  const b = makeFakeWindow()
+
+  const first = registry.openOrFocus(sessionWindowIdForOpen('s1'), () => a, { kind: 'session', sessionId: 's1' })
+  const second = registry.openOrFocus(sessionWindowIdForOpen('s1'), () => b, { kind: 'session', sessionId: 's1' })
+
+  assert.equal(first.created && second.created, true, 'a deliberate second window is a real second window')
+  assert.notEqual(first.win, second.win)
+
+  const saved = registry.entries().map(e => toSavedWindowEntry(e, BOUNDS, false))
+
+  assert.equal(saved.length, 2)
+  assert.deepEqual(saved.map(e => e.sessionId), ['s1', 's1'])
+  assert.notEqual(saved[0].windowId, saved[1].windowId)
+})
+
+test('re-opening the SAME saved window focuses it instead of doubling it', () => {
+  const registry = createSessionWindowRegistry()
+  const win = makeFakeWindow()
+  const id = sessionWindowIdForOpen('s1', { windowId: 'saved-1' })
+
+  registry.openOrFocus(id, () => win, { kind: 'session', sessionId: 's1' })
+  const again = registry.openOrFocus(sessionWindowIdForOpen('s1', { windowId: 'saved-1' }), () => makeFakeWindow())
+
+  assert.equal(again.created, false)
+  assert.equal(again.win, win)
+})
+
+test('watch windows keep focus-existing per session', () => {
+  assert.equal(sessionWindowIdForOpen('s1', { watch: true }), sessionWindowIdForOpen('s1', { watch: true }))
+})
+
+test('a peer window is saved with its route and the session it is showing (criteria 2-3)', () => {
+  const registry = createSessionWindowRegistry()
+  const peer = makeFakeWindow()
+
+  registry.openOrFocus('peer-1', () => peer, { kind: 'peer', profile: 'work', connectionId: 'c1', profileWindow: true })
+  assert.equal(registry.setSession(peer, 's9'), true)
+  assert.equal(registry.setSession(peer, 's9'), false, 'no-op when unchanged')
+
+  const [saved] = registry.entries().map(e => toSavedWindowEntry(e, BOUNDS, true))
+
+  assert.deepEqual(
+    { windowId: saved.windowId, kind: saved.kind, sessionId: saved.sessionId, profile: saved.profile },
+    { windowId: 'peer-1', kind: 'peer', sessionId: 's9', profile: 'work' }
+  )
+  assert.equal(saved.connectionId, 'c1')
+  assert.equal(saved.profileWindow, true)
+
+  // ...and round-trips through the reader unchanged.
+  const [read] = readSavedWindowEntries([saved])
+
+  assert.equal(read.kind, 'peer')
+  assert.equal(read.sessionId, 's9')
+  assert.equal(read.connectionId, 'c1')
+})
+
+test('a restored peer opens on its OWN saved session (criterion 3)', () => {
+  const url = buildInstanceWindowUrl({ devServer: 'http://localhost:5174', profile: 'work', connectionId: 'c1', sessionId: 's9' })
+
+  assert.match(url, /\?peer=1[^#]*#\/s9$/)
+  assert.doesNotMatch(buildInstanceWindowUrl({ devServer: 'http://localhost:5174' }), /#/, 'a fresh peer has no session route')
+})
+
+test('a peer showing a fresh chat is still a saved entry', () => {
+  const [read] = readSavedWindowEntries([{ windowId: 'p', kind: 'peer', sessionId: null, ...BOUNDS }])
+
+  assert.equal(read.kind, 'peer')
+  assert.equal(read.sessionId, null)
+})
+
+test('a legacy session-keyed state file migrates forward without losing entries', () => {
+  const legacy = [
+    { sessionId: 's1', ...BOUNDS, profile: 'work' },
+    { sessionId: 's2', ...BOUNDS },
+    { sessionId: 's1', ...BOUNDS } // two rows for one session: both kept
+  ]
+
+  const read = readSavedWindowEntries(legacy)
+
+  assert.equal(read.length, 3)
+  assert.deepEqual(read.map(e => e.kind), ['session', 'session', 'session'])
+  assert.deepEqual(read.map(e => e.sessionId), ['s1', 's2', 's1'])
+  assert.equal(new Set(read.map(e => e.windowId)).size, 3, 'every migrated entry has its own window id')
+  assert.deepEqual(readSavedWindowEntries(legacy).map(e => e.windowId), read.map(e => e.windowId), 'ids are stable across reads')
 })

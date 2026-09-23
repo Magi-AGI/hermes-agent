@@ -3,6 +3,7 @@
 // here so they can be unit-tested with node --test (mirroring how the rest of
 // electron/*.ts splits testable logic out of the main.ts monolith).
 
+import { randomUUID } from 'node:crypto'
 import { pathToFileURL } from 'node:url'
 
 import type { DesktopWindowLaunch } from './desktop-profile'
@@ -93,6 +94,10 @@ function buildSessionWindowUrl(sessionId: string, { devServer, profile, renderer
 interface InstanceWindowUrlOptions extends Partial<DesktopWindowLaunch> {
   devServer?: string
   rendererIndexPath?: string
+  // Magi: a RESTORED peer window opens directly on the session it was showing
+  // (hash route, like a session pop-out); a fresh peer omits it and boots on a
+  // new chat.
+  sessionId?: null | string
 }
 
 function buildInstanceWindowUrl({
@@ -100,17 +105,20 @@ function buildInstanceWindowUrl({
   devServer,
   profile,
   profileWindow,
-  rendererIndexPath
+  rendererIndexPath,
+  sessionId
 }: InstanceWindowUrlOptions = {}) {
   const query = `?peer=1${profile ? `&profile=${encodeURIComponent(profile)}&connectionId=${encodeURIComponent(connectionId ?? '')}${profileWindow ? '&profileWindow=1' : ''}` : ''}`
+  const session = typeof sessionId === 'string' ? sessionId.trim() : ''
+  const route = session ? `#/${encodeURIComponent(session)}` : ''
 
   if (devServer) {
     const base = devServer.endsWith('/') ? devServer.slice(0, -1) : devServer
 
-    return `${base}/${query}`
+    return `${base}/${query}${route}`
   }
 
-  return `${pathToFileURL(rendererIndexPath).toString()}${query}`
+  return `${pathToFileURL(rendererIndexPath).toString()}${query}${route}`
 }
 
 // Full "instance" windows (⌘⇧N / the "New Window" command) open a complete app
@@ -144,37 +152,74 @@ function instanceWindowBounds(
   return { ...bounds, ...computeWindowOptions(bounds, displays) }
 }
 
-// A small registry keyed by sessionId that guarantees one window per chat:
-// opening a session that already has a live window focuses it instead of
-// spawning a duplicate, and a window removes itself from the registry when it
-// closes. The actual BrowserWindow construction is injected (the `factory`) so
-// this module stays free of Electron and is unit-testable.
+// Registry of every restorable app window (session pop-outs, watch windows and
+// full peer windows), keyed by a per-WINDOW id — never by session (Magi, sync
+// A4: two windows on one session are two windows and two saved entries). The
+// actual BrowserWindow construction is injected (the `factory`) so this module
+// stays free of Electron and is unit-testable.
 //
-// Each entry also carries the `watch` flag it was opened with (a spectator
-// window on a subagent run) — close-all/persistence consumers need it to
-// exclude watch windows from the "reopen saved windows" set. The flag is
-// fixed at creation time: re-requesting the same sessionId with a different
-// watch value still just focuses the existing window (one window per
-// sessionId is the invariant; watch does not "upgrade" or replace it).
+// openOrFocus(windowId) focuses a window only when that SAME window id is
+// already live: re-opening a saved window that is still open, or a caller that
+// deliberately keys by something stable (watch windows use `watch:<session>`).
+// A new pop-out or peer window gets a fresh id, so it is always a new window.
+//
+// Returns { win, created } — `created` distinguishes "focused an existing live
+// window" from "factory actually spawned a new one". Callers that need to know
+// whether a window is brand-new (e.g. the reopen queue: a fast-path readiness
+// check is only valid for a window that isn't going to redo its boot sequence
+// — see session-reopen-gate.ts) must use `created`, never
+// BrowserWindow.webContents.isLoading() as a proxy for it.
+type RestorableWindowKind = 'peer' | 'session'
+
+interface RestorableWindowMeta {
+  connectionId?: null | string
+  kind?: RestorableWindowKind
+  profile?: null | string
+  profileWindow?: boolean
+  sessionId?: null | string
+  watch?: boolean
+}
+
+function newWindowId(): string {
+  return randomUUID()
+}
+
+function watchWindowId(sessionId: string): string {
+  return `watch:${sessionId}`
+}
+
+// The window id a session pop-out opens under. Restoring a saved window reuses
+// its saved id; a watch window is keyed by its session (a spectator, not a
+// layout entry, keeps focus-existing); every other open is a NEW window.
+function sessionWindowIdForOpen(sessionId: string, { watch = false, windowId }: { watch?: boolean; windowId?: string } = {}) {
+  return windowId || (watch ? watchWindowId(sessionId) : newWindowId())
+}
+
+// The persisted shape of one live registry entry.
+function toSavedWindowEntry(
+  entry: { windowId: string; kind: RestorableWindowKind; sessionId: null | string; profile: null | string; connectionId?: null | string; profileWindow?: boolean },
+  bounds: { x: number; y: number; width: number; height: number },
+  isMaximized: boolean
+) {
+  return {
+    windowId: entry.windowId,
+    kind: entry.kind,
+    sessionId: entry.sessionId ?? null,
+    x: bounds.x,
+    y: bounds.y,
+    width: bounds.width,
+    height: bounds.height,
+    isMaximized,
+    profile: entry.profile ?? null,
+    ...(entry.kind === 'peer' ? { connectionId: entry.connectionId ?? null, profileWindow: entry.profileWindow === true } : {})
+  }
+}
+
 function createSessionWindowRegistry() {
   const windows = new Map()
 
-  // Returns { win, created } — `created` distinguishes "focused an existing
-  // live window" from "factory actually spawned a new one". Callers that need
-  // to know whether a window is brand-new (e.g. the reopen queue: a fast-path
-  // readiness check is only valid for a window that isn't going to redo its
-  // boot sequence — see session-reopen-gate.ts) must use `created`, never
-  // BrowserWindow.webContents.isLoading() as a proxy for it: Electron gives no
-  // synchronous guarantee that a just-constructed window's isLoading() reads
-  // true before its navigation actually starts (a just-created window can read
-  // isLoading() === false for a tick), so that check can spuriously fire for a
-  // NEW window too, not just a genuinely-focused existing one.
-  function openOrFocus(
-    sessionId,
-    factory,
-    { watch = false, profile = null }: { watch?: boolean; profile?: null | string } = {}
-  ) {
-    const key = typeof sessionId === 'string' ? sessionId.trim() : ''
+  function openOrFocus(windowId, factory, meta: RestorableWindowMeta = {}) {
+    const key = typeof windowId === 'string' ? windowId.trim() : ''
 
     if (!key) {
       return { win: null, created: false }
@@ -183,7 +228,6 @@ function createSessionWindowRegistry() {
     const existing = windows.get(key)
 
     if (existing && !existing.win.isDestroyed()) {
-      // Focus-or-create: never duplicate a window for the same chat.
       if (typeof existing.win.isMinimized === 'function' && existing.win.isMinimized()) {
         existing.win.restore?.()
       }
@@ -203,7 +247,17 @@ function createSessionWindowRegistry() {
       return { win: null, created: false }
     }
 
-    windows.set(key, { win, watch: Boolean(watch), profile: profile || null })
+    const sessionId = typeof meta.sessionId === 'string' ? meta.sessionId.trim() : ''
+
+    windows.set(key, {
+      win,
+      kind: meta.kind === 'peer' ? 'peer' : 'session',
+      sessionId: sessionId || null,
+      watch: Boolean(meta.watch),
+      profile: meta.profile || null,
+      connectionId: meta.connectionId ?? null,
+      profileWindow: Boolean(meta.profileWindow)
+    })
 
     // Self-cleanup on close so the registry never holds a destroyed window.
     win.on?.('closed', () => {
@@ -215,12 +269,38 @@ function createSessionWindowRegistry() {
     return { win, created: true }
   }
 
+  function windowIdOf(win): null | string {
+    for (const [key, entry] of windows) {
+      if (entry.win === win) {
+        return key
+      }
+    }
+
+    return null
+  }
+
   return {
     openOrFocus,
+    windowIdOf,
     get: key => windows.get(key)?.win,
     has: key => windows.has(key),
     get size() {
       return windows.size
+    },
+    // A peer window navigates between sessions; its saved entry follows the
+    // session it is currently showing. Returns true when it changed.
+    setSession: (win, sessionId: null | string): boolean => {
+      const key = windowIdOf(win)
+      const entry = key ? windows.get(key) : null
+      const next = typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : null
+
+      if (!entry || entry.sessionId === next) {
+        return false
+      }
+
+      entry.sessionId = next
+
+      return true
     },
     // Metadata snapshot for close-all / persistence — drops anything already
     // destroyed as a defensive measure (should be unreachable: 'closed' self-
@@ -228,15 +308,16 @@ function createSessionWindowRegistry() {
     entries: () =>
       Array.from(windows.entries())
         .filter(([, entry]) => entry.win && !entry.win.isDestroyed())
-        .map(([sessionId, entry]) => ({
-          sessionId,
+        .map(([windowId, entry]) => ({
+          windowId,
+          kind: entry.kind,
+          sessionId: entry.sessionId,
           win: entry.win,
           watch: entry.watch,
-          profile: entry.profile ?? null
+          profile: entry.profile ?? null,
+          connectionId: entry.connectionId ?? null,
+          profileWindow: entry.profileWindow
         })),
-    // Closes every live window in the registry (including watch windows —
-    // "close all" means all session pop-outs, not just the reopenable set).
-    // Each window's own 'closed' handler removes it from the map.
     closeAll: () => {
       for (const { win } of Array.from(windows.values())) {
         if (win && !win.isDestroyed()) {
@@ -262,13 +343,21 @@ function computeSessionWindowOptions(state, displays) {
   })
 }
 
-// Validate one persisted "reopen saved session windows" entry. Requires a
-// non-empty sessionId plus sane geometry (via sanitizeSessionWindowState);
-// drops anything else rather than falling back to main-window-sized defaults.
+// Validate one persisted "reopen saved windows" entry. Every entry carries its
+// own `windowId` and a `kind` ('session' pop-out or 'peer' full window). A
+// session pop-out requires a sessionId; a peer may have none (it was showing a
+// fresh chat). Sane geometry is required (via sanitizeSessionWindowState);
+// anything else is dropped rather than falling back to main-window defaults.
+//
+// Migration (Magi, sync A4): files written before per-window ids were keyed by
+// session and carry no windowId/kind. They are read as session pop-outs with
+// the stable id `legacy:<sessionId>` (stable across reads until the file is
+// next written with real ids), so no saved entry is lost on upgrade.
 function sanitizeSessionWindowEntry(raw?: any) {
+  const kind: RestorableWindowKind = raw?.kind === 'peer' ? 'peer' : 'session'
   const sessionId = typeof raw?.sessionId === 'string' ? raw.sessionId.trim() : ''
 
-  if (!sessionId) {
+  if (kind === 'session' && !sessionId) {
     return null
   }
 
@@ -278,9 +367,55 @@ function sanitizeSessionWindowEntry(raw?: any) {
     return null
   }
 
-  const profile = typeof raw?.profile === 'string' ? raw.profile.trim() : ''
+  const rawId = typeof raw?.windowId === 'string' ? raw.windowId.trim() : ''
+  const windowId = rawId || (sessionId ? `legacy:${sessionId}` : '')
 
-  return { sessionId, ...geometry, profile: profile || null }
+  if (!windowId) {
+    return null
+  }
+
+  const profile = typeof raw?.profile === 'string' ? raw.profile.trim() : ''
+  const connectionId = typeof raw?.connectionId === 'string' && raw.connectionId.trim() ? raw.connectionId.trim() : null
+
+  return {
+    windowId,
+    kind,
+    sessionId: sessionId || null,
+    ...geometry,
+    profile: profile || null,
+    ...(kind === 'peer' ? { connectionId, profileWindow: raw?.profileWindow === true } : {})
+  }
+}
+
+// Read side of the saved list: sanitize every entry and keep window ids unique
+// (a hand-edited or legacy file with two `legacy:` rows for one session keeps
+// both, suffixing the later id).
+function readSavedWindowEntries(raw: unknown) {
+  if (!Array.isArray(raw)) {
+    return []
+  }
+
+  const seen = new Set<string>()
+  const out = []
+
+  for (const item of raw) {
+    const entry = sanitizeSessionWindowEntry(item)
+
+    if (!entry) {
+      continue
+    }
+
+    let id = entry.windowId
+
+    for (let n = 2; seen.has(id); n++) {
+      id = `${entry.windowId}#${n}`
+    }
+
+    seen.add(id)
+    out.push({ ...entry, windowId: id })
+  }
+
+  return out
 }
 
 export {
@@ -290,8 +425,15 @@ export {
   computeSessionWindowOptions,
   createSessionWindowRegistry,
   instanceWindowBounds,
+  newWindowId,
+  readSavedWindowEntries,
+  type RestorableWindowKind,
+  type RestorableWindowMeta,
   sanitizeSessionWindowEntry,
   sanitizeSessionWindowState,
   SESSION_WINDOW_MIN_HEIGHT,
-  SESSION_WINDOW_MIN_WIDTH
+  SESSION_WINDOW_MIN_WIDTH,
+  sessionWindowIdForOpen,
+  toSavedWindowEntry,
+  watchWindowId
 }

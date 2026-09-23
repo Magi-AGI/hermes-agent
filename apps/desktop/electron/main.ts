@@ -426,9 +426,12 @@ import {
   computeSessionWindowOptions,
   createSessionWindowRegistry,
   instanceWindowBounds,
-  sanitizeSessionWindowEntry,
+  newWindowId,
+  readSavedWindowEntries,
   SESSION_WINDOW_MIN_HEIGHT,
-  SESSION_WINDOW_MIN_WIDTH
+  SESSION_WINDOW_MIN_WIDTH,
+  sessionWindowIdForOpen,
+  toSavedWindowEntry
 } from './session-windows'
 import { shouldSkipShrinkingSessionWindowsWrite } from './session-windows-persist-guard'
 import { ensureLoginShellPath } from './shell-path'
@@ -3217,9 +3220,7 @@ const schedulePersistWindowState = debounce(persistWindowState, 250)
 
 function readSessionWindowsState() {
   try {
-    const raw = JSON.parse(fs.readFileSync(SESSION_WINDOWS_STATE_PATH, 'utf8'))
-
-    return Array.isArray(raw) ? raw.map(sanitizeSessionWindowEntry).filter(Boolean) : []
+    return readSavedWindowEntries(JSON.parse(fs.readFileSync(SESSION_WINDOWS_STATE_PATH, 'utf8')))
   } catch {
     return []
   }
@@ -3236,15 +3237,7 @@ function persistSessionWindowsState() {
     const entries = sessionWindows
       .entries()
       .filter(({ watch }) => !watch)
-      .map(({ sessionId, win, profile }) => {
-        if (win.isDestroyed()) {
-          return null
-        }
-
-        const { x, y, width, height } = win.getNormalBounds()
-
-        return { sessionId, x, y, width, height, isMaximized: win.isMaximized(), profile: profile ?? null }
-      })
+      .map(entry => (entry.win.isDestroyed() ? null : toSavedWindowEntry(entry, entry.win.getNormalBounds(), entry.win.isMaximized())))
       .filter(Boolean)
 
     // Never let an empty live set clobber a non-empty saved snapshot. The state
@@ -14139,16 +14132,29 @@ function spawnSecondaryWindow({
 // Open (or focus) a standalone window for a single chat session. `bounds`/
 // `isMaximized` are only passed by reopenSessionWindows() (restoring a saved
 // window) — a normal cmd-click / "New window" open omits them.
-function createSessionWindow(sessionId, { profile = null, watch = false, bounds, isMaximized }: {
+function createSessionWindow(sessionId, { profile = null, watch = false, bounds, isMaximized, windowId }: {
   profile?: null | string
   watch?: boolean
   bounds?: { width: number; height: number; x?: number; y?: number }
   isMaximized?: boolean
+  // The saved window's own id when restoring it; omitted for a new pop-out.
+  windowId?: string
 } = {}) {
+  const key = typeof sessionId === 'string' ? sessionId.trim() : ''
+
+  if (!key) {
+    return { win: null, created: false }
+  }
+
+  // Magi (sync A4): keyed per WINDOW. A deliberate new pop-out is always a new
+  // window, even on a session that already has one; watch windows keep
+  // focus-existing (a spectator is not a layout entry).
+  const id = sessionWindowIdForOpen(key, { watch, windowId })
+
   return sessionWindows.openOrFocus(
-    sessionId,
+    id,
     () => {
-      const win = spawnSecondaryWindow({ sessionId, profile, watch, bounds, isMaximized })
+      const win = spawnSecondaryWindow({ sessionId: key, profile, watch, bounds, isMaximized })
 
       // Only keyed, non-watch windows are eligible for "reopen saved windows" —
       // wired inside the factory so it only fires when a window is actually
@@ -14160,7 +14166,7 @@ function createSessionWindow(sessionId, { profile = null, watch = false, bounds,
 
       return win
     },
-    { watch, profile }
+    { kind: 'session', sessionId: key, watch, profile }
   )
 }
 
@@ -14300,12 +14306,38 @@ async function runReopenQueue(entries: any[]) {
     // profile would otherwise fail validation and get destroyed.
     const expectedProfile = entry.profile ?? primaryProfileKey()
 
-    const { win, created } = createSessionWindow(entry.sessionId, {
-      watch: false,
-      bounds,
-      isMaximized: entry.isMaximized === true,
-      profile: entry.profile ?? null
-    })
+    let opened: { win: any; created: boolean }
+
+    try {
+      opened =
+        entry.kind === 'peer'
+          ? openInstanceWindow(
+              entry.profile ? { profile: entry.profile, connectionId: entry.connectionId ?? null } : undefined,
+              null,
+              {
+                windowId: entry.windowId,
+                sessionId: entry.sessionId ?? null,
+                profileWindow: entry.profileWindow === true,
+                bounds: computeWindowOptions(entry, displays),
+                isMaximized: entry.isMaximized === true
+              }
+            )
+          : createSessionWindow(entry.sessionId, {
+              watch: false,
+              bounds,
+              isMaximized: entry.isMaximized === true,
+              profile: entry.profile ?? null,
+              windowId: entry.windowId
+            })
+    } catch (err) {
+      // An unresolvable saved route (e.g. a removed connection) skips this one
+      // window; its saved entry is kept (never pruned for being stale).
+      rememberLog(`[session-windows] reopen skipped ${entry.windowId}: ${err instanceof Error ? err.message : err}`)
+
+      continue
+    }
+
+    const { win, created } = opened
 
     if (!win || win.isDestroyed()) {
       continue
@@ -14333,6 +14365,9 @@ async function runReopenQueue(entries: any[]) {
       // re-creates it fresh (created: true) and is genuinely re-verified, at
       // the cost of a rare in-flight-but-about-to-succeed load being restarted.
       if (!win.isDestroyed()) {
+        // Not an explicit user close: its saved entry must survive (it is
+        // retained for retry below).
+        suppressPersistOnClose.add(win)
         win.destroy()
       }
 
@@ -14458,17 +14493,60 @@ function createInstanceWindow(
   options?: DesktopProfileRoute,
   source: BrowserWindow | null = BrowserWindow.getFocusedWindow() || mainWindow
 ) {
+  return openInstanceWindow(options, source).win
+}
+
+// Magi (sync A4): a peer window is a restorable window too. It gets a per-window
+// id in the shared registry, is persisted with its route and the session it is
+// showing (reported by its renderer, hermes:window:session), and the reopen
+// queue restores it on that session. `restore` is only passed by the reopen
+// queue: the saved id (so a still-open saved window is focused, not doubled),
+// its session, geometry and profileWindow flag.
+function openInstanceWindow(
+  options?: DesktopProfileRoute,
+  source: BrowserWindow | null = BrowserWindow.getFocusedWindow() || mainWindow,
+  restore?: {
+    windowId: string
+    sessionId: null | string
+    profileWindow: boolean
+    bounds?: { width: number; height: number; x?: number; y?: number }
+    isMaximized?: boolean
+  }
+) {
   const route = resolveDesktopWindowLaunch(
     options,
     source && !source.isDestroyed() ? windowConnectionRoutes.get(source.webContents.id) : null,
     { connectionId: null, profile: primaryProfileKey() }
   )
 
+  if (restore) {
+    route.profileWindow = restore.profileWindow
+  }
+
   validateDesktopProfileRoute(route)
+
+  return sessionWindows.openOrFocus(
+    restore?.windowId || newWindowId(),
+    () => spawnInstanceWindow(route, source, restore),
+    {
+      kind: 'peer',
+      sessionId: restore?.sessionId ?? null,
+      profile: route.profile,
+      connectionId: route.connectionId,
+      profileWindow: route.profileWindow
+    }
+  )
+}
+
+function spawnInstanceWindow(
+  route: ReturnType<typeof resolveDesktopWindowLaunch>,
+  source: BrowserWindow | null,
+  restore?: { sessionId: null | string; bounds?: { width: number; height: number; x?: number; y?: number }; isMaximized?: boolean }
+) {
   const icon = getAppIconPath()
 
   const win = new BrowserWindow({
-    ...nextInstanceBounds(source),
+    ...(restore?.bounds || nextInstanceBounds(source)),
     minWidth: WINDOW_MIN_WIDTH,
     minHeight: WINDOW_MIN_HEIGHT,
     title: 'Hermes',
@@ -14483,6 +14561,15 @@ function createInstanceWindow(
 
   instanceWindows.add(win)
   recordWindowConnectionRoute(win.webContents, { ...route, registryScoped: route.connectionId !== null })
+
+  if (restore?.isMaximized) {
+    win.maximize()
+  }
+
+  // Close All reaches peers too (they are part of the saved layout).
+  secondaryWindows.add(win)
+  win.on('closed', () => secondaryWindows.delete(win))
+  wireSessionWindowPersistence(win)
 
   // Chat-surface registration: see applyWindowTranslucency.
   translucencyBackedWindows.add(win)
@@ -14524,7 +14611,8 @@ function createInstanceWindow(
     buildInstanceWindowUrl({
       ...route,
       devServer: DEV_SERVER,
-      rendererIndexPath: DEV_SERVER ? undefined : resolveRendererIndex()
+      rendererIndexPath: DEV_SERVER ? undefined : resolveRendererIndex(),
+      sessionId: restore?.sessionId ?? null
     }),
     'Instance window'
   )
@@ -15986,6 +16074,15 @@ ipcMain.handle('hermes:window:resumeReopenSessionWindows', async () => {
     rememberLog(`[session-windows] resumed reopen failed: ${err instanceof Error ? err.message : err}`)
 
     return { ok: false, error: err instanceof Error ? err.message : String(err) }
+  }
+})
+// A peer window reports the session it is currently showing (null = a fresh
+// chat) so its saved entry reopens it there.
+ipcMain.on('hermes:window:session', (event, sessionId) => {
+  const win = BrowserWindow.fromWebContents(event.sender)
+
+  if (win && sessionWindows.setSession(win, typeof sessionId === 'string' ? sessionId : null)) {
+    schedulePersistSessionWindowsState()
   }
 })
 ipcMain.handle('hermes:window:openInstance', async (event, options) => {
