@@ -150,15 +150,15 @@ class TestExplicitEncodingPassed:
         auth_path = hermes_home / "auth.json"
         _write_utf8(auth_path, {"version": auth.AUTH_STORE_VERSION, "providers": {}})
 
-        with mock.patch.object(
-            Path, "read_text", wraps=Path.read_text
-        ) as spy:
-            auth._load_auth_store(auth_path)
-
-        assert spy.call_count == 1
-        kwargs = spy.call_args.kwargs
-        assert "encoding" in kwargs, "read_text() must pass an explicit encoding"
-        assert "utf-8" in str(kwargs["encoding"]).lower()
+        # The store is read through the share-delete reader (Magi sync, phase 2b), which opens the
+        # handle with an explicit UTF-8 decode: assert the decode itself, locale-independently.
+        label = "ラベル \u2014 caf\u00e9"
+        auth_path.write_bytes(json.dumps(
+            {"version": auth.AUTH_STORE_VERSION, "providers": {"x": {"label": label}}},
+            ensure_ascii=False).encode("utf-8"))
+        with mock.patch("locale.getpreferredencoding", return_value="cp1252"):
+            store = auth._load_auth_store(auth_path)
+        assert store["providers"]["x"]["label"] == label
 
     def test_codex_store_reader_passes_utf8_encoding(self, tmp_path, monkeypatch):
         """The ~/.codex/auth.json reader must pass an explicit UTF-8 encoding."""

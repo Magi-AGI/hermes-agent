@@ -658,12 +658,91 @@ def _empty_auth_store() -> Dict[str, Any]:
     return {"version": AUTH_STORE_VERSION, "providers": {}}
 
 
+class AuthStoreStaleReadError(RuntimeError):
+    """A store derived from an unparseable read would overwrite an ``auth.json`` that now parses."""
+
+
+# Magi sync (phase 2b). Every open reader without FILE_SHARE_DELETE makes a Windows writer's
+# ``os.replace`` fail, and ``atomic_replace`` then falls back to a NON-atomic in-place rewrite that a
+# concurrent reader can catch half-written. Hermes's own readers open with full share flags, so a
+# Hermes read never forces that fallback. A torn read (another program still holding the file, or a
+# rewrite in progress) is retried a FEW times only: this is on the startup/resume hot path.
+_AUTH_TORN_READ_ATTEMPTS = 3
+_AUTH_TORN_READ_DELAY_S = 0.025
+# Private marker on a store derived from an unparseable read; never persisted.
+_DEGRADED_READ_KEY = "_hermes_degraded_read"
+_create_file_w = None
+
+
+@contextmanager
+def _open_auth_store_for_read(path: Path):
+    """Text handle on *path*; on Windows opened with FILE_SHARE_READ|WRITE|DELETE so an atomic
+    rename can replace the file while this handle is open."""
+    if os.name != "nt":
+        with path.open("r", encoding="utf-8-sig") as fh:
+            yield fh
+        return
+    global _create_file_w
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+    if _create_file_w is None:
+        fn = ctypes.WinDLL("kernel32", use_last_error=True).CreateFileW
+        fn.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                       wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        fn.restype = wintypes.HANDLE
+        _create_file_w = fn
+    # GENERIC_READ; FILE_SHARE_READ|WRITE|DELETE; OPEN_EXISTING; FILE_ATTRIBUTE_NORMAL
+    handle = _create_file_w(str(path), 0x80000000, 0x7, None, 3, 0x80, None)
+    if handle is None or handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())  # PermissionError / FileNotFoundError
+    try:
+        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY)
+    except OSError:
+        ctypes.windll.kernel32.CloseHandle(wintypes.HANDLE(handle))
+        raise
+    with open(fd, "r", encoding="utf-8-sig") as fh:
+        yield fh
+
+
+def _read_auth_store_text(path: Path) -> str:
+    with _open_auth_store_for_read(path) as fh:
+        return fh.read()
+
+
+def _preserve_corrupt_copy(auth_file: Path, raw_bytes: Optional[bytes]) -> Optional[Path]:
+    """Keep every distinct corrupt copy: a later corruption never overwrites an earlier one."""
+    base = auth_file.with_suffix(".json.corrupt")
+    target = base if not base.exists() else auth_file.with_suffix(
+        f".json.corrupt.{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}")
+    try:
+        if raw_bytes is not None:
+            target.write_bytes(raw_bytes)
+        else:
+            shutil.copy2(auth_file, target)
+        return target
+    except Exception:
+        logger.debug("auth: could not preserve a copy of the corrupt store at %s", target, exc_info=True)
+        return None
+
+
 def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
     auth_file = auth_file or _auth_file_path()
     if not auth_file.exists():
         return _empty_auth_store()
     try:
-        raw = json.loads(auth_file.read_text(encoding="utf-8-sig"))
+        text = ""
+        for attempt in range(1, _AUTH_TORN_READ_ATTEMPTS + 1):
+            text = _read_auth_store_text(auth_file)
+            try:
+                raw = json.loads(text)
+                break
+            except ValueError:
+                if attempt == _AUTH_TORN_READ_ATTEMPTS:
+                    raise
+                time.sleep(_AUTH_TORN_READ_DELAY_S * attempt)
+    except FileNotFoundError:
+        return _empty_auth_store()
     except OSError:
         # Exists but unreadable (EMFILE, EACCES, EIO, stalled mount): contents are not bad, and this
         # module read-modify-writes everywhere, so an empty store here is one _save_auth_store()
@@ -674,22 +753,21 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
             auth_file, exc_info=True)
         raise
     except Exception as exc:
-        # Genuine corruption: unparseable JSON or non-UTF-8 bytes. Preserve a copy, but never
-        # advertise a backup that was not written.
-        corrupt_path = auth_file.with_suffix(".json.corrupt")
+        # Unparseable after the retries: genuine corruption OR a read torn by another writer. Keep a
+        # copy (never overwriting an earlier one), and hand back an empty store MARKED as derived
+        # from this read: ``_save_auth_store`` refuses to write it over a file that parses again
+        # (the read was transient) but allows it while the same bad bytes are still there, so a
+        # re-login can still recover a genuinely corrupt store.
         try:
-            shutil.copy2(auth_file, corrupt_path)
-            preserved = True
-        except Exception:
-            preserved = False
-            logger.debug("auth: could not preserve a copy of the corrupt store at %s", corrupt_path,
-                         exc_info=True)
+            raw_bytes = auth_file.read_bytes()
+        except OSError:
+            raw_bytes = None
+        preserved = _preserve_corrupt_copy(auth_file, raw_bytes)
         logger.warning(
-            "auth: failed to parse %s (%s), starting with empty store. %s %s",
+            "auth: failed to parse %s (%s), using an empty store for this read. %s",
             auth_file, exc,
-            "Corrupt file preserved at" if preserved else "A copy could NOT be preserved at",
-            corrupt_path)
-        return _empty_auth_store()
+            f"Corrupt file preserved at {preserved}" if preserved else "A copy could NOT be preserved")
+        return {**_empty_auth_store(), _DEGRADED_READ_KEY: {"path": str(auth_file), "bytes": raw_bytes}}
 
     if isinstance(raw, dict) and (
         isinstance(raw.get("providers"), dict) or isinstance(raw.get("credential_pool"), dict)):
@@ -719,6 +797,26 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     """Atomically persist *auth_store* (0o600, parent tightened to 0o700) to the active store, or to
     an explicit *target_path* (e.g. the global-root write-through for rotating xAI OAuth grants)."""
     auth_file = target_path if target_path is not None else _auth_file_path()
+    degraded = auth_store.pop(_DEGRADED_READ_KEY, None)
+    if isinstance(degraded, dict):
+        # This store came from an unparseable read. Writing it back is only safe if the file still
+        # holds those same bad bytes; if it parses now, the read was torn by a concurrent writer
+        # and saving would erase every credential in it.
+        try:
+            current = auth_file.read_bytes() if auth_file.exists() else None
+        except OSError:
+            current = degraded.get("bytes")
+        if current is not None and current != degraded.get("bytes"):
+            try:
+                json.loads(current.decode("utf-8-sig"))
+                parses = True
+            except ValueError:
+                parses = False
+            if parses:
+                auth_store[_DEGRADED_READ_KEY] = degraded
+                raise AuthStoreStaleReadError(
+                    f"refusing to save {auth_file}: this store was built from an unreadable copy, "
+                    "and the file on disk is valid now (the read was torn by a concurrent writer)")
     auth_store["version"] = AUTH_STORE_VERSION
     auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
     _save_private_json(auth_file, auth_store, fsync_dir=True)
