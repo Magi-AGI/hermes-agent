@@ -49,77 +49,112 @@ describe('reopenReadyVerdict (Codex A4 #3)', () => {
   })
 })
 
-describe('createReopenReadySignaller (Codex A4 round 3 #1)', () => {
-  it('re-reports for the CURRENT session after /new moves the window', () => {
-    const sent: unknown[] = []
-    const signal = createReopenReadySignaller(payload => sent.push(payload))
+describe('createReopenReadySignaller (Codex A4 rounds 3-6)', () => {
+  const ambient = { profile: 'work', connectionId: null }
+  const state = { boot: 'ready' as const, target: 's1', selected: null, runtime: null, exhausted: null, ambient }
 
-    signal({ ...base, target: 's-a', selected: 's-a', runtime: 'r1' })
-    // /new: the window now routes to s-b, which is still loading.
-    signal({ ...base, target: 's-b', selected: 's-a', runtime: 'r1' })
-    signal({ ...base, target: 's-b', selected: 's-b', runtime: 'r2' })
+  // Drives the signaller the way the hook does; `resolve` is the owner route.
+  function harness() {
+    const sent: any[] = []
+    const signaller = createReopenReadySignaller(payload => sent.push(payload))
 
-    expect(sent).toEqual([
-      { ok: true, phase: 'session', profile: 'work', connectionId: null, sessionId: 's-a', attempt: 0 },
-      { ok: false, pending: true, phase: 'pending', profile: 'work', connectionId: null, sessionId: 's-b', attempt: 1 },
-      { ok: true, phase: 'session', profile: 'work', connectionId: null, sessionId: 's-b', attempt: 1 }
+    return {
+      sent,
+      signaller,
+      step: (s: typeof state | any, resolve?: { profile: null | string; connectionId: null | string }) => {
+        const step = signaller.update(s)
+
+        if (step && resolve) {
+          signaller.settle(step, resolve)
+        }
+
+        return step
+      }
+    }
+  }
+
+  it('an establishment change sends pending IMMEDIATELY, before the owner route resolves (round 6 #2)', () => {
+    const h = harness()
+
+    h.step({ ...state, target: 's-a', selected: 's-a', runtime: 'r1' }, { profile: 'prof-a', connectionId: null })
+    h.sent.length = 0
+
+    // /new -> s-b, which is ALREADY loaded: the verdict is ready at once, but
+    // its owner route has not resolved yet.
+    const step = h.signaller.update({ ...state, target: 's-b', selected: 's-b', runtime: 'r2' })
+
+    expect(h.sent).toEqual([
+      { ok: false, pending: true, phase: 'pending', profile: null, connectionId: null, sessionId: 's-b', attempt: 2 }
+    ])
+
+    // Only once resolved is READY sent — with the resolved route.
+    h.signaller.settle(step!, { profile: 'prof-b', connectionId: 'conn-b' })
+    expect(h.sent[1]).toEqual({
+      ok: true,
+      phase: 'session',
+      profile: 'prof-b',
+      connectionId: 'conn-b',
+      sessionId: 's-b',
+      attempt: 2
+    })
+  })
+
+  it('a pending report carries no route (never authorizes a probe on a fallback route)', () => {
+    const h = harness()
+
+    h.step({ ...state, boot: 'pending' })
+    expect(h.sent).toEqual([
+      { ok: false, pending: true, phase: 'pending', profile: null, connectionId: null, sessionId: 's1', attempt: 1 }
     ])
   })
 
-  it('re-reports a boot retry (ready -> pending -> ready) and a route change', () => {
-    const sent: { ok: boolean; phase: string; profile: null | string }[] = []
-    const signal = createReopenReadySignaller(payload => sent.push(payload))
+  it('a superseded resolution is dropped', () => {
+    const h = harness()
 
-    signal({ ...base, target: null })
-    signal({ ...base, target: null, boot: 'pending' })
-    signal({ ...base, target: null })
-    signal({ ...base, target: null, profile: 'other' })
+    const stale = h.signaller.update({ ...state, target: 's-a', selected: 's-a', runtime: 'r1' })
 
-    expect(sent.map(p => [p.phase, p.profile])).toEqual([
-      ['boot', 'work'],
-      ['pending', 'work'],
-      ['boot', 'work'],
-      ['boot', 'other']
-    ])
+    h.signaller.update({ ...state, target: 's-b', selected: 's-b', runtime: 'r2' })
+    h.signaller.settle(stale!, { profile: 'prof-a', connectionId: null })
+    expect(h.sent.every(p => p.sessionId !== 's-a' || p.pending)).toBe(true)
   })
 
-  it('stamps each new attempt: entering pending starts one, and its verdict carries it (Codex A4 r4 #1)', () => {
-    const sent: { attempt?: number; phase: string }[] = []
-    const signal = createReopenReadySignaller(payload => sent.push(payload))
+  it('each establishment change is a new attempt: boot retry, target change, ambient route change', () => {
+    const h = harness()
+    const route = { profile: 'work', connectionId: null }
 
-    signal({ ...base, target: null, boot: 'pending' })
-    signal({ ...base, target: null })
-    signal({ ...base, target: null, boot: 'pending' })
-    signal({ ...base, target: null })
+    h.step({ ...state, target: null }, route)
+    h.step({ ...state, target: null, boot: 'pending' })
+    h.step({ ...state, target: null }, route)
+    h.step({ ...state, target: null, ambient: { profile: 'work', connectionId: 'c2' } }, { profile: 'work', connectionId: 'c2' })
 
-    expect(sent.map(p => [p.phase, p.attempt])).toEqual([
+    expect(h.sent.map(p => [p.phase, p.attempt])).toEqual([
       ['pending', 1],
       ['boot', 1],
       ['pending', 2],
-      ['boot', 2]
+      ['pending', 3],
+      ['boot', 3],
+      ['pending', 4],
+      ['boot', 4]
     ])
   })
 
-  it('carries the fully resolved owner route, connection included (Codex A4 round 5)', () => {
-    const sent: unknown[] = []
-    const signal = createReopenReadySignaller(payload => sent.push(payload))
+  it('carries the fully resolved owner route, connection included (round 5)', () => {
+    const h = harness()
 
-    signal({ ...base, target: 's1', selected: 's1', runtime: 'r1', profile: 'prof-b', connectionId: 'conn-b' })
-    signal({ ...base, target: 's1', selected: 's1', runtime: 'r1', profile: 'prof-b', connectionId: 'conn-c' })
-
-    expect(sent).toEqual([
-      { ok: true, phase: 'session', profile: 'prof-b', connectionId: 'conn-b', sessionId: 's1', attempt: 0 },
-      { ok: true, phase: 'session', profile: 'prof-b', connectionId: 'conn-c', sessionId: 's1', attempt: 0 }
-    ])
+    h.step({ ...state, selected: 's1', runtime: 'r1' }, { profile: 'prof-b', connectionId: 'conn-b' })
+    expect(h.sent[h.sent.length - 1]).toMatchObject({ ok: true, profile: 'prof-b', connectionId: 'conn-b', sessionId: 's1' })
   })
 
-  it('does not re-send an unchanged verdict', () => {
-    const sent: unknown[] = []
-    const signal = createReopenReadySignaller(payload => sent.push(payload))
+  it('does not re-send an unchanged verdict, but re-resolves one whose resolution was cancelled', () => {
+    const h = harness()
 
-    signal({ ...base, target: null })
-    signal({ ...base, target: null })
-    expect(sent).toHaveLength(1)
+    const first = h.signaller.update({ ...state, target: null })
+    const again = h.signaller.update({ ...state, target: null })
+
+    expect(again).toBe(first)
+    h.signaller.settle(again!, { profile: 'work', connectionId: null })
+    expect(h.signaller.update({ ...state, target: null })).toBeNull()
+    expect(h.sent.filter(p => !p.pending)).toHaveLength(1)
   })
 })
 

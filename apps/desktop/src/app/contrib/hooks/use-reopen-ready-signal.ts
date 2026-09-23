@@ -31,13 +31,13 @@ export function bootFunctionalState(boot: { error?: null | string; phase?: strin
 // boot retry). Harmless for windows the queue is not waiting on (main records
 // every window's latest verdict).
 //
-// Each report carries the session's fully resolved OWNER route (profile AND
-// connection), resolved here BEFORE sending (Codex A4 round 5): main probes
-// exactly that route, so it must never have to pair this report with a
-// separately-arriving route report. A resolution overtaken by a newer state is
-// dropped, so reports stay in state order.
+// Each READY/failed report carries the session's fully resolved OWNER route
+// (profile AND connection), resolved here BEFORE sending (Codex A4 round 5), so
+// main never pairs it with a separately-arriving route report. Any change of
+// what the window is establishing sends "pending" synchronously FIRST, before
+// that resolution starts (round 6 #2) — see createReopenReadySignaller.
 export function useReopenReadySignal(routedSessionId: null | string) {
-  const [signal] = useState(() =>
+  const [signaller] = useState(() =>
     createReopenReadySignaller(payload => window.hermesDesktop?.signalSessionFunctionalReady?.(payload))
   )
 
@@ -49,31 +49,28 @@ export function useReopenReadySignal(routedSessionId: null | string) {
   const connectionId = useStore($activeConnectionId)
 
   useEffect(() => {
-    let current = true
     const target = routedSessionId ?? null
+    const ambient = { profile: profile || null, connectionId }
+
+    // Synchronous: sends pending on any establishment change.
+    const step = signaller.update({ boot: bootFunctionalState(boot), target, selected, runtime, exhausted, ambient })
+
+    if (!step) {
+      return
+    }
+
+    let current = true
 
     void resolveSessionOwner(target)
       .catch(() => undefined)
       .then(owner => {
-        if (!current) {
-          return
+        if (current) {
+          signaller.settle(step, windowSessionReport(target, owner, ambient))
         }
-
-        const route = windowSessionReport(target, owner, { profile: profile || null, connectionId })
-
-        signal({
-          boot: bootFunctionalState(boot),
-          target,
-          selected,
-          runtime,
-          exhausted,
-          profile: route.profile,
-          connectionId: route.connectionId
-        })
       })
 
     return () => {
       current = false
     }
-  }, [boot, connectionId, exhausted, profile, routedSessionId, runtime, selected, signal])
+  }, [boot, connectionId, exhausted, profile, routedSessionId, runtime, selected, signaller])
 }

@@ -341,21 +341,32 @@ export function waitForSessionWindowFunctionallyReady(
         connectionId: payload?.connectionId ?? null
       }
 
+      // A pending report carries NO route (round 6 #2): its identity is marked
+      // as such, never filled in with a fallback route.
+      const isPending = payload?.pending === true
+
       const nextIdentity = JSON.stringify([
         generation,
         payload?.attempt ?? null,
         payload?.sessionId ?? null,
-        normalizeProfile(route.profile),
-        route.connectionId
+        isPending ? '\u0000pending' : [normalizeProfile(route.profile), route.connectionId]
       ])
 
       if (nextIdentity !== latestIdentity) {
-        const firstReport = latestIdentity === null
         rendererReady = false
         latestIdentity = nextIdentity
 
-        if (firstReport && probeIdentity === LAUNCH && routeKey(generation, payload?.sessionId, route) === launchKey) {
-          // The launch probe checked exactly this identity: it counts for it.
+        if (isPending) {
+          // Never authorizes a probe (there is no resolved route to probe); a
+          // probe bound to an earlier report no longer counts. Only the launch
+          // probe (saved opening route, bound to no report) survives, for the
+          // first routed report to claim.
+          if (probeIdentity !== LAUNCH) {
+            dropProbe()
+          }
+        } else if (probeIdentity === LAUNCH && routeKey(generation, payload?.sessionId, route) === launchKey) {
+          // The first routed report matches the launch probe's identity
+          // exactly: its result counts for it.
           probeIdentity = nextIdentity
         } else {
           runProbe(route, nextIdentity)

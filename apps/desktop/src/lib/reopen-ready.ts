@@ -77,45 +77,98 @@ export function reopenReadyVerdict(inputs: ReopenReadyInputs): null | ReopenRead
   return null
 }
 
-// Keeps main's record of this window CURRENT (Codex A4 round 3 #1). The window
-// used to report once, for its launch session; after /new moved it to another
-// session, Reopen compared the saved new session with that stale launch verdict
-// and destroyed a healthy window. Now the target is the window's current
-// session, and every change of verdict — including back to pending while a new
-// session, route or boot attempt is being established — is sent; an unchanged
-// one is not re-sent. Every report is stamped with its attempt, so main never
-// pairs a verdict (or a health result) from an earlier attempt with the latest.
+// The window's establishment state: everything that decides WHICH session on
+// WHICH route it is establishing. `ambient` is the window's active route (a
+// change of it is an establishment change); the session's resolved OWNER route
+// is supplied separately, to settle().
+export type ReopenReadyState = Omit<ReopenReadyInputs, 'connectionId' | 'profile'> & {
+  ambient: { connectionId: null | string; profile: null | string }
+}
+
+// A verdict waiting for its owner route (see createReopenReadySignaller).
+export interface ReopenReadyStep {
+  readonly attempt: number
+  readonly verdict: ReopenReadyPayload
+}
+
+// Keeps main's record of this window CURRENT (Codex A4 rounds 3-6).
+//
+// update() runs synchronously on every state change. On ANY establishment
+// change (target session, boot state, ambient route) it starts a new attempt
+// and sends "pending" IMMEDIATELY — before any async work — so main never goes
+// on holding the previous session's ready verdict while the new one resolves
+// (round 6 #2). A pending report carries no route: an unresolved window never
+// authorizes a probe against a fallback/ambient route.
+//
+// Once the verdict is ready (or failed), update() returns a step; the caller
+// resolves the session's owner route and calls settle(step, route), which
+// sends the verdict WITH that route — unless the step was superseded meanwhile.
+// Unchanged reports are not re-sent.
 export function createReopenReadySignaller(send: (payload: ReopenReadyPayload) => void) {
-  let last: null | string = null
+  let lastSent: null | string = null
   let attempt = 0
-  let wasPending = false
+  let establishment: null | string = null
+  let step: (ReopenReadyStep & { key: string; settled: boolean }) | null = null
 
-  return (inputs: ReopenReadyInputs) => {
-    const verdict = reopenReadyVerdict(inputs)
-
-    if (!verdict && !wasPending) {
-      attempt += 1
-    }
-
-    wasPending = !verdict
-
-    const payload: ReopenReadyPayload = {
-      ...(verdict ?? {
-        ok: false,
-        pending: true as const,
-        phase: 'pending' as const,
-        profile: inputs.profile,
-        connectionId: inputs.connectionId,
-        sessionId: inputs.target
-      }),
-      attempt
-    }
-
+  const emit = (payload: ReopenReadyPayload) => {
     const key = JSON.stringify(payload)
 
-    if (key !== last) {
-      last = key
+    if (key !== lastSent) {
+      lastSent = key
       send(payload)
+    }
+  }
+
+  const pending = (target: null | string): ReopenReadyPayload => ({
+    ok: false,
+    pending: true,
+    phase: 'pending',
+    profile: null,
+    connectionId: null,
+    sessionId: target,
+    attempt
+  })
+
+  return {
+    update(state: ReopenReadyState): null | ReopenReadyStep {
+      const bootKey = typeof state.boot === 'object' ? `error:${state.boot.error}` : state.boot
+      const nextEstablishment = JSON.stringify([state.target, bootKey, state.ambient.profile, state.ambient.connectionId])
+
+      if (nextEstablishment !== establishment) {
+        establishment = nextEstablishment
+        attempt += 1
+        step = null
+        emit(pending(state.target))
+      }
+
+      const verdict = reopenReadyVerdict({ ...state, profile: null, connectionId: null })
+
+      if (!verdict) {
+        step = null
+        emit(pending(state.target))
+
+        return null
+      }
+
+      const key = JSON.stringify(verdict)
+
+      if (step && step.key === key) {
+        // Same verdict: re-resolve only if it has not been sent yet (a
+        // resolution can be cancelled by a re-render).
+        return step.settled ? null : step
+      }
+
+      step = { attempt, verdict, key, settled: false }
+
+      return step
+    },
+    settle(settling: ReopenReadyStep, route: { connectionId: null | string; profile: null | string }) {
+      if (settling !== step || step.settled) {
+        return
+      }
+
+      step.settled = true
+      emit({ ...settling.verdict, profile: route.profile, connectionId: route.connectionId, attempt: settling.attempt })
     }
   }
 }

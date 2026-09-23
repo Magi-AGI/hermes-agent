@@ -721,12 +721,14 @@ test('after an identity change the queue advances only on the latest ready AND a
   ready(ipcMain, { ok: true, attempt: 1, profile: 'default', sessionId: 's1' })
   ready(ipcMain, { ok: false, pending: true, attempt: 2, profile: 'default', sessionId: 's1' })
 
-  assert.equal(probes.calls.length, 2, 'the probe is re-run for the new identity')
+  // Pending (round 6): the stale probe is discarded and none is started for it.
+  assert.equal(probes.calls.length, 1, 'pending authorizes no probe')
   assert.equal(probes.calls[0].signal.aborted, true, 'the stale probe is discarded')
 
   // The stale probe's result must not count.
   probes.calls[0].ctl.resolve()
   ready(ipcMain, { ok: true, attempt: 2, profile: 'default', sessionId: 's1' })
+  assert.equal(probes.calls.length, 2, 'the latest routed report is probed')
   await tick()
   assert.equal(settled, null, 'latest ready, but its probe has not finished')
 
@@ -852,6 +854,38 @@ test('the launch probe is reused only when the first report matches its identity
   await tick()
   assert.equal(settled, null, 'the launch probe does not satisfy a different identity')
 
+  probes.calls[1].ctl.resolve()
+  await tick()
+  assert.deepEqual(settled, { ok: true })
+})
+
+test('pending for B (owner route unresolved) blocks advance on A and authorizes no probe (Codex A4 r6 #2)', async () => {
+  const ipcMain = makeFakeIpcMain()
+  const win = makeFakeWindow()
+  const probes = makeProbes()
+  let settled: unknown = null
+
+  void waitForSessionWindowFunctionallyReady(
+    win as any,
+    { profile: 'prof-a', sessionId: 's-a', identity: 'functional', probeTarget: { profile: 'prof-a', connectionId: null } },
+    {
+      ipcMain,
+      probeBackendHealth: probes.probe as any,
+      knownVerdict: { ok: true, attempt: 1, profile: 'prof-a', connectionId: null, sessionId: 's-a' },
+      timeoutMs: 500
+    }
+  ).then(r => (settled = r))
+
+  // /new -> B: pending is sent at once, with no route (B's owner not resolved).
+  ready(ipcMain, { ok: false, pending: true, attempt: 2, profile: null, connectionId: null, sessionId: 's-b' })
+
+  assert.equal(probes.calls.length, 1, 'pending authorizes no probe (no fallback-route probe)')
+  probes.calls[0].ctl.resolve()
+  await tick()
+  assert.equal(settled, null, "A's probe does not advance a window that is now establishing B")
+
+  ready(ipcMain, { ok: true, attempt: 2, profile: 'prof-b', connectionId: 'conn-b', sessionId: 's-b' })
+  assert.deepEqual(probes.calls[1].target, { profile: 'prof-b', connectionId: 'conn-b' })
   probes.calls[1].ctl.resolve()
   await tick()
   assert.deepEqual(settled, { ok: true })
