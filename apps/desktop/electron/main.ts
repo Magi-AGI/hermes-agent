@@ -416,6 +416,10 @@ import {
 } from './secret-storage-policy'
 import { describeGitSpawnFailure, GIT_UNUSABLE, selectRunnableBinary } from './select-runnable-binary'
 import {
+  REOPEN_WINDOW_SETTLE_MS,
+  waitForSessionWindowFunctionallyReady
+} from './session-reopen-gate'
+import {
   buildInstanceWindowUrl,
   buildSessionWindowUrl,
   chatWindowWebPreferences,
@@ -426,10 +430,6 @@ import {
   SESSION_WINDOW_MIN_HEIGHT,
   SESSION_WINDOW_MIN_WIDTH
 } from './session-windows'
-import {
-  REOPEN_WINDOW_SETTLE_MS,
-  waitForSessionWindowFunctionallyReady
-} from './session-reopen-gate'
 import { shouldSkipShrinkingSessionWindowsWrite } from './session-windows-persist-guard'
 import { ensureLoginShellPath } from './shell-path'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
@@ -7522,6 +7522,7 @@ function buildApplicationMenu() {
       { role: 'togglefullscreen' }
     ]
   })
+
   // Close-all/reopen-saved act on the secondaryWindows set / sessionWindows
   // registry, never BrowserWindow.getAllWindows() — they can't touch the
   // primary window, the pet overlay, or the hidden link-title-fetch window.
@@ -7538,6 +7539,7 @@ function buildApplicationMenu() {
         )
     }
   ]
+
   template.push({
     label: 'Window',
     submenu: IS_MAC
@@ -14297,6 +14299,7 @@ async function runReopenQueue(entries: any[]) {
     // literally "default" (e.g. claudetriad), every entry with no stored
     // profile would otherwise fail validation and get destroyed.
     const expectedProfile = entry.profile ?? primaryProfileKey()
+
     const { win, created } = createSessionWindow(entry.sessionId, {
       watch: false,
       bounds,

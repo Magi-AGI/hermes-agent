@@ -103,6 +103,19 @@ test('computeWindowOptions clamps a trusted saved position fully inside its disp
   assert.deepEqual(computeWindowOptions(saved, PRIMARY), { width: 960, height: 1032, x: 0, y: 8 })
 })
 
+test('a caller-supplied minimum also floors the work-area clamp (session windows)', () => {
+  // A saved session window on a work area NARROWER than the session minimum: the
+  // work-area clamp must not undercut the caller's floor (it used the main-window
+  // minimum), or a restored session window opens below its own minWidth.
+  const narrow = [{ workArea: { x: 0, y: 0, width: 410, height: 1040 } }]
+  const opts = computeWindowOptions({ width: 500, height: 700, x: 0, y: 0 }, narrow, {
+    minWidth: 420,
+    minHeight: 620
+  })
+
+  assert.equal(opts.width, 420)
+})
+
 test('computeWindowOptions caps a positioned window to the display it overlaps', () => {
   const dual = [
     { workArea: { x: 0, y: 0, width: 2560, height: 1400 } },

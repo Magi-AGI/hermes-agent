@@ -22,6 +22,7 @@ import { usePaneLifecycle, usePaneVisible } from '@/components/pane-shell/pane-v
 import { useI18n } from '@/i18n'
 import { messagePaintWeight } from '@/lib/render-weight'
 import { cn } from '@/lib/utils'
+import { $activeSessionId, $selectedStoredSessionId } from '@/store/session'
 import {
   getThreadScrollPosition,
   onScrollToBottomRequest,
@@ -39,7 +40,6 @@ import {
   threadScrollStorageKey,
   threadScrollTargetTop
 } from '@/store/thread-scroll'
-import { $activeSessionId, $selectedStoredSessionId } from '@/store/session'
 import { isHeaderlessSecondaryWindow } from '@/store/windows'
 
 import { MessageRenderBoundary } from '../message-render-boundary'

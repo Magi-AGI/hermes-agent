@@ -194,7 +194,7 @@ export {
   MIN_HEIGHT,
   MIN_VISIBLE,
   MIN_WIDTH,
-  sanitizeWindowState,
   type SanitizedWindowState,
+  sanitizeWindowState,
   type WindowOptions
 }
