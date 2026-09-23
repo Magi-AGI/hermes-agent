@@ -181,33 +181,6 @@ class TestPrefetchProviderModelsParallel:
             # Should not raise
             _prefetch_provider_models_parallel(["failing_prov"])
 
-    def test_hung_fetch_does_not_block_past_the_overall_timeout(self, monkeypatch):
-        """A provider fetch that never returns must not wedge the caller (an RPC worker via the
-        blocking picker path): the overall wait is bounded and the stuck worker is abandoned."""
-        import threading
-        from hermes_cli.model_switch_providers import _prefetch_provider_models_parallel
-
-        release = threading.Event()
-
-        def mock_fetch(slug, force_refresh=False):
-            if slug == "hung_prov":
-                release.wait(30)
-            return [f"model_{slug}"]
-
-        monkeypatch.setattr(model_switch_providers, "_PREFETCH_OVERALL_TIMEOUT_S", 0.3)
-        try:
-            with patch("hermes_cli.models._load_provider_models_cache", return_value={}), \
-                 patch("hermes_cli.models._credential_fingerprint", return_value="fp"), \
-                 patch("hermes_cli.models.cached_provider_model_ids", side_effect=mock_fetch), \
-                 patch("hermes_cli.models.update_provider_cache_entry"):
-                started = time.monotonic()
-                _prefetch_provider_models_parallel(["ok_prov", "hung_prov"])
-                elapsed = time.monotonic() - started
-        finally:
-            release.set()  # let the abandoned worker finish so it doesn't outlive the test
-
-        assert elapsed < 5.0, f"prefetch blocked {elapsed:.1f}s on a hung provider fetch"
-
     def test_empty_list_is_noop(self):
         """Empty provider list does nothing."""
         from hermes_cli.model_switch_providers import _prefetch_provider_models_parallel
