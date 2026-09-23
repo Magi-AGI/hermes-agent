@@ -91,6 +91,9 @@ model-options/listing never wait on probes (cdacc2bcf1, cb24121a8e).
 | B | 30d3fa1599 (48bb63b8d6) + 3982518f82 (curator preview bookkeeping, Codex #4-#6); ca86781a91 residual: afc54d5e6a reverted (75df8f6ce5), replaced by 9bcc841ff1 (model.save_key + recommended-default cache-only, bounded single-provider wait) | round 2 in triad |
 | D | 42c5344382..5cafcfff1d (16 picks + sync adaptations; ccb1168f23 split: ceiling part 42398eca41, EOF nit in 0e1b43f781, auth markers deferred to 2b) | in triad |
 | C | DECIDED 2026-09-22 (Lake; Codex + Antigravity agree): adopt upstream's ownership model, do not port the 19 commits. G1-G4 are RELEASE GATES. Codex's bar: G2 = new id owned before any continuation write, failure stops the turn; G3 = takeover waits for / fences the old executor. Implementation in progress | in progress |
+| C impl | 85a7b52b87 telemetry, 666ea9081e G1, e7c851631e G4, 4a6518a070 G2/G3 (durable turn lease already meets Codex's bar for transcript writes; residuals R1-R4 documented), bc7d17986d salvaged scenarios; 37fd1d3aaf test adaptations; b7c9d156af fallback-session AttributeError fix | in triad |
+| A3 | df65e59b80 (d33fec0394 route guard; no upstream equivalent; credential walk rewritten to upstream's resolver order) + 214c3bb682 oneshot test follow-up | in triad |
+| extra | 8e188195ef git probes GIT_OPTIONAL_LOCKS=0 (stale index.lock hazard; not fixed upstream) | in triad |
 
 ## Order
 0 → A1, A2 → B (48bb63b8d6; ca86781a91 residual only) → D → A3 → A4 (+ window fixes) → C (analysis
