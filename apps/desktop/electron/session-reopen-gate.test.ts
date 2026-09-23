@@ -5,6 +5,7 @@ import { test } from 'vitest'
 import {
   createSingleFlight,
   createWindowReadinessTracker,
+  reopenProbeTarget,
   waitForSessionWindowFunctionallyReady
 } from './session-reopen-gate'
 
@@ -201,8 +202,8 @@ test('health gating is delegated to the injected probe, not a raw fetch', async 
     { profile: 'claudetriad' },
     {
       ipcMain,
-      probeBackendHealth: (profile, signal) => {
-        probedProfile = profile
+      probeBackendHealth: (target, signal) => {
+        probedProfile = target.profile
         probeSignal = signal
 
         return health.promise
@@ -545,4 +546,40 @@ test('concurrent Reopen requests share one queue', async () => {
   release()
   await third
   assert.equal(runs, 2, 'a request after the queue finished starts a new one')
+})
+
+// ─── Codex A4 #7: the probe checks the exact route the window was opened on ──
+
+test('a peer is probed on its recorded connection+profile, a pop-out on its profile', () => {
+  const peer = { kind: 'peer', profile: 'work', connectionId: 'saved-c' }
+
+  assert.deepEqual(reopenProbeTarget(peer, { profile: 'work', connectionId: 'remote-1' }, 'default'), {
+    profile: 'work',
+    connectionId: 'remote-1'
+  })
+  assert.deepEqual(reopenProbeTarget(peer, null, 'default'), { profile: 'work', connectionId: 'saved-c' })
+  assert.deepEqual(reopenProbeTarget({ kind: 'session', profile: null, connectionId: 'x' }, null, 'claudetriad'), {
+    profile: 'claudetriad',
+    connectionId: null
+  })
+})
+
+test('a ready REMOTE peer is not failed because the local backend of the same profile is down', async () => {
+  const ipcMain = makeFakeIpcMain()
+  const win = makeFakeWindow()
+
+  // Local "work" is down; the remote connection is healthy.
+  const probe = (target: { connectionId: null | string }) =>
+    target.connectionId === 'remote-1' ? Promise.resolve() : Promise.reject(new Error('local backend down'))
+
+  const pending = waitForSessionWindowFunctionallyReady(
+    win as any,
+    { profile: 'work', probeTarget: { profile: 'work', connectionId: 'remote-1' } },
+    { ipcMain, probeBackendHealth: probe, timeoutMs: 500 }
+  )
+
+  await new Promise(resolve => setTimeout(resolve, 5))
+  ipcMain.emit('hermes:window:functional-ready', { sender: { id: 1 } }, { ok: true, profile: 'work' })
+
+  assert.deepEqual(await pending, { ok: true })
 })

@@ -29,6 +29,29 @@ export interface FunctionalReadyPayload {
   error?: string
 }
 
+export interface ReopenProbeTarget {
+  connectionId: null | string
+  profile: null | string
+}
+
+// The route the reopen probe must check for one saved window: a peer's route
+// recorded when it was spawned (exact connection + profile) when available,
+// else its saved route; a session pop-out boots by profile (its URL carries no
+// connection), so it is probed on that profile's route.
+export function reopenProbeTarget(
+  entry: { connectionId?: null | string; kind?: string; profile?: null | string },
+  recorded: { connectionId?: null | string; profile?: null | string } | null,
+  fallbackProfile: string
+): ReopenProbeTarget {
+  if (entry.kind === 'peer') {
+    const route = recorded ?? entry
+
+    return { profile: route.profile || fallbackProfile, connectionId: route.connectionId ?? null }
+  }
+
+  return { profile: entry.profile || fallbackProfile, connectionId: null }
+}
+
 export interface ReopenGateResult {
   ok: boolean
   reason?: string
@@ -54,7 +77,10 @@ export interface ReopenGateDeps {
   // path (backend-health.ts) — do not reinvent it as a raw HTTP poll (that
   // path already prefers /api/health, falls back to /api/status only for old
   // backends, and already handles credentialed/auth-gated probes correctly).
-  probeBackendHealth: (profile: string | null, signal: AbortSignal) => Promise<void>
+  // Receives the EXACT route the window was opened on (Codex A4 #7): a peer on a
+  // remote connection is probed on that connection, never on the local backend
+  // of the same profile name.
+  probeBackendHealth: (target: ReopenProbeTarget, signal: AbortSignal) => Promise<void>
   timeoutMs?: number
   // The window's already-recorded verdict (createWindowReadinessTracker), if it
   // reported before this wait began (an already-open window).
@@ -101,7 +127,11 @@ export function createSingleFlight<T>(run: () => Promise<T>) {
 
 export function waitForSessionWindowFunctionallyReady(
   win: ReopenGateWindow,
-  { profile, sessionId }: { profile: string | null; sessionId?: null | string },
+  {
+    profile,
+    sessionId,
+    probeTarget
+  }: { profile: string | null; sessionId?: null | string; probeTarget?: ReopenProbeTarget },
   deps: ReopenGateDeps
 ): Promise<ReopenGateResult> {
   if (win.isDestroyed()) {
@@ -227,7 +257,7 @@ export function waitForSessionWindowFunctionallyReady(
     // the whole reopen queue over a window the user (or the app) closed.
     win.once('closed', () => finish({ ok: true }))
 
-    void probeBackendHealth(profile, controller.signal)
+    void probeBackendHealth(probeTarget ?? { profile, connectionId: null }, controller.signal)
       .then(() => {
         healthReady = true
         succeedIfBothReady()

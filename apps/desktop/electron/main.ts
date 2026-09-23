@@ -419,6 +419,8 @@ import {
   createSingleFlight,
   createWindowReadinessTracker,
   REOPEN_WINDOW_SETTLE_MS,
+  type ReopenProbeTarget,
+  reopenProbeTarget,
   waitForSessionWindowFunctionallyReady
 } from './session-reopen-gate'
 import { createCloseIntentTracker } from './session-window-close-intent'
@@ -14221,27 +14223,18 @@ let pendingReopenEntries: any[] | null = null
 // Every window's functional-ready verdict (see createWindowReadinessTracker).
 const windowReadiness = createWindowReadinessTracker(ipcMain)
 
-// v1 scope: profile-only lookup. session-windows-state.json persists
-// sessionId/geometry/profile only (see persistSessionWindowsState) — there is
-// no connectionId/registry-scoped routing in the persisted surface today, so
-// a window whose real target isn't the plain per-profile route (e.g. a
-// registry-scoped/remote connection) is NOT covered by this health probe.
-// Documented limitation, not a bug — see design doc §7.2.
-//
-// Routes through ensureBackend() — the SAME connection-resolution path the
-// renderer's own boot sequence uses (via desktop.getConnection) — rather than
-// reading backendPool directly. Triad review round 2 caught that a
-// backendPool-only lookup silently skips the PRIMARY profile entirely: an
-// active primary routes through startHermes(), never through backendPool
-// (see ensureBackend's route.backend === 'primary' branch), so the most
-// likely real failure case (the primary profile's backend frozen) would have
-// gotten zero independent health verification. ensureBackend returns
-// immediately for an already-running backend (cached connection/promise on
-// both the pooled and primary paths) — it does not itself re-probe health —
-// so this stays bounded by the explicit waitForHermes() call below, not by
-// however long a cold spawn might take.
-async function probeProfileBackendHealth(profile: string | null, signal: AbortSignal): Promise<void> {
-  const connection = await ensureBackend(profile)
+// Probes the EXACT route a reopened window was opened on (Codex A4 #7) through
+// connectDesktopProfileRoute — the same resolver the window's own renderer dials
+// (desktop.getConnection): a registry connection resolves via
+// ensureRegistryBackend, a profile-only route via ensureBackend (which also
+// covers the primary; triad round 2). A remote peer is therefore never failed
+// (and destroyed) because the LOCAL backend of the same profile name is down.
+// Bounded by waitForHermes(), not by a cold spawn.
+async function probeWindowRouteHealth(target: ReopenProbeTarget, signal: AbortSignal): Promise<void> {
+  const connection = await connectDesktopProfileRoute(
+    { profile: target.profile || primaryProfileKey(), connectionId: target.connectionId },
+    'background'
+  )
 
   await waitForHermes(connection.baseUrl, connection.token, signal, connection.authMode, connection.headers)
 }
@@ -14336,10 +14329,14 @@ async function runReopenQueue(entries: any[]) {
 
     const result = await waitForSessionWindowFunctionallyReady(
       win,
-      { profile: expectedProfile, sessionId: entry.sessionId ?? null },
+      {
+        profile: expectedProfile,
+        sessionId: entry.sessionId ?? null,
+        probeTarget: reopenProbeTarget(entry, windowConnectionRoutes.get(win.webContents.id), expectedProfile)
+      },
       {
         ipcMain,
-        probeBackendHealth: probeProfileBackendHealth,
+        probeBackendHealth: probeWindowRouteHealth,
         // An already-open window is judged by what it actually reported, not
         // assumed ready because the registry only focused it.
         knownVerdict: windowReadiness.get(win.webContents.id)
