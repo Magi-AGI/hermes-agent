@@ -1246,8 +1246,11 @@ def model_options():
     try:
         from hermes_cli.inventory import build_models_payload, load_picker_context
 
+        # Cache-only catalogs: a request worker must never wait on a live provider probe (a cold row
+        # warms in the background and appears on the next open) — review: Codex, sync bucket D.
         payload = build_models_payload(
-            load_picker_context(), explicit_only=True, canonical_order=True, probe_custom_providers=False)
+            load_picker_context(), explicit_only=True, canonical_order=True, probe_custom_providers=False,
+            non_blocking_catalogs=True)
         return {
             "providers": [
                 {"slug": row.get("slug", ""), "label": row.get("label") or row.get("slug", ""),

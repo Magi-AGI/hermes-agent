@@ -245,6 +245,7 @@ class TestSessionOps:
             probe_custom_providers=False,
             probe_current_custom_provider=False,
             max_models=ACP_MAX_MODELS_PER_PROVIDER,
+            non_blocking_catalogs=True,
         )
 
 

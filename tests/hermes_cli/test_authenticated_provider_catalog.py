@@ -102,3 +102,35 @@ def test_hanging_provider_does_not_hold_the_inventory_read(monkeypatch):
     finally:
         release.set()
     assert elapsed < 10.0, f"inventory read blocked {elapsed:.1f}s on a hanging provider"
+
+
+def _record_build(monkeypatch):
+    calls = []
+
+    def _fake_build(ctx, **kwargs):
+        calls.append(kwargs)
+        return {"providers": []}
+
+    monkeypatch.setattr(inventory, "build_models_payload", _fake_build)
+    return calls
+
+
+def test_kanban_model_options_reads_catalogs_cache_only(monkeypatch):
+    """Review (Codex, bucket D caller audit): the kanban drawer's request worker must not wait on a
+    live provider probe."""
+    from plugins.kanban.dashboard import plugin_api
+
+    calls = _record_build(monkeypatch)
+    plugin_api.model_options()
+    assert calls and calls[0].get("non_blocking_catalogs") is True
+
+
+def test_acp_model_state_reads_catalogs_cache_only(monkeypatch):
+    """ACP builds the picker synchronously inside async session handlers: a live probe would block
+    its event loop."""
+    from acp_adapter import model_catalog
+
+    calls = _record_build(monkeypatch)
+    monkeypatch.setattr(model_catalog, "_named_custom_provider_catalogs", lambda: [])
+    model_catalog.build_model_state("m", "openrouter", "")
+    assert calls and calls[0].get("non_blocking_catalogs") is True

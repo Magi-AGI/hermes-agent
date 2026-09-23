@@ -249,6 +249,9 @@ def build_model_state(model: str, provider: str, base_url: str) -> SessionModelS
         context, explicit_only=True, include_unconfigured=False, picker_hints=False,
         canonical_order=True, pricing=False, capabilities=False, refresh=False,
         probe_custom_providers=False, probe_current_custom_provider=False, max_models=ACP_MAX_MODELS_PER_PROVIDER,
+        # Cache-only catalogs: ACP builds this synchronously inside async session handlers, so a live
+        # provider probe would block its event loop (review: Codex, sync bucket D).
+        non_blocking_catalogs=True,
     )
 
     named_catalogs = _named_custom_provider_catalogs()
