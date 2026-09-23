@@ -43,6 +43,13 @@ def _fence_cancel_before_commit(fence, *, when_in_flight: bool, failure_log: str
     owns the fence and completes on its own."""
     if fence is None or bool(getattr(fence, "commit_in_flight", False)) is not when_in_flight:
         return
+    # Owner-aware (Magi sync, bucket C): the thread INSIDE this fence's commit holds its non-reentrant
+    # lock, so waiting would wait on itself. That commit is the caller and completes on its own; the
+    # interrupt state is still published and stops the turn once it returns. Checked HERE, at the one
+    # place that would block, so it holds for whichever fence the slot names at this instant.
+    is_owner = getattr(fence, "is_commit_owner", None)
+    if callable(is_owner) and is_owner():
+        return
     cancel_before_commit = getattr(type(fence), "cancel_before_commit", None)
     if callable(cancel_before_commit):
         try:
