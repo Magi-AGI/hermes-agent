@@ -554,10 +554,15 @@ def try_acquire_active_session(
                     entries[index] = entry
                     _write_entries(state_path, entries)
                     return lease, None
+                # Both sides, so an "already has a live owner" report is attributable from agent.log
+                # alone (slimmed from the 2026-09-08 phase-0 ownership telemetry, 5a41e8aa96).
                 return refuse(
                     session_already_owned_message(key, existing), SESSION_NOT_OWNED,
-                    "Refused active session %s: already held by pid=%s surface=%s",
-                    key, existing.get("pid"), existing.get("surface"),
+                    "Refused active session %s: claimant=(pid=%s,live_session_id=%s,surface=%s) "
+                    "incumbent=(pid=%s,live_session_id=%s,surface=%s,started_at=%s)",
+                    key, os.getpid(), (metadata or {}).get("live_session_id"), surface,
+                    existing.get("pid"), (existing.get("metadata") or {}).get("live_session_id"),
+                    existing.get("surface"), existing.get("started_at"),
                 )
 
         # Capacity second, and only when an operator asked for one.

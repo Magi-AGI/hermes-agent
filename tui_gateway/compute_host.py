@@ -580,6 +580,12 @@ def _default_workers() -> int:
 
 def run_host(stdin: Any = None, stdout: Any = None) -> None:
     os.environ["HERMES_COMPUTE_HOST_CHILD"] = "1"
+    # The child is launched directly (`python -m tui_gateway.compute_host`), bypassing
+    # hermes_cli.main's setup_logging(), so its records (ownership refusals included) never
+    # reached agent.log. A logging-setup failure must never block turn processing.
+    with contextlib.suppress(Exception):
+        from hermes_logging import setup_logging
+        setup_logging()
     stdin = stdin or sys.stdin
     host = ComputeHost(stdout=stdout or sys.stdout)
     shutting_down = threading.Event()

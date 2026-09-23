@@ -782,3 +782,26 @@ def test_snapshot_prunes_after_lock_release_and_keeps_concurrent_lease(tmp_path,
     assert [e["lease_id"] for e in live] == ["live-1"]
     persisted = active_sessions._read_entries(state_path, strict=True)
     assert sorted(e["lease_id"] for e in persisted) == ["live-1", "new-1"]
+
+
+def test_ownership_refusal_logs_claimant_and_incumbent(tmp_path, monkeypatch, caplog):
+    """Slimmed phase-0 telemetry (5a41e8aa96): a refusal names BOTH sides (claimant pid,
+    live_session_id and surface; incumbent live_session_id and start time), so an "already has
+    a live owner" report can be attributed from agent.log alone."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    first, error = active_sessions.try_acquire_active_session(
+        session_id="stored-1", surface="desktop", config={},
+        metadata={"live_session_id": "live-incumbent"})
+    assert first is not None and error is None
+    try:
+        with caplog.at_level(logging.INFO, logger=active_sessions.logger.name):
+            second, refusal = active_sessions.try_acquire_active_session(
+                session_id="stored-1", surface="compute-host", config={},
+                metadata={"live_session_id": "live-claimant"})
+        assert second is None and refusal is not None
+        line = next(r.getMessage() for r in caplog.records if "stored-1" in r.getMessage())
+        assert "claimant=(pid=%d" % os.getpid() in line
+        assert "live-claimant" in line and "compute-host" in line
+        assert "live-incumbent" in line and "started_at=" in line
+    finally:
+        first.release()
