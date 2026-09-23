@@ -105,6 +105,20 @@ def _compute_host_adopt_frame_meta(session: dict, frame: dict) -> None:
     borrowed token (``_install_borrowed_lease``), so the REAL registry lease is re-anchored here,
     by its owner — never claimed from the child pid (authority stays singular, #103737 review)."""
     new_key = str(frame.get("session_key") or "")
+    # Magi (RelayBuffer): turn.end/turn.error are relayed off the stdout reader, while control acks
+    # (e.g. compression A->B) are applied immediately, so an OLDER completion can arrive after the
+    # parent already moved to the compressed key. Compression bumps history_version, so a frame whose
+    # version is below the parent's is stale and must never revert the key or re-anchor the lease.
+    try:
+        frame_version = int(frame["history_version"]) if frame.get("history_version") is not None else None
+    except (TypeError, ValueError):
+        frame_version = None
+    if frame_version is not None and frame_version < int(session.get("history_version", 0) or 0):
+        if new_key and new_key != str(session.get("session_key") or ""):
+            logger.info("Ignoring stale host frame session_key: sid=%s frame=%s@v%s current=%s@v%s",
+                        frame.get("sid"), new_key, frame_version, session.get("session_key"),
+                        session.get("history_version"))
+        return
     if new_key and new_key != str(session.get("session_key") or ""):
         if not _transfer_active_session_slot(str(frame.get("sid") or ""), session, new_session_id=new_key):
             logger.warning("Compression session lease did not re-anchor: sid=%s old_session_id=%s new_session_id=%s",
