@@ -159,8 +159,8 @@ gap fixes (G1-G3), in the same order and under the same decision.
 | telemetry | 9f96207120 | ported slimmed: refusal names claimant + incumbent; child setup_logging() |
 | G1 | 110d09031e | FIXED, red-first (child ended the parent's row for all 4 shutdown reasons) |
 | G4 | 9d48f8e528 | FIXED, red-first (parent stayed at 7 after a respawned host compressed) |
-| G2 | see below | write-level guarantee already provided upstream (pinned by tests); registry-level residual is a DESIGN CHOICE, not implemented |
-| G3 | see below | same: write-level guarantee provided upstream (pinned); residuals listed |
+| G2 | 94216610b4, e19e38f148 | upstream's lease fenced turn APPENDS only; compression COMMITS and a holder-less retry bypassed it (Codex review). FIXED, red-first. Registry-level residual R1 is a design choice |
+| G3 | 94216610b4, e19e38f148, bd9fddabe7 | same fixes, plus ACP's non-owning transcript replace (R2 was a real destructive write). FIXED, red-first |
 
 ## G2 / G3 against Codex's bar: what upstream already guarantees (found while implementing)
 
@@ -181,12 +181,38 @@ that the analysis did not account for: the **session turn lease** in state.db
   lives; once the child is gone its lease is reclaimable by the dead-pid rule, and a stalled child
   whose lease expired and was reclaimed is fenced on its next write.
 
-So Codex's G2 bar ("ownership of B established before any continuation write; failure stops
-execution") and G3 bar ("takeover waits for the previous executor to stop, or the previous executor
-is fenced") hold at the **transcript-write** level on v2026.9.21. Pinned by
-`tests/hermes_state/test_turn_lease_spans_compression_rotation.py` (4 tests; negative-checked by
-disabling lineage keying and dead-holder detection). Read from code, not reproduced end-to-end
-through a live compute host.
+The claim that this already met Codex's G2/G3 bar at the transcript-write level was WRONG for three
+paths (Codex review of 4a6518a070, reproduced red-first before each fix):
+
+1. **Compression commits bypassed the turn lease.** `publish_compression_child` and
+   `archive_and_compact` checked only the compression lock, which stays valid independently of the
+   turn lease: a taken-over executor could still publish a continuation or commit an in-place
+   compaction over the successor. The pre-publication flush also swallowed failure.
+   **Now (94216610b4, e19e38f148):** both commits run `_check_compression_turn_fence` inside the
+   publication transaction (same rule and renewal as transcript writes). A turn's commit must still
+   hold its lease; a turn-less commit is refused while another turn holds the conversation. Every
+   in-turn caller passes its holder (rotation / in-place from the agent; proactive prune and
+   micro-compaction via a weakref'd holder callback on the compressor). A recorded lease loss stops
+   the rotation before publishing.
+2. **A cleared holder authorized a late, unfenced retry.** After a refused flush, turn cleanup
+   cleared `_active_session_turn_lease_holder`, and the shutdown flush retried the pending rows with
+   `None`, which skips the lease check. **Now (e19e38f148):** the refused holder is recorded; until a
+   new lease is admitted, a holder-less flush is fenced by the LOST holder, so the DB keeps refusing
+   it. Re-admission under a new lease may persist pending rows (upstream's pinned contract; admission
+   reloads the transcript after a wait).
+3. **R2 hid a concrete destructive write.** ACP `_persist` from a non-owning agent (a second client
+   after restore + model switch) replaced active messages from stale history with a DELETE and no
+   lease check. **Now (bd9fddabe7):** metadata-only saves never touch messages; a non-owning
+   transcript sync is lease-fenced in-txn (`reject_active_turn_lease`) and soft-archives dropped rows.
+
+With those, Codex's G2 bar ("ownership of B established before any continuation write; failure stops
+execution") and G3 bar ("takeover waits for the previous executor to stop, or it is fenced") hold for
+turn appends, compression commits, late/shutdown flushes and ACP transcript syncs. Pinned by
+`tests/hermes_state/test_turn_lease_spans_compression_rotation.py`,
+`tests/hermes_state/test_compression_turn_lease_fence.py`,
+`tests/agent/test_flush_after_turn_lease_loss.py` and
+`tests/acp_adapter/test_session_persist_ownership.py`. Read and unit-tested against a real SessionDB,
+not reproduced end-to-end through a live compute host.
 
 ### Residuals (open choices for Lake + reviewers)
 
@@ -202,8 +228,9 @@ through a live compute host.
   it would duplicate a guarantee the DB lease already gives); (c) accept, documented.
   Recommendation: (c) or (a). (b) buys no data safety.
 - **R2: non-turn transcript mutations.** Writes outside a turn (rewind, edits, archive) are fenced
-  against an active turn lease only when the caller opts in (`reject_active_turn_lease`). Not audited
-  here; worth one pass to confirm every user-initiated mutation path opts in.
+  against an active turn lease only when the caller opts in (`reject_active_turn_lease`). The ACP
+  path was a real hole (fixed, bd9fddabe7). A complete audit of every other `replace_messages` /
+  mutation caller is still open.
 - **R3: first turn of a brand-new session.** `admit_durable_turn_lease` skips the lease when no durable
   row exists yet ("a fresh session id has no durable transcript to race over"). Two runtimes racing
   the very first turn of the same new session are not serialized by it. Pre-existing upstream design.
