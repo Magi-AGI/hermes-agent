@@ -86,10 +86,10 @@ model-options/listing never wait on probes (cdacc2bcf1, cb24121a8e).
 | bucket | commit | status |
 |---|---|---|
 | 0 | 86bc926241 | approved |
-| A1 | 8fa5ab0dbf (re-port WITHOUT RelayBuffer, Lake's call) + a4115bb96f (raising rpc_sink fix, both reviewers) | round 2 in triad |
+| A1 | 8fa5ab0dbf (re-port WITHOUT RelayBuffer, Lake's call) + a4115bb96f (raising rpc_sink fix, both reviewers) | APPROVED |
 | A2 | d5fb8ebae4 | approved |
-| B | 30d3fa1599 (48bb63b8d6) + 3982518f82 (curator preview bookkeeping, Codex #4-#6); ca86781a91 residual: afc54d5e6a reverted (75df8f6ce5), replaced by 9bcc841ff1 (model.save_key + recommended-default cache-only, bounded single-provider wait) | round 2 in triad |
-| D | 42c5344382..5cafcfff1d (16 picks + sync adaptations; ccb1168f23 split: ceiling part 42398eca41, EOF nit in 0e1b43f781, auth markers deferred to 2b) | in triad |
+| B | 30d3fa1599 (48bb63b8d6) + 3982518f82 (curator preview bookkeeping, Codex #4-#6); ca86781a91 residual: afc54d5e6a reverted (75df8f6ce5), replaced by 9bcc841ff1 (model.save_key + recommended-default cache-only, bounded single-provider wait) | APPROVED |
+| D | 42c5344382..5cafcfff1d (16 picks + sync adaptations; ccb1168f23 split: ceiling part 42398eca41, EOF nit in 0e1b43f781, auth markers deferred to 2b); follow-ups cc463233ed..753dabbc29, 56d7267d2b, 8a0f37b2b7, e7f5201c9a, 70e8ec6955, 8efbd2ec03 | APPROVED |
 | C | DECIDED 2026-09-22 (Lake; Codex + Antigravity agree): adopt upstream's ownership model, do not port the 19 commits. G1-G4 are RELEASE GATES. Codex's bar: G2 = new id owned before any continuation write, failure stops the turn; G3 = takeover waits for / fences the old executor. Implementation in progress | in progress |
 | C impl | 85a7b52b87..bc7d17986d (telemetry, G1, G4, G2/G3 design, scenarios) + fencing follow-ups 332888e317..33b6fe52b2, 69d1d3e9a4, 67017165b8, cc24078df1, 2b0723622a, 986a4a8441, 912e489a0a, 8711773970 (7 Codex rounds: compression commits lease-fenced; one effective ownership token; sticky loss; ACP metadata/transcript split; lease-loss interrupt parked on the committing thread's own fence) | APPROVED 2026-09-23 (Codex + Antigravity) |
 | A3 | df65e59b80 + 214c3bb682; follow-ups 01f6d79802 (effective-auth screen), 2ce27e8d6a (native compaction), 7caa28fc2e (case-variant headers) | APPROVED 2026-09-23 (Codex + Antigravity) |
