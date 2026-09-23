@@ -52,6 +52,7 @@ def _client_sync():
     # about routing) don't trip the guard. See test_compression_route_guard.py.
     inner = MagicMock()
     inner.api_key = "codex-oauth-token"
+    inner.default_headers = {"Authorization": f"Bearer {inner.api_key}"}  # as a real SDK client exposes it (A3 effective-auth screen)
     inner.base_url = "https://chatgpt.com/backend-api/codex"
     client = CodexAuxiliaryClient(inner, "gpt-5.5")
     client.chat = MagicMock()
@@ -62,6 +63,7 @@ def _client_sync():
 def _client_async():
     inner = MagicMock()
     inner.api_key = "codex-oauth-token"
+    inner.default_headers = {"Authorization": f"Bearer {inner.api_key}"}  # as a real SDK client exposes it (A3 effective-auth screen)
     inner.base_url = "https://chatgpt.com/backend-api/codex"
     sync_wrapper = CodexAuxiliaryClient(inner, "gpt-5.5")
     client = AsyncCodexAuxiliaryClient(sync_wrapper)

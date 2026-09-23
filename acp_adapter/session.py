@@ -376,7 +376,8 @@ class SessionManager:
             # create/fork every row is active (== full replace), and archived rows survive.
             # Unconditional because an existence probe would fail OPEN on DB error and can
             # race a concurrent archive_and_compact. Still rolls back on mid-rewrite failure.
-            db.replace_messages(state.session_id, state.history, archive_dropped=True,
+            # active_only is implied by archive_dropped; kept explicit for upstream's #80216 guard.
+            db.replace_messages(state.session_id, state.history, active_only=True, archive_dropped=True,
                                 reject_active_turn_lease=True)
         except Exception:
             logger.warning("Failed to persist ACP session %s", state.session_id, exc_info=True)

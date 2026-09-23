@@ -394,7 +394,7 @@ def test_compressed_summary_column_is_added_to_legacy_databases(tmp_path):
     assert model_history[-1].get("_compressed_summary") is True
 
 
-def test_native_responses_compaction_is_suppressed_when_checkpoint_required():
+def test_native_responses_compaction_is_suppressed_when_checkpoint_required(monkeypatch):
     """checkpoint_required must keep ``context_management`` off the wire.
 
     Server-side native compaction is a lossy boundary the provider owns; no
@@ -404,7 +404,13 @@ def test_native_responses_compaction_is_suppressed_when_checkpoint_required():
     """
     from types import SimpleNamespace
 
+    import agent.native_compaction as _nc
     from agent.native_compaction import native_compaction_context_management
+
+    # Magi (sync A3 #5): the fork refuses native compaction on api.openai.com; this test pins the
+    # CHECKPOINT gate on upstream's route, so the route policy is lifted here (tested separately in
+    # test_native_compaction_route_guard.py).
+    monkeypatch.setattr(_nc, "native_compaction_route_allowed", lambda _base_url: True)
 
     def agent(checkpoint_required):
         return SimpleNamespace(

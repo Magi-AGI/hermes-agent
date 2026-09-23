@@ -212,6 +212,7 @@ class TestCompressionRetryGate:
         # doesn't trip the guard. See test_compression_route_guard.py.
         primary_inner = MagicMock()
         primary_inner.api_key = "codex-oauth-token"
+        primary_inner.default_headers = {"Authorization": f"Bearer {primary_inner.api_key}"}  # as a real SDK client exposes it (A3 effective-auth screen)
         primary_inner.base_url = "https://chatgpt.com/backend-api/codex"
         primary_client = CodexAuxiliaryClient(primary_inner, "gpt-5.6-sol")
         primary_client.chat = MagicMock()
@@ -224,6 +225,7 @@ class TestCompressionRetryGate:
 
         fallback_inner = MagicMock()
         fallback_inner.api_key = "codex-oauth-token"
+        fallback_inner.default_headers = {"Authorization": f"Bearer {fallback_inner.api_key}"}  # as a real SDK client exposes it (A3 effective-auth screen)
         fallback_inner.base_url = "https://chatgpt.com/backend-api/codex"
         fallback_client = CodexAuxiliaryClient(fallback_inner, "fb")
         fallback_client.chat = MagicMock()
