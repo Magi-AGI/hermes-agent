@@ -14,6 +14,16 @@ from agent.native_compaction import (
     resolve_native_compaction_capabilities,
 )
 
+
+@pytest.fixture(autouse=True)
+def _upstream_native_compaction_routes_allowed(monkeypatch):
+    """Magi (sync A3, review: Codex #5): the fork's subscription-only compaction policy refuses native
+    compaction on api.openai.com and trusted proxies. This file pins upstream's MECHANICS on those
+    routes (thresholds, per-request gate, capability agreement), so the route policy is lifted here;
+    the policy itself is tested in test_native_compaction_route_guard.py with the real gate."""
+    import agent.native_compaction as _nc
+    monkeypatch.setattr(_nc, "native_compaction_route_allowed", lambda _base_url: True)
+
 _CODEX = "https://chatgpt.com/backend-api/codex"
 
 

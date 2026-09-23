@@ -105,6 +105,39 @@ def _warn_native_compaction_suppressed_by_checkpoint_gate() -> None:
         )
 
 
+_route_guard_suppression_logged = False
+
+
+def native_compaction_route_allowed(base_url: Optional[str]) -> bool:
+    """Magi: the subscription-only compaction route policy (sync bucket A3) applied to SERVER-SIDE
+    compaction. Native compaction hands the conversation to the main model's provider for
+    summarising, so it may only happen where a Hermes compaction summary could: the ChatGPT Codex
+    OAuth backend, and only while ``("openai-codex", "oauth_subscription")`` is an allowed
+    compaction route. ``api.openai.com`` (a metered API key) and trusted proxies (not provably a
+    subscription) are refused. A config error in ``allowed_routes`` fails closed, as the guard does.
+    When refused, no ``context_management`` is sent; the local compressor, armed below the native
+    threshold, then compacts through the guarded auxiliary path (review: Codex A3 #5)."""
+    if not is_official_codex_base_url(base_url or ""):
+        return False
+    try:
+        from agent.auxiliary_client import AUTH_MODE_OAUTH_SUBSCRIPTION, _allowed_compression_routes
+        return ("openai-codex", AUTH_MODE_OAUTH_SUBSCRIPTION) in _allowed_compression_routes()
+    except Exception:
+        logger.debug("native compaction route check failed; refusing", exc_info=True)
+        return False
+
+
+def _warn_native_compaction_suppressed_by_route_guard() -> None:
+    global _route_guard_suppression_logged
+    if not _route_guard_suppression_logged:
+        _route_guard_suppression_logged = True
+        logger.warning(
+            "Native server-side compaction (context_management) is disabled on this route: "
+            "compaction may only run on the ChatGPT Codex OAuth or Claude subscription routes. "
+            "The Hermes compressor compacts through the guarded route instead."
+        )
+
+
 def native_compaction_context_management(agent: Any, *, is_codex_backend: bool, is_xai_responses: bool = False,
                                          is_github_responses: bool = False) -> Optional[List[Dict[str, Any]]]:
     """Return the ``context_management`` payload for this request, or None ("do not send").
@@ -131,6 +164,9 @@ def native_compaction_context_management(agent: Any, *, is_codex_backend: bool, 
         return None
     trusted_proxy = bool(getattr(agent, "capabilities", {}).get("openai_native_compaction", False))
     if not trusted_proxy and not is_direct_openai_route(getattr(agent, "base_url", None), is_codex_backend=is_codex_backend):
+        return None
+    if not native_compaction_route_allowed(getattr(agent, "base_url", None)):
+        _warn_native_compaction_suppressed_by_route_guard()
         return None
 
     compressor = getattr(agent, "context_compressor", None)
