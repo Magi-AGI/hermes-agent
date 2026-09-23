@@ -116,6 +116,26 @@ test('a Reopen during an active queue merges new windows into it (no duplicates)
   assert.deepEqual(h.log, ['a', 'b', 'c'])
 })
 
+test('a Reopen never re-admits a window the active queue is checking or already opened (Codex A4 r4 #3)', async () => {
+  const h = harness()
+
+  const first = h.queue.reopen([e('a'), e('b')])
+
+  // a is being checked: a Reopen of [a, b, c] must add only c.
+  const second = h.queue.reopen([e('a'), e('b'), e('c')])
+
+  await h.release('a')
+  await h.release('b')
+
+  // b is done now too: re-admitting it would reopen it again.
+  const third = h.queue.reopen([e('b'), e('c')])
+
+  await h.release('c')
+  await Promise.all([first, second, third])
+
+  assert.deepEqual(h.log, ['a', 'b', 'c'])
+})
+
 test('a halt keeps the failed window and everything after it for Resume', async () => {
   const h = harness({ b: { ok: false, profile: 'p', reason: 'timeout' } })
 

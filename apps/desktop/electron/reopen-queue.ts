@@ -31,13 +31,15 @@ export function createReopenQueue<E extends { windowId: string }>(deps: {
   let active: Promise<void> | null = null
   let restored = 0
   let total = 0
+  // Every window id admitted during the current run — pending, being checked
+  // or already done (Codex A4 round 4 #3): a Reopen merged in mid-run never
+  // opens one of them a second time.
+  let admitted = new Set<string>()
 
   function enqueue(entries: E[]) {
-    const queued = new Set(pending.map(entry => entry.windowId))
-
     for (const entry of entries) {
-      if (!queued.has(entry.windowId) && !cancelled(entry.windowId)) {
-        queued.add(entry.windowId)
+      if (!admitted.has(entry.windowId) && !cancelled(entry.windowId)) {
+        admitted.add(entry.windowId)
         pending.push(entry)
         total += 1
       }
@@ -88,6 +90,7 @@ export function createReopenQueue<E extends { windowId: string }>(deps: {
   }
 
   function reset() {
+    admitted = new Set()
     halted = null
     restored = 0
     total = 0
