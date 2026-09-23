@@ -23,6 +23,9 @@ const FUNCTIONAL_READY_CHANNEL = 'hermes:window:functional-ready'
 
 export interface FunctionalReadyPayload {
   ok: boolean
+  // The window's establishment attempt this report belongs to (Codex A4
+  // round 4 #1); see createReopenReadySignaller.
+  attempt?: number
   // The window is (re)establishing its current target — a new session after
   // /new, a boot retry. Not a verdict: the gate keeps waiting.
   pending?: boolean
@@ -163,10 +166,14 @@ export function waitForSessionWindowFunctionallyReady(
     profile,
     sessionId,
     probeTarget,
+    resolveProbeTarget,
     identity = 'exact'
   }: {
     identity?: ReopenIdentityCheck
     probeTarget?: ReopenProbeTarget
+    // Re-resolves the route to probe each time the probe (re)runs — an
+    // existing window's route can change with its identity. Else probeTarget.
+    resolveProbeTarget?: () => ReopenProbeTarget
     profile: string | null
     sessionId?: null | string
   },
@@ -178,7 +185,6 @@ export function waitForSessionWindowFunctionallyReady(
 
   const { ipcMain, knownVerdict, probeBackendHealth, timeoutMs = REOPEN_WINDOW_READY_TIMEOUT_MS } = deps
   const wcId = win.webContents.id
-  const controller = new AbortController()
 
   return new Promise(resolve => {
     let settled = false
@@ -195,8 +201,21 @@ export function waitForSessionWindowFunctionallyReady(
     // entirely; that made the "independent" probe load-bearing only in the
     // all-frozen case (no renderer signal ever arrives), not the case this
     // paragraph describes.
+    //
+    // And both must belong to the window's LATEST identity (Codex A4 round 4
+    // #1): its establishment attempt + profile + session. A later pending
+    // report, or any report of a new identity, clears renderer readiness; a
+    // new identity also discards the in-flight/finished probe and re-runs it,
+    // so the queue only advances when the latest ready and a probe run for
+    // that same identity both succeeded.
     let rendererReady = false
     let healthReady = false
+    let latestIdentity: null | string = null
+    let probeRun = 0
+    let probeController: AbortController | null = null
+
+    const identityOf = (payload: FunctionalReadyPayload) =>
+      JSON.stringify([payload?.attempt ?? null, payload?.profile ?? null, payload?.sessionId ?? null])
 
     const finish = (result: ReopenGateResult) => {
       if (settled) {
@@ -204,7 +223,7 @@ export function waitForSessionWindowFunctionallyReady(
       }
 
       settled = true
-      controller.abort()
+      probeController?.abort()
       clearTimeout(timer)
       ipcMain.removeListener(FUNCTIONAL_READY_CHANNEL, onReady)
       resolve(result)
@@ -222,8 +241,50 @@ export function waitForSessionWindowFunctionallyReady(
     const normalizeProfile = (p: string | null | undefined) => p || 'default'
     const expectedProfile = normalizeProfile(profile)
 
+    const runProbe = () => {
+      const run = ++probeRun
+
+      probeController?.abort()
+      probeController = new AbortController()
+      healthReady = false
+
+      const target = resolveProbeTarget?.() ?? probeTarget ?? { profile, connectionId: null }
+
+      void probeBackendHealth(target, probeController.signal)
+        .then(() => {
+          if (run === probeRun) {
+            healthReady = true
+            succeedIfBothReady()
+          }
+        })
+        .catch(err => {
+          // A probe superseded by a newer identity is discarded, not a failure.
+          if (run === probeRun) {
+            finish({ ok: false, reason: `backend health check failed: ${err?.message || err}` })
+          }
+        })
+    }
+
     const onReady = (event: { sender: { id: number } }, payload: FunctionalReadyPayload) => {
-      if (event.sender.id !== wcId || payload?.pending === true) {
+      if (event.sender.id !== wcId) {
+        return
+      }
+
+      const nextIdentity = identityOf(payload)
+
+      if (latestIdentity !== null && nextIdentity !== latestIdentity) {
+        rendererReady = false
+
+        if (probeRun > 0) {
+          runProbe()
+        }
+      }
+
+      latestIdentity = nextIdentity
+
+      if (payload?.pending === true) {
+        rendererReady = false
+
         return
       }
 
@@ -295,13 +356,8 @@ export function waitForSessionWindowFunctionallyReady(
     // the whole reopen queue over a window the user (or the app) closed.
     win.once('closed', () => finish({ ok: true }))
 
-    void probeBackendHealth(probeTarget ?? { profile, connectionId: null }, controller.signal)
-      .then(() => {
-        healthReady = true
-        succeedIfBothReady()
-      })
-      .catch(err => {
-        finish({ ok: false, reason: `backend health check failed: ${err?.message || err}` })
-      })
+    if (!settled) {
+      runProbe()
+    }
   })
 }

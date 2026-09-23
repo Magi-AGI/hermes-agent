@@ -28,6 +28,10 @@ export interface ReopenReadyInputs {
 
 export interface ReopenReadyPayload {
   ok: boolean
+  // Which establishment attempt this report belongs to (Codex A4 round 4 #1):
+  // a new one starts each time the window goes (back) to pending — a new
+  // session, route or boot attempt. Stamped by createReopenReadySignaller.
+  attempt?: number
   pending?: true
   phase: 'boot' | 'pending' | 'session'
   profile: null | string
@@ -67,17 +71,31 @@ export function reopenReadyVerdict(inputs: ReopenReadyInputs): null | ReopenRead
 // and destroyed a healthy window. Now the target is the window's current
 // session, and every change of verdict — including back to pending while a new
 // session, route or boot attempt is being established — is sent; an unchanged
-// one is not re-sent.
+// one is not re-sent. Every report is stamped with its attempt, so main never
+// pairs a verdict (or a health result) from an earlier attempt with the latest.
 export function createReopenReadySignaller(send: (payload: ReopenReadyPayload) => void) {
   let last: null | string = null
+  let attempt = 0
+  let wasPending = false
 
   return (inputs: ReopenReadyInputs) => {
-    const payload = reopenReadyVerdict(inputs) ?? {
-      ok: false,
-      pending: true as const,
-      phase: 'pending' as const,
-      profile: inputs.profile,
-      sessionId: inputs.target
+    const verdict = reopenReadyVerdict(inputs)
+
+    if (!verdict && !wasPending) {
+      attempt += 1
+    }
+
+    wasPending = !verdict
+
+    const payload: ReopenReadyPayload = {
+      ...(verdict ?? {
+        ok: false,
+        pending: true as const,
+        phase: 'pending' as const,
+        profile: inputs.profile,
+        sessionId: inputs.target
+      }),
+      attempt
     }
 
     const key = JSON.stringify(payload)

@@ -51,9 +51,9 @@ describe('createReopenReadySignaller (Codex A4 round 3 #1)', () => {
     signal({ ...base, target: 's-b', selected: 's-b', runtime: 'r2' })
 
     expect(sent).toEqual([
-      { ok: true, phase: 'session', profile: 'work', sessionId: 's-a' },
-      { ok: false, pending: true, phase: 'pending', profile: 'work', sessionId: 's-b' },
-      { ok: true, phase: 'session', profile: 'work', sessionId: 's-b' }
+      { ok: true, phase: 'session', profile: 'work', sessionId: 's-a', attempt: 0 },
+      { ok: false, pending: true, phase: 'pending', profile: 'work', sessionId: 's-b', attempt: 1 },
+      { ok: true, phase: 'session', profile: 'work', sessionId: 's-b', attempt: 1 }
     ])
   })
 
@@ -71,6 +71,23 @@ describe('createReopenReadySignaller (Codex A4 round 3 #1)', () => {
       ['pending', 'work'],
       ['boot', 'work'],
       ['boot', 'other']
+    ])
+  })
+
+  it('stamps each new attempt: entering pending starts one, and its verdict carries it (Codex A4 r4 #1)', () => {
+    const sent: { attempt?: number; phase: string }[] = []
+    const signal = createReopenReadySignaller(payload => sent.push(payload))
+
+    signal({ ...base, target: null, boot: 'pending' })
+    signal({ ...base, target: null })
+    signal({ ...base, target: null, boot: 'pending' })
+    signal({ ...base, target: null })
+
+    expect(sent.map(p => [p.phase, p.attempt])).toEqual([
+      ['pending', 1],
+      ['boot', 1],
+      ['pending', 2],
+      ['boot', 2]
     ])
   })
 
