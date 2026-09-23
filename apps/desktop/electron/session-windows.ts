@@ -312,6 +312,14 @@ function createSessionWindowRegistry() {
         connectionId: clean(report?.connectionId)
       }
 
+      // A session pop-out passing through a fresh draft (e.g. /new before the
+      // first send) keeps its last session and route until the draft becomes a
+      // session: its saved entry must stay reopenable (Codex A4 #6). A peer
+      // showing a fresh chat is a valid saved state and is recorded as such.
+      if (entry.kind === 'session' && !next.sessionId) {
+        return false
+      }
+
       if (
         entry.sessionId === next.sessionId &&
         entry.profile === next.profile &&

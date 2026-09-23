@@ -9,7 +9,7 @@ import { $diskPluginsScanPending } from '@/contrib/runtime-loader'
 import { resolveDeepLinkAction } from '@/lib/deeplink-routes'
 import { pathFromHermesDeepLink, resolveHermesOpenPath } from '@/lib/hermes-open-target'
 import { storedSessionIdForNotification } from '@/lib/session-ids'
-import { windowSessionReport } from '@/lib/window-session-report'
+import { reportsWindowSession, windowSessionReport } from '@/lib/window-session-report'
 import { announceNewSessionDraftKey } from '@/store/composer'
 import { $activeConnectionId } from '@/store/connections'
 import { requestMcpInstallFromDeepLink } from '@/store/mcp-deeplink-install'
@@ -36,7 +36,13 @@ import {
 import { $botChatScopes, $sessionTiles, storedSessionIdForRuntimeId } from '@/store/session-states'
 import { onSessionsChanged } from '@/store/session-sync'
 import { openUpdatesWindow, startUpdatePoller, stopUpdatePoller } from '@/store/updates'
-import { isBrowserWindow, isHeaderlessSecondaryWindow, isHudWindow, isPeerInstanceWindow } from '@/store/windows'
+import {
+  isBrowserWindow,
+  isHeaderlessSecondaryWindow,
+  isHudWindow,
+  isPeerInstanceWindow,
+  isSecondaryWindow
+} from '@/store/windows'
 import type { SessionInfo } from '@/types/hermes'
 
 import { requestComposerFocus, requestComposerInsert } from '../../chat/composer/focus'
@@ -122,7 +128,10 @@ export function useDesktopIntegrations({
   const activeConnectionId = useStore($activeConnectionId)
 
   useEffect(() => {
-    if (!isPeerInstanceWindow()) {
+    // Every restorable window reports: peers AND session pop-outs (a pop-out
+    // can move to another session, e.g. via /new). Main ignores windows it
+    // does not save (watch windows, the primary).
+    if (!reportsWindowSession({ peer: isPeerInstanceWindow(), secondary: isSecondaryWindow() })) {
       return
     }
 

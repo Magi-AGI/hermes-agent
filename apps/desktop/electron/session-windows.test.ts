@@ -503,3 +503,39 @@ test('a route-only change (same session, owner now resolved elsewhere) is saved 
   assert.equal(registry.setRoute(peer, { sessionId: 's1', profile: 'work', connectionId: 'c9' }), true)
   assert.equal(registry.entries()[0].connectionId, 'c9')
 })
+
+// ─── Codex A4 #6: every restorable kind reports; drafts never lose an entry ───
+
+test('a session pop-out moving to another session (e.g. via /new) is saved on the new one', () => {
+  const registry = createSessionWindowRegistry()
+  const pop = makeFakeWindow()
+
+  registry.openOrFocus('pop-1', () => pop, { kind: 'session', sessionId: 's1', profile: 'work' })
+  assert.equal(registry.setRoute(pop, { sessionId: 's2', profile: 'work', connectionId: null }), true)
+  assert.equal(registry.entries()[0].sessionId, 's2')
+})
+
+test('a pop-out passing through a fresh draft keeps its saved session until the draft becomes one', () => {
+  const registry = createSessionWindowRegistry()
+  const pop = makeFakeWindow()
+
+  registry.openOrFocus('pop-1', () => pop, { kind: 'session', sessionId: 's1', profile: 'work' })
+  assert.equal(registry.setRoute(pop, { sessionId: null, profile: 'work', connectionId: null }), false)
+
+  const [kept] = registry.entries().map(e => toSavedWindowEntry(e, BOUNDS, false))
+
+  assert.equal(kept.sessionId, 's1')
+  assert.equal(readSavedWindowEntries([kept]).length, 1, 'still a valid, reopenable saved entry')
+
+  registry.setRoute(pop, { sessionId: 's3', profile: 'work', connectionId: null })
+  assert.equal(registry.entries()[0].sessionId, 's3')
+})
+
+test('a peer on a fresh chat is recorded as such', () => {
+  const registry = createSessionWindowRegistry()
+  const peer = makeFakeWindow()
+
+  registry.openOrFocus('peer-1', () => peer, { kind: 'peer', sessionId: 's1', profile: 'work' })
+  assert.equal(registry.setRoute(peer, { sessionId: null, profile: 'work', connectionId: null }), true)
+  assert.equal(registry.entries()[0].sessionId, null)
+})

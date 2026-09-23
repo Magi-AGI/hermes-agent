@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { windowSessionReport } from './window-session-report'
+import { reportsWindowSession, windowSessionReport } from './window-session-report'
 
 const active = { profile: 'work', connectionId: 'local' }
 
@@ -20,5 +20,13 @@ describe('windowSessionReport (Codex A4 #5)', () => {
   it('an unknown owner or a fresh draft falls back to the active route', () => {
     expect(windowSessionReport('s1', undefined, active)).toEqual({ sessionId: 's1', ...active })
     expect(windowSessionReport(null, { profile: 'x', connectionId: 'y' }, active)).toEqual({ sessionId: null, ...active })
+  })
+})
+
+describe('reportsWindowSession (Codex A4 #6)', () => {
+  it('session pop-outs report too, not only peers', () => {
+    expect(reportsWindowSession({ peer: false, secondary: true })).toBe(true)
+    expect(reportsWindowSession({ peer: true, secondary: false })).toBe(true)
+    expect(reportsWindowSession({ peer: false, secondary: false })).toBe(false)
   })
 })
