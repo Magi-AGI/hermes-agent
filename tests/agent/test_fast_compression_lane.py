@@ -25,6 +25,7 @@ def _codex_oauth_client(create_side_effect=None, create_return=None):
     inner = MagicMock()
     inner.api_key = "codex-oauth-token"
     inner.base_url = "https://chatgpt.com/backend-api/codex"
+    inner.default_headers = {"Authorization": f"Bearer {inner.api_key}"}  # as a real SDK client exposes it
     client = CodexAuxiliaryClient(inner, "gpt-5.5")
     client.chat = MagicMock()
     if create_side_effect is not None:

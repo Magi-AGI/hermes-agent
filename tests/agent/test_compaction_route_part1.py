@@ -94,8 +94,10 @@ class TestRouteRejectedCounter:
         ) == 2
 
     def test_admitted_route_does_not_increment(self):
+        sdk = MagicMock()
+        sdk.default_headers = {"Authorization": f"Bearer {OAUTH_TOKEN}"}  # as a real OAuth SDK client exposes it
         oauth = ac.AnthropicAuxiliaryClient(
-            MagicMock(), "claude-haiku-4-5", OAUTH_TOKEN,
+            sdk, "claude-haiku-4-5", OAUTH_TOKEN,
             "https://api.anthropic.com", is_oauth=True,
         )
         with compression_route_guard():

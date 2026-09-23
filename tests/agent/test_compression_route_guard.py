@@ -70,7 +70,10 @@ def isolate_anthropic_sources(monkeypatch):
 
 def _fake_anthropic_client(base_url="https://api.anthropic.com", is_oauth=True, token=OAUTH_TOKEN):
     """A real AnthropicAuxiliaryClient over a stub SDK client."""
-    return AnthropicAuxiliaryClient(MagicMock(), "claude-haiku-4-5", token, base_url, is_oauth=is_oauth)
+    sdk = MagicMock()
+    # What a real SDK client exposes: OAuth sends Bearer <token>, a key sends X-Api-Key.
+    sdk.default_headers = {"Authorization": f"Bearer {token}"} if is_oauth else {"X-Api-Key": token}
+    return AnthropicAuxiliaryClient(sdk, "claude-haiku-4-5", token, base_url, is_oauth=is_oauth)
 
 
 # ── 1. Anthropic provenance: shape beats source, scan-past, exhaustion ───────
@@ -338,6 +341,7 @@ class TestClientRouteClassification:
         real = MagicMock()
         real.api_key = "codex-oauth"
         real.base_url = "https://chatgpt.com/backend-api/codex"
+        real.default_headers = {"Authorization": f"Bearer {real.api_key}"}  # as a real SDK client exposes it
         codex = CodexAuxiliaryClient(real, "gpt-5.6")
         assert ac._client_compression_route(codex) == ("openai-codex", AUTH_MODE_OAUTH_SUBSCRIPTION)
         with compression_route_guard():

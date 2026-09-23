@@ -64,6 +64,7 @@ def _codex_oauth_client(create_mock):
     inner = MagicMock()
     inner.api_key = "codex-oauth-token"
     inner.base_url = "https://chatgpt.com/backend-api/codex"
+    inner.default_headers = {"Authorization": f"Bearer {inner.api_key}"}  # as a real SDK client exposes it
     client = CodexAuxiliaryClient(inner, "gpt-5.5")
     client.chat = MagicMock()
     client.chat.completions.create = create_mock
@@ -2036,6 +2037,7 @@ class TestAuxiliaryFallbackLayering:
         real_client = MagicMock()
         real_client.api_key = "codex-oauth-token"
         real_client.base_url = "https://chatgpt.com/backend-api/codex"
+        real_client.default_headers = {"Authorization": f"Bearer {real_client.api_key}"}  # as a real SDK client exposes it
 
         with patch("agent.auxiliary_client._select_pool_entry",
                    return_value=(True, pool_entry)), \
@@ -5123,6 +5125,7 @@ class TestNoProgressTimeoutTaskConfigGating:
 
             real_client = SimpleNamespace(
                 api_key="k", base_url="https://chatgpt.com/backend-api/codex/", close=lambda: None,
+                default_headers={"Authorization": "Bearer k"},  # as a real SDK client exposes it
                 responses=SimpleNamespace(create=lambda **kw: None),
             )
             client = CodexAuxiliaryClient(real_client, "gpt-5.6-sol")

@@ -9,6 +9,7 @@ in neither chain (undocumented, shifting allow-list): main provider or explicit
 """
 
 import contextlib
+from collections.abc import Mapping
 import contextvars
 import functools
 import hashlib
@@ -1494,6 +1495,7 @@ class _CodexCompletionsAdapter:
         # Per-request HTTP headers (OpenCode session affinity, Copilot x-initiator) map to real
         # headers via the SDK kwarg — forward them.
         if isinstance(kwargs.get("extra_headers"), dict) and kwargs["extra_headers"]:
+            _refuse_compaction_auth_override_headers(kwargs["extra_headers"])
             resp_kwargs["extra_headers"] = dict(kwargs["extra_headers"])
         # The Codex endpoint rejects max_output_tokens/temperature (400) — omit.
         extra_body = kwargs.get("extra_body") or {}
@@ -1788,6 +1790,7 @@ class _AnthropicCompletionsAdapter:
                 if not isinstance(existing, dict):
                     existing = {}
                 anthropic_kwargs["extra_body"] = {**existing, **passthrough}
+        _refuse_compaction_auth_override_headers(anthropic_kwargs.get("extra_headers"))
         response = create_anthropic_message(
             self._client,
             anthropic_kwargs,
@@ -3375,11 +3378,71 @@ def _compression_client_allowed(label: str, client: Any) -> bool:
             "metered_auth_mode" if route[1] == AUTH_MODE_API_KEY else "not_allowlisted",
         )
         return False
+    problem = _compression_auth_override_problem(client)
+    if problem is not None:
+        _note_route_rejected(route[0], problem)
+        return False
     logger.info(
         "Compaction route guard: admitted route (provider=%s, auth_mode=%s) via %s",
         route[0], route[1], label or "primary",
     )
     return True
+
+
+# Header names that carry or override credentials, matched case-insensitively as substrings of the
+# lowercased name (``x-api-key``, ``authorization``, ``proxy-authorization``, ``api-key``,
+# ``x-auth-token``, ``cookie``, ...). Routing/identity headers (``anthropic-beta``, ``x-app``,
+# ``chatgpt-account-id``, ``originator``, ``session_id``) match none of them.
+_CREDENTIAL_HEADER_MARKERS = ("auth", "key", "token", "cookie", "secret", "credential", "password")
+
+
+def _is_credential_header(name: Any) -> bool:
+    lowered = str(name or "").strip().lower()
+    return any(marker in lowered for marker in _CREDENTIAL_HEADER_MARKERS)
+
+
+def _compression_auth_override_problem(client: Any) -> Optional[str]:
+    """Why a route-classified client's EFFECTIVE authentication is not its subscription token, or
+    None when it is (review: Codex, sync A3 finding 4).
+
+    Classification alone trusts how the wrapper was BUILT (``is_oauth``, host). But configured
+    headers (``custom_providers[].extra_headers`` merged by ``_new_sdk_client``, any
+    ``default_headers``) are applied AFTER the builder suppressed the other credential, so an
+    OAuth-built client could carry a metered ``X-Api-Key`` and an empty ``Authorization`` and send
+    only the key. This inspects the SDK client's own merged ``default_headers`` (what every
+    request, including a cached client's, starts from): ``Authorization`` must be exactly
+    ``Bearer <token>`` and no other credential-bearing header may be present. SDK ``Omit`` sentinels
+    (the builder's deliberate removals) are not strings and are ignored. A client whose headers
+    cannot be read fails closed."""
+    real = getattr(client, "_real_client", None)
+    headers = getattr(real, "default_headers", None) if real is not None else None
+    if not isinstance(headers, Mapping):
+        return "unverifiable_auth"
+    token = getattr(client, "api_key", None)
+    if not isinstance(token, str) or not token.strip():
+        return "unverifiable_auth"
+    live = {str(k).lower(): v for k, v in headers.items() if isinstance(v, str)}
+    if live.get("authorization") != f"Bearer {token}":
+        return "auth_override"
+    if any(name != "authorization" and _is_credential_header(name) for name in live):
+        return "auth_override"
+    return None
+
+
+def _refuse_compaction_auth_override_headers(headers: Any) -> None:
+    """Per-request ``extra_headers`` under the compaction guard may not carry credentials: they would
+    replace or supplement the subscription token on that one request, after every route screen
+    passed (review: Codex, sync A3 finding 4)."""
+    if not _compression_guard_active() or not isinstance(headers, Mapping):
+        return
+    offending = sorted(str(k) for k in headers if _is_credential_header(k))
+    if not offending:
+        return
+    _note_route_rejected("request", "auth_override")
+    raise CompressionRoutingRejected(
+        f"Compaction refused: per-request headers would override the subscription credential "
+        f"({', '.join(offending)}). Compaction may only authenticate with the subscription "
+        f"OAuth token itself.")
 
 
 def _assert_compression_route(label: str, client: Any) -> None:
