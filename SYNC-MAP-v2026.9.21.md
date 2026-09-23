@@ -86,10 +86,15 @@ model-options/listing never wait on probes (cdacc2bcf1, cb24121a8e).
 | bucket | commit | status |
 |---|---|---|
 | 0 | 86bc926241 | approved |
-| A1 | 2436ad4e24 + 6f01d7ef32 superseded by 8fa5ab0dbf (re-port WITHOUT RelayBuffer, Lake's call) | in triad |
+| A1 | 8fa5ab0dbf (re-port WITHOUT RelayBuffer, Lake's call) + a4115bb96f (raising rpc_sink fix, both reviewers) | round 2 in triad |
 | A2 | d5fb8ebae4 | approved |
-| B | 30d3fa1599 (48bb63b8d6) + afc54d5e6a (ca86781a91 residual: two blocking callers remain, methods_complete.py:377 and web_routers/models.py:165) | in triad |
+| B | 30d3fa1599 (48bb63b8d6) + 3982518f82 (curator preview bookkeeping, Codex #4-#6); ca86781a91 residual: afc54d5e6a reverted (75df8f6ce5), replaced by 9bcc841ff1 (model.save_key + recommended-default cache-only, bounded single-provider wait) | round 2 in triad |
+| D | 42c5344382..5cafcfff1d (16 picks + sync adaptations; ccb1168f23 split: ceiling part 42398eca41, EOF nit in 0e1b43f781, auth markers deferred to 2b) | in triad |
+| C | NOT ported as commits: BUCKET-C-SUPERSESSION-v2026.9.21.md recommends adopting upstream's ownership model + salvaging tests + slimmed telemetry + gap fixes G1-G3 | awaiting Lake |
 
 ## Order
 0 → A1, A2 → B (48bb63b8d6; ca86781a91 residual only) → D → A3 → A4 (+ window fixes) → C (analysis
 started early) → phase 2b auth redesign → Group 2. Each bucket: triad before the next.
+
+## Environment notes
+- v2026.9.21 requires Node ^22.22 / npm <11.10 or >=11.17; this machine has Node 22.18 / npm 11.5.2. Sync-repo `npm ci` ran with --engine-strict=false for typecheck/tests only; the deploy build needs a Node upgrade (Lake's call).
