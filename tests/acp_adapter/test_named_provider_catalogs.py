@@ -21,6 +21,15 @@ from acp.schema import SessionModelState
 MANTLE_URL = "https://bedrock-mantle.us-east-1.api.aws/openai/v1"
 
 
+@pytest.fixture(autouse=True)
+def _inline_discovery(monkeypatch):
+    """These tests pin how discovery RESULTS map into the catalog. Discovery itself now runs off the
+    caller's thread (served from the last result, refreshed in the background); run it inline here.
+    The non-blocking behaviour has its own tests in test_model_catalog_nonblocking_discovery.py."""
+    from acp_adapter import model_catalog
+    monkeypatch.setattr(model_catalog, "_discovered_models_nonblocking", lambda _key, fetch: fetch())
+
+
 def _cfg(providers=None, custom_providers=None):
     cfg = {}
     if providers is not None:

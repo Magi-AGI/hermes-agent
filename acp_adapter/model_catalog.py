@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import contextvars
+import hashlib
 import logging
 import os
+import threading
+import time
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Any, Callable
 
 from acp.schema import ModelInfo, SessionModelState
 
@@ -14,6 +18,48 @@ logger = logging.getLogger("acp_adapter.server")
 # Per-provider row cap (clients render all `availableModels` in one dropdown; mirrors the
 # MoA picker cap). Not a total cap; the current model is always kept via the fallback insert.
 ACP_MAX_MODELS_PER_PROVIDER = 200
+
+# Named custom-provider discovery never runs on the caller's thread: ACP builds the picker inside
+# async session handlers, and a per-attempt timeout is not an overall deadline (two cold
+# endpoints = several sequential probes). The last result per endpoint is served; a cold or stale
+# endpoint gets ONE background refresh at a time (review: Codex, sync bucket D).
+_DISCOVERY_FRESH_SECONDS = 300.0
+_discovered: dict[tuple, tuple[float, Any]] = {}
+_discovery_inflight: set[tuple] = set()
+_discovery_lock = threading.Lock()
+
+
+def _discovery_key(provider_key: str, base_url: str, api_key: str) -> tuple:
+    from hermes_constants import hermes_home_key
+    return (hermes_home_key(), provider_key.lower(), base_url.rstrip("/").lower(),
+            hashlib.sha256(api_key.encode("utf-8")).hexdigest() if api_key else "")
+
+
+def _discovered_models_nonblocking(key: tuple, fetch: Callable[[], Any]) -> Any:
+    """The last discovery result for *key* (None when never discovered), scheduling a deduplicated
+    background refresh when it is missing or older than ``_DISCOVERY_FRESH_SECONDS``."""
+    with _discovery_lock:
+        cached = _discovered.get(key)
+        due = cached is None or time.monotonic() - cached[0] >= _DISCOVERY_FRESH_SECONDS
+        start = due and key not in _discovery_inflight
+        if start:
+            _discovery_inflight.add(key)
+    if start:
+        def _refresh() -> None:
+            try:
+                result = fetch()
+                with _discovery_lock:
+                    _discovered[key] = (time.monotonic(), result)
+            except Exception:
+                logger.debug("custom provider discovery failed", exc_info=True)
+            finally:
+                with _discovery_lock:
+                    _discovery_inflight.discard(key)
+
+        # The caller's profile context: discovery reads that profile's config/credentials/cache.
+        ctx = contextvars.copy_context()
+        threading.Thread(target=ctx.run, args=(_refresh,), daemon=True, name="acp-model-discovery").start()
+    return cached[1] if cached is not None else None
 
 
 def _named_custom_provider_catalogs() -> list[tuple[str, str, list[tuple[str, str]]]]:
@@ -75,14 +121,13 @@ def _named_custom_provider_catalogs() -> list[tuple[str, str, list[tuple[str, st
         model_ids = list(declared)
         live = None
         if _discover_flag(entry) and (api_key or is_native_ollama):
-            try:
-                live = _fetch_picker_live_models(
-                    api_key, base_url, provider_key if is_native_ollama and is_ollama_key else "custom",
-                    _models_config_is_allowlist(models_cfg, _entry_models_discovered(entry)),
-                    headers=native_headers, timeout=1.5, api_mode=entry.get("api_mode"),
-                )
-            except Exception:
-                live = None
+            native_provider = provider_key if is_native_ollama and is_ollama_key else "custom"
+            preserve = _models_config_is_allowlist(models_cfg, _entry_models_discovered(entry))
+            live = _discovered_models_nonblocking(
+                _discovery_key(provider_key, base_url, api_key),
+                lambda: _fetch_picker_live_models(
+                    api_key, base_url, native_provider, preserve,
+                    headers=native_headers, timeout=1.5, api_mode=entry.get("api_mode")))
             if isinstance(live, _NativePickerModelList):
                 model_ids = list(live)
             elif live is not None:
