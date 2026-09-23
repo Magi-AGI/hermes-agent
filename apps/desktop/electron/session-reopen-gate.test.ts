@@ -7,6 +7,7 @@ import {
   createWindowReadinessTracker,
   reopenedWindowPolicy,
   reopenProbeTarget,
+  trackWindowDocuments,
   waitForSessionWindowFunctionallyReady
 } from './session-reopen-gate'
 
@@ -33,6 +34,41 @@ function makeFakeIpcMain() {
     },
     listenerCount(channel: string) {
       return listeners.get(channel)?.size ?? 0
+    }
+  }
+}
+
+// The gate consumes ONLY a tracker's validated reports (Codex A4 round 6 #1):
+// one tracker per fake ipcMain, created on first use.
+const trackers = new WeakMap<object, ReturnType<typeof createWindowReadinessTracker>>()
+
+function readinessFor(ipcMain: ReturnType<typeof makeFakeIpcMain>) {
+  let tracker = trackers.get(ipcMain)
+
+  if (!tracker) {
+    tracker = createWindowReadinessTracker(ipcMain)
+    trackers.set(ipcMain, tracker)
+  }
+
+  return tracker
+}
+
+// A fake webContents for the document lifecycle (trackWindowDocuments).
+function makeFakeWebContents(id = 1) {
+  const listeners: Record<string, Function[]> = {}
+
+  return {
+    id,
+    on(event: string, listener: Function) {
+      ;(listeners[event] ??= []).push(listener)
+    },
+    once(event: string, listener: Function) {
+      ;(listeners[event] ??= []).push(listener)
+    },
+    emit(event: string, ...args: unknown[]) {
+      for (const listener of listeners[event] ?? []) {
+        listener(...args)
+      }
     }
   }
 }
@@ -93,13 +129,13 @@ test('a window with no recorded verdict never fast-paths on window state -- it w
   const pending = waitForSessionWindowFunctionallyReady(
     win as any,
     { profile: 'default' },
-    { ipcMain, probeBackendHealth: () => Promise.resolve(), timeoutMs: 200 }
+    { readiness: readinessFor(ipcMain), probeBackendHealth: () => Promise.resolve(), timeoutMs: 200 }
   )
 
   // Give the promise a tick to register its listener before asserting it
   // hasn't resolved -- a newly-created window must not resolve on tick 0.
   await new Promise(resolve => setTimeout(resolve, 5))
-  assert.equal(ipcMain.listenerCount('hermes:window:functional-ready'), 1)
+  assert.equal(readinessFor(ipcMain).listenerCount(1) > 0, true, 'the gate is subscribed to validated reports')
 
   ipcMain.emit('hermes:window:functional-ready', { sender: { id: 1 } }, { ok: true })
 
@@ -115,7 +151,7 @@ test('functional-ready ok:false stops the queue for this window', async () => {
   const pending = waitForSessionWindowFunctionallyReady(
     win as any,
     { profile: 'claudetriad' },
-    { ipcMain, probeBackendHealth: neverSettles, timeoutMs: 200 }
+    { readiness: readinessFor(ipcMain), probeBackendHealth: neverSettles, timeoutMs: 200 }
   )
 
   await new Promise(resolve => setTimeout(resolve, 5))
@@ -138,7 +174,7 @@ test('ok:true for the WRONG profile does not release the queue', async () => {
   const pending = waitForSessionWindowFunctionallyReady(
     win as any,
     { profile: 'claudetriad' },
-    { ipcMain, probeBackendHealth: neverSettles, timeoutMs: 200 }
+    { readiness: readinessFor(ipcMain), probeBackendHealth: neverSettles, timeoutMs: 200 }
   )
 
   await new Promise(resolve => setTimeout(resolve, 5))
@@ -160,7 +196,7 @@ test('ok:true with no profile field on the payload is treated as "default", and 
   const pending = waitForSessionWindowFunctionallyReady(
     win as any,
     { profile: null },
-    { ipcMain, probeBackendHealth: () => Promise.resolve(), timeoutMs: 200 }
+    { readiness: readinessFor(ipcMain), probeBackendHealth: () => Promise.resolve(), timeoutMs: 200 }
   )
 
   await new Promise(resolve => setTimeout(resolve, 5))
@@ -178,7 +214,7 @@ test('a signal from a different window (different webContents id) is ignored', a
   const pending = waitForSessionWindowFunctionallyReady(
     win as any,
     { profile: 'default' },
-    { ipcMain, probeBackendHealth: neverSettles, timeoutMs: 30 }
+    { readiness: readinessFor(ipcMain), probeBackendHealth: neverSettles, timeoutMs: 30 }
   )
 
   await new Promise(resolve => setTimeout(resolve, 5))
@@ -202,7 +238,7 @@ test('health gating is delegated to the injected probe, not a raw fetch', async 
     win as any,
     { profile: 'claudetriad' },
     {
-      ipcMain,
+      readiness: readinessFor(ipcMain),
       probeBackendHealth: (target, signal) => {
         probedProfile = target.profile
         probeSignal = signal
@@ -241,7 +277,7 @@ test('renderer success does NOT short-circuit a still-pending health probe -- a 
   const pending = waitForSessionWindowFunctionallyReady(
     win as any,
     { profile: 'claudetriad' },
-    { ipcMain, probeBackendHealth: () => health.promise, timeoutMs: 5_000 }
+    { readiness: readinessFor(ipcMain), probeBackendHealth: () => health.promise, timeoutMs: 5_000 }
   )
 
   await new Promise(resolve => setTimeout(resolve, 5))
@@ -264,7 +300,7 @@ test('renderer success followed by health TIMEOUT still fails closed, not a sile
   const pending = waitForSessionWindowFunctionallyReady(
     win as any,
     { profile: 'default' },
-    { ipcMain, probeBackendHealth: neverSettles, timeoutMs: 20 }
+    { readiness: readinessFor(ipcMain), probeBackendHealth: neverSettles, timeoutMs: 20 }
   )
 
   await new Promise(resolve => setTimeout(resolve, 5))
@@ -284,7 +320,7 @@ test('both signals succeeding resolves ok:true regardless of arrival order (rend
   const pending = waitForSessionWindowFunctionallyReady(
     win as any,
     { profile: 'default' },
-    { ipcMain, probeBackendHealth: () => health.promise, timeoutMs: 5_000 }
+    { readiness: readinessFor(ipcMain), probeBackendHealth: () => health.promise, timeoutMs: 5_000 }
   )
 
   await new Promise(resolve => setTimeout(resolve, 5))
@@ -305,7 +341,7 @@ test('both signals succeeding resolves ok:true regardless of arrival order (heal
   const pending = waitForSessionWindowFunctionallyReady(
     win as any,
     { profile: 'default' },
-    { ipcMain, probeBackendHealth: () => health.promise, timeoutMs: 5_000 }
+    { readiness: readinessFor(ipcMain), probeBackendHealth: () => health.promise, timeoutMs: 5_000 }
   )
 
   await new Promise(resolve => setTimeout(resolve, 5))
@@ -326,7 +362,7 @@ test('a rejecting health probe fails the window closed, even with no renderer si
     win as any,
     { profile: 'claudetriad' },
     {
-      ipcMain,
+      readiness: readinessFor(ipcMain),
       probeBackendHealth: () => Promise.reject(new Error('backend never became healthy')),
       timeoutMs: 200
     }
@@ -343,14 +379,14 @@ test('timeout path fails closed with a reported reason, not a silent resolve', a
   const result = await waitForSessionWindowFunctionallyReady(
     win as any,
     { profile: 'default' },
-    { ipcMain, probeBackendHealth: neverSettles, timeoutMs: 20 }
+    { readiness: readinessFor(ipcMain), probeBackendHealth: neverSettles, timeoutMs: 20 }
   )
 
   assert.equal(result.ok, false)
   assert.match(result.reason ?? '', /timed out after 20ms/)
-  // The listener must be cleaned up on timeout too, or every timed-out window
-  // leaks an ipcMain listener for the life of the process.
-  assert.equal(ipcMain.listenerCount('hermes:window:functional-ready'), 0)
+  // The subscriptions must be cleaned up on timeout too, or every timed-out
+  // window leaks a listener for the life of the process.
+  assert.equal(readinessFor(ipcMain).listenerCount(1), 0)
 })
 
 test('a main-frame did-fail-load fails closed without waiting out the full timeout', async () => {
@@ -360,7 +396,7 @@ test('a main-frame did-fail-load fails closed without waiting out the full timeo
   const pending = waitForSessionWindowFunctionallyReady(
     win as any,
     { profile: 'default' },
-    { ipcMain, probeBackendHealth: neverSettles, timeoutMs: 5_000 }
+    { readiness: readinessFor(ipcMain), probeBackendHealth: neverSettles, timeoutMs: 5_000 }
   )
 
   await new Promise(resolve => setTimeout(resolve, 5))
@@ -381,7 +417,7 @@ test('a non-main-frame did-fail-load is ignored (an iframe/subresource failing i
   const pending = waitForSessionWindowFunctionallyReady(
     win as any,
     { profile: 'default' },
-    { ipcMain, probeBackendHealth: neverSettles, timeoutMs: 20 }
+    { readiness: readinessFor(ipcMain), probeBackendHealth: neverSettles, timeoutMs: 20 }
   )
 
   await new Promise(resolve => setTimeout(resolve, 5))
@@ -401,7 +437,7 @@ test('the window closing mid-wait resolves ok -- a closed window is not a backen
   const pending = waitForSessionWindowFunctionallyReady(
     win as any,
     { profile: 'default' },
-    { ipcMain, probeBackendHealth: neverSettles, timeoutMs: 5_000 }
+    { readiness: readinessFor(ipcMain), probeBackendHealth: neverSettles, timeoutMs: 5_000 }
   )
 
   await new Promise(resolve => setTimeout(resolve, 5))
@@ -421,11 +457,11 @@ test('an already-destroyed window resolves immediately without registering any l
   const result = await waitForSessionWindowFunctionallyReady(
     win as any,
     { profile: 'default' },
-    { ipcMain, probeBackendHealth: neverSettles }
+    { readiness: readinessFor(ipcMain), probeBackendHealth: neverSettles }
   )
 
   assert.deepEqual(result, { ok: true })
-  assert.equal(ipcMain.listenerCount('hermes:window:functional-ready'), 0)
+  assert.equal(readinessFor(ipcMain).listenerCount(1), 0)
 })
 
 test('ok:true on a DIFFERENT session than the one the window was asked to open fails (Codex A4 #3)', async () => {
@@ -435,7 +471,7 @@ test('ok:true on a DIFFERENT session than the one the window was asked to open f
   const pending = waitForSessionWindowFunctionallyReady(
     win as any,
     { profile: 'default', sessionId: 's-target' },
-    { ipcMain, probeBackendHealth: () => Promise.resolve(), timeoutMs: 500 }
+    { readiness: readinessFor(ipcMain), probeBackendHealth: () => Promise.resolve(), timeoutMs: 500 }
   )
 
   await new Promise(resolve => setTimeout(resolve, 5))
@@ -454,7 +490,7 @@ test('ok:true on the expected session releases the queue', async () => {
   const pending = waitForSessionWindowFunctionallyReady(
     win as any,
     { profile: 'default', sessionId: 's-target' },
-    { ipcMain, probeBackendHealth: () => Promise.resolve(), timeoutMs: 500 }
+    { readiness: readinessFor(ipcMain), probeBackendHealth: () => Promise.resolve(), timeoutMs: 500 }
   )
 
   await new Promise(resolve => setTimeout(resolve, 5))
@@ -475,7 +511,7 @@ test('an already-open window that reported ready is judged by its recorded verdi
   const result = await waitForSessionWindowFunctionallyReady(
     win as any,
     { profile: 'default', sessionId: 's1' },
-    { ipcMain, probeBackendHealth: () => Promise.resolve(), knownVerdict: readiness.get(1), timeoutMs: 500 }
+    { readiness: readinessFor(ipcMain), probeBackendHealth: () => Promise.resolve(), knownVerdict: readiness.get(1), timeoutMs: 500 }
   )
 
   assert.deepEqual(result, { ok: true })
@@ -491,7 +527,7 @@ test('an already-open window that FAILED is not treated as ready just because it
   const result = await waitForSessionWindowFunctionallyReady(
     win as any,
     { profile: 'default' },
-    { ipcMain, probeBackendHealth: () => Promise.resolve(), knownVerdict: readiness.get(1), timeoutMs: 500 }
+    { readiness: readinessFor(ipcMain), probeBackendHealth: () => Promise.resolve(), knownVerdict: readiness.get(1), timeoutMs: 500 }
   )
 
   assert.equal(result.ok, false)
@@ -506,23 +542,27 @@ test('an already-open window that has not reported yet (still booting) is waited
   const result = await waitForSessionWindowFunctionallyReady(
     win as any,
     { profile: 'default' },
-    { ipcMain, probeBackendHealth: () => Promise.resolve(), knownVerdict: readiness.get(1), timeoutMs: 50 }
+    { readiness: readinessFor(ipcMain), probeBackendHealth: () => Promise.resolve(), knownVerdict: readiness.get(1), timeoutMs: 50 }
   )
 
   assert.equal(result.ok, false)
   assert.match(result.reason ?? '', /timed out/)
 })
 
-test('a reload forgets the previous verdict and starts a new main-assigned load generation', () => {
+test('a new document forgets the previous verdict; reports are accepted only with the current document token', () => {
   const ipcMain = makeFakeIpcMain()
   const readiness = createWindowReadinessTracker(ipcMain)
+  const t1 = readiness.registerDocument(7)
 
-  ipcMain.emit('hermes:window:functional-ready', { sender: { id: 7 } }, { ok: true, generation: 99 })
-  assert.deepEqual(readiness.get(7), { ok: true, generation: 0 }, 'main stamps the generation, not the renderer')
-  readiness.reload(7)
-  assert.equal(readiness.get(7), null)
-  ipcMain.emit('hermes:window:functional-ready', { sender: { id: 7 } }, { ok: true })
-  assert.deepEqual(readiness.get(7), { ok: true, generation: 1 })
+  ipcMain.emit('hermes:window:functional-ready', { sender: { id: 7 } }, { ok: true, token: t1 })
+  assert.deepEqual(readiness.get(7), { ok: true, token: t1 })
+
+  const t2 = readiness.registerDocument(7)
+
+  assert.notEqual(t2, t1)
+  assert.equal(readiness.get(7), null, 'the old document verdict is forgotten')
+  ipcMain.emit('hermes:window:functional-ready', { sender: { id: 7 } }, { ok: true, token: t2 })
+  assert.deepEqual(readiness.get(7), { ok: true, token: t2 })
 })
 
 test('concurrent Reopen requests share one queue', async () => {
@@ -570,7 +610,7 @@ test('an already-open window that moved to another session (/new) is judged on i
   const result = await waitForSessionWindowFunctionallyReady(
     win as any,
     { profile: 'default', sessionId: 's-b', ...reopenedWindowPolicy(false) },
-    { ipcMain, probeBackendHealth: () => Promise.resolve(), knownVerdict: readiness.get(1), timeoutMs: 500 }
+    { readiness: readinessFor(ipcMain), probeBackendHealth: () => Promise.resolve(), knownVerdict: readiness.get(1), timeoutMs: 500 }
   )
 
   assert.deepEqual(result, { ok: true })
@@ -585,7 +625,7 @@ test('an already-open window is judged on being functional, not on a saved entry
     win as any,
     { profile: 'default', sessionId: 's-a', identity: reopenedWindowPolicy(false).identity },
     {
-      ipcMain,
+      readiness: readinessFor(ipcMain),
       probeBackendHealth: () => Promise.resolve(),
       knownVerdict: { ok: true, profile: 'default', sessionId: null },
       timeoutMs: 500
@@ -603,7 +643,7 @@ test('a window the queue created must still come up on the saved session', async
     win as any,
     { profile: 'default', sessionId: 's-a', identity: reopenedWindowPolicy(true).identity },
     {
-      ipcMain,
+      readiness: readinessFor(ipcMain),
       probeBackendHealth: () => Promise.resolve(),
       knownVerdict: { ok: true, profile: 'default', sessionId: 's-other' },
       timeoutMs: 500
@@ -627,7 +667,7 @@ test('a pending verdict is not a verdict: the gate waits for the real one', asyn
   const pending = waitForSessionWindowFunctionallyReady(
     win as any,
     { profile: 'default', sessionId: 's1' },
-    { ipcMain, probeBackendHealth: () => Promise.resolve(), knownVerdict: readiness.get(1), timeoutMs: 500 }
+    { readiness: readinessFor(ipcMain), probeBackendHealth: () => Promise.resolve(), knownVerdict: readiness.get(1), timeoutMs: 500 }
   )
 
   await new Promise(resolve => setTimeout(resolve, 5))
@@ -673,7 +713,7 @@ test('a later pending report clears an earlier ready: the queue does not advance
   void waitForSessionWindowFunctionallyReady(
     win as any,
     { profile: 'default', sessionId: 's1' },
-    { ipcMain, probeBackendHealth: probes.probe as any, timeoutMs: 300 }
+    { readiness: readinessFor(ipcMain), probeBackendHealth: probes.probe as any, timeoutMs: 300 }
   ).then(r => (settled = r))
 
   ready(ipcMain, { ok: true, attempt: 1, profile: 'default', sessionId: 's1' })
@@ -697,7 +737,7 @@ test('baseline: one identity, ready and healthy, advances on a single probe', as
   void waitForSessionWindowFunctionallyReady(
     win as any,
     { profile: 'default', sessionId: 's1' },
-    { ipcMain, probeBackendHealth: probes.probe as any, timeoutMs: 500 }
+    { readiness: readinessFor(ipcMain), probeBackendHealth: probes.probe as any, timeoutMs: 500 }
   ).then(r => (settled = r))
 
   ready(ipcMain, { ok: true, attempt: 1, profile: 'default', sessionId: 's1' })
@@ -715,7 +755,7 @@ test('after an identity change the queue advances only on the latest ready AND a
   void waitForSessionWindowFunctionallyReady(
     win as any,
     { profile: 'default', sessionId: 's1' },
-    { ipcMain, probeBackendHealth: probes.probe as any, timeoutMs: 500 }
+    { readiness: readinessFor(ipcMain), probeBackendHealth: probes.probe as any, timeoutMs: 500 }
   ).then(r => (settled = r))
 
   ready(ipcMain, { ok: true, attempt: 1, profile: 'default', sessionId: 's1' })
@@ -752,7 +792,7 @@ test('A->B switch: the gate probes B from the readiness report itself, even whil
     win as any,
     { profile: 'prof-a', sessionId: 's-a', identity: 'functional', probeTarget: { profile: 'prof-a', connectionId: null } },
     {
-      ipcMain,
+      readiness: readinessFor(ipcMain),
       probeBackendHealth: probes.probe as any,
       knownVerdict: { ok: true, attempt: 1, profile: 'prof-a', connectionId: null, sessionId: 's-a' },
       timeoutMs: 500
@@ -787,7 +827,7 @@ test('a connection-only switch (same profile and session) re-probes the new conn
   void waitForSessionWindowFunctionallyReady(
     win as any,
     { profile: 'work', sessionId: 's1', identity: 'functional', probeTarget: { profile: 'work', connectionId: 'c1' } },
-    { ipcMain, probeBackendHealth: probes.probe as any, timeoutMs: 500 }
+    { readiness: readinessFor(ipcMain), probeBackendHealth: probes.probe as any, timeoutMs: 500 }
   ).then(r => (settled = r))
 
   ready(ipcMain, { ok: true, attempt: 1, profile: 'work', connectionId: 'c1', sessionId: 's1' })
@@ -809,26 +849,201 @@ test('a reloaded renderer reusing attempt 1 is not accepted on the pre-reload pr
   const win = makeFakeWindow()
   const probes = makeProbes()
   let settled: unknown = null
+  const t1 = readiness.registerDocument(1)
   const report = { attempt: 1, profile: 'default', connectionId: null, sessionId: 's1' }
 
   void waitForSessionWindowFunctionallyReady(
     win as any,
     { profile: 'default', sessionId: 's1', probeTarget: { profile: 'default', connectionId: null } },
-    { ipcMain, readiness, probeBackendHealth: probes.probe as any, timeoutMs: 500 }
+    { readiness, probeBackendHealth: probes.probe as any, timeoutMs: 500 }
   ).then(r => (settled = r))
 
-  ready(ipcMain, { ...report, ok: false, pending: true })
   probes.calls[0].ctl.resolve()
   await tick()
 
-  // Reload (main bumps the load generation); the new renderer starts at attempt 1 again.
-  readiness.reload(1)
-  ready(ipcMain, { ...report, ok: true })
+  // Reload: a new document registers; its renderer starts at attempt 1 again.
+  const t2 = readiness.registerDocument(1)
+
+  ready(ipcMain, { ...report, ok: true, token: t2 })
   await tick()
-  assert.equal(settled, null, 'the pre-reload probe result does not count for the new load')
-  assert.equal(probes.calls.length, 2, 'the new load is probed')
+  assert.equal(t1 === t2, false)
+  assert.equal(settled, null, 'the pre-reload probe result does not count for the new document')
+  assert.equal(probes.calls.length, 2, 'the new document is probed')
 
   probes.calls[1].ctl.resolve()
+  await tick()
+  assert.deepEqual(settled, { ok: true })
+})
+
+// ─── Codex A4 round 6 #1/#3: per-DOCUMENT tokens; main-frame lifecycle only ──
+
+test("an outgoing document's in-flight report is rejected once the new document exists (either order)", async () => {
+  for (const order of ['register-then-commit', 'commit-then-register']) {
+    const ipcMain = makeFakeIpcMain()
+    const readiness = createWindowReadinessTracker(ipcMain)
+    const wc = makeFakeWebContents(1)
+    const win = makeFakeWindow(1)
+    const probes = makeProbes()
+    let settled: unknown = null
+
+    trackWindowDocuments(wc as any, readiness)
+    wc.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
+    const t1 = readiness.registerDocument(1)
+
+    wc.emit('did-navigate')
+
+    void waitForSessionWindowFunctionallyReady(
+      win as any,
+      { profile: 'default', sessionId: 's1', probeTarget: { profile: 'default', connectionId: null } },
+      { readiness, probeBackendHealth: probes.probe as any, timeoutMs: 500 }
+    ).then(r => (settled = r))
+
+    probes.calls[0].ctl.resolve()
+
+    // Reload starts; the old document's READY report is still in flight.
+    wc.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
+
+    if (order === 'register-then-commit') {
+      readiness.registerDocument(1)
+      wc.emit('did-navigate')
+    } else {
+      wc.emit('did-navigate')
+    }
+
+    ready(ipcMain, { ok: true, attempt: 1, profile: 'default', connectionId: null, sessionId: 's1', token: t1 })
+    await tick()
+    assert.equal(settled, null, `${order}: the old document's report is rejected`)
+    assert.equal(readiness.get(1), null, `${order}: and never recorded`)
+  }
+})
+
+test("a reload committing while the old document's probe is in flight: that probe never settles the gate", async () => {
+  const ipcMain = makeFakeIpcMain()
+  const readiness = createWindowReadinessTracker(ipcMain)
+  const wc = makeFakeWebContents(1)
+  const win = makeFakeWindow(1)
+  const probes = makeProbes()
+  let settled: unknown = null
+
+  trackWindowDocuments(wc as any, readiness)
+  const t1 = readiness.registerDocument(1)
+
+  void waitForSessionWindowFunctionallyReady(
+    win as any,
+    { profile: 'default', sessionId: 's1', probeTarget: { profile: 'default', connectionId: null } },
+    { readiness, probeBackendHealth: probes.probe as any, timeoutMs: 500 }
+  ).then(r => (settled = r))
+
+  ready(ipcMain, { ok: true, attempt: 1, profile: 'default', connectionId: null, sessionId: 's1', token: t1 })
+
+  // Reload commits before the new document registers; the old probe then succeeds.
+  wc.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
+  wc.emit('did-navigate')
+  probes.calls[0].ctl.resolve()
+  await tick()
+  assert.equal(settled, null, 'the retired document never releases the queue')
+})
+
+test('a renderer-supplied generation is ignored and a renderer-chosen token is rejected', async () => {
+  const ipcMain = makeFakeIpcMain()
+  const readiness = createWindowReadinessTracker(ipcMain)
+  const win = makeFakeWindow()
+  const probes = makeProbes()
+  const t1 = readiness.registerDocument(1)
+  const base = { ok: true, attempt: 1, profile: 'default', connectionId: null, sessionId: 's1' }
+
+  void waitForSessionWindowFunctionallyReady(
+    win as any,
+    { profile: 'default', sessionId: 's1', probeTarget: { profile: 'default', connectionId: 'other' } },
+    { readiness, probeBackendHealth: probes.probe as any, timeoutMs: 300 }
+  )
+
+  ready(ipcMain, { ...base, token: t1, generation: 5 })
+  const probesAfterFirst = probes.calls.length
+
+  // Same report, different self-declared generation: not a new identity.
+  ready(ipcMain, { ...base, token: t1, generation: 6 })
+  assert.equal(probes.calls.length, probesAfterFirst, 'generation is not part of the identity')
+
+  // A token the renderer made up (not its document's) is dropped outright.
+  ready(ipcMain, { ...base, token: t1 + 1, connectionId: 'c9' })
+  assert.equal(probes.calls.length, probesAfterFirst, 'a foreign-token report never reaches the gate')
+  assert.deepEqual(readiness.get(1), { ...base, token: t1, generation: 6 })
+})
+
+test("an iframe load or same-document navigation does not invalidate a healthy window's readiness", () => {
+  const ipcMain = makeFakeIpcMain()
+  const readiness = createWindowReadinessTracker(ipcMain)
+  const wc = makeFakeWebContents(1)
+  let reloads = 0
+
+  trackWindowDocuments(wc as any, readiness)
+  wc.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
+  const t1 = readiness.registerDocument(1)
+
+  wc.emit('did-navigate')
+  readiness.onReload(1, () => (reloads += 1))
+  ready(ipcMain, { ok: true, token: t1 })
+
+  // An iframe navigates/loads (did-start-loading fires for it too: electron#30479).
+  wc.emit('did-start-loading')
+  wc.emit('did-start-navigation', { isMainFrame: false, isSameDocument: false })
+  wc.emit('did-frame-navigate')
+  wc.emit('did-stop-loading')
+  // A same-document (hash-route) navigation of the main frame.
+  wc.emit('did-start-navigation', { isMainFrame: true, isSameDocument: true })
+  wc.emit('did-navigate-in-page')
+
+  assert.equal(reloads, 0)
+  assert.deepEqual(readiness.get(1), { ok: true, token: t1 })
+})
+
+test('with tracking attached before loadURL, a load whose events fire synchronously inside it is seen, and the next reload is detected', async () => {
+  const ipcMain = makeFakeIpcMain()
+  const readiness = createWindowReadinessTracker(ipcMain)
+  const wc = makeFakeWebContents(1)
+  const win = makeFakeWindow(1)
+  const probes = makeProbes()
+  let settled: unknown = null
+  let reloads = 0
+
+  // Attached at webContents creation, BEFORE loadURL.
+  trackWindowDocuments(wc as any, readiness)
+
+  const loadURL = () => {
+    // Native navigation can emit synchronously inside loadURL.
+    wc.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
+  }
+
+  loadURL()
+  // A reload starts before the initial document even committed.
+  wc.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
+  wc.emit('did-navigate')
+  const t1 = readiness.registerDocument(1)
+
+  void waitForSessionWindowFunctionallyReady(
+    win as any,
+    { profile: 'default', sessionId: 's1', probeTarget: { profile: 'default', connectionId: null } },
+    { readiness, probeBackendHealth: probes.probe as any, timeoutMs: 500 }
+  ).then(r => (settled = r))
+
+  readiness.onReload(1, () => (reloads += 1))
+  ready(ipcMain, { ok: false, pending: true, attempt: 1, profile: null, connectionId: null, sessionId: 's1', token: t1 })
+  probes.calls[0].ctl.resolve()
+
+  // The first REAL reload after that load: detected (not skipped as an "initial load").
+  wc.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
+  wc.emit('did-navigate')
+  assert.equal(reloads, 1, 'the reload is detected')
+
+  ready(ipcMain, { ok: true, attempt: 1, profile: 'default', connectionId: null, sessionId: 's1', token: t1 })
+  await tick()
+  assert.equal(settled, null, "the retired document's report is rejected")
+
+  const t2 = readiness.registerDocument(1)
+
+  ready(ipcMain, { ok: true, attempt: 1, profile: 'default', connectionId: null, sessionId: 's1', token: t2 })
+  probes.calls[probes.calls.length - 1].ctl.resolve()
   await tick()
   assert.deepEqual(settled, { ok: true })
 })
@@ -842,7 +1057,7 @@ test('the launch probe is reused only when the first report matches its identity
   void waitForSessionWindowFunctionallyReady(
     win as any,
     { profile: 'prof-a', sessionId: 's1', probeTarget: { profile: 'prof-a', connectionId: null } },
-    { ipcMain, probeBackendHealth: probes.probe as any, timeoutMs: 500 }
+    { readiness: readinessFor(ipcMain), probeBackendHealth: probes.probe as any, timeoutMs: 500 }
   ).then(r => (settled = r))
 
   // First report: same session and profile, but on another connection.
@@ -869,7 +1084,7 @@ test('pending for B (owner route unresolved) blocks advance on A and authorizes 
     win as any,
     { profile: 'prof-a', sessionId: 's-a', identity: 'functional', probeTarget: { profile: 'prof-a', connectionId: null } },
     {
-      ipcMain,
+      readiness: readinessFor(ipcMain),
       probeBackendHealth: probes.probe as any,
       knownVerdict: { ok: true, attempt: 1, profile: 'prof-a', connectionId: null, sessionId: 's-a' },
       timeoutMs: 500
@@ -900,7 +1115,7 @@ test('baseline: a first report matching the launch identity reuses the launch pr
   void waitForSessionWindowFunctionallyReady(
     win as any,
     { profile: 'prof-a', sessionId: 's1', probeTarget: { profile: 'prof-a', connectionId: null } },
-    { ipcMain, probeBackendHealth: probes.probe as any, timeoutMs: 500 }
+    { readiness: readinessFor(ipcMain), probeBackendHealth: probes.probe as any, timeoutMs: 500 }
   ).then(r => (settled = r))
 
   ready(ipcMain, { ok: true, attempt: 0, profile: 'prof-a', connectionId: null, sessionId: 's1' })
@@ -943,7 +1158,7 @@ test('a healthy existing pop-out on profile B is not halted because saved profil
       probeTarget: reopenProbeTarget({ kind: 'session', profile: 'prof-a', connectionId: null }, null, 'default')
     },
     {
-      ipcMain,
+      readiness: readinessFor(ipcMain),
       probeBackendHealth: probe,
       knownVerdict: { ok: true, profile: 'prof-b', connectionId: null, sessionId: 's-b' },
       timeoutMs: 500
@@ -964,7 +1179,7 @@ test('a ready REMOTE peer is not failed because the local backend of the same pr
   const pending = waitForSessionWindowFunctionallyReady(
     win as any,
     { profile: 'work', probeTarget: { profile: 'work', connectionId: 'remote-1' } },
-    { ipcMain, probeBackendHealth: probe, timeoutMs: 500 }
+    { readiness: readinessFor(ipcMain), probeBackendHealth: probe, timeoutMs: 500 }
   )
 
   await new Promise(resolve => setTimeout(resolve, 5))

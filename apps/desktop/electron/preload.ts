@@ -14,6 +14,11 @@ const translucencySupport = ipcRenderer.sendSync('hermes:translucency:support')
 const hudWindowing = ipcRenderer.sendSync('hermes:hud:windowing')
 const hudNativeDrag = hudWindowing?.nativeDrag === true
 const launchFlags = ipcRenderer.sendSync('hermes:launch-flags')
+// This DOCUMENT's token (Codex A4 round 6 #1): registered synchronously at
+// document start, minted by main, and stamped here on every readiness report —
+// never chosen by the page. A report the previous document had in flight when
+// a reload started carries ITS token and is rejected by main.
+const documentToken = ipcRenderer.sendSync('hermes:window:register-document') ?? null
 
 contextBridge.exposeInMainWorld('hermesDesktop', {
   glassSupported: translucencySupport?.glass === true,
@@ -506,7 +511,8 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   // Fire-and-forget: reports whether THIS window actually became usable after
   // connecting (not just that its transport opened) — the reopen queue's real
   // gate. See session-reopen-gate.ts / DESIGN-SESSION-WINDOW-SEQUENTIAL-GATING-2026-09-07.md.
-  signalSessionFunctionalReady: payload => ipcRenderer.send('hermes:window:functional-ready', payload),
+  signalSessionFunctionalReady: payload =>
+    ipcRenderer.send('hermes:window:functional-ready', { ...payload, token: documentToken }),
   // Fired when the reopen queue halts because a window failed to become
   // functionally ready — the shared backend it depends on is unhealthy.
   onSessionReopenHalted: callback => {

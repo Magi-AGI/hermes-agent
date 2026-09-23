@@ -422,6 +422,7 @@ import {
   reopenedWindowPolicy,
   type ReopenProbeTarget,
   reopenProbeTarget,
+  trackWindowDocuments,
   waitForSessionWindowFunctionallyReady
 } from './session-reopen-gate'
 import {
@@ -3304,23 +3305,8 @@ function wireSessionWindowPersistence(win, windowId: string) {
   win.on('moved', schedulePersistSessionWindowsState)
   win.on('maximize', schedulePersistSessionWindowsState)
   win.on('unmaximize', schedulePersistSessionWindowsState)
-  // A (re)load re-runs boot: main starts a new LOAD generation, the verdict
-  // recorded for the previous load no longer describes the window, and active
-  // reopen gates on it drop their readiness and probe (session-reopen-gate.ts
-  // createWindowReadinessTracker; Codex A4 round 5). The window's first load is
-  // generation 0 itself: this runs synchronously right after the window is
-  // created, and Electron emits did-start-loading asynchronously, so the first
-  // event seen here is always that initial load.
-  const webContentsId = win.webContents.id
-  let loadsStarted = 0
-
-  win.webContents.on('did-start-loading', () => {
-    if (loadsStarted++ > 0) {
-      windowReadiness.reload(webContentsId)
-    }
-  })
-  win.webContents.on('render-process-gone', () => windowReadiness.reload(webContentsId))
-  win.on('closed', () => windowReadiness.forget(webContentsId))
+  // (Its document lifecycle — reloads, crashes — is tracked for EVERY window
+  // from creation, before its first loadURL: see trackWindowDocuments below.)
   // Record the window's final bounds/session as it closes — closes NEVER remove
   // its saved entry (any reason: user, taskbar, quit, OS shutdown, Close All).
   win.on('close', () => {
@@ -14224,6 +14210,24 @@ function closeAllSessionWindows() {
 // Every window's functional-ready verdict (see createWindowReadinessTracker).
 const windowReadiness = createWindowReadinessTracker(ipcMain)
 
+// Each window's document lifecycle, tracked from webContents CREATION — before
+// any loadURL, at every window-creation site — so a navigation event emitted
+// synchronously inside loadURL is never missed (Codex A4 round 6 #3). Only
+// main-frame cross-document navigations and renderer crashes count; iframe
+// loads do not. Webview guests carry their own preload and never register.
+app.on('web-contents-created', (_event, contents) => {
+  if (contents.getType() === 'window') {
+    trackWindowDocuments(contents, windowReadiness)
+  }
+})
+
+// A new document registers from its preload, synchronously at document start,
+// and gets its main-minted token (echoed on every readiness report; Codex A4
+// round 6 #1).
+ipcMain.on('hermes:window:register-document', event => {
+  event.returnValue = windowReadiness.registerDocument(event.sender.id)
+})
+
 // Probes the EXACT route a reopened window was opened on (Codex A4 #7) through
 // connectDesktopProfileRoute — the same resolver the window's own renderer dials
 // (desktop.getConnection): a registry connection resolves via
@@ -14339,12 +14343,12 @@ async function runReopenEntry(entry: any): Promise<ReopenStep> {
       identity: policy.identity
     },
     {
-      ipcMain,
       probeBackendHealth: probeWindowRouteHealth,
       // An already-open window is judged by what it actually reported, not
       // assumed ready because the registry only focused it.
       knownVerdict: windowReadiness.get(win.webContents.id),
-      // Main's load generation + reload invalidation for this window.
+      // The ONLY source of reports: validated current-document reports, plus
+      // new-document invalidation for this window.
       readiness: windowReadiness
     }
   )

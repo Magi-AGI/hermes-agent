@@ -29,9 +29,12 @@ export interface FunctionalReadyPayload {
   // The session's resolved OWNER route, resolved by the renderer BEFORE it
   // sends (Codex A4 round 5): route and readiness always arrive together.
   connectionId?: string | null
-  // The webContents LOAD generation, stamped by MAIN when it records the
-  // report (createWindowReadinessTracker) — never chosen by the renderer.
-  generation?: number
+  // The sending DOCUMENT's token (Codex A4 round 6 #1): minted by main when
+  // the document registered (createWindowReadinessTracker.registerDocument,
+  // from the preload at document start) and echoed by the preload on every
+  // report. The tracker drops any report whose token is not the window's
+  // current document's.
+  token?: null | number
   // The window is (re)establishing its current target — a new session after
   // /new, a boot retry. Not a verdict: the gate keeps waiting.
   pending?: boolean
@@ -99,7 +102,9 @@ export interface ReopenGateIpcMain {
 }
 
 export interface ReopenGateDeps {
-  ipcMain: ReopenGateIpcMain
+  // The ONLY source of reports the gate consumes: the tracker's validated
+  // (current-document) reports (Codex A4 round 6 #1).
+  readiness: ReopenReadinessSource
   // Independently confirms the target profile's backend is (or becomes)
   // responsive, decoupled from the window's own self-report. Must resolve
   // once healthy, or reject once genuinely unhealthy past its own budget.
@@ -115,14 +120,12 @@ export interface ReopenGateDeps {
   // The window's already-recorded verdict (createWindowReadinessTracker), if it
   // reported before this wait began (an already-open window).
   knownVerdict?: FunctionalReadyPayload | null
-  // Main's per-webContents load generation, and reload notifications
-  // (createWindowReadinessTracker; Codex A4 round 5).
-  readiness?: ReopenReadinessSource
 }
 
 export interface ReopenReadinessSource {
-  generation: (webContentsId: number) => number
+  documentState: (webContentsId: number) => { documents: number; token: null | number }
   onReload: (webContentsId: number, listener: () => void) => () => void
+  subscribe: (webContentsId: number, listener: (payload: FunctionalReadyPayload) => void) => () => void
 }
 
 // Every window's latest functional-ready verdict, recorded for the life of the
@@ -133,51 +136,155 @@ export interface ReopenReadinessSource {
 // so the entry here is always its LATEST state; one that has not reported yet
 // (or is pending) is waited for like a new window.
 //
-// Main owns each webContents' LOAD generation (Codex A4 round 5): bumped on
-// every (re)load or renderer crash (reload()), stamped onto each recorded
-// report, never chosen by the renderer — a reloaded renderer restarts its
-// attempt numbering, so attempt alone cannot tell two loads apart. A reload
-// also tells every active gate on that window to drop its readiness and probe.
+// Main owns each window's DOCUMENT identity (Codex A4 round 6 #1). Every new
+// document's preload registers synchronously at document start
+// (registerDocument) and receives a main-minted token, which the preload
+// stamps on every report it sends; the renderer never chooses it. Only a report
+// carrying the CURRENT document's token is recorded and passed to gates — a
+// report the outgoing document had in flight when a reload started is dropped,
+// whatever it claims.
+//
+// Lifecycle (trackWindowDocuments): a main-frame cross-document navigation
+// retires the old document once it commits (if the new one has not registered
+// yet, no document is current until it does); a renderer crash retires it at
+// once. Either — and a new document registering over an old one — tells every
+// active gate on the window to drop its readiness and probe. Iframe loads and
+// same-document navigations are not document changes.
 export function createWindowReadinessTracker(ipcMain: ReopenGateIpcMain) {
   const verdicts = new Map<number, FunctionalReadyPayload>()
-  const generations = new Map<number, number>()
+  const documents = new Map<number, { count: number; navStartToken?: null | number; token: null | number }>()
   const reloadListeners = new Map<number, Set<() => void>>()
-  const generation = (webContentsId: number) => generations.get(webContentsId) ?? 0
+  const reportListeners = new Map<number, Set<(payload: FunctionalReadyPayload) => void>>()
+
+  const doc = (id: number) => {
+    let state = documents.get(id)
+
+    if (!state) {
+      state = { count: 0, token: null }
+      documents.set(id, state)
+    }
+
+    return state
+  }
+
+  const listen = <L>(map: Map<number, Set<L>>, id: number, listener: L) => {
+    const set = map.get(id) ?? new Set<L>()
+
+    set.add(listener)
+    map.set(id, set)
+
+    return () => void set.delete(listener)
+  }
+
+  const invalidate = (id: number) => {
+    verdicts.delete(id)
+
+    for (const listener of reloadListeners.get(id) ?? []) {
+      listener()
+    }
+  }
 
   ipcMain.on(FUNCTIONAL_READY_CHANNEL, (event: { sender: { id: number } }, payload: FunctionalReadyPayload) => {
-    if (event?.sender && typeof event.sender.id === 'number') {
-      verdicts.set(event.sender.id, { ...payload, generation: generation(event.sender.id) })
+    const id = event?.sender?.id
+
+    if (typeof id !== 'number' || (payload?.token ?? null) !== doc(id).token) {
+      return
+    }
+
+    verdicts.set(id, payload)
+
+    for (const listener of reportListeners.get(id) ?? []) {
+      listener(payload)
     }
   })
 
   return {
     get: (webContentsId: number) => verdicts.get(webContentsId) ?? null,
-    generation,
-    // A (re)load or renderer crash re-runs boot: a new generation, and the old
-    // verdict no longer describes the window.
-    reload: (webContentsId: number) => {
-      generations.set(webContentsId, generation(webContentsId) + 1)
-      verdicts.delete(webContentsId)
+    documentState: (webContentsId: number) => ({ documents: doc(webContentsId).count, token: doc(webContentsId).token }),
+    /** A new document (its preload, at document start): mints its token. */
+    registerDocument: (webContentsId: number): number => {
+      const state = doc(webContentsId)
+      const replaced = state.count > 0
 
-      for (const listener of reloadListeners.get(webContentsId) ?? []) {
-        listener()
+      state.count += 1
+      state.token = state.count
+
+      if (replaced) {
+        invalidate(webContentsId)
+      }
+
+      return state.token
+    },
+    /** A main-frame, cross-document navigation started. */
+    navigationStarted: (webContentsId: number) => {
+      doc(webContentsId).navStartToken = doc(webContentsId).token
+    },
+    /** It committed: the old document is gone, unless the new one already registered. */
+    navigationCommitted: (webContentsId: number) => {
+      const state = doc(webContentsId)
+
+      if (state.navStartToken !== undefined && state.token !== null && state.token === state.navStartToken) {
+        state.token = null
+        invalidate(webContentsId)
+      }
+
+      state.navStartToken = undefined
+    },
+    /** The renderer crashed: its document is gone. */
+    documentGone: (webContentsId: number) => {
+      const state = doc(webContentsId)
+
+      if (state.token !== null) {
+        state.token = null
+        invalidate(webContentsId)
       }
     },
-    onReload: (webContentsId: number, listener: () => void) => {
-      const listeners = reloadListeners.get(webContentsId) ?? new Set()
-
-      listeners.add(listener)
-      reloadListeners.set(webContentsId, listeners)
-
-      return () => void listeners.delete(listener)
-    },
-    // The window is gone for good.
+    onReload: (webContentsId: number, listener: () => void) => listen(reloadListeners, webContentsId, listener),
+    subscribe: (webContentsId: number, listener: (payload: FunctionalReadyPayload) => void) =>
+      listen(reportListeners, webContentsId, listener),
+    // Active gate subscriptions on a window (a finished gate must leave none).
+    listenerCount: (webContentsId: number) =>
+      (reportListeners.get(webContentsId)?.size ?? 0) + (reloadListeners.get(webContentsId)?.size ?? 0),
+    // The webContents is gone for good.
     forget: (webContentsId: number) => {
       verdicts.delete(webContentsId)
-      generations.delete(webContentsId)
+      documents.delete(webContentsId)
       reloadListeners.delete(webContentsId)
+      reportListeners.delete(webContentsId)
     }
   }
+}
+
+export type WindowReadinessTracker = ReturnType<typeof createWindowReadinessTracker>
+
+interface TrackedWebContents {
+  id: number
+  on: (event: string, listener: (...args: any[]) => void) => unknown
+  once: (event: string, listener: (...args: any[]) => void) => unknown
+}
+
+// Wires a webContents' document lifecycle into the tracker. Must run BEFORE its
+// first loadURL (main.ts does it from app 'web-contents-created'), so even a
+// navigation event emitted synchronously inside loadURL is seen. Only MAIN-frame
+// CROSS-document navigation and renderer crashes count (Codex A4 round 6 #3):
+// did-start-loading also fires for iframe loads (electron#30479), and must not
+// erase a healthy window's readiness.
+export function trackWindowDocuments(webContents: TrackedWebContents, tracker: WindowReadinessTracker) {
+  const id = webContents.id
+
+  webContents.on('did-start-navigation', (event: any, _url?: string, isInPlace?: boolean, isMainFrame?: boolean) => {
+    const mainFrame = event?.isMainFrame ?? isMainFrame
+    const sameDocument = event?.isSameDocument ?? isInPlace
+
+    if (mainFrame === true && sameDocument !== true) {
+      tracker.navigationStarted(id)
+    }
+  })
+  // Main frame only, and never for same-document navigations (those emit
+  // did-navigate-in-page).
+  webContents.on('did-navigate', () => tracker.navigationCommitted(id))
+  webContents.on('render-process-gone', () => tracker.documentGone(id))
+  webContents.once('destroyed', () => tracker.forget(id))
 }
 
 // Runs one reopen at a time: a request while one is active joins it instead of
@@ -216,9 +323,8 @@ export function waitForSessionWindowFunctionallyReady(
     return Promise.resolve({ ok: true })
   }
 
-  const { ipcMain, knownVerdict, probeBackendHealth, readiness, timeoutMs = REOPEN_WINDOW_READY_TIMEOUT_MS } = deps
+  const { knownVerdict, probeBackendHealth, readiness, timeoutMs = REOPEN_WINDOW_READY_TIMEOUT_MS } = deps
   const wcId = win.webContents.id
-  const currentGeneration = () => readiness?.generation(wcId) ?? 0
 
   return new Promise(resolve => {
     let settled = false
@@ -239,17 +345,17 @@ export function waitForSessionWindowFunctionallyReady(
     // And both must belong to the window's LATEST identity (Codex A4 rounds 4
     // and 5): the tuple
     //
-    //   (generation, attempt, sessionId, profile, connectionId)
+    //   (document token, attempt, sessionId, profile, connectionId)
     //
-    // — main's load generation plus what ONE report carries (the renderer
+    // — the validated document token plus what ONE report carries (the renderer
     // resolves the session's owner route before sending, so route and
     // readiness never arrive separately). The probe checks exactly that
     // identity's route, and its result satisfies only the identity it was
     // started for. Any change of any field — a pending report, a new session,
-    // profile or connection, a new attempt, a reload — clears renderer
+    // profile or connection, a new attempt, a new document — clears renderer
     // readiness and aborts/ignores the in-flight probe. The launch probe (on
     // the saved opening route, run before any report) is reused only when the
-    // first report's generation, session and route match it exactly.
+    // first routed report's document, session and route match it exactly.
     let rendererReady = false
     let healthReady = false
     let latestIdentity: null | string = null
@@ -261,12 +367,17 @@ export function waitForSessionWindowFunctionallyReady(
     const normalizeProfile = (p: string | null | undefined) => p || 'default'
     const LAUNCH = '\u0000launch'
     const launchRoute: ReopenProbeTarget = probeTarget ?? { profile, connectionId: null }
-    const launchGeneration = currentGeneration()
+    // The document the launch probe belongs to: the current one, or — for a
+    // window with no document yet — its FIRST document (token 1).
+    const launchDocument = readiness.documentState(wcId)
 
-    const routeKey = (generation: number, session: null | string | undefined, route: ReopenProbeTarget) =>
-      JSON.stringify([generation, session ?? null, normalizeProfile(route.profile), route.connectionId ?? null])
+    const launchDocumentMatches = (token: null | number) =>
+      launchDocument.documents === 0 ? token === null || token === 1 : token !== null && token === launchDocument.token
 
-    const launchKey = routeKey(launchGeneration, sessionId, launchRoute)
+    const routeKey = (session: null | string | undefined, route: ReopenProbeTarget) =>
+      JSON.stringify([session ?? null, normalizeProfile(route.profile), route.connectionId ?? null])
+
+    const launchKey = routeKey(sessionId, launchRoute)
 
     const finish = (result: ReopenGateResult) => {
       if (settled) {
@@ -276,7 +387,7 @@ export function waitForSessionWindowFunctionallyReady(
       settled = true
       probeController?.abort()
       clearTimeout(timer)
-      ipcMain.removeListener(FUNCTIONAL_READY_CHANNEL, onReady)
+      stopReports?.()
       stopReloadWatch?.()
       resolve(result)
     }
@@ -327,14 +438,9 @@ export function waitForSessionWindowFunctionallyReady(
         })
     }
 
-    const onReady = (event: { sender: { id: number } }, payload: FunctionalReadyPayload) => {
-      if (event.sender.id !== wcId) {
-        return
-      }
-
-      // A recorded verdict carries the generation main stamped on it; a live
-      // report belongs to the window's current load.
-      const generation = typeof payload?.generation === 'number' ? payload.generation : currentGeneration()
+    // Only ever called with the tracker's validated reports for THIS window.
+    const onReady = (payload: FunctionalReadyPayload) => {
+      const token = payload?.token ?? null
 
       const route: ReopenProbeTarget = {
         profile: payload?.profile || profile,
@@ -346,7 +452,7 @@ export function waitForSessionWindowFunctionallyReady(
       const isPending = payload?.pending === true
 
       const nextIdentity = JSON.stringify([
-        generation,
+        token,
         payload?.attempt ?? null,
         payload?.sessionId ?? null,
         isPending ? '\u0000pending' : [normalizeProfile(route.profile), route.connectionId]
@@ -364,7 +470,11 @@ export function waitForSessionWindowFunctionallyReady(
           if (probeIdentity !== LAUNCH) {
             dropProbe()
           }
-        } else if (probeIdentity === LAUNCH && routeKey(generation, payload?.sessionId, route) === launchKey) {
+        } else if (
+          probeIdentity === LAUNCH &&
+          launchDocumentMatches(token) &&
+          routeKey(payload?.sessionId, route) === launchKey
+        ) {
           // The first routed report matches the launch probe's identity
           // exactly: its result counts for it.
           probeIdentity = nextIdentity
@@ -428,12 +538,12 @@ export function waitForSessionWindowFunctionallyReady(
       })
     }, timeoutMs)
 
-    ipcMain.on(FUNCTIONAL_READY_CHANNEL, onReady)
+    const stopReports = readiness.subscribe(wcId, onReady)
 
-    // A reload invalidates this window's readiness and its probe; the next
-    // load's first report is a new identity (its generation differs) and is
-    // probed afresh.
-    const stopReloadWatch = readiness?.onReload(wcId, () => {
+    // A new document (reload, crash) invalidates this window's readiness and
+    // its probe; the next document's first report is a new identity (its token
+    // differs) and is probed afresh.
+    const stopReloadWatch = readiness.onReload(wcId, () => {
       rendererReady = false
       dropProbe()
       reloads += 1
@@ -441,7 +551,7 @@ export function waitForSessionWindowFunctionallyReady(
     })
 
     if (knownVerdict) {
-      onReady({ sender: { id: wcId } }, knownVerdict)
+      onReady(knownVerdict)
     }
 
     win.webContents.once(
