@@ -207,7 +207,8 @@ describe('useComposerSubmit external request routing', () => {
 
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith('[setup] links opened', {
       composerScope: 'stored-session',
-      displayKind: 'hidden'
+      displayKind: 'hidden',
+      submitTraceId: expect.any(String)
     })
     expect(onSteer).not.toHaveBeenCalled()
     expect(getQueuedPrompts('stored-session')).toEqual([])
