@@ -31,8 +31,11 @@ def test_oneshot_hides_skill_manage_and_skill_authoring_coaching(oneshot, intera
 
     prompt = build_skills_system_prompt(available_tools={"skill_view", "skills_list"}, skills_dir_override=_skills_dir(tmp_path))
     assert "demo-skill" in prompt and "skill_view" in prompt
-    assert "skill_manage" not in prompt and "offer to save as a skill" not in prompt
-    assert "skill_manage" in interactive_prompt and "offer to save as a skill" in interactive_prompt
+    # Magi (bucket D, dfe2a29a06): the interactive coaching reads "Offer to save a new skill only for a
+    # reusable, non-trivial workflow" instead of upstream's "offer to save as a skill".
+    authoring = "offer to save a new skill"
+    assert "skill_manage" not in prompt and authoring not in prompt.lower()
+    assert "skill_manage" in interactive_prompt and authoring in interactive_prompt.lower()
 
 
 def _skills_dir(tmp_path):
