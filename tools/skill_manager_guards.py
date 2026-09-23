@@ -311,17 +311,17 @@ def _background_review_size_ceiling_guard(
     max_kb, max_refs = _curator.get_max_skill_size_kb(), _curator.get_max_reference_files()
     # Each dimension binds only the write that grows it: an oversized SKILL.md must not freeze fixes
     # to a small reference file, and a crowded references/ must not freeze edits to existing files.
-    # Any other file is capped on its own post-write size, so a skill cannot grow through its references.
-    grows_skill_md = target.name == "SKILL.md" and target.parent == skill_dir
+    # Size is the file's POST-write size (content is the whole new file), so an under-ceiling
+    # SKILL.md cannot leap past the ceiling in one write, and no file can grow past it.
     written_bytes = len(content.encode("utf-8")) if isinstance(content, str) else 0
-    over_size = (size_bytes if grows_skill_md else written_bytes) > max_kb * 1024
+    over_size = written_bytes > max_kb * 1024
     over_refs = adds_reference and effective_ref_count > max_refs
     if not (over_size or over_refs):
         return None
     with suppress(Exception):
         _curator.flag_consolidation_recommended(name, size_bytes=size_bytes, ref_count=effective_ref_count)
     reason = ", ".join(
-        r for r, cond in ((f"{target.name} would be {(size_bytes if grows_skill_md else written_bytes) / 1024:.1f}KB "
+        r for r, cond in ((f"{target.name} would be {written_bytes / 1024:.1f}KB "
                            f"(ceiling {max_kb}KB)", over_size),
                           (f"references/ has {effective_ref_count} files (ceiling {max_refs})", over_refs)) if cond)
     if is_foreground():

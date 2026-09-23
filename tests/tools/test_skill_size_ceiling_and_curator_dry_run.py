@@ -260,6 +260,17 @@ class TestSizeCeilingGuard:
         assert json.loads(raw)["success"] is True
         assert json.loads(new_ref)["success"] is False
 
+    def test_under_ceiling_skill_md_cannot_leap_past_it_in_one_write(self, tmp_path, monkeypatch):
+        """Antigravity review: the check uses the post-write size, not the pre-write size on disk."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        with _skill_dir(tmp_path):
+            _create_skill("mid-skill", VALID_SKILL_CONTENT + f"\n<!-- {'y' * 35_000} -->\n")
+            raw = skill_manage(action="patch", name="mid-skill", old_string="Do the thing.",
+                               new_string="Do the thing." + "z" * 30_000)
+        result = json.loads(raw)
+        assert result["success"] is False
+        assert "SKILL.md would be" in json.dumps(result)
+
     def test_foreground_non_growing_fix_to_an_oversized_skill_is_allowed(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
         with _skill_dir(tmp_path):
