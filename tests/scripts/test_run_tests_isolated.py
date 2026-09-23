@@ -140,3 +140,22 @@ def test_wait_returns_promptly_on_timeout_with_short_slices(tmp_path):
         assert time.monotonic() - start < 2.0
     finally:
         job.close()
+
+
+@pytest.mark.windows_only
+def test_pending_interrupt_is_handled_during_an_untimed_wait(tmp_path):
+    """Codex round 4 nit: with wait(timeout=None) the old INFINITE native wait held a pending Ctrl-C
+    until the child exited; sliced waits deliver it promptly so job.close() is reached."""
+    import _thread
+    import threading
+
+    job = rti._Job()
+    try:
+        proc = job.spawn([sys.executable, "-c", "import time; time.sleep(30)"], env=dict(os.environ), cwd=str(tmp_path))
+        threading.Timer(0.3, _thread.interrupt_main).start()
+        start = time.monotonic()
+        with pytest.raises(KeyboardInterrupt):
+            proc.wait()  # no timeout
+        assert time.monotonic() - start < 3.0
+    finally:
+        job.close()
