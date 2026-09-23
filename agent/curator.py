@@ -70,21 +70,24 @@ def save_state(data: Dict[str, Any]) -> None:
 _state_thread_lock = threading.Lock()
 
 
+class CuratorStateLockError(RuntimeError):
+    """The curator state lock could not be taken; the update was NOT applied."""
+
+
 @contextlib.contextmanager
 def _state_lock():
     """Serialize curator-state read-modify-writes across threads AND processes (the routine review
     fork flags skills while a scheduled pass writes its report; a stale snapshot saved late erased
-    the newer flags). Best-effort: if the lock file cannot be opened or locked, proceed unlocked."""
+    the newer flags). Fails closed: if the lock file cannot be opened or locked, raise
+    ``CuratorStateLockError`` instead of saving an unlocked snapshot (review: Codex)."""
     with _state_thread_lock:
         path = _state_file().with_name(".curator_state.lock")
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             fh = open(path, "a+", encoding="utf-8")
-        except OSError:
-            yield
-            return
+        except OSError as e:
+            raise CuratorStateLockError(f"cannot open curator state lock {path}: {e}") from e
         with fh:
-            locked = False
             try:
                 if os.name == "nt":
                     import msvcrt
@@ -93,26 +96,25 @@ def _state_lock():
                 else:
                     import fcntl
                     fcntl.flock(fh, fcntl.LOCK_EX)
-                locked = True
             except OSError as e:
-                logger.debug("curator state lock unavailable, proceeding unlocked: %s", e)
+                raise CuratorStateLockError(f"curator state lock unavailable: {e}") from e
             try:
                 yield
             finally:
-                if locked:
-                    with contextlib.suppress(OSError):
-                        if os.name == "nt":
-                            import msvcrt
-                            fh.seek(0)
-                            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
-                        else:
-                            import fcntl
-                            fcntl.flock(fh, fcntl.LOCK_UN)
+                with contextlib.suppress(OSError):
+                    if os.name == "nt":
+                        import msvcrt
+                        fh.seek(0)
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(fh, fcntl.LOCK_UN)
 
 
 def update_state(mutate: Callable[[Dict[str, Any]], None]) -> Dict[str, Any]:
     """Load, mutate and save the curator state under ``_state_lock``, so concurrent writers never
-    save over each other's changes with a stale snapshot. Returns the saved state."""
+    save over each other's changes with a stale snapshot. Returns the saved state. Raises
+    ``CuratorStateLockError`` (nothing saved) when the lock cannot be taken."""
     with _state_lock():
         state = load_state()
         mutate(state)
@@ -1044,6 +1046,7 @@ def run_curator_review(
     on_summary: Optional[Callable[[str], None]] = None, synchronous: bool = False,
     dry_run: bool = False, consolidate: Optional[bool] = None, llm_dry_run: Optional[bool] = None,
     mark_previewed_on_success: Optional[List[str]] = None,
+    on_finished: Optional[Callable[[], None]] = None,
 ) -> Dict[str, Any]:
     """Execute a single curator review pass: (1) automatic state transitions (no LLM); (2) if *consolidate* and there are
     candidates, fork an AIAgent on the review prompt; (3) update .curator_state; (4) call *on_summary*.
@@ -1127,7 +1130,10 @@ def run_curator_review(
         except Exception as e:
             logger.debug("Curator report write failed: %s", e, exc_info=True)
         # Merge into the CURRENT state: flags set while this pass ran must survive.
-        update_state(lambda state: state.update(run_updates))
+        try:
+            update_state(lambda state: state.update(run_updates))
+        except CuratorStateLockError as e:
+            logger.warning("curator run summary not recorded: %s", e)
         # Only mark previewed once the report the human is meant to read actually exists AND the fork
         # really reviewed the skill — a crash, an error, a skipped fork ("no candidates") or a skill
         # excluded from this fork (disabled meanwhile) leaves the flag armed for the next pass.
@@ -1139,10 +1145,18 @@ def run_curator_review(
                         mark_consolidation_previewed(_name, _fingerprint)
         _notify(on_summary, f"curator: {final_summary}")
 
+    def _llm_pass_then_finish():
+        try:
+            _llm_pass()
+        finally:
+            if on_finished is not None:
+                with contextlib.suppress(Exception):
+                    on_finished()
+
     if synchronous:
-        _llm_pass()
+        _llm_pass_then_finish()
     else:
-        threading.Thread(target=_llm_pass, daemon=True, name="curator-review").start()
+        threading.Thread(target=_llm_pass_then_finish, daemon=True, name="curator-review").start()
     return {"started_at": start.isoformat(), "auto_transitions": counts, "summary_so_far": auto_summary}
 
 
@@ -1333,6 +1347,29 @@ def _release_run_claim() -> None:
         _run_claim_path().unlink()
 
 
+_CLAIM_HEARTBEAT_SECONDS = 300.0
+
+
+def _hold_run_claim() -> Callable[[], None]:
+    """Keep a held claim fresh while its review runs (a live review longer than
+    ``_CLAIM_STALE_SECONDS`` must not look crashed); returns the release callback. A dead process
+    stops refreshing, so its claim still goes stale and is taken over."""
+    stop = threading.Event()
+
+    def _beat() -> None:
+        while not stop.wait(_CLAIM_HEARTBEAT_SECONDS):
+            with contextlib.suppress(OSError):
+                os.utime(_run_claim_path())
+
+    threading.Thread(target=_beat, daemon=True, name="curator-claim-heartbeat").start()
+
+    def _release() -> None:
+        stop.set()
+        _release_run_claim()
+
+    return _release
+
+
 def maybe_run_curator(*, idle_for_seconds: Optional[float] = None, on_summary: Optional[Callable[[str], None]] = None) -> Optional[Dict[str, Any]]:
     """Best-effort: run a curator pass if all gates pass. Returns the result dict if a pass was started, else None. Never
     raises. When ``curator.consolidate`` is off (the default) but the size-ceiling guard has flagged one or more
@@ -1352,6 +1389,8 @@ def maybe_run_curator(*, idle_for_seconds: Optional[float] = None, on_summary: O
             return None
         if not _claim_run():
             return None
+        release_claim = _hold_run_claim()
+        handed_off = False
         try:
             # Recheck under the claim: a caller that saw the interval elapse before another pass
             # claimed, ran and released would otherwise start a second pass (review: Codex #6).
@@ -1366,11 +1405,17 @@ def maybe_run_curator(*, idle_for_seconds: Optional[float] = None, on_summary: O
                 pending = [n for n in skills_needing_consolidation_preview() if n in eligible]
             if pending:
                 consolidate, llm_dry_run, mark_previewed = True, True, pending
-            return run_curator_review(
+            # The claim is held until the review itself finishes (its async fork included), so one
+            # automatic review runs per home at a time; a crashed holder is taken over after
+            # _CLAIM_STALE_SECONDS (review: Codex).
+            result = run_curator_review(
                 on_summary=on_summary, consolidate=consolidate, llm_dry_run=llm_dry_run,
-                mark_previewed_on_success=mark_previewed)
+                mark_previewed_on_success=mark_previewed, on_finished=release_claim)
+            handed_off = True
+            return result
         finally:
-            _release_run_claim()
+            if not handed_off:
+                release_claim()
     except Exception as e:
         logger.debug("maybe_run_curator failed: %s", e, exc_info=True)
         return None

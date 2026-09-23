@@ -211,9 +211,10 @@ def _print_curator_recent_run_notice() -> None:
             print(f"  {line}")
         print("  (This message shows once per curator run. View anytime: hermes curator status)")
 
+    # Change only this field on the CURRENT state: a background review may have flagged a skill
+    # since ``state`` was loaded, and saving that snapshot back would erase it (review: Codex).
     with suppress(Exception):
-        state["last_run_summary_shown_at"] = last_run_at
-        curator.save_state(state)
+        curator.update_state(lambda fresh: fresh.__setitem__("last_run_summary_shown_at", last_run_at))
 
 
 def _format_time_ago(iso_ts: str) -> str:
