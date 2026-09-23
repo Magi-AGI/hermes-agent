@@ -16076,10 +16076,10 @@ ipcMain.handle('hermes:window:resumeReopenSessionWindows', async () => {
 })
 // A peer window reports the session it is currently showing (null = a fresh
 // chat) so its saved entry reopens it there.
-ipcMain.on('hermes:window:session', (event, sessionId) => {
+ipcMain.on('hermes:window:session', (event, report) => {
   const win = BrowserWindow.fromWebContents(event.sender)
 
-  if (win && sessionWindows.setSession(win, typeof sessionId === 'string' ? sessionId : null)) {
+  if (win && report && typeof report === 'object' && sessionWindows.setRoute(win, report)) {
     schedulePersistSessionWindowsState()
   }
 })

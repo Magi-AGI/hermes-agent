@@ -1,0 +1,24 @@
+import { describe, expect, it } from 'vitest'
+
+import { windowSessionReport } from './window-session-report'
+
+const active = { profile: 'work', connectionId: 'local' }
+
+describe('windowSessionReport (Codex A4 #5)', () => {
+  it('carries the session with its resolved EXACT owner route', () => {
+    expect(windowSessionReport('s1', { profile: 'remote-prof', connectionId: 'c2' }, active)).toEqual({
+      sessionId: 's1',
+      profile: 'remote-prof',
+      connectionId: 'c2'
+    })
+  })
+
+  it('a bare-profile owner belongs to the window active connection', () => {
+    expect(windowSessionReport('s1', 'other', active)).toEqual({ sessionId: 's1', profile: 'other', connectionId: 'local' })
+  })
+
+  it('an unknown owner or a fresh draft falls back to the active route', () => {
+    expect(windowSessionReport('s1', undefined, active)).toEqual({ sessionId: 's1', ...active })
+    expect(windowSessionReport(null, { profile: 'x', connectionId: 'y' }, active)).toEqual({ sessionId: null, ...active })
+  })
+})

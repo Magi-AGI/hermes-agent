@@ -9,7 +9,9 @@ import { $diskPluginsScanPending } from '@/contrib/runtime-loader'
 import { resolveDeepLinkAction } from '@/lib/deeplink-routes'
 import { pathFromHermesDeepLink, resolveHermesOpenPath } from '@/lib/hermes-open-target'
 import { storedSessionIdForNotification } from '@/lib/session-ids'
+import { windowSessionReport } from '@/lib/window-session-report'
 import { announceNewSessionDraftKey } from '@/store/composer'
+import { $activeConnectionId } from '@/store/connections'
 import { requestMcpInstallFromDeepLink } from '@/store/mcp-deeplink-install'
 import { startMcpHealthChecker, stopMcpHealthChecker } from '@/store/mcp-health'
 import {
@@ -39,6 +41,7 @@ import type { SessionInfo } from '@/types/hermes'
 
 import { requestComposerFocus, requestComposerInsert } from '../../chat/composer/focus'
 import { appViewForPath, isOverlayView, NEW_CHAT_ROUTE, routeSessionId, sessionRoute } from '../../routes'
+import { resolveSessionOwner } from '../../session/hooks/use-session-actions/utils'
 
 import { useReopenReadySignal } from './use-reopen-ready-signal'
 
@@ -112,11 +115,34 @@ export function useDesktopIntegrations({
 
   // A peer window (Ctrl+Shift+N) is part of the saved window layout; tell main
   // which session it is showing so "Reopen Saved Windows" restores it there.
+  //
+  // The session travels with its resolved OWNER route (connection/profile) as
+  // one unit (lib/window-session-report.ts), re-reported when the window's
+  // active route changes too.
+  const activeConnectionId = useStore($activeConnectionId)
+
   useEffect(() => {
-    if (isPeerInstanceWindow()) {
-      window.hermesDesktop?.reportWindowSession?.(routedSessionId ?? null)
+    if (!isPeerInstanceWindow()) {
+      return
     }
-  }, [routedSessionId])
+
+    let current = true
+    const sessionId = routedSessionId ?? null
+
+    void resolveSessionOwner(sessionId)
+      .catch(() => undefined)
+      .then(owner => {
+        if (current) {
+          window.hermesDesktop?.reportWindowSession?.(
+            windowSessionReport(sessionId, owner, { profile: activeProfile || null, connectionId: activeConnectionId })
+          )
+        }
+      })
+
+    return () => {
+      current = false
+    }
+  }, [activeConnectionId, activeProfile, routedSessionId])
 
   const restoredRef = useRef(false)
   const diskPluginsScanPending = useStore($diskPluginsScanPending)

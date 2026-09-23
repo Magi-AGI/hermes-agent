@@ -289,16 +289,40 @@ function createSessionWindowRegistry() {
     },
     // A peer window navigates between sessions; its saved entry follows the
     // session it is currently showing. Returns true when it changed.
-    setSession: (win, sessionId: null | string): boolean => {
+    // The session a window is showing and that session's resolved OWNER route
+    // (connection/profile) are one unit (Codex A4 #5): they are always updated
+    // together, so a saved entry can never pair a session with another
+    // backend's route. Returns true when anything changed.
+    setRoute: (
+      win,
+      report: { connectionId?: null | string; profile?: null | string; sessionId?: null | string }
+    ): boolean => {
       const key = windowIdOf(win)
       const entry = key ? windows.get(key) : null
-      const next = typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : null
 
-      if (!entry || entry.sessionId === next) {
+      if (!entry) {
         return false
       }
 
-      entry.sessionId = next
+      const clean = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : null)
+
+      const next = {
+        sessionId: clean(report?.sessionId),
+        profile: clean(report?.profile),
+        connectionId: clean(report?.connectionId)
+      }
+
+      if (
+        entry.sessionId === next.sessionId &&
+        entry.profile === next.profile &&
+        (entry.connectionId ?? null) === next.connectionId
+      ) {
+        return false
+      }
+
+      entry.sessionId = next.sessionId
+      entry.profile = next.profile
+      entry.connectionId = next.connectionId
 
       return true
     },

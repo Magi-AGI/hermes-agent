@@ -401,8 +401,8 @@ test('a peer window is saved with its route and the session it is showing (crite
   const peer = makeFakeWindow()
 
   registry.openOrFocus('peer-1', () => peer, { kind: 'peer', profile: 'work', connectionId: 'c1', profileWindow: true })
-  assert.equal(registry.setSession(peer, 's9'), true)
-  assert.equal(registry.setSession(peer, 's9'), false, 'no-op when unchanged')
+  assert.equal(registry.setRoute(peer, { sessionId: 's9', profile: 'work', connectionId: 'c1' }), true)
+  assert.equal(registry.setRoute(peer, { sessionId: 's9', profile: 'work', connectionId: 'c1' }), false, 'no-op when unchanged')
 
   const [saved] = registry.entries().map(e => toSavedWindowEntry(e, BOUNDS, true))
 
@@ -476,4 +476,30 @@ test('a readable file loads its entries', () => {
 
   assert.equal(loaded.ok, true)
   assert.equal(loaded.ok && loaded.entries.length, 1)
+})
+
+// ─── Codex A4 #5: session + owner route saved and updated together ───────────
+
+test('switching a window to a session on another backend updates session AND route together', () => {
+  const registry = createSessionWindowRegistry()
+  const peer = makeFakeWindow()
+
+  registry.openOrFocus('peer-1', () => peer, { kind: 'peer', profile: 'work', connectionId: 'c1', sessionId: 's1' })
+  assert.equal(registry.setRoute(peer, { sessionId: 's2', profile: 'remote-prof', connectionId: 'c2' }), true)
+
+  const [saved] = registry.entries().map(e => toSavedWindowEntry(e, BOUNDS, false))
+
+  assert.deepEqual(
+    { sessionId: saved.sessionId, profile: saved.profile, connectionId: saved.connectionId },
+    { sessionId: 's2', profile: 'remote-prof', connectionId: 'c2' }
+  )
+})
+
+test('a route-only change (same session, owner now resolved elsewhere) is saved too', () => {
+  const registry = createSessionWindowRegistry()
+  const peer = makeFakeWindow()
+
+  registry.openOrFocus('peer-1', () => peer, { kind: 'peer', profile: 'work', connectionId: null, sessionId: 's1' })
+  assert.equal(registry.setRoute(peer, { sessionId: 's1', profile: 'work', connectionId: 'c9' }), true)
+  assert.equal(registry.entries()[0].connectionId, 'c9')
 })
