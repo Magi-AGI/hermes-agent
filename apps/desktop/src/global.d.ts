@@ -562,6 +562,8 @@ declare global {
       }) => void
       signalSessionFunctionalReady?: (payload: {
         ok: boolean
+        attempt?: number
+        connectionId?: string | null
         pending?: boolean
         phase?: string
         profile?: string | null

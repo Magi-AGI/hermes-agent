@@ -513,14 +513,16 @@ test('an already-open window that has not reported yet (still booting) is waited
   assert.match(result.reason ?? '', /timed out/)
 })
 
-test('a reload forgets the previous verdict', () => {
+test('a reload forgets the previous verdict and starts a new main-assigned load generation', () => {
   const ipcMain = makeFakeIpcMain()
   const readiness = createWindowReadinessTracker(ipcMain)
 
-  ipcMain.emit('hermes:window:functional-ready', { sender: { id: 7 } }, { ok: true })
-  assert.deepEqual(readiness.get(7), { ok: true })
-  readiness.forget(7)
+  ipcMain.emit('hermes:window:functional-ready', { sender: { id: 7 } }, { ok: true, generation: 99 })
+  assert.deepEqual(readiness.get(7), { ok: true, generation: 0 }, 'main stamps the generation, not the renderer')
+  readiness.reload(7)
   assert.equal(readiness.get(7), null)
+  ipcMain.emit('hermes:window:functional-ready', { sender: { id: 7 } }, { ok: true })
+  assert.deepEqual(readiness.get(7), { ok: true, generation: 1 })
 })
 
 test('concurrent Reopen requests share one queue', async () => {
@@ -733,30 +735,145 @@ test('after an identity change the queue advances only on the latest ready AND a
   assert.deepEqual(settled, { ok: true })
 })
 
-test('a re-run probe re-resolves the window route', async () => {
+// ─── Codex A4 round 5: one report carries the COMPLETE identity ──────────────
+// (generation, attempt, session, profile, connection); the gate probes exactly
+// the reported route, and a probe satisfies only the identity it was run for.
+
+test('A->B switch: the gate probes B from the readiness report itself, even while the route message lags', async () => {
   const ipcMain = makeFakeIpcMain()
   const win = makeFakeWindow()
   const probes = makeProbes()
-  let route = { profile: 'prof-a', connectionId: null }
+  let settled: unknown = null
+
+  // An existing window; its separate route report (routeOf) still says A.
+  void waitForSessionWindowFunctionallyReady(
+    win as any,
+    { profile: 'prof-a', sessionId: 's-a', identity: 'functional', probeTarget: { profile: 'prof-a', connectionId: null } },
+    {
+      ipcMain,
+      probeBackendHealth: probes.probe as any,
+      knownVerdict: { ok: true, attempt: 1, profile: 'prof-a', connectionId: null, sessionId: 's-a' },
+      timeoutMs: 500
+    }
+  ).then(r => (settled = r))
+
+  ready(ipcMain, { ok: false, pending: true, attempt: 2, profile: 'prof-b', connectionId: 'conn-b', sessionId: 's-b' })
+  ready(ipcMain, { ok: true, attempt: 2, profile: 'prof-b', connectionId: 'conn-b', sessionId: 's-b' })
+
+  const last = probes.calls[probes.calls.length - 1]
+
+  assert.deepEqual(last.target, { profile: 'prof-b', connectionId: 'conn-b' })
+
+  for (const call of probes.calls.slice(0, -1)) {
+    call.ctl.resolve()
+  }
+
+  await tick()
+  assert.equal(settled, null, 'a probe of A never satisfies B')
+
+  last.ctl.resolve()
+  await tick()
+  assert.deepEqual(settled, { ok: true })
+})
+
+test('a connection-only switch (same profile and session) re-probes the new connection', async () => {
+  const ipcMain = makeFakeIpcMain()
+  const win = makeFakeWindow()
+  const probes = makeProbes()
+  let settled: unknown = null
 
   void waitForSessionWindowFunctionallyReady(
     win as any,
-    { profile: 'prof-a', sessionId: 's1', identity: 'functional', resolveProbeTarget: () => route },
-    { ipcMain, probeBackendHealth: probes.probe as any, timeoutMs: 300 }
-  )
+    { profile: 'work', sessionId: 's1', identity: 'functional', probeTarget: { profile: 'work', connectionId: 'c1' } },
+    { ipcMain, probeBackendHealth: probes.probe as any, timeoutMs: 500 }
+  ).then(r => (settled = r))
 
-  ready(ipcMain, { ok: true, attempt: 1, profile: 'prof-a', sessionId: 's1' })
-  // The window moves to a session on prof-b: its registry route follows.
-  route = { profile: 'prof-b', connectionId: null }
-  ready(ipcMain, { ok: false, pending: true, attempt: 2, profile: 'prof-b', sessionId: 's2' })
+  ready(ipcMain, { ok: true, attempt: 1, profile: 'work', connectionId: 'c1', sessionId: 's1' })
+  ready(ipcMain, { ok: true, attempt: 1, profile: 'work', connectionId: 'c2', sessionId: 's1' })
 
-  assert.deepEqual(
-    probes.calls.map(c => c.target),
-    [
-      { profile: 'prof-a', connectionId: null },
-      { profile: 'prof-b', connectionId: null }
-    ]
-  )
+  assert.deepEqual(probes.calls[probes.calls.length - 1].target, { profile: 'work', connectionId: 'c2' })
+  probes.calls[0].ctl.resolve()
+  await tick()
+  assert.equal(settled, null, 'the c1 probe does not satisfy c2')
+
+  probes.calls[probes.calls.length - 1].ctl.resolve()
+  await tick()
+  assert.deepEqual(settled, { ok: true })
+})
+
+test('a reloaded renderer reusing attempt 1 is not accepted on the pre-reload probe', async () => {
+  const ipcMain = makeFakeIpcMain()
+  const readiness = createWindowReadinessTracker(ipcMain)
+  const win = makeFakeWindow()
+  const probes = makeProbes()
+  let settled: unknown = null
+  const report = { attempt: 1, profile: 'default', connectionId: null, sessionId: 's1' }
+
+  void waitForSessionWindowFunctionallyReady(
+    win as any,
+    { profile: 'default', sessionId: 's1', probeTarget: { profile: 'default', connectionId: null } },
+    { ipcMain, readiness, probeBackendHealth: probes.probe as any, timeoutMs: 500 }
+  ).then(r => (settled = r))
+
+  ready(ipcMain, { ...report, ok: false, pending: true })
+  probes.calls[0].ctl.resolve()
+  await tick()
+
+  // Reload (main bumps the load generation); the new renderer starts at attempt 1 again.
+  readiness.reload(1)
+  ready(ipcMain, { ...report, ok: true })
+  await tick()
+  assert.equal(settled, null, 'the pre-reload probe result does not count for the new load')
+  assert.equal(probes.calls.length, 2, 'the new load is probed')
+
+  probes.calls[1].ctl.resolve()
+  await tick()
+  assert.deepEqual(settled, { ok: true })
+})
+
+test('the launch probe is reused only when the first report matches its identity', async () => {
+  const ipcMain = makeFakeIpcMain()
+  const win = makeFakeWindow()
+  const probes = makeProbes()
+  let settled: unknown = null
+
+  void waitForSessionWindowFunctionallyReady(
+    win as any,
+    { profile: 'prof-a', sessionId: 's1', probeTarget: { profile: 'prof-a', connectionId: null } },
+    { ipcMain, probeBackendHealth: probes.probe as any, timeoutMs: 500 }
+  ).then(r => (settled = r))
+
+  // First report: same session and profile, but on another connection.
+  ready(ipcMain, { ok: true, attempt: 0, profile: 'prof-a', connectionId: 'conn-x', sessionId: 's1' })
+
+  assert.equal(probes.calls.length, 2, 'a mismatching first report is probed on its own route')
+  assert.deepEqual(probes.calls[1].target, { profile: 'prof-a', connectionId: 'conn-x' })
+  probes.calls[0].ctl.resolve()
+  await tick()
+  assert.equal(settled, null, 'the launch probe does not satisfy a different identity')
+
+  probes.calls[1].ctl.resolve()
+  await tick()
+  assert.deepEqual(settled, { ok: true })
+})
+
+test('baseline: a first report matching the launch identity reuses the launch probe', async () => {
+  const ipcMain = makeFakeIpcMain()
+  const win = makeFakeWindow()
+  const probes = makeProbes()
+  let settled: unknown = null
+
+  void waitForSessionWindowFunctionallyReady(
+    win as any,
+    { profile: 'prof-a', sessionId: 's1', probeTarget: { profile: 'prof-a', connectionId: null } },
+    { ipcMain, probeBackendHealth: probes.probe as any, timeoutMs: 500 }
+  ).then(r => (settled = r))
+
+  ready(ipcMain, { ok: true, attempt: 0, profile: 'prof-a', connectionId: null, sessionId: 's1' })
+  probes.calls[0].ctl.resolve()
+  await tick()
+  assert.equal(probes.calls.length, 1)
+  assert.deepEqual(settled, { ok: true })
 })
 
 // ─── Codex A4 #7: the probe checks the exact route the window was opened on ──
@@ -775,28 +892,6 @@ test('a peer is probed on its recorded connection+profile, a pop-out on its prof
   })
 })
 
-test('an EXISTING window is probed on its current session-owner route, whatever its kind (Codex A4 r4 #2)', () => {
-  // A pop-out saved on profile A that has since moved to a session on profile B.
-  const pop = { kind: 'session', profile: 'prof-a', connectionId: null }
-  const current = { profile: 'prof-b', connectionId: 'conn-b' }
-
-  assert.deepEqual(reopenProbeTarget(pop, null, 'default', current), { profile: 'prof-b', connectionId: 'conn-b' })
-
-  // ...and a peer: its current route wins over the route recorded at spawn.
-  const peer = { kind: 'peer', profile: 'work', connectionId: 'saved-c' }
-
-  assert.deepEqual(reopenProbeTarget(peer, { profile: 'work', connectionId: 'spawn-c' }, 'default', current), {
-    profile: 'prof-b',
-    connectionId: 'conn-b'
-  })
-})
-
-test('a NEWLY created window is probed on its saved opening route (Codex A4 r4 #2)', () => {
-  const pop = { kind: 'session', profile: 'prof-a', connectionId: null }
-
-  assert.deepEqual(reopenProbeTarget(pop, null, 'default', null), { profile: 'prof-a', connectionId: null })
-})
-
 test('a healthy existing pop-out on profile B is not halted because saved profile A is offline', async () => {
   const ipcMain = makeFakeIpcMain()
   const win = makeFakeWindow()
@@ -810,17 +905,13 @@ test('a healthy existing pop-out on profile B is not halted because saved profil
       profile: 'prof-a',
       sessionId: 's-a',
       identity: reopenedWindowPolicy(false).identity,
-      probeTarget: reopenProbeTarget(
-        { kind: 'session', profile: 'prof-a', connectionId: null },
-        null,
-        'default',
-        { profile: 'prof-b', connectionId: null }
-      )
+      // Its saved opening route is A; the window REPORTS it is on B.
+      probeTarget: reopenProbeTarget({ kind: 'session', profile: 'prof-a', connectionId: null }, null, 'default')
     },
     {
       ipcMain,
       probeBackendHealth: probe,
-      knownVerdict: { ok: true, profile: 'prof-b', sessionId: 's-b' },
+      knownVerdict: { ok: true, profile: 'prof-b', connectionId: null, sessionId: 's-b' },
       timeoutMs: 500
     }
   )
@@ -843,7 +934,8 @@ test('a ready REMOTE peer is not failed because the local backend of the same pr
   )
 
   await new Promise(resolve => setTimeout(resolve, 5))
-  ipcMain.emit('hermes:window:functional-ready', { sender: { id: 1 } }, { ok: true, profile: 'work' })
+  // The report carries the window's resolved route (Codex A4 round 5).
+  ipcMain.emit('hermes:window:functional-ready', { sender: { id: 1 } }, { ok: true, profile: 'work', connectionId: 'remote-1' })
 
   assert.deepEqual(await pending, { ok: true })
 })

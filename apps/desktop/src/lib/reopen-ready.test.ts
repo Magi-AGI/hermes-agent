@@ -4,7 +4,15 @@ import { bootFunctionalState } from '@/app/contrib/hooks/use-reopen-ready-signal
 
 import { createReopenReadySignaller, reopenReadyVerdict } from './reopen-ready'
 
-const base = { boot: 'ready' as const, target: 's1', selected: null, runtime: null, exhausted: null, profile: 'work' }
+const base = {
+  boot: 'ready' as const,
+  target: 's1',
+  selected: null,
+  runtime: null,
+  exhausted: null,
+  profile: 'work',
+  connectionId: null
+}
 
 describe('reopenReadyVerdict (Codex A4 #3)', () => {
   it('is pending until every required boot op succeeded', () => {
@@ -22,6 +30,7 @@ describe('reopenReadyVerdict (Codex A4 #3)', () => {
       ok: true,
       phase: 'session',
       profile: 'work',
+      connectionId: null,
       sessionId: 's1'
     })
   })
@@ -36,7 +45,7 @@ describe('reopenReadyVerdict (Codex A4 #3)', () => {
   })
 
   it('a window with no target session (a restored peer on a fresh chat) is ready after boot', () => {
-    expect(reopenReadyVerdict({ ...base, target: null })).toEqual({ ok: true, phase: 'boot', profile: 'work', sessionId: null })
+    expect(reopenReadyVerdict({ ...base, target: null })).toEqual({ ok: true, phase: 'boot', profile: 'work', connectionId: null, sessionId: null })
   })
 })
 
@@ -51,9 +60,9 @@ describe('createReopenReadySignaller (Codex A4 round 3 #1)', () => {
     signal({ ...base, target: 's-b', selected: 's-b', runtime: 'r2' })
 
     expect(sent).toEqual([
-      { ok: true, phase: 'session', profile: 'work', sessionId: 's-a', attempt: 0 },
-      { ok: false, pending: true, phase: 'pending', profile: 'work', sessionId: 's-b', attempt: 1 },
-      { ok: true, phase: 'session', profile: 'work', sessionId: 's-b', attempt: 1 }
+      { ok: true, phase: 'session', profile: 'work', connectionId: null, sessionId: 's-a', attempt: 0 },
+      { ok: false, pending: true, phase: 'pending', profile: 'work', connectionId: null, sessionId: 's-b', attempt: 1 },
+      { ok: true, phase: 'session', profile: 'work', connectionId: null, sessionId: 's-b', attempt: 1 }
     ])
   })
 
@@ -88,6 +97,19 @@ describe('createReopenReadySignaller (Codex A4 round 3 #1)', () => {
       ['boot', 1],
       ['pending', 2],
       ['boot', 2]
+    ])
+  })
+
+  it('carries the fully resolved owner route, connection included (Codex A4 round 5)', () => {
+    const sent: unknown[] = []
+    const signal = createReopenReadySignaller(payload => sent.push(payload))
+
+    signal({ ...base, target: 's1', selected: 's1', runtime: 'r1', profile: 'prof-b', connectionId: 'conn-b' })
+    signal({ ...base, target: 's1', selected: 's1', runtime: 'r1', profile: 'prof-b', connectionId: 'conn-c' })
+
+    expect(sent).toEqual([
+      { ok: true, phase: 'session', profile: 'prof-b', connectionId: 'conn-b', sessionId: 's1', attempt: 0 },
+      { ok: true, phase: 'session', profile: 'prof-b', connectionId: 'conn-c', sessionId: 's1', attempt: 0 }
     ])
   })
 

@@ -26,6 +26,12 @@ export interface FunctionalReadyPayload {
   // The window's establishment attempt this report belongs to (Codex A4
   // round 4 #1); see createReopenReadySignaller.
   attempt?: number
+  // The session's resolved OWNER route, resolved by the renderer BEFORE it
+  // sends (Codex A4 round 5): route and readiness always arrive together.
+  connectionId?: string | null
+  // The webContents LOAD generation, stamped by MAIN when it records the
+  // report (createWindowReadinessTracker) — never chosen by the renderer.
+  generation?: number
   // The window is (re)establishing its current target — a new session after
   // /new, a boot retry. Not a verdict: the gate keeps waiting.
   pending?: boolean
@@ -40,27 +46,17 @@ export interface ReopenProbeTarget {
   profile: null | string
 }
 
-// The route the reopen probe must check for one saved window.
-//
-// An ALREADY-OPEN window (`current`) is probed on its current established
-// session-owner route, whatever its kind (Codex A4 round 4 #2): a pop-out that
-// moved to a session on profile B is working on B, and must not halt the queue
-// because its saved profile A is offline.
-//
-// A window the queue just CREATED is probed on its saved opening route: a
+// The saved OPENING route of one saved window: the route its launch probe
+// checks before the window has reported (see waitForSessionWindowFunctionally-
+// Ready — once it reports, the gate probes exactly the route it reported). A
 // peer's route recorded when it was spawned (exact connection + profile) when
 // available, else its saved route; a session pop-out boots by profile (its URL
 // carries no connection), so it is probed on that profile's route.
 export function reopenProbeTarget(
   entry: { connectionId?: null | string; kind?: string; profile?: null | string },
   recorded: { connectionId?: null | string; profile?: null | string } | null,
-  fallbackProfile: string,
-  current?: { connectionId?: null | string; profile?: null | string } | null
+  fallbackProfile: string
 ): ReopenProbeTarget {
-  if (current) {
-    return { profile: current.profile || fallbackProfile, connectionId: current.connectionId ?? null }
-  }
-
   if (entry.kind === 'peer') {
     const route = recorded ?? entry
 
@@ -119,6 +115,14 @@ export interface ReopenGateDeps {
   // The window's already-recorded verdict (createWindowReadinessTracker), if it
   // reported before this wait began (an already-open window).
   knownVerdict?: FunctionalReadyPayload | null
+  // Main's per-webContents load generation, and reload notifications
+  // (createWindowReadinessTracker; Codex A4 round 5).
+  readiness?: ReopenReadinessSource
+}
+
+export interface ReopenReadinessSource {
+  generation: (webContentsId: number) => number
+  onReload: (webContentsId: number, listener: () => void) => () => void
 }
 
 // Every window's latest functional-ready verdict, recorded for the life of the
@@ -128,19 +132,51 @@ export interface ReopenGateDeps {
 // session, route or boot attempt (useReopenReadySignal; Codex A4 round 3 #1) —
 // so the entry here is always its LATEST state; one that has not reported yet
 // (or is pending) is waited for like a new window.
+//
+// Main owns each webContents' LOAD generation (Codex A4 round 5): bumped on
+// every (re)load or renderer crash (reload()), stamped onto each recorded
+// report, never chosen by the renderer — a reloaded renderer restarts its
+// attempt numbering, so attempt alone cannot tell two loads apart. A reload
+// also tells every active gate on that window to drop its readiness and probe.
 export function createWindowReadinessTracker(ipcMain: ReopenGateIpcMain) {
   const verdicts = new Map<number, FunctionalReadyPayload>()
+  const generations = new Map<number, number>()
+  const reloadListeners = new Map<number, Set<() => void>>()
+  const generation = (webContentsId: number) => generations.get(webContentsId) ?? 0
 
   ipcMain.on(FUNCTIONAL_READY_CHANNEL, (event: { sender: { id: number } }, payload: FunctionalReadyPayload) => {
     if (event?.sender && typeof event.sender.id === 'number') {
-      verdicts.set(event.sender.id, payload)
+      verdicts.set(event.sender.id, { ...payload, generation: generation(event.sender.id) })
     }
   })
 
   return {
     get: (webContentsId: number) => verdicts.get(webContentsId) ?? null,
-    // A reload re-runs boot: its old verdict no longer describes the window.
-    forget: (webContentsId: number) => void verdicts.delete(webContentsId)
+    generation,
+    // A (re)load or renderer crash re-runs boot: a new generation, and the old
+    // verdict no longer describes the window.
+    reload: (webContentsId: number) => {
+      generations.set(webContentsId, generation(webContentsId) + 1)
+      verdicts.delete(webContentsId)
+
+      for (const listener of reloadListeners.get(webContentsId) ?? []) {
+        listener()
+      }
+    },
+    onReload: (webContentsId: number, listener: () => void) => {
+      const listeners = reloadListeners.get(webContentsId) ?? new Set()
+
+      listeners.add(listener)
+      reloadListeners.set(webContentsId, listeners)
+
+      return () => void listeners.delete(listener)
+    },
+    // The window is gone for good.
+    forget: (webContentsId: number) => {
+      verdicts.delete(webContentsId)
+      generations.delete(webContentsId)
+      reloadListeners.delete(webContentsId)
+    }
   }
 }
 
@@ -166,14 +202,11 @@ export function waitForSessionWindowFunctionallyReady(
     profile,
     sessionId,
     probeTarget,
-    resolveProbeTarget,
     identity = 'exact'
   }: {
     identity?: ReopenIdentityCheck
+    // The saved OPENING route: probed only until the window reports.
     probeTarget?: ReopenProbeTarget
-    // Re-resolves the route to probe each time the probe (re)runs — an
-    // existing window's route can change with its identity. Else probeTarget.
-    resolveProbeTarget?: () => ReopenProbeTarget
     profile: string | null
     sessionId?: null | string
   },
@@ -183,8 +216,9 @@ export function waitForSessionWindowFunctionallyReady(
     return Promise.resolve({ ok: true })
   }
 
-  const { ipcMain, knownVerdict, probeBackendHealth, timeoutMs = REOPEN_WINDOW_READY_TIMEOUT_MS } = deps
+  const { ipcMain, knownVerdict, probeBackendHealth, readiness, timeoutMs = REOPEN_WINDOW_READY_TIMEOUT_MS } = deps
   const wcId = win.webContents.id
+  const currentGeneration = () => readiness?.generation(wcId) ?? 0
 
   return new Promise(resolve => {
     let settled = false
@@ -202,20 +236,37 @@ export function waitForSessionWindowFunctionallyReady(
     // all-frozen case (no renderer signal ever arrives), not the case this
     // paragraph describes.
     //
-    // And both must belong to the window's LATEST identity (Codex A4 round 4
-    // #1): its establishment attempt + profile + session. A later pending
-    // report, or any report of a new identity, clears renderer readiness; a
-    // new identity also discards the in-flight/finished probe and re-runs it,
-    // so the queue only advances when the latest ready and a probe run for
-    // that same identity both succeeded.
+    // And both must belong to the window's LATEST identity (Codex A4 rounds 4
+    // and 5): the tuple
+    //
+    //   (generation, attempt, sessionId, profile, connectionId)
+    //
+    // — main's load generation plus what ONE report carries (the renderer
+    // resolves the session's owner route before sending, so route and
+    // readiness never arrive separately). The probe checks exactly that
+    // identity's route, and its result satisfies only the identity it was
+    // started for. Any change of any field — a pending report, a new session,
+    // profile or connection, a new attempt, a reload — clears renderer
+    // readiness and aborts/ignores the in-flight probe. The launch probe (on
+    // the saved opening route, run before any report) is reused only when the
+    // first report's generation, session and route match it exactly.
     let rendererReady = false
     let healthReady = false
     let latestIdentity: null | string = null
     let probeRun = 0
+    let probeIdentity: null | string = null
     let probeController: AbortController | null = null
+    let reloads = 0
 
-    const identityOf = (payload: FunctionalReadyPayload) =>
-      JSON.stringify([payload?.attempt ?? null, payload?.profile ?? null, payload?.sessionId ?? null])
+    const normalizeProfile = (p: string | null | undefined) => p || 'default'
+    const LAUNCH = '\u0000launch'
+    const launchRoute: ReopenProbeTarget = probeTarget ?? { profile, connectionId: null }
+    const launchGeneration = currentGeneration()
+
+    const routeKey = (generation: number, session: null | string | undefined, route: ReopenProbeTarget) =>
+      JSON.stringify([generation, session ?? null, normalizeProfile(route.profile), route.connectionId ?? null])
+
+    const launchKey = routeKey(launchGeneration, sessionId, launchRoute)
 
     const finish = (result: ReopenGateResult) => {
       if (settled) {
@@ -226,6 +277,7 @@ export function waitForSessionWindowFunctionallyReady(
       probeController?.abort()
       clearTimeout(timer)
       ipcMain.removeListener(FUNCTIONAL_READY_CHANNEL, onReady)
+      stopReloadWatch?.()
       resolve(result)
     }
 
@@ -238,20 +290,30 @@ export function waitForSessionWindowFunctionallyReady(
     // Normalizes both sides the same way ('' / null / undefined all mean the
     // default profile) before comparing, so a plain string mismatch can't
     // slip through as a false negative.
-    const normalizeProfile = (p: string | null | undefined) => p || 'default'
     const expectedProfile = normalizeProfile(profile)
 
-    const runProbe = () => {
-      const run = ++probeRun
-
+    const dropProbe = () => {
+      probeRun += 1
+      probeIdentity = null
       probeController?.abort()
-      probeController = new AbortController()
+      probeController = null
       healthReady = false
+    }
 
-      const target = resolveProbeTarget?.() ?? probeTarget ?? { profile, connectionId: null }
+    const runProbe = (target: ReopenProbeTarget, forIdentity: string) => {
+      dropProbe()
 
-      void probeBackendHealth(target, probeController.signal)
+      const run = probeRun
+      const controller = new AbortController()
+
+      probeController = controller
+      probeIdentity = forIdentity
+
+      void probeBackendHealth(target, controller.signal)
         .then(() => {
+          // Satisfies only the identity it was started for: every identity
+          // change supersedes this run (runProbe/dropProbe bump probeRun),
+          // except the launch probe's exact-match reuse for the first report.
           if (run === probeRun) {
             healthReady = true
             succeedIfBothReady()
@@ -270,17 +332,35 @@ export function waitForSessionWindowFunctionallyReady(
         return
       }
 
-      const nextIdentity = identityOf(payload)
+      // A recorded verdict carries the generation main stamped on it; a live
+      // report belongs to the window's current load.
+      const generation = typeof payload?.generation === 'number' ? payload.generation : currentGeneration()
 
-      if (latestIdentity !== null && nextIdentity !== latestIdentity) {
-        rendererReady = false
-
-        if (probeRun > 0) {
-          runProbe()
-        }
+      const route: ReopenProbeTarget = {
+        profile: payload?.profile || profile,
+        connectionId: payload?.connectionId ?? null
       }
 
-      latestIdentity = nextIdentity
+      const nextIdentity = JSON.stringify([
+        generation,
+        payload?.attempt ?? null,
+        payload?.sessionId ?? null,
+        normalizeProfile(route.profile),
+        route.connectionId
+      ])
+
+      if (nextIdentity !== latestIdentity) {
+        const firstReport = latestIdentity === null
+        rendererReady = false
+        latestIdentity = nextIdentity
+
+        if (firstReport && probeIdentity === LAUNCH && routeKey(generation, payload?.sessionId, route) === launchKey) {
+          // The launch probe checked exactly this identity: it counts for it.
+          probeIdentity = nextIdentity
+        } else {
+          runProbe(route, nextIdentity)
+        }
+      }
 
       if (payload?.pending === true) {
         rendererReady = false
@@ -339,6 +419,16 @@ export function waitForSessionWindowFunctionallyReady(
 
     ipcMain.on(FUNCTIONAL_READY_CHANNEL, onReady)
 
+    // A reload invalidates this window's readiness and its probe; the next
+    // load's first report is a new identity (its generation differs) and is
+    // probed afresh.
+    const stopReloadWatch = readiness?.onReload(wcId, () => {
+      rendererReady = false
+      dropProbe()
+      reloads += 1
+      latestIdentity = `\u0000reload:${reloads}`
+    })
+
     if (knownVerdict) {
       onReady({ sender: { id: wcId } }, knownVerdict)
     }
@@ -356,8 +446,10 @@ export function waitForSessionWindowFunctionallyReady(
     // the whole reopen queue over a window the user (or the app) closed.
     win.once('closed', () => finish({ ok: true }))
 
-    if (!settled) {
-      runProbe()
+    // Before any report: probe the saved opening route (reused only if the
+    // first report matches it — see above).
+    if (!settled && latestIdentity === null) {
+      runProbe(launchRoute, LAUNCH)
     }
   })
 }

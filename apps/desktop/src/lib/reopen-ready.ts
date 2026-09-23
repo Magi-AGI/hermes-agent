@@ -10,8 +10,10 @@
 // A window with no target session (a restored peer that was showing a fresh
 // chat) is ready as soon as boot is. A terminal boot failure, or the target's
 // resume being exhausted, is reported ok:false. Anything else is still pending
-// (null). The payload carries the resolved target identity so main can check
-// the window came up on the session it was asked to open.
+// (null). The payload carries the window's COMPLETE identity — the session and
+// its fully resolved owner route (profile AND connection), resolved before
+// sending — so main checks and probes exactly what the window is on, and route
+// and readiness can never arrive separately (Codex A4 round 5).
 
 export type BootFunctionalState = 'pending' | 'ready' | { error: string }
 
@@ -23,7 +25,9 @@ export interface ReopenReadyInputs {
   selected: null | string
   runtime: null | string
   exhausted: null | string
+  // The target session's resolved OWNER route (windowSessionReport).
   profile: null | string
+  connectionId: null | string
 }
 
 export interface ReopenReadyPayload {
@@ -35,31 +39,39 @@ export interface ReopenReadyPayload {
   pending?: true
   phase: 'boot' | 'pending' | 'session'
   profile: null | string
+  connectionId: null | string
   sessionId: null | string
   error?: string
 }
 
 export function reopenReadyVerdict(inputs: ReopenReadyInputs): null | ReopenReadyPayload {
-  const { boot, target, selected, runtime, exhausted, profile } = inputs
+  const { boot, target, selected, runtime, exhausted, profile, connectionId } = inputs
 
   if (boot === 'pending') {
     return null
   }
 
   if (typeof boot === 'object') {
-    return { ok: false, phase: 'boot', profile, sessionId: target, error: boot.error }
+    return { ok: false, phase: 'boot', profile, connectionId, sessionId: target, error: boot.error }
   }
 
   if (!target) {
-    return { ok: true, phase: 'boot', profile, sessionId: null }
+    return { ok: true, phase: 'boot', profile, connectionId, sessionId: null }
   }
 
   if (exhausted === target) {
-    return { ok: false, phase: 'session', profile, sessionId: target, error: `session ${target} failed to load` }
+    return {
+      ok: false,
+      phase: 'session',
+      profile,
+      connectionId,
+      sessionId: target,
+      error: `session ${target} failed to load`
+    }
   }
 
   if (selected === target && runtime) {
-    return { ok: true, phase: 'session', profile, sessionId: target }
+    return { ok: true, phase: 'session', profile, connectionId, sessionId: target }
   }
 
   return null
@@ -93,6 +105,7 @@ export function createReopenReadySignaller(send: (payload: ReopenReadyPayload) =
         pending: true as const,
         phase: 'pending' as const,
         profile: inputs.profile,
+        connectionId: inputs.connectionId,
         sessionId: inputs.target
       }),
       attempt

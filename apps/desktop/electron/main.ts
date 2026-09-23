@@ -3304,11 +3304,22 @@ function wireSessionWindowPersistence(win, windowId: string) {
   win.on('moved', schedulePersistSessionWindowsState)
   win.on('maximize', schedulePersistSessionWindowsState)
   win.on('unmaximize', schedulePersistSessionWindowsState)
-  // A (re)load re-runs boot: a verdict recorded for the previous load no longer
-  // describes the window (session-reopen-gate.ts createWindowReadinessTracker).
+  // A (re)load re-runs boot: main starts a new LOAD generation, the verdict
+  // recorded for the previous load no longer describes the window, and active
+  // reopen gates on it drop their readiness and probe (session-reopen-gate.ts
+  // createWindowReadinessTracker; Codex A4 round 5). The window's first load is
+  // generation 0 itself: this runs synchronously right after the window is
+  // created, and Electron emits did-start-loading asynchronously, so the first
+  // event seen here is always that initial load.
   const webContentsId = win.webContents.id
+  let loadsStarted = 0
 
-  win.webContents.on('did-start-loading', () => windowReadiness.forget(webContentsId))
+  win.webContents.on('did-start-loading', () => {
+    if (loadsStarted++ > 0) {
+      windowReadiness.reload(webContentsId)
+    }
+  })
+  win.webContents.on('render-process-gone', () => windowReadiness.reload(webContentsId))
   win.on('closed', () => windowReadiness.forget(webContentsId))
   // Record the window's final bounds/session as it closes — closes NEVER remove
   // its saved entry (any reason: user, taskbar, quit, OS shutdown, Close All).
@@ -14321,16 +14332,10 @@ async function runReopenEntry(entry: any): Promise<ReopenStep> {
     {
       profile: expectedProfile,
       sessionId: entry.sessionId ?? null,
-      // Existing window: its current established route. Created: the saved
-      // opening route (Codex A4 round 4 #2). Re-resolved whenever the probe
-      // re-runs for a new window identity (round 4 #1).
-      resolveProbeTarget: () =>
-        reopenProbeTarget(
-          entry,
-          windowConnectionRoutes.get(win.webContents.id),
-          expectedProfile,
-          created ? null : sessionWindows.routeOf(win)
-        ),
+      // The saved OPENING route: probed only until the window reports. From
+      // then on the gate probes exactly the route the window's report carries
+      // (Codex A4 round 5) — never the separately-reported registry route.
+      probeTarget: reopenProbeTarget(entry, windowConnectionRoutes.get(win.webContents.id), expectedProfile),
       identity: policy.identity
     },
     {
@@ -14338,7 +14343,9 @@ async function runReopenEntry(entry: any): Promise<ReopenStep> {
       probeBackendHealth: probeWindowRouteHealth,
       // An already-open window is judged by what it actually reported, not
       // assumed ready because the registry only focused it.
-      knownVerdict: windowReadiness.get(win.webContents.id)
+      knownVerdict: windowReadiness.get(win.webContents.id),
+      // Main's load generation + reload invalidation for this window.
+      readiness: windowReadiness
     }
   )
 
