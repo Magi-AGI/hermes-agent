@@ -2,76 +2,147 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { mergeSavedWindows, planSavedWindowsWrite } from './session-windows-persist-guard'
+import {
+  createSavedWindowLayout,
+  mergeSavedWindows,
+  planSavedWindowsWrite,
+  type WindowCloseReason
+} from './session-windows-persist-guard'
 
 const w = (windowId: string, sessionId = windowId, x = 0) => ({ windowId, sessionId, x })
 const ids = (entries: { windowId: string }[]) => entries.map(e => e.windowId)
 
-test('an explicit individual close removes exactly that saved entry (criterion 1)', () => {
-  const saved = [w('a'), w('b'), w('c')]
-  const { entries, removed } = mergeSavedWindows(saved, [w('a'), w('c')], ['b'])
+// A saved layout over an in-memory file, driven the way main.ts drives it.
+function harness(initial: ReturnType<typeof w>[] = []) {
+  const file = { text: JSON.stringify(initial, null, 2) as null | string, unreadable: false }
+  let open = [...initial]
 
-  assert.deepEqual(ids(entries), ['a', 'c'])
-  assert.deepEqual(removed, ['b'])
+  const layout = createSavedWindowLayout({
+    load: () =>
+      file.unreadable
+        ? { ok: false as const, error: 'unparsable' }
+        : { ok: true as const, entries: file.text ? JSON.parse(file.text) : [] },
+    write: text => {
+      file.text = text
+    },
+    live: () => open
+  })
+
+  return {
+    layout,
+    file,
+    saved: () => ids(JSON.parse(file.text || '[]')),
+    open: (...entries: ReturnType<typeof w>[]) => {
+      open = [...open, ...entries]
+      layout.persist()
+    },
+    close: (windowId: string, reason: WindowCloseReason) => {
+      layout.onWindowClosed(windowId, reason)
+      open = open.filter(e => e.windowId !== windowId)
+      layout.persist()
+    },
+    forgetAndClose: (windowId: string) => {
+      open = open.filter(e => e.windowId !== windowId)
+      layout.forget(windowId)
+    }
+  }
+}
+
+const EVERY_CLOSE: WindowCloseReason[] = [
+  'user-x',
+  'user-ctrl-w',
+  'user-alt-f4',
+  'taskbar-close',
+  'taskbar-close-all',
+  'app-quit',
+  'os-shutdown',
+  'crash',
+  'destroy',
+  'close-all-session-windows',
+  'reopen-teardown'
+]
+
+// ─── Lake: closes never remove ───────────────────────────────────────────────
+
+for (const reason of EVERY_CLOSE) {
+  test(`closing a window (${reason}) never removes its saved entry`, () => {
+    const h = harness()
+
+    h.open(w('a'), w('b'))
+    h.close('a', reason)
+    assert.deepEqual(h.saved(), ['a', 'b'])
+  })
+}
+
+test('closing every window, one after another, keeps them all', () => {
+  const h = harness()
+
+  h.open(w('a'), w('b'), w('c'))
+
+  for (const id of ['a', 'b', 'c']) {
+    h.close(id, 'user-x')
+  }
+
+  assert.deepEqual(h.saved(), ['a', 'b', 'c'])
 })
 
-test('closing the last window individually empties the list', () => {
-  assert.deepEqual(mergeSavedWindows([w('a')], [], ['a']).entries, [])
+test('a normally closed window comes back on Reopen (its saved entry is read back)', () => {
+  const h = harness()
+
+  h.open(w('a', 's1', 40), w('b'))
+  h.close('a', 'user-x')
+
+  const reopened = JSON.parse(h.file.text || '[]')
+
+  assert.deepEqual(reopened.find(e => e.windowId === 'a'), w('a', 's1', 40))
 })
 
-test('windows that are simply not open (quit, crash, never reopened) are never removed', () => {
-  const saved = [w('a'), w('b'), w('c')]
+// ─── Close and Forget This Window: the only removal ─────────────────────────
 
-  assert.deepEqual(ids(mergeSavedWindows(saved, [], []).entries), ['a', 'b', 'c'])
-  assert.deepEqual(ids(mergeSavedWindows(saved, [w('b')], []).entries), ['a', 'b', 'c'])
+test('Forget removes exactly that entry (and the window is closed)', () => {
+  const h = harness()
+
+  h.open(w('a'), w('b'), w('c'))
+  h.forgetAndClose('b')
+  assert.deepEqual(h.saved(), ['a', 'c'])
 })
 
-test('after a cascade, a write that only ADDS windows goes through (new windows always recorded)', () => {
-  // The saved list is larger than the live set (a partial crash cascade left it
-  // that way); the user now opens two new windows. Under the old count guard
-  // (saved 21 vs live 3) this write was refused forever.
-  const saved = Array.from({ length: 21 }, (_, i) => w(`s${i}`))
-  const live = [saved[0], w('new-1'), w('new-2')]
-  const { entries, removed } = mergeSavedWindows(saved, live, [])
+test('a forgotten window that is still closing is never re-recorded', () => {
+  const h = harness([w('a'), w('b')])
 
-  assert.equal(entries.length, 23)
-  assert.deepEqual(ids(entries).slice(-2), ['new-1', 'new-2'])
-  assert.deepEqual(removed, [])
+  // forget() runs before the window finishes closing: it is still live here.
+  h.layout.forget('b')
+  assert.deepEqual(h.saved(), ['a'])
 })
 
-test('live windows update their own entry in place, keyed per window (criterion 2)', () => {
-  const saved = [w('x', 's1', 0), w('y', 's1', 0)]
-  const { entries } = mergeSavedWindows(saved, [w('y', 's1', 50)], [])
+test('Forget on an unreadable state file writes nothing and keeps the forget pending', () => {
+  const h = harness([w('a'), w('b')])
 
-  assert.deepEqual(entries, [w('x', 's1', 0), w('y', 's1', 50)])
+  h.file.unreadable = true
+  const before = h.file.text
+
+  assert.equal(h.layout.forget('b'), false)
+  assert.equal(h.file.text, before, 'nothing written over the unreadable file')
+  assert.equal(h.layout.isForgotten('b'), true, 'the forget is retained')
+
+  h.file.unreadable = false
+  assert.equal(h.layout.persist(), true)
+  assert.deepEqual(h.saved(), ['a'], 'applied on the next successful write')
+  assert.equal(h.layout.isForgotten('b'), false)
 })
 
-test('several individually-intended closes in one write are all removed (no count/timing verdict)', () => {
-  const saved = [w('a'), w('b'), w('c')]
-  const { entries, removed } = mergeSavedWindows(saved, [w('d')], ['a', 'b'])
+// ─── merge / plan ────────────────────────────────────────────────────────────
 
-  assert.deepEqual(ids(entries), ['c', 'd'])
-  assert.deepEqual(removed, ['a', 'b'])
+test('live windows update their own entry in place and new windows are appended', () => {
+  const { entries } = mergeSavedWindows([w('x', 's1', 0), w('y', 's1', 0)], [w('y', 's1', 50), w('z')], [])
+
+  assert.deepEqual(entries, [w('x', 's1', 0), w('y', 's1', 50), w('z')])
 })
 
-test('a cascade (crash, quit, destroy) produces no close ids, so nothing is removed', () => {
-  const saved = Array.from({ length: 21 }, (_, i) => w(`s${i}`))
-
-  assert.equal(mergeSavedWindows(saved, [saved[0]], []).entries.length, 21)
-})
-
-// ─── Codex A4 #2: a failed read never erases the layout ──────────────────────
-
-test('a failed load writes nothing and retains the pending close decisions', () => {
-  const plan = planSavedWindowsWrite({ ok: false, error: 'unparsable' }, [w('new')], ['a'])
-
-  assert.deepEqual(plan, { write: null, clearClosed: false, error: 'unparsable' })
-})
-
-test('a successful load merges, writes when changed, and clears applied closes', () => {
-  const plan = planSavedWindowsWrite({ ok: true, entries: [w('a'), w('b')] }, [w('b')], ['a'])
-
-  assert.equal(plan.clearClosed, true)
-  assert.deepEqual(JSON.parse(plan.write), [w('b')])
-  assert.equal(planSavedWindowsWrite({ ok: true, entries: [w('a')] }, [w('a')], []).write, null, 'unchanged: no write')
+test('a failed load writes nothing and retains pending forgets', () => {
+  assert.deepEqual(planSavedWindowsWrite({ ok: false, error: 'unparsable' }, [w('new')], ['a']), {
+    write: null,
+    clearForgets: false,
+    error: 'unparsable'
+  })
 })

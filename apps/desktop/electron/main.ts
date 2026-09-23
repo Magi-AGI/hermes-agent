@@ -423,7 +423,6 @@ import {
   reopenProbeTarget,
   waitForSessionWindowFunctionallyReady
 } from './session-reopen-gate'
-import { createCloseIntentTracker } from './session-window-close-intent'
 import {
   buildInstanceWindowUrl,
   buildSessionWindowUrl,
@@ -438,7 +437,7 @@ import {
   sessionWindowIdForOpen,
   toSavedWindowEntry
 } from './session-windows'
-import { planSavedWindowsWrite } from './session-windows-persist-guard'
+import { createSavedWindowLayout, type WindowCloseReason } from './session-windows-persist-guard'
 import { ensureLoginShellPath } from './shell-path'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
 import { collectSshConfigHosts, parseSshGOutput } from './ssh-config'
@@ -3241,66 +3240,54 @@ function readSessionWindowsState() {
   return loaded.entries
 }
 
-// Window ids whose explicit individual-close INTENT was recorded and which then
-// actually closed (session-window-close-intent.ts). Only these are removed from
-// the saved layout; a quit, crash, destroy or our own programmatic close never
-// lands here.
-const pendingClosedWindowIds = new Set<string>()
+// Windows the user chose to "Close and Forget": never recorded again while they
+// finish closing.
+const forgottenWindows = new WeakSet<object>()
 
-const closeIntent = createCloseIntentTracker()
-
-// Merges the live, non-watch restorable windows (session pop-outs and peers)
-// into the saved layout — see session-windows-persist-guard.ts. The saved list
-// is never re-derived from the live set: a window that is simply not open
-// (quit, crash, never reopened) keeps its entry; only an explicit individual
-// close removes one; new windows are always recorded. Watch windows are never
-// saved (the subagent run they spectate may not exist after a restart).
-function persistSessionWindowsState() {
-  // Pending close decisions are cleared ONLY after a write succeeds (or is a
-  // no-op); a failed read or write retains them for the next attempt.
-  const closed = Array.from(pendingClosedWindowIds)
-
-  try {
-    const live = sessionWindows
+// The saved layout (session-windows-persist-guard.ts). Lake's rule: CLOSES NEVER
+// REMOVE — no close of any kind removes a saved entry; only "Close and Forget
+// This Window" does. Live, non-watch restorable windows (pop-outs and peers) are
+// merged in; watch windows are never saved (the subagent run they spectate may
+// not exist after a restart).
+const savedWindowLayout = createSavedWindowLayout({
+  load: () => loadSessionWindowsState(),
+  write: text => {
+    fs.mkdirSync(path.dirname(SESSION_WINDOWS_STATE_PATH), { recursive: true })
+    writeFileAtomic(SESSION_WINDOWS_STATE_PATH, text)
+  },
+  live: () =>
+    sessionWindows
       .entries()
-      .filter(({ watch }) => !watch)
-      .map(entry =>
-        entry.win.isDestroyed() ? null : toSavedWindowEntry(entry, entry.win.getNormalBounds(), entry.win.isMaximized())
-      )
-      .filter(Boolean)
+      .filter(({ watch, win }) => !watch && !forgottenWindows.has(win) && !win.isDestroyed())
+      .map(entry => toSavedWindowEntry(entry, entry.win.getNormalBounds(), entry.win.isMaximized())),
+  log: rememberLog
+})
 
-    const plan = planSavedWindowsWrite(loadSessionWindowsState(), live, closed)
+function persistSessionWindowsState() {
+  savedWindowLayout.persist()
+}
 
-    if (plan.error) {
-      // Only a MISSING file means an empty layout. A read/parse failure must not
-      // be replaced by a merge over [] — that would erase every saved window.
-      rememberLog(`[session-windows-state] not writing: cannot read saved layout (${plan.error})`)
+// "Close and Forget This Window" (Window menu, CommandOrControl+Alt+W): the ONLY
+// way a saved window entry is removed. Removes the entry (refused, and kept
+// pending, while the state file is unreadable) and then closes the window.
+function forgetAndCloseWindow(win: BrowserWindow | null | undefined) {
+  const windowId = win && !win.isDestroyed() ? sessionWindows.windowIdOf(win) : null
 
-      return
-    }
-
-    if (plan.write !== null) {
-      fs.mkdirSync(path.dirname(SESSION_WINDOWS_STATE_PATH), { recursive: true })
-      writeFileAtomic(SESSION_WINDOWS_STATE_PATH, plan.write)
-    }
-
-    if (plan.clearClosed) {
-      for (const id of closed) {
-        pendingClosedWindowIds.delete(id)
-      }
-    }
-  } catch (err) {
-    rememberLog(`[session-windows-state] persist failed: ${err?.message || err}`)
+  if (!win || !windowId) {
+    return
   }
+
+  forgottenWindows.add(win)
+  savedWindowLayout.forget(windowId)
+  win.close()
 }
 
 const schedulePersistSessionWindowsState = debounce(persistSessionWindowsState, 250)
 
 
-// Set true in the before-quit handler. A quit must NOT shrink the saved set — the user's workflow is
-// "every active session is an open pop-out somewhere", so quitting should
-// preserve the whole layout for the next "reopen saved windows". Only a
-// deliberate single-window close while the app keeps running removes a session.
+// Set true in the before-quit handler (past the "Keep Running" gate): lets a
+// window's close be labelled as part of the quit. Closes never remove saved
+// entries either way.
 let appIsQuitting = false
 
 // Wired only onto keyed, non-watch session windows (watch windows are excluded
@@ -3314,25 +3301,20 @@ function wireSessionWindowPersistence(win, windowId: string) {
   win.on('moved', schedulePersistSessionWindowsState)
   win.on('maximize', schedulePersistSessionWindowsState)
   win.on('unmaximize', schedulePersistSessionWindowsState)
-  // Individual-close intent (see session-window-close-intent.ts for exactly
-  // which paths count): recorded on the cancellable 'close', committed on
-  // 'closed'. OS logout/shutdown latches "no individual closes from here on".
   // A (re)load re-runs boot: a verdict recorded for the previous load no longer
   // describes the window (session-reopen-gate.ts createWindowReadinessTracker).
   const webContentsId = win.webContents.id
 
   win.webContents.on('did-start-loading', () => windowReadiness.forget(webContentsId))
   win.on('closed', () => windowReadiness.forget(webContentsId))
-  win.on('close', () => closeIntent.onClose(win, windowId, { quitting: appIsQuitting }))
-  win.on('query-session-end', () => closeIntent.markShuttingDown())
-  win.on('session-end', () => closeIntent.markShuttingDown())
-  win.on('closed', () => {
-    if (!closeIntent.onClosed(win, windowId, { quitting: appIsQuitting })) {
-      return
-    }
+  // Record the window's final bounds/session as it closes — closes NEVER remove
+  // its saved entry (any reason: user, taskbar, quit, OS shutdown, Close All).
+  win.on('close', () => {
+    if (!forgottenWindows.has(win)) {
+      const reason: WindowCloseReason = appIsQuitting ? 'app-quit' : 'user-x'
 
-    pendingClosedWindowIds.add(windowId)
-    schedulePersistSessionWindowsState()
+      savedWindowLayout.onWindowClosed(windowId, reason)
+    }
   })
 }
 
@@ -7526,6 +7508,14 @@ function buildApplicationMenu() {
   // literals too (the renderer's i18n framework isn't available in the main
   // process).
   const sessionWindowMenuItems = [
+    // The ONLY way to remove a saved window (closes never do; Lake). Not Ctrl+W
+    // (the close-tab/window keybind, which preserves) and not Ctrl+Shift+W (the
+    // renderer's view.closeTerminal default).
+    {
+      label: 'Close and Forget This Window',
+      accelerator: 'CommandOrControl+Alt+W',
+      click: (_item, focused) => forgetAndCloseWindow(focused as BrowserWindow | undefined)
+    },
     { label: 'Close All Session Windows', click: () => closeAllSessionWindows() },
     {
       label: 'Reopen Saved Session Windows',
@@ -14176,16 +14166,14 @@ function createSessionWindow(sessionId, { profile = null, watch = false, bounds,
 // Closes every secondary session window — keyed pop-outs AND watch/spectator
 // windows — via the secondaryWindows Set (never BrowserWindow.getAllWindows(),
 // so the primary/pet-overlay/hidden windows can't be touched). Writes the
-// current layout to disk BEFORE closing anything, then marks every window as a
-// programmatic close, so none of them records an individual-close intent and
-// every saved entry is preserved (session-window-close-intent.ts).
+// current layout to disk BEFORE closing anything; closes never remove saved
+// entries, so every window comes back on Reopen (session-windows-persist-guard.ts).
 function closeAllSessionWindows() {
   schedulePersistSessionWindowsState.flush()
 
   for (const win of Array.from(secondaryWindows)) {
     if (win && !win.isDestroyed()) {
       // Our own close: never an individual-close intent (entries preserved).
-      closeIntent.markProgrammatic(win, sessionWindows.windowIdOf(win) ?? undefined)
       win.close()
     }
   }
@@ -14361,7 +14349,6 @@ async function runReopenQueue(entries: any[]) {
       if (!win.isDestroyed()) {
         // Not an explicit user close: its saved entry must survive (it is
         // retained for retry below).
-        closeIntent.markProgrammatic(win, sessionWindows.windowIdOf(win) ?? undefined)
         win.destroy()
       }
 
