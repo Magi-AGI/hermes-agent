@@ -102,6 +102,7 @@ model-options/listing never wait on probes (cdacc2bcf1, cb24121a8e).
 - Next: A4 (desktop session windows + e5b7b1d336, 7f39779443, 82972e687a), then phase 2b auth redesign, Group 2, Pass A remainder, Pass B.
 
 ## Decisions log
+- 2026-09-23 A4 review stopping rule (Lake): after Codex round 6, any further A4 findings that are NOT blockers go to a documented residuals list instead of another fix round; A4 then moves to Lake's live check. Blockers are still fixed.
 - 2026-09-23 R1 (registry lag after a mid-turn rotation; second window can claim the new id in active_sessions.json while the durable turn lease still serializes its turns): Lake chose option (c), accept and document. Both reviewers endorsed (c) or (a) and rejected (b) (synchronous handoff: deadlock risk, no data-safety gain). Revisit (a) (async re-anchor frame) only if it shows up in practice.
 
 ## Order
