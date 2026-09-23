@@ -101,11 +101,23 @@ export function createSavedWindowLayout<T extends SavedWindow>(deps: {
 
   // Pending forgets are cleared ONLY after a write succeeds (or is a no-op); a
   // failed read or write retains them for the next attempt.
+  // The latest state of every window seen live since the last successful write
+  // (Codex A4 round 3 #5). Additions/updates are retained exactly like pending
+  // forgets: while the file is unreadable, a window opened and then closed must
+  // not vanish once reading recovers — its last snapshot (incl. the one taken
+  // as it closes) is written then.
+  const pendingSnapshots = new Map<string, T>()
+
   function persist(): boolean {
+    for (const entry of deps.live()) {
+      pendingSnapshots.set(entry.windowId, entry)
+    }
+
     const forgets = Array.from(pendingForgets)
+    const snapshots = Array.from(pendingSnapshots.values())
 
     try {
-      const plan = planSavedWindowsWrite(deps.load(), deps.live(), forgets)
+      const plan = planSavedWindowsWrite(deps.load(), snapshots, forgets)
 
       if (plan.error) {
         deps.log?.(`[session-windows-state] not writing: cannot read saved layout (${plan.error})`)
@@ -119,6 +131,12 @@ export function createSavedWindowLayout<T extends SavedWindow>(deps: {
 
       for (const id of forgets) {
         pendingForgets.delete(id)
+      }
+
+      for (const entry of snapshots) {
+        if (pendingSnapshots.get(entry.windowId) === entry) {
+          pendingSnapshots.delete(entry.windowId)
+        }
       }
 
       return true

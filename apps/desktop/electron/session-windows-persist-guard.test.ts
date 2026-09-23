@@ -146,3 +146,18 @@ test('a failed load writes nothing and retains pending forgets', () => {
     error: 'unparsable'
   })
 })
+
+// ─── Codex A4 round 3 #5: additions survive an unreadable file ───────────────
+
+test('a window opened and closed while the file is unreadable is written once reading recovers', () => {
+  const h = harness([w('a')])
+
+  h.file.unreadable = true
+  h.open(w('c', 's-c', 70))
+  h.close('c', 'user-x')
+  assert.equal(h.saved().includes('c'), false, 'nothing written while unreadable')
+
+  h.file.unreadable = false
+  assert.equal(h.layout.persist(), true)
+  assert.deepEqual(JSON.parse(h.file.text || '[]'), [w('a'), w('c', 's-c', 70)])
+})
