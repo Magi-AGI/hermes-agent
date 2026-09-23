@@ -232,19 +232,45 @@ def record_turn_lease_loss(agent, holder: Optional[str]) -> None:
         agent._turn_lease_lost_holder = holder
 
 
-def on_turn_lease_lost(agent, holder: Optional[str],
-                       message: str = "Session turn lease lost; stopping to protect the transcript.") -> None:
-    """A transcript/compression write was refused for turn-lease loss: record the token it presented
-    (so late writers stay fenced) and stop the turn, like the refresher does."""
-    if agent is None:
-        return
-    record_turn_lease_loss(agent, holder)
+_LEASE_LOST_MESSAGE = "Session turn lease lost; stopping to protect the transcript."
+
+
+def _hard_interrupt_for_lease_loss(agent, message: str) -> None:
     try:
         agent.interrupt(message, hard_cancel=True, tool_reason=_REASON_LEASE_LOST)
     except Exception:
         agent._interrupt_requested = True
         agent._interrupt_message = message
         agent._tool_interrupt_reason = _REASON_LEASE_LOST
+
+
+def on_turn_lease_lost(agent, holder: Optional[str], message: str = _LEASE_LOST_MESSAGE) -> None:
+    """A transcript/compression write was refused for turn-lease loss: record the token it presented
+    (so late writers stay fenced) and stop the turn, like the refresher does.
+
+    The record is immediate. The hard interrupt is NOT delivered while a compression commit is in
+    flight: ``interrupt(hard_cancel=True)`` waits for that commit's fence, and when the refusal came
+    from inside the commit the thread would wait on itself (review: Codex, sync bucket C). It is
+    parked instead and delivered by the fence owner right after ``finish_commit``
+    (:func:`deliver_pending_lease_loss_interrupt`)."""
+    if agent is None:
+        return
+    record_turn_lease_loss(agent, holder)
+    fence = vars(agent).get("_active_compression_commit_fence") if hasattr(agent, "__dict__") else None
+    if fence is not None and bool(getattr(fence, "commit_in_flight", False)):
+        agent._pending_lease_loss_interrupt = message
+        return
+    _hard_interrupt_for_lease_loss(agent, message)
+
+
+def deliver_pending_lease_loss_interrupt(agent) -> None:
+    """Deliver a lease-loss interrupt parked during a compression commit; call after the commit
+    fence is released."""
+    message = getattr(agent, "_pending_lease_loss_interrupt", None)
+    if not message:
+        return
+    agent._pending_lease_loss_interrupt = None
+    _hard_interrupt_for_lease_loss(agent, message)
 
 
 @dataclass

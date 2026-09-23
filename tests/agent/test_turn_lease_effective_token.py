@@ -226,3 +226,44 @@ def test_a_live_refresher_still_records_the_loss(agent_db):
     lease.turn_active = True
     lease._interrupt_turn("Session turn lease lost; stopping to protect the transcript.")
     assert agent._turn_lease_lost_holder == "old-executor"
+
+
+# --- review round 4 (Codex): no self-deadlock inside a compression commit ---------------------------
+
+def test_a_loss_detected_inside_a_compression_commit_does_not_deadlock(agent_db):
+    """Real CompressionCommitFence + real interrupt(): a refusal detected INSIDE the commit (fence
+    lock held by this thread) records the loss at once and parks the hard interrupt; the fence
+    owner delivers it after finish_commit. Delivering it inside waited on this very fence."""
+    import threading
+    from agent.conversation_compression import CompressionCommitFence
+    from agent.turn_facade_lease import deliver_pending_lease_loss_interrupt, on_turn_lease_lost
+    agent, _db = agent_db
+    fence = CompressionCommitFence()
+    agent._active_compression_commit_fence = fence
+    assert fence.begin_commit()
+    done = threading.Event()
+
+    def _inside_commit():
+        on_turn_lease_lost(agent, "old-executor")   # what the commit's except handler does
+        done.set()
+
+    worker = threading.Thread(target=_inside_commit, daemon=True)
+    worker.start()
+    finished = done.wait(10.0)
+    try:
+        assert finished, "on_turn_lease_lost blocked on the commit fence it was called under"
+        assert agent._turn_lease_lost_holder == "old-executor", "the loss is recorded immediately"
+        assert agent._pending_lease_loss_interrupt, "the hard interrupt is parked, not dropped"
+    finally:
+        fence.finish_commit()
+    deliver_pending_lease_loss_interrupt(agent)
+    assert getattr(agent, "_interrupt_requested", False) is True
+    assert agent._pending_lease_loss_interrupt is None
+
+
+def test_outside_a_commit_the_interrupt_is_immediate(agent_db):
+    from agent.turn_facade_lease import on_turn_lease_lost
+    agent, _db = agent_db
+    on_turn_lease_lost(agent, "old-executor")
+    assert getattr(agent, "_interrupt_requested", False) is True
+    assert not getattr(agent, "_pending_lease_loss_interrupt", None)

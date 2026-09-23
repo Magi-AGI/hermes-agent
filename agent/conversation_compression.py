@@ -4164,6 +4164,10 @@ def compress_context(
         finally:
             if _commit_fence_entered:
                 commit_fence.finish_commit()
+            # A lease loss detected inside the commit parks its hard interrupt (delivering it there
+            # would wait on this very fence); the fence is released now.
+            from agent.turn_facade_lease import deliver_pending_lease_loss_interrupt
+            deliver_pending_lease_loss_interrupt(agent)
 
 
 def _codex_compaction_cooldown_remaining(agent: Any) -> float:
