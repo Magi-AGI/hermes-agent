@@ -427,14 +427,14 @@ import {
   computeSessionWindowOptions,
   createSessionWindowRegistry,
   instanceWindowBounds,
+  loadSavedWindowsFile,
   newWindowId,
-  readSavedWindowEntries,
   SESSION_WINDOW_MIN_HEIGHT,
   SESSION_WINDOW_MIN_WIDTH,
   sessionWindowIdForOpen,
   toSavedWindowEntry
 } from './session-windows'
-import { mergeSavedWindows } from './session-windows-persist-guard'
+import { planSavedWindowsWrite } from './session-windows-persist-guard'
 import { ensureLoginShellPath } from './shell-path'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
 import { collectSshConfigHosts, parseSshGOutput } from './ssh-config'
@@ -3219,12 +3219,22 @@ const schedulePersistWindowState = debounce(persistWindowState, 250)
 // menu / command palette) — never automatically on Desktop launch, so closing
 // a pop-out never gets silently un-done by the next restart.
 
+function loadSessionWindowsState() {
+  return loadSavedWindowsFile(() => fs.readFileSync(SESSION_WINDOWS_STATE_PATH, 'utf8'))
+}
+
+// Reopen's read: an unreadable file reopens nothing (and is logged); it is never
+// rewritten from here.
 function readSessionWindowsState() {
-  try {
-    return readSavedWindowEntries(JSON.parse(fs.readFileSync(SESSION_WINDOWS_STATE_PATH, 'utf8')))
-  } catch {
+  const loaded = loadSessionWindowsState()
+
+  if ('error' in loaded) {
+    rememberLog(`[session-windows-state] cannot read saved layout (${loaded.error}); nothing to reopen`)
+
     return []
   }
+
+  return loaded.entries
 }
 
 // Window ids whose explicit individual-close INTENT was recorded and which then
@@ -3242,9 +3252,9 @@ const closeIntent = createCloseIntentTracker()
 // close removes one; new windows are always recorded. Watch windows are never
 // saved (the subagent run they spectate may not exist after a restart).
 function persistSessionWindowsState() {
+  // Pending close decisions are cleared ONLY after a write succeeds (or is a
+  // no-op); a failed read or write retains them for the next attempt.
   const closed = Array.from(pendingClosedWindowIds)
-
-  pendingClosedWindowIds.clear()
 
   try {
     const live = sessionWindows
@@ -3255,17 +3265,26 @@ function persistSessionWindowsState() {
       )
       .filter(Boolean)
 
-    const saved = readSessionWindowsState()
-    const { entries } = mergeSavedWindows(saved, live, closed)
+    const plan = planSavedWindowsWrite(loadSessionWindowsState(), live, closed)
 
-    const next = JSON.stringify(entries, null, 2)
+    if (plan.error) {
+      // Only a MISSING file means an empty layout. A read/parse failure must not
+      // be replaced by a merge over [] — that would erase every saved window.
+      rememberLog(`[session-windows-state] not writing: cannot read saved layout (${plan.error})`)
 
-    if (next === JSON.stringify(saved, null, 2)) {
       return
     }
 
-    fs.mkdirSync(path.dirname(SESSION_WINDOWS_STATE_PATH), { recursive: true })
-    writeFileAtomic(SESSION_WINDOWS_STATE_PATH, next)
+    if (plan.write !== null) {
+      fs.mkdirSync(path.dirname(SESSION_WINDOWS_STATE_PATH), { recursive: true })
+      writeFileAtomic(SESSION_WINDOWS_STATE_PATH, plan.write)
+    }
+
+    if (plan.clearClosed) {
+      for (const id of closed) {
+        pendingClosedWindowIds.delete(id)
+      }
+    }
   } catch (err) {
     rememberLog(`[session-windows-state] persist failed: ${err?.message || err}`)
   }

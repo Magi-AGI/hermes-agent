@@ -387,6 +387,40 @@ function sanitizeSessionWindowEntry(raw?: any) {
   }
 }
 
+// Loads session-windows-state.json. ONLY a missing file (ENOENT) means an empty
+// layout; any other read error, unparsable JSON or a non-array is a FAILURE, and
+// the caller must not write a replacement (it would erase the saved layout; Codex
+// A4 review). `read` is injected (fs.readFileSync in main.ts) for unit tests.
+function loadSavedWindowsFile(
+  read: () => string
+): { entries: ReturnType<typeof readSavedWindowEntries>; ok: true } | { error: string; ok: false } {
+  let text: string
+
+  try {
+    text = read()
+  } catch (err: any) {
+    if (err?.code === 'ENOENT') {
+      return { ok: true, entries: [] }
+    }
+
+    return { ok: false, error: `read failed: ${err?.message || err}` }
+  }
+
+  let raw: unknown
+
+  try {
+    raw = JSON.parse(text)
+  } catch (err: any) {
+    return { ok: false, error: `unparsable: ${err?.message || err}` }
+  }
+
+  if (!Array.isArray(raw)) {
+    return { ok: false, error: 'not a list' }
+  }
+
+  return { ok: true, entries: readSavedWindowEntries(raw) }
+}
+
 // Read side of the saved list: sanitize every entry and keep window ids unique
 // (a hand-edited or legacy file with two `legacy:` rows for one session keeps
 // both, suffixing the later id).
@@ -425,6 +459,7 @@ export {
   computeSessionWindowOptions,
   createSessionWindowRegistry,
   instanceWindowBounds,
+  loadSavedWindowsFile,
   newWindowId,
   readSavedWindowEntries,
   type RestorableWindowKind,

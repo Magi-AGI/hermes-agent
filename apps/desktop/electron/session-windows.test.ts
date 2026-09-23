@@ -8,6 +8,7 @@ import {
   chatWindowWebPreferences,
   createSessionWindowRegistry,
   instanceWindowBounds,
+  loadSavedWindowsFile,
   readSavedWindowEntries,
   sanitizeSessionWindowEntry,
   sessionWindowIdForOpen,
@@ -448,4 +449,31 @@ test('a legacy session-keyed state file migrates forward without losing entries'
   assert.deepEqual(read.map(e => e.sessionId), ['s1', 's2', 's1'])
   assert.equal(new Set(read.map(e => e.windowId)).size, 3, 'every migrated entry has its own window id')
   assert.deepEqual(readSavedWindowEntries(legacy).map(e => e.windowId), read.map(e => e.windowId), 'ids are stable across reads')
+})
+
+// ─── Codex A4 #2: only ENOENT means an empty layout ──────────────────────────
+
+test('a missing state file is an empty layout', () => {
+  const missing = () => {
+    throw Object.assign(new Error('nope'), { code: 'ENOENT' })
+  }
+
+  assert.deepEqual(loadSavedWindowsFile(missing), { ok: true, entries: [] })
+})
+
+test('any other read failure, unparsable JSON or a non-list is a FAILURE, never an empty layout', () => {
+  const locked = () => {
+    throw Object.assign(new Error('busy'), { code: 'EBUSY' })
+  }
+
+  assert.equal(loadSavedWindowsFile(locked).ok, false)
+  assert.equal(loadSavedWindowsFile(() => '{"truncated": ').ok, false)
+  assert.equal(loadSavedWindowsFile(() => '{"not": "a list"}').ok, false)
+})
+
+test('a readable file loads its entries', () => {
+  const loaded = loadSavedWindowsFile(() => JSON.stringify([{ windowId: 'a', kind: 'session', sessionId: 's', ...BOUNDS }]))
+
+  assert.equal(loaded.ok, true)
+  assert.equal(loaded.ok && loaded.entries.length, 1)
 })

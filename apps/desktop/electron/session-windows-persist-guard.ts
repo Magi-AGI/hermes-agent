@@ -54,3 +54,23 @@ export function mergeSavedWindows<T extends SavedWindow>(
 
   return { entries, removed }
 }
+
+/**
+ * One persist decision. A failed load (anything but a missing file — see
+ * loadSavedWindowsFile) writes nothing and RETAINS the pending close decisions
+ * for the next attempt; otherwise the merged list is written when it changed,
+ * and the applied close decisions may be cleared once that write succeeds.
+ */
+export function planSavedWindowsWrite<T extends SavedWindow>(
+  loaded: { entries: T[]; ok: true } | { error: string; ok: false },
+  live: T[],
+  closedIds: string[]
+): { clearClosed: boolean; error?: string; write: null | string } {
+  if ('error' in loaded) {
+    return { write: null, clearClosed: false, error: loaded.error }
+  }
+
+  const next = JSON.stringify(mergeSavedWindows(loaded.entries, live, closedIds).entries, null, 2)
+
+  return { write: next === JSON.stringify(loaded.entries, null, 2) ? null : next, clearClosed: true }
+}

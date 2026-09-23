@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { mergeSavedWindows } from './session-windows-persist-guard'
+import { mergeSavedWindows, planSavedWindowsWrite } from './session-windows-persist-guard'
 
 const w = (windowId: string, sessionId = windowId, x = 0) => ({ windowId, sessionId, x })
 const ids = (entries: { windowId: string }[]) => entries.map(e => e.windowId)
@@ -58,4 +58,20 @@ test('a cascade (crash, quit, destroy) produces no close ids, so nothing is remo
   const saved = Array.from({ length: 21 }, (_, i) => w(`s${i}`))
 
   assert.equal(mergeSavedWindows(saved, [saved[0]], []).entries.length, 21)
+})
+
+// ─── Codex A4 #2: a failed read never erases the layout ──────────────────────
+
+test('a failed load writes nothing and retains the pending close decisions', () => {
+  const plan = planSavedWindowsWrite({ ok: false, error: 'unparsable' }, [w('new')], ['a'])
+
+  assert.deepEqual(plan, { write: null, clearClosed: false, error: 'unparsable' })
+})
+
+test('a successful load merges, writes when changed, and clears applied closes', () => {
+  const plan = planSavedWindowsWrite({ ok: true, entries: [w('a'), w('b')] }, [w('b')], ['a'])
+
+  assert.equal(plan.clearClosed, true)
+  assert.deepEqual(JSON.parse(plan.write), [w('b')])
+  assert.equal(planSavedWindowsWrite({ ok: true, entries: [w('a')] }, [w('a')], []).write, null, 'unchanged: no write')
 })
