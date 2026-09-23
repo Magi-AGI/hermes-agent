@@ -237,3 +237,12 @@ not reproduced end-to-end through a live compute host.
 - **R4: G3 detection latency** (parent-guard 3 confirmations + orphan drain up to 10s) still exists, but
   it bounds only how long an orphaned child keeps running, not whether its writes can interleave with
   a successor's (they cannot, per above).
+
+## Open item (explicit): Yuanbao recall redaction
+
+`gateway/platforms/yuanbao.py:530` (`_redact`) rewrites the WHOLE transcript (`rewrite_transcript(...,
+active_only=True)`) without `reject_active_turn_lease`. Deferred because Lake does not use the
+Yuanbao adapter, but it is NOT safe merely because redaction is a privacy action (Codex): a
+whole-transcript rewrite can delete unrelated concurrent messages, and a stale writer could restore
+recalled content. The eventual fix is a targeted, transactional redaction of the one recalled row,
+fenced so stale writers cannot re-insert it. Stays open until fixed or the adapter is disabled.

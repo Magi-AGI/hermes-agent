@@ -3313,6 +3313,13 @@ def _carry_session_state_to_child(agent: Any, old_session_id: str, old_title: An
             agent._session_db.set_session_title_source(agent.session_id, _src)
 
 
+def _effective_turn_lease_holder(agent: Any) -> Optional[str]:
+    """Every compression writer presents the same ownership token as transcript flushes: the active
+    holder, else a recorded lost holder (review: Codex, sync bucket C)."""
+    from agent.turn_facade_lease import effective_turn_lease_holder
+    return effective_turn_lease_holder(agent)
+
+
 def _compression_child_source(agent: Any, parent_session_id: str) -> str:
     """The parent row's persisted source: a compression child is the same conversation, so a ``--source tool``,
     ``oneshot`` or inherited ``kanban`` label must not degrade to the bare ``agent.platform`` (#112550)."""
@@ -3377,7 +3384,7 @@ def _publish_rotated_compaction(
         require_lease_refresh=lease.holder is not None, lease_ttl_seconds=lease.ttl,
         watermark=(lease.watermark if _foreign_tail_ceiling is not None else None),
         watermark_ceiling=_foreign_tail_ceiling,
-        turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
+        turn_lease_holder=_effective_turn_lease_holder(agent),
     )
     # `already_present` stamping is done by run_agent's _sync_persisted_markers;
     # this branch covers inserted/merged only; direct callers must use that wrapper.
@@ -3681,7 +3688,7 @@ def _commit_compaction(
                     agent.session_id, compressed, model_config_patch={PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None},
                     watermark=lease.watermark, lock_holder=lease.holder,
                     tail_count=sum(1 for m in compressed if id(m) in _tail_tagged_ids),
-                    turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
+                    turn_lease_holder=_effective_turn_lease_holder(agent),
                 )
                 split_status = "in_place_committed"
                 # compress() returned marker-swept copies; stamp them as persisted or the next

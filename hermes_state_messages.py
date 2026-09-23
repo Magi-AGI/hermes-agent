@@ -366,19 +366,23 @@ class SessionMessagesMixin:
     def append_messages_batch(
         self, session_id: str, messages: List[Dict[str, Any]], compression_lock_holder: Optional[str] = None,
         turn_lease_holder: Optional[str] = None, chunk_rows: Optional[int] = None,
-        turn_lease_ttl_seconds: float = 300.0) -> int:
+        turn_lease_ttl_seconds: float = 300.0, reject_active_turn_lease: bool = False) -> int:
         """Append *messages* in ONE write txn (all rows land or none, guards run once); returns the inserted
-        count. ``chunk_rows`` bounds txn size for LARGE copies (branch seeds; FTS triggers run per row)."""
+        count. ``chunk_rows`` bounds txn size for LARGE copies (branch seeds; FTS triggers run per row).
+        ``reject_active_turn_lease`` (holder-less writers only) refuses while another turn holds the
+        conversation, instead of skipping the lease check."""
         if not messages:
             return 0
         if chunk_rows is not None and len(messages) > chunk_rows:
             return sum(self.append_messages_batch(session_id, messages[start:start + chunk_rows],
                     compression_lock_holder=compression_lock_holder, turn_lease_holder=turn_lease_holder,
-                    turn_lease_ttl_seconds=turn_lease_ttl_seconds)
+                    turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+                    reject_active_turn_lease=reject_active_turn_lease)
                 for start in range(0, len(messages), chunk_rows))
         def _do(conn):
             self._check_transcript_write_guards(conn, session_id, compression_lock_holder,
-                turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds)
+                turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+                reject_active_turn_lease=reject_active_turn_lease and not turn_lease_holder)
             from agent.transcript_repair import resolve_and_repair_transcript_batch
             inserted_rows = resolve_and_repair_transcript_batch(conn, session_id, messages,
                 encode_content_fn=self._encode_content, decode_content_fn=self._decode_content)

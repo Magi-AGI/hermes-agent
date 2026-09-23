@@ -268,18 +268,19 @@ def _db_flush_write(agent, batch_rows: List[Dict[str, Any]], batch_msgs: List[Di
     from hermes_state_errors import SessionTurnLeaseLostError
     if not batch_rows:
         return
-    holder = getattr(agent, "_active_session_turn_lease_holder", None) or getattr(
-        agent, "_turn_lease_lost_holder", None)
+    from agent.turn_facade_lease import effective_turn_lease_holder, record_turn_lease_loss
+    holder = effective_turn_lease_holder(agent)
     try:
         agent._session_db.append_messages_batch(
             session_id=agent.session_id, messages=batch_rows,
             compression_lock_holder=getattr(agent, "_active_compression_lock_holder", None),
             turn_lease_holder=holder,
             turn_lease_ttl_seconds=getattr(agent, "_active_session_turn_lease_ttl_seconds", 300.0) or 300.0,
+            # With no token at all, never write into another process's live turn.
+            reject_active_turn_lease=not holder,
         )
     except SessionTurnLeaseLostError:
-        if holder:
-            agent._turn_lease_lost_holder = holder
+        record_turn_lease_loss(agent, holder)
         raise
     sync_flushed_message_markers(batch_msgs, batch_rows)
     if _newest_checkpoint_carrier(batch_msgs, "codex_reasoning_items") >= 0:

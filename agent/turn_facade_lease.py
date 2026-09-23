@@ -196,6 +196,7 @@ class DurableTurnLease:
             logger.error(
                 "Lost session turn lease while turn is active: %s", self._current_session_id()
             )
+            record_turn_lease_loss(self.agent, self.holder)
             self._interrupt_turn("Session turn lease lost; stopping to protect the transcript.")
         except Exception:
             if self.stop.is_set():
@@ -203,10 +204,29 @@ class DurableTurnLease:
             logger.warning(
                 "Failed to refresh session turn lease: %s", self._current_session_id(), exc_info=True,
             )
+            # Ownership is now unproven: fence late writers with this holder (a still-valid lease
+            # admits it; a successor's does not).
+            record_turn_lease_loss(self.agent, self.holder)
             self._interrupt_turn(
                 "Session turn lease could not be refreshed; stopping to protect the transcript."
             )
         return False
+
+
+def effective_turn_lease_holder(agent) -> Optional[str]:
+    """The ownership token every transcript/compression writer must present: the active lease holder,
+    else the holder whose loss was recorded (sticky until a new lease is FULLY admitted). A recorded
+    loss therefore keeps fencing late writers after turn cleanup clears the active holder, and after
+    a DB error or a failed re-admission (review: Codex, sync bucket C)."""
+    return getattr(agent, "_active_session_turn_lease_holder", None) or getattr(
+        agent, "_turn_lease_lost_holder", None)
+
+
+def record_turn_lease_loss(agent, holder: Optional[str]) -> None:
+    """Record that *holder* may no longer own the conversation. Safe to call on mere suspicion: a
+    writer presenting a holder that still owns the lease is admitted as before."""
+    if holder:
+        agent._turn_lease_lost_holder = holder
 
 
 @dataclass
@@ -286,8 +306,6 @@ def admit_durable_turn_lease(
     lease = DurableTurnLease(agent, db, session_id, holder)
     agent._active_session_turn_lease_holder = holder
     agent._active_session_turn_lease_ttl_seconds = LEASE_TTL_SECONDS
-    # A freshly admitted lease ends the sticky ownership-loss fence (agent/session_persistence.py).
-    agent._turn_lease_lost_holder = None
     try:
         if waited:
             agent._emit_status("Session is free; loading the latest transcript...")
@@ -311,9 +329,12 @@ def admit_durable_turn_lease(
             admission.conversation_history = reloaded
         lease.build_threads()
     except BaseException:
-        # The façade never saw this lease; release here so an admitted row is not leaked.
+        # The façade never saw this lease; release here so an admitted row is not leaked. Any recorded
+        # ownership loss stays in place: a failed re-admission must not erase the fence.
         lease.release()
         raise
+    # Only a FULLY admitted lease (reload + setup done) ends the sticky ownership-loss fence.
+    agent._turn_lease_lost_holder = None
     admission.lease = lease
     return admission
 
