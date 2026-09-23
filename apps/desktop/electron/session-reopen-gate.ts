@@ -56,32 +56,59 @@ export interface ReopenGateDeps {
   // backends, and already handles credentialed/auth-gated probes correctly).
   probeBackendHealth: (profile: string | null, signal: AbortSignal) => Promise<void>
   timeoutMs?: number
+  // The window's already-recorded verdict (createWindowReadinessTracker), if it
+  // reported before this wait began (an already-open window).
+  knownVerdict?: FunctionalReadyPayload | null
 }
 
-// `created` distinguishes a window the registry actually spawned from one it
-// merely focused (session-windows.ts: openOrFocus's `created` flag). ONLY a
-// focused, pre-existing window is safe to resolve immediately — it already
-// finished its boot sequence and won't re-run it, so it will never emit a new
-// functional-ready signal. A newly-created window must always be proven, and
-// must NEVER be fast-pathed via `!win.webContents.isLoading()` — Electron
-// gives no synchronous guarantee that a just-constructed window's
-// isLoading() reads true before its navigation actually starts, so that
-// check (the previous gate's approach) could spuriously resolve on tick 0 for
-// a brand-new window too, not just a genuinely pre-existing one.
+// Every window's latest functional-ready verdict, recorded for the life of the
+// app (Codex A4 #4). The reopen queue used to trust `created: false` (a window
+// it only focused) as ready, which is wrong for a window that is still booting
+// or already failed. A window reports once per load (useReopenReadySignal), so
+// an already-open window's verdict is looked up here; one that has not reported
+// yet is waited for like a new window.
+export function createWindowReadinessTracker(ipcMain: ReopenGateIpcMain) {
+  const verdicts = new Map<number, FunctionalReadyPayload>()
+
+  ipcMain.on(FUNCTIONAL_READY_CHANNEL, (event: { sender: { id: number } }, payload: FunctionalReadyPayload) => {
+    if (event?.sender && typeof event.sender.id === 'number') {
+      verdicts.set(event.sender.id, payload)
+    }
+  })
+
+  return {
+    get: (webContentsId: number) => verdicts.get(webContentsId) ?? null,
+    // A reload re-runs boot: its old verdict no longer describes the window.
+    forget: (webContentsId: number) => void verdicts.delete(webContentsId)
+  }
+}
+
+// Runs one reopen at a time: a request while one is active joins it instead of
+// starting a second, overlapping queue (Codex A4 #4).
+export function createSingleFlight<T>(run: () => Promise<T>) {
+  let active: Promise<T> | null = null
+
+  return () => {
+    if (!active) {
+      active = run().finally(() => {
+        active = null
+      })
+    }
+
+    return active
+  }
+}
+
 export function waitForSessionWindowFunctionallyReady(
   win: ReopenGateWindow,
-  { created, profile, sessionId }: { created: boolean; profile: string | null; sessionId?: null | string },
+  { profile, sessionId }: { profile: string | null; sessionId?: null | string },
   deps: ReopenGateDeps
 ): Promise<ReopenGateResult> {
-  if (!created) {
-    return Promise.resolve({ ok: true })
-  }
-
   if (win.isDestroyed()) {
     return Promise.resolve({ ok: true })
   }
 
-  const { ipcMain, probeBackendHealth, timeoutMs = REOPEN_WINDOW_READY_TIMEOUT_MS } = deps
+  const { ipcMain, knownVerdict, probeBackendHealth, timeoutMs = REOPEN_WINDOW_READY_TIMEOUT_MS } = deps
   const wcId = win.webContents.id
   const controller = new AbortController()
 
@@ -182,6 +209,10 @@ export function waitForSessionWindowFunctionallyReady(
     }, timeoutMs)
 
     ipcMain.on(FUNCTIONAL_READY_CHANNEL, onReady)
+
+    if (knownVerdict) {
+      onReady({ sender: { id: wcId } }, knownVerdict)
+    }
 
     win.webContents.once(
       'did-fail-load',

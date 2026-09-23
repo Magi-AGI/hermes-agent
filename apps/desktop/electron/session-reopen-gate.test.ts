@@ -2,7 +2,11 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { waitForSessionWindowFunctionallyReady } from './session-reopen-gate'
+import {
+  createSingleFlight,
+  createWindowReadinessTracker,
+  waitForSessionWindowFunctionallyReady
+} from './session-reopen-gate'
 
 // A minimal fake ipcMain: tracks listeners per channel and lets a test fire
 // one, mirroring the slice of Electron's ipcMain the gate actually touches.
@@ -80,29 +84,13 @@ function makeControllable() {
   return { promise, resolve, reject }
 }
 
-test('created === false resolves immediately without waiting on anything', async () => {
-  const ipcMain = makeFakeIpcMain()
-  const win = makeFakeWindow()
-
-  const result = await waitForSessionWindowFunctionallyReady(
-    win as any,
-    { created: false, profile: 'default' },
-    { ipcMain, probeBackendHealth: neverSettles }
-  )
-
-  assert.deepEqual(result, { ok: true })
-  // Never registered a listener at all -- a focused, pre-existing window
-  // never gets isLoading()-style or any other readiness check applied to it.
-  assert.equal(ipcMain.listenerCount('hermes:window:functional-ready'), 0)
-})
-
-test('created === true never fast-paths on window state -- it waits for an explicit signal', async () => {
+test('a window with no recorded verdict never fast-paths on window state -- it waits for an explicit signal', async () => {
   const ipcMain = makeFakeIpcMain()
   const win = makeFakeWindow()
 
   const pending = waitForSessionWindowFunctionallyReady(
     win as any,
-    { created: true, profile: 'default' },
+    { profile: 'default' },
     { ipcMain, probeBackendHealth: () => Promise.resolve(), timeoutMs: 200 }
   )
 
@@ -124,7 +112,7 @@ test('functional-ready ok:false stops the queue for this window', async () => {
 
   const pending = waitForSessionWindowFunctionallyReady(
     win as any,
-    { created: true, profile: 'claudetriad' },
+    { profile: 'claudetriad' },
     { ipcMain, probeBackendHealth: neverSettles, timeoutMs: 200 }
   )
 
@@ -147,7 +135,7 @@ test('ok:true for the WRONG profile does not release the queue', async () => {
 
   const pending = waitForSessionWindowFunctionallyReady(
     win as any,
-    { created: true, profile: 'claudetriad' },
+    { profile: 'claudetriad' },
     { ipcMain, probeBackendHealth: neverSettles, timeoutMs: 200 }
   )
 
@@ -169,7 +157,7 @@ test('ok:true with no profile field on the payload is treated as "default", and 
 
   const pending = waitForSessionWindowFunctionallyReady(
     win as any,
-    { created: true, profile: null },
+    { profile: null },
     { ipcMain, probeBackendHealth: () => Promise.resolve(), timeoutMs: 200 }
   )
 
@@ -187,7 +175,7 @@ test('a signal from a different window (different webContents id) is ignored', a
 
   const pending = waitForSessionWindowFunctionallyReady(
     win as any,
-    { created: true, profile: 'default' },
+    { profile: 'default' },
     { ipcMain, probeBackendHealth: neverSettles, timeoutMs: 30 }
   )
 
@@ -210,7 +198,7 @@ test('health gating is delegated to the injected probe, not a raw fetch', async 
 
   const pending = waitForSessionWindowFunctionallyReady(
     win as any,
-    { created: true, profile: 'claudetriad' },
+    { profile: 'claudetriad' },
     {
       ipcMain,
       probeBackendHealth: (profile, signal) => {
@@ -250,7 +238,7 @@ test('renderer success does NOT short-circuit a still-pending health probe -- a 
 
   const pending = waitForSessionWindowFunctionallyReady(
     win as any,
-    { created: true, profile: 'claudetriad' },
+    { profile: 'claudetriad' },
     { ipcMain, probeBackendHealth: () => health.promise, timeoutMs: 5_000 }
   )
 
@@ -273,7 +261,7 @@ test('renderer success followed by health TIMEOUT still fails closed, not a sile
 
   const pending = waitForSessionWindowFunctionallyReady(
     win as any,
-    { created: true, profile: 'default' },
+    { profile: 'default' },
     { ipcMain, probeBackendHealth: neverSettles, timeoutMs: 20 }
   )
 
@@ -293,7 +281,7 @@ test('both signals succeeding resolves ok:true regardless of arrival order (rend
 
   const pending = waitForSessionWindowFunctionallyReady(
     win as any,
-    { created: true, profile: 'default' },
+    { profile: 'default' },
     { ipcMain, probeBackendHealth: () => health.promise, timeoutMs: 5_000 }
   )
 
@@ -314,7 +302,7 @@ test('both signals succeeding resolves ok:true regardless of arrival order (heal
 
   const pending = waitForSessionWindowFunctionallyReady(
     win as any,
-    { created: true, profile: 'default' },
+    { profile: 'default' },
     { ipcMain, probeBackendHealth: () => health.promise, timeoutMs: 5_000 }
   )
 
@@ -334,7 +322,7 @@ test('a rejecting health probe fails the window closed, even with no renderer si
 
   const result = await waitForSessionWindowFunctionallyReady(
     win as any,
-    { created: true, profile: 'claudetriad' },
+    { profile: 'claudetriad' },
     {
       ipcMain,
       probeBackendHealth: () => Promise.reject(new Error('backend never became healthy')),
@@ -352,7 +340,7 @@ test('timeout path fails closed with a reported reason, not a silent resolve', a
 
   const result = await waitForSessionWindowFunctionallyReady(
     win as any,
-    { created: true, profile: 'default' },
+    { profile: 'default' },
     { ipcMain, probeBackendHealth: neverSettles, timeoutMs: 20 }
   )
 
@@ -369,7 +357,7 @@ test('a main-frame did-fail-load fails closed without waiting out the full timeo
 
   const pending = waitForSessionWindowFunctionallyReady(
     win as any,
-    { created: true, profile: 'default' },
+    { profile: 'default' },
     { ipcMain, probeBackendHealth: neverSettles, timeoutMs: 5_000 }
   )
 
@@ -390,7 +378,7 @@ test('a non-main-frame did-fail-load is ignored (an iframe/subresource failing i
 
   const pending = waitForSessionWindowFunctionallyReady(
     win as any,
-    { created: true, profile: 'default' },
+    { profile: 'default' },
     { ipcMain, probeBackendHealth: neverSettles, timeoutMs: 20 }
   )
 
@@ -410,7 +398,7 @@ test('the window closing mid-wait resolves ok -- a closed window is not a backen
 
   const pending = waitForSessionWindowFunctionallyReady(
     win as any,
-    { created: true, profile: 'default' },
+    { profile: 'default' },
     { ipcMain, probeBackendHealth: neverSettles, timeoutMs: 5_000 }
   )
 
@@ -430,7 +418,7 @@ test('an already-destroyed window resolves immediately without registering any l
 
   const result = await waitForSessionWindowFunctionallyReady(
     win as any,
-    { created: true, profile: 'default' },
+    { profile: 'default' },
     { ipcMain, probeBackendHealth: neverSettles }
   )
 
@@ -444,7 +432,7 @@ test('ok:true on a DIFFERENT session than the one the window was asked to open f
 
   const pending = waitForSessionWindowFunctionallyReady(
     win as any,
-    { created: true, profile: 'default', sessionId: 's-target' },
+    { profile: 'default', sessionId: 's-target' },
     { ipcMain, probeBackendHealth: () => Promise.resolve(), timeoutMs: 500 }
   )
 
@@ -463,7 +451,7 @@ test('ok:true on the expected session releases the queue', async () => {
 
   const pending = waitForSessionWindowFunctionallyReady(
     win as any,
-    { created: true, profile: 'default', sessionId: 's-target' },
+    { profile: 'default', sessionId: 's-target' },
     { ipcMain, probeBackendHealth: () => Promise.resolve(), timeoutMs: 500 }
   )
 
@@ -471,4 +459,90 @@ test('ok:true on the expected session releases the queue', async () => {
   ipcMain.emit('hermes:window:functional-ready', { sender: { id: 1 } }, { ok: true, profile: 'default', sessionId: 's-target' })
 
   assert.equal((await pending).ok, true)
+})
+
+// ─── Codex A4 #4: real per-window readiness; one reopen at a time ────────────
+
+test('an already-open window that reported ready is judged by its recorded verdict', async () => {
+  const ipcMain = makeFakeIpcMain()
+  const readiness = createWindowReadinessTracker(ipcMain)
+  const win = makeFakeWindow()
+
+  ipcMain.emit('hermes:window:functional-ready', { sender: { id: 1 } }, { ok: true, profile: 'default', sessionId: 's1' })
+
+  const result = await waitForSessionWindowFunctionallyReady(
+    win as any,
+    { profile: 'default', sessionId: 's1' },
+    { ipcMain, probeBackendHealth: () => Promise.resolve(), knownVerdict: readiness.get(1), timeoutMs: 500 }
+  )
+
+  assert.deepEqual(result, { ok: true })
+})
+
+test('an already-open window that FAILED is not treated as ready just because it was only focused', async () => {
+  const ipcMain = makeFakeIpcMain()
+  const readiness = createWindowReadinessTracker(ipcMain)
+  const win = makeFakeWindow()
+
+  ipcMain.emit('hermes:window:functional-ready', { sender: { id: 1 } }, { ok: false, error: 'boot failed' })
+
+  const result = await waitForSessionWindowFunctionallyReady(
+    win as any,
+    { profile: 'default' },
+    { ipcMain, probeBackendHealth: () => Promise.resolve(), knownVerdict: readiness.get(1), timeoutMs: 500 }
+  )
+
+  assert.equal(result.ok, false)
+  assert.match(result.reason ?? '', /boot failed/)
+})
+
+test('an already-open window that has not reported yet (still booting) is waited for', async () => {
+  const ipcMain = makeFakeIpcMain()
+  const readiness = createWindowReadinessTracker(ipcMain)
+  const win = makeFakeWindow()
+
+  const result = await waitForSessionWindowFunctionallyReady(
+    win as any,
+    { profile: 'default' },
+    { ipcMain, probeBackendHealth: () => Promise.resolve(), knownVerdict: readiness.get(1), timeoutMs: 50 }
+  )
+
+  assert.equal(result.ok, false)
+  assert.match(result.reason ?? '', /timed out/)
+})
+
+test('a reload forgets the previous verdict', () => {
+  const ipcMain = makeFakeIpcMain()
+  const readiness = createWindowReadinessTracker(ipcMain)
+
+  ipcMain.emit('hermes:window:functional-ready', { sender: { id: 7 } }, { ok: true })
+  assert.deepEqual(readiness.get(7), { ok: true })
+  readiness.forget(7)
+  assert.equal(readiness.get(7), null)
+})
+
+test('concurrent Reopen requests share one queue', async () => {
+  let runs = 0
+  let release!: () => void
+
+  const reopen = createSingleFlight(async () => {
+    runs += 1
+    await new Promise<void>(resolve => {
+      release = resolve
+    })
+  })
+
+  const first = reopen()
+  const second = reopen()
+
+  assert.equal(first, second, 'the second request joins the active queue')
+  release()
+  await first
+  assert.equal(runs, 1)
+
+  const third = reopen()
+
+  release()
+  await third
+  assert.equal(runs, 2, 'a request after the queue finished starts a new one')
 })

@@ -416,6 +416,8 @@ import {
 } from './secret-storage-policy'
 import { describeGitSpawnFailure, GIT_UNUSABLE, selectRunnableBinary } from './select-runnable-binary'
 import {
+  createSingleFlight,
+  createWindowReadinessTracker,
   REOPEN_WINDOW_SETTLE_MS,
   waitForSessionWindowFunctionallyReady
 } from './session-reopen-gate'
@@ -3313,6 +3315,12 @@ function wireSessionWindowPersistence(win, windowId: string) {
   // Individual-close intent (see session-window-close-intent.ts for exactly
   // which paths count): recorded on the cancellable 'close', committed on
   // 'closed'. OS logout/shutdown latches "no individual closes from here on".
+  // A (re)load re-runs boot: a verdict recorded for the previous load no longer
+  // describes the window (session-reopen-gate.ts createWindowReadinessTracker).
+  const webContentsId = win.webContents.id
+
+  win.webContents.on('did-start-loading', () => windowReadiness.forget(webContentsId))
+  win.on('closed', () => windowReadiness.forget(webContentsId))
   win.on('close', () => closeIntent.onClose(win, windowId, { quitting: appIsQuitting }))
   win.on('query-session-end', () => closeIntent.markShuttingDown())
   win.on('session-end', () => closeIntent.markShuttingDown())
@@ -14210,6 +14218,9 @@ function closeAllSessionWindows() {
 // resumeReopenSessionWindows() call — see notifyReopenHalted below.
 let pendingReopenEntries: any[] | null = null
 
+// Every window's functional-ready verdict (see createWindowReadinessTracker).
+const windowReadiness = createWindowReadinessTracker(ipcMain)
+
 // v1 scope: profile-only lookup. session-windows-state.json persists
 // sessionId/geometry/profile only (see persistSessionWindowsState) — there is
 // no connectionId/registry-scoped routing in the persisted surface today, so
@@ -14247,14 +14258,16 @@ function notifyReopenHalted(payload: {
 // Explicit-action entry point: "Reopen Saved Session Windows" always starts
 // fresh from the current disk state, discarding any halted queue left over
 // from a previous attempt (that's what resumeReopenSessionWindows is for).
-async function reopenSessionWindows() {
+// One reopen at a time: a second Reopen (menu, palette, IPC) while one runs
+// joins it rather than starting an overlapping queue.
+const reopenSessionWindows = createSingleFlight(async () => {
   pendingReopenEntries = null
   await runReopenQueue(readSessionWindowsState())
-}
+})
 
 // Continues a queue a previous reopenSessionWindows() call halted partway
 // through (see notifyReopenHalted). A no-op if there's nothing pending.
-async function resumeReopenSessionWindows(): Promise<{ ok: boolean; error?: string }> {
+const resumeReopenSessionWindows = createSingleFlight(async (): Promise<{ ok: boolean; error?: string }> => {
   if (!pendingReopenEntries || pendingReopenEntries.length === 0) {
     return { ok: false, error: 'nothing to resume' }
   }
@@ -14265,7 +14278,7 @@ async function resumeReopenSessionWindows(): Promise<{ ok: boolean; error?: stri
   await runReopenQueue(entries)
 
   return { ok: true }
-}
+})
 
 async function runReopenQueue(entries: any[]) {
   const displays = screen.getAllDisplays()
@@ -14315,7 +14328,7 @@ async function runReopenQueue(entries: any[]) {
       continue
     }
 
-    const { win, created } = opened
+    const { win } = opened
 
     if (!win || win.isDestroyed()) {
       continue
@@ -14323,8 +14336,14 @@ async function runReopenQueue(entries: any[]) {
 
     const result = await waitForSessionWindowFunctionallyReady(
       win,
-      { created, profile: expectedProfile, sessionId: entry.sessionId ?? null },
-      { ipcMain, probeBackendHealth: probeProfileBackendHealth }
+      { profile: expectedProfile, sessionId: entry.sessionId ?? null },
+      {
+        ipcMain,
+        probeBackendHealth: probeProfileBackendHealth,
+        // An already-open window is judged by what it actually reported, not
+        // assumed ready because the registry only focused it.
+        knownVerdict: windowReadiness.get(win.webContents.id)
+      }
     )
 
     if (!result.ok) {
