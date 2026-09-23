@@ -208,6 +208,11 @@ def prewarm_picker_cache_async() -> Optional["_threading.Thread"]:
     return t
 
 
+# Slightly above the longest individual provider fetch's own nominal timeout (10s, Codex) so
+# well-behaved providers get a fair chance to finish before the caller gives up on the batch.
+_PREFETCH_OVERALL_TIMEOUT_S = 12.0
+
+
 def _prefetch_provider_models_parallel(provider_slugs: list[str]) -> None:
     """Fetch stale/missing provider catalogs in parallel before the serial picker loop.
 
@@ -250,10 +255,22 @@ def _prefetch_provider_models_parallel(provider_slugs: list[str]) -> None:
         except Exception:
             pass  # best-effort; picker falls back to curated list
 
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=min(8, len(stale_slugs)), thread_name_prefix="model-cache-prefetch",
-    ) as executor:
-        list(executor.map(_fetch_one, stale_slugs))
+    # Bounded overall wait, deliberately NOT `with ThreadPoolExecutor(...) as executor:` /
+    # `list(executor.map(...))` — both block indefinitely if a single provider fetch never
+    # returns. Each provider fetch already carries its own 5-10s timeout, but that per-call
+    # timeout is not reliably enforced at the socket level in every environment (observed live:
+    # a thread stuck in ssl.recv well past its nominal timeout) — this is a backstop that does
+    # not depend on those inner timeouts firing correctly. A stuck fetch's worker thread is
+    # abandoned (shutdown(wait=False)) rather than joined, so callers of this best-effort cache
+    # warm never block on it; the thread dies on its own if the underlying call ever returns.
+    # See [[hermes-rpc-worker-pool-exhaustion]] investigation, 2026-09-08/09.
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(8, len(stale_slugs)), thread_name_prefix="model-cache-prefetch")
+    try:
+        futures = [executor.submit(_fetch_one, slug) for slug in stale_slugs]
+        concurrent.futures.wait(futures, timeout=_PREFETCH_OVERALL_TIMEOUT_S)
+    finally:
+        executor.shutdown(wait=False)
 
 
 def _any_env(env_vars, read_env=os.environ.get) -> bool:
