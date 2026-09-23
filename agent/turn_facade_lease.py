@@ -248,28 +248,20 @@ def on_turn_lease_lost(agent, holder: Optional[str], message: str = _LEASE_LOST_
     """A transcript/compression write was refused for turn-lease loss: record the token it presented
     (so late writers stay fenced) and stop the turn, like the refresher does.
 
-    The record is immediate. The hard interrupt is NOT delivered while a compression commit is in
-    flight: ``interrupt(hard_cancel=True)`` waits for that commit's fence, and when the refusal came
-    from inside the commit the thread would wait on itself (review: Codex, sync bucket C). It is
-    parked instead and delivered by the fence owner right after ``finish_commit``
-    (:func:`deliver_pending_lease_loss_interrupt`)."""
+    The record is immediate. Only the thread that OWNS an in-flight compression commit defers the
+    hard interrupt: ``interrupt(hard_cancel=True)`` waits for that commit's fence, which that thread
+    holds (review: Codex, sync bucket C). It parks the interrupt on the fence itself and delivers it
+    right after its own ``finish_commit`` (same thread, sequential: no handoff race, and the slot
+    dies with that compression, so it can never reach another turn). Every other thread delivers
+    immediately, waiting out an in-flight commit exactly like any external hard cancel."""
     if agent is None:
         return
     record_turn_lease_loss(agent, holder)
     fence = vars(agent).get("_active_compression_commit_fence") if hasattr(agent, "__dict__") else None
-    if fence is not None and bool(getattr(fence, "commit_in_flight", False)):
-        agent._pending_lease_loss_interrupt = message
+    is_owner = getattr(fence, "is_commit_owner", None)
+    if callable(is_owner) and is_owner():
+        fence.park_owner_interrupt(message)
         return
-    _hard_interrupt_for_lease_loss(agent, message)
-
-
-def deliver_pending_lease_loss_interrupt(agent) -> None:
-    """Deliver a lease-loss interrupt parked during a compression commit; call after the commit
-    fence is released."""
-    message = getattr(agent, "_pending_lease_loss_interrupt", None)
-    if not message:
-        return
-    agent._pending_lease_loss_interrupt = None
     _hard_interrupt_for_lease_loss(agent, message)
 
 
