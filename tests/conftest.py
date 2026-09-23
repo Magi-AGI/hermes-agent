@@ -59,6 +59,11 @@ if str(PROJECT_ROOT) not in sys.path:
 # would silently stop protecting the operator's actual ~/.hermes (#69385).
 _PRE_SANDBOX_KANBAN_OVERRIDE = os.environ.get("HERMES_KANBAN_HOME", "").strip()
 _PRE_SANDBOX_HERMES_HOME = os.environ.get("HERMES_HOME", "")
+# Magi: real live roots exported by scripts/run_tests_isolated.py, which redirects LOCALAPPDATA into a
+# sandbox (so the platform-default root would otherwise point at the sandbox). Additive deny roots.
+_ENV_LIVE_ROOTS = tuple(
+    Path(x).expanduser().resolve()
+    for x in os.environ.get("HERMES_TEST_LIVE_ROOTS", "").split(os.pathsep) if x.strip())
 
 
 def _hermes_home_points_at_production(value: str) -> bool:
@@ -876,10 +881,14 @@ def _kanban_write_guard(_hermetic_environment, monkeypatch):
                 .expanduser()
                 .resolve()
             )
-        try:
-            resolved.relative_to(_REAL_KANBAN_ROOT)
-        except ValueError:
-            # Resolved path is NOT under the real root — safe to write.
+        for _root in (_REAL_KANBAN_ROOT, *_ENV_LIVE_ROOTS):
+            try:
+                resolved.relative_to(_root)
+                break
+            except ValueError:
+                continue
+        else:
+            # Resolved path is NOT under any real root — safe to write.
             return _orig_connect(db_path, *args, **kwargs)
         raise RuntimeError(
             f"kanban_write_guard: kanban DB path resolved to {resolved}, "
@@ -924,6 +933,7 @@ def _state_db_write_guard(request, monkeypatch):
         extra_roots.append(
             Path(_PRE_SANDBOX_HERMES_HOME).expanduser().resolve()
         )
+    extra_roots.extend(_ENV_LIVE_ROOTS)
     monkeypatch.setattr(
         _hs, "_STATE_DB_GUARD_EXTRA_DENY_ROOTS", tuple(extra_roots)
     )

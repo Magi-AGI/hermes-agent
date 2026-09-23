@@ -188,6 +188,7 @@ def _default_db_path() -> Path:
 # and ``_EXTRA_DENY_ROOTS`` (the pre-sandbox root, so custom-HERMES_HOME deployments are covered).
 _STATE_DB_GUARD_BYPASS = False
 _STATE_DB_GUARD_EXTRA_DENY_ROOTS: Tuple[Path, ...] = ()
+_TEST_LIVE_ROOTS_ENV = "HERMES_TEST_LIVE_ROOTS"
 
 
 def _ensure_test_isolation(db_path: Path) -> None:
@@ -204,7 +205,11 @@ def _ensure_test_isolation(db_path: Path) -> None:
     except Exception:
         return
     roots = [r for r in (_real_platform_state_root(),) if r is not None]
-    for extra in _STATE_DB_GUARD_EXTRA_DENY_ROOTS:
+    # Magi: a test runner that redirects LOCALAPPDATA (so default-root resolution lands in a sandbox)
+    # also moves _real_platform_state_root() into the sandbox; it exports the REAL roots here, which
+    # every child inherits. Additive only: a value here can widen the deny list, never narrow it.
+    env_roots = [x for x in os.environ.get(_TEST_LIVE_ROOTS_ENV, "").split(os.pathsep) if x.strip()]
+    for extra in (*_STATE_DB_GUARD_EXTRA_DENY_ROOTS, *env_roots):
         try:
             roots.append(Path(extra).expanduser().resolve())
         except Exception:
