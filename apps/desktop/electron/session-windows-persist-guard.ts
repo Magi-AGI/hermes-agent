@@ -1,25 +1,18 @@
 /**
  * Computes the next saved session-window layout (session-windows-state.json).
  *
- * Lake's rules (sync A4):
- * - A saved entry is removed ONLY by an explicit individual close of that
- *   window — never by age, count, app shutdown or a bulk close.
- * - Writes that add windows always go through, even after a crash cascade:
- *   new windows are always recorded.
- * - A write that would remove more than one saved entry at once is refused
- *   (a cascade, not a deliberate close); its additions/updates still apply.
+ * Lake's rules (sync A4): never lose a saved window; remove one ONLY after an
+ * explicit individual close; always record new windows.
  *
- * So the saved list is a MERGE, never re-derived from the live windows: live
- * windows update their own entry (by per-window id) or are appended, saved
- * entries whose windows are not open stay, and only the ids in `closedIds`
- * (the windows individually closed since the last write, gathered by main.ts
- * over one debounce) can be removed.
- *
- * Previously the list was re-derived from the live set and a count guard
- * refused any write more than one smaller than the saved list. After a
- * partial crash cascade that guard kept refusing EVERY later write,
- * including ones that only added new windows, until the live count caught
- * back up (history: hermes-session-window-list-wipe.md, 21/31/13 -> 1).
+ * The saved list is a MERGE, never re-derived from the live windows: live
+ * windows update their own entry (by per-window id) or are appended; saved
+ * entries whose windows are not open (quit, crash, destroy, never reopened)
+ * stay; only `closedIds` are removed. `closedIds` must hold ONLY windows whose
+ * individual-close intent was recorded (session-window-close-intent.ts) — the
+ * cascade protection is that a quit, crash, destroy or programmatic close never
+ * produces an id here, not a timing or count heuristic (the earlier 250ms-batch
+ * refusal deleted two deliberate closes 300ms apart and kept two deliberate
+ * closes 200ms apart; Codex A4 review).
  */
 interface SavedWindow {
   windowId: string
@@ -29,17 +22,22 @@ export function mergeSavedWindows<T extends SavedWindow>(
   saved: T[],
   live: T[],
   closedIds: Iterable<string>
-): { entries: T[]; refusedRemovals: string[] } {
+): { entries: T[]; removed: string[] } {
   const liveById = new Map(live.map(entry => [entry.windowId, entry]))
-  const closed = Array.from(new Set(closedIds)).filter(id => !liveById.has(id))
-  const removable = new Set(closed.length === 1 ? closed : [])
-  const refusedRemovals = closed.length > 1 ? closed.filter(id => saved.some(e => e.windowId === id)) : []
+  const removable = new Set(Array.from(closedIds).filter(id => !liveById.has(id)))
 
   const entries: T[] = []
+  const removed: string[] = []
   const seen = new Set<string>()
 
   for (const entry of saved) {
-    if (removable.has(entry.windowId) || seen.has(entry.windowId)) {
+    if (removable.has(entry.windowId)) {
+      removed.push(entry.windowId)
+
+      continue
+    }
+
+    if (seen.has(entry.windowId)) {
       continue
     }
 
@@ -54,5 +52,5 @@ export function mergeSavedWindows<T extends SavedWindow>(
     }
   }
 
-  return { entries, refusedRemovals }
+  return { entries, removed }
 }

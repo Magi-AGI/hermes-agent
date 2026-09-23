@@ -419,6 +419,7 @@ import {
   REOPEN_WINDOW_SETTLE_MS,
   waitForSessionWindowFunctionallyReady
 } from './session-reopen-gate'
+import { createCloseIntentTracker } from './session-window-close-intent'
 import {
   buildInstanceWindowUrl,
   buildSessionWindowUrl,
@@ -3226,10 +3227,13 @@ function readSessionWindowsState() {
   }
 }
 
-// Window ids closed INDIVIDUALLY since the last write (see
-// wireSessionWindowPersistence). One debounce batch with more than one close is
-// a cascade, not a deliberate close, and mergeSavedWindows refuses its removals.
+// Window ids whose explicit individual-close INTENT was recorded and which then
+// actually closed (session-window-close-intent.ts). Only these are removed from
+// the saved layout; a quit, crash, destroy or our own programmatic close never
+// lands here.
 const pendingClosedWindowIds = new Set<string>()
+
+const closeIntent = createCloseIntentTracker()
 
 // Merges the live, non-watch restorable windows (session pop-outs and peers)
 // into the saved layout — see session-windows-persist-guard.ts. The saved list
@@ -3252,14 +3256,7 @@ function persistSessionWindowsState() {
       .filter(Boolean)
 
     const saved = readSessionWindowsState()
-    const { entries, refusedRemovals } = mergeSavedWindows(saved, live, closed)
-
-    if (refusedRemovals.length > 0) {
-      rememberLog(
-        `[session-windows-state] ${refusedRemovals.length} windows closed in one batch (a cascade, not a ` +
-          'deliberate close) — keeping their saved entries'
-      )
-    }
+    const { entries } = mergeSavedWindows(saved, live, closed)
 
     const next = JSON.stringify(entries, null, 2)
 
@@ -3276,20 +3273,8 @@ function persistSessionWindowsState() {
 
 const schedulePersistSessionWindowsState = debounce(persistSessionWindowsState, 250)
 
-// Windows whose upcoming 'closed' event must NOT trigger the individual
-// per-window persistence flush below. closeAllSessionWindows() (see near
-// secondaryWindows/reopenSessionWindows) writes one atomic pre-close-all
-// snapshot before tearing anything down, then marks every window it's about
-// to close here — otherwise each window's own 'closed' handler would fire in
-// turn, recompute from the registry (which excludes destroyed windows), and
-// progressively shrink session-windows-state.json down to a partial or empty
-// set as the sweep works through them, overwriting the very snapshot the
-// close-all sweep just wrote. Self-cleans: each entry is consumed by its own
-// 'closed' handler below.
-const suppressPersistOnClose = new Set()
 
-// Set true in the before-quit handler. A quit (or a taskbar "close all windows"
-// that quits the app) must NOT shrink the saved set — the user's workflow is
+// Set true in the before-quit handler. A quit must NOT shrink the saved set — the user's workflow is
 // "every active session is an open pop-out somewhere", so quitting should
 // preserve the whole layout for the next "reopen saved windows". Only a
 // deliberate single-window close while the app keeps running removes a session.
@@ -3306,20 +3291,17 @@ function wireSessionWindowPersistence(win, windowId: string) {
   win.on('moved', schedulePersistSessionWindowsState)
   win.on('maximize', schedulePersistSessionWindowsState)
   win.on('unmaximize', schedulePersistSessionWindowsState)
+  // Individual-close intent (see session-window-close-intent.ts for exactly
+  // which paths count): recorded on the cancellable 'close', committed on
+  // 'closed'. OS logout/shutdown latches "no individual closes from here on".
+  win.on('close', () => closeIntent.onClose(win, windowId, { quitting: appIsQuitting }))
+  win.on('query-session-end', () => closeIntent.markShuttingDown())
+  win.on('session-end', () => closeIntent.markShuttingDown())
   win.on('closed', () => {
-    if (suppressPersistOnClose.delete(win)) {
+    if (!closeIntent.onClosed(win, windowId, { quitting: appIsQuitting })) {
       return
     }
 
-    // On quit, preserve the full snapshot — don't let the close cascade shrink it.
-    if (appIsQuitting) {
-      return
-    }
-
-    // Record the explicit close and SCHEDULE (debounced), never flush: closes that
-    // land in one debounce batch are judged together, so a lone close removes
-    // its entry while a bulk close (taskbar/system tray, not via Close All)
-    // records more than one and mergeSavedWindows keeps them all.
     pendingClosedWindowIds.add(windowId)
     schedulePersistSessionWindowsState()
   })
@@ -14165,31 +14147,16 @@ function createSessionWindow(sessionId, { profile = null, watch = false, bounds,
 // Closes every secondary session window — keyed pop-outs AND watch/spectator
 // windows — via the secondaryWindows Set (never BrowserWindow.getAllWindows(),
 // so the primary/pet-overlay/hidden windows can't be touched). Writes the
-// reopenable (non-watch, keyed) snapshot to disk BEFORE closing anything, then
-// suppresses each closing window's own individual persistence flush — otherwise
-// those would fire one by one as the sweep progresses, each recomputing from the
-// (by-then-shrinking) registry, and overwrite the snapshot with a partial or
-// empty set. See suppressPersistOnClose / wireSessionWindowPersistence.
+// current layout to disk BEFORE closing anything, then marks every window as a
+// programmatic close, so none of them records an individual-close intent and
+// every saved entry is preserved (session-window-close-intent.ts).
 function closeAllSessionWindows() {
   schedulePersistSessionWindowsState.flush()
 
-  // Only keyed, non-watch windows are wired with wireSessionWindowPersistence
-  // (see createSessionWindow), so only those ever consume/delete a
-  // suppressPersistOnClose entry — adding watch windows here would just leak
-  // destroyed-window references that nothing removes.
-  const reopenable = new Set(
-    sessionWindows
-      .entries()
-      .filter(({ watch }) => !watch)
-      .map(({ win }) => win)
-  )
-
   for (const win of Array.from(secondaryWindows)) {
     if (win && !win.isDestroyed()) {
-      if (reopenable.has(win)) {
-        suppressPersistOnClose.add(win)
-      }
-
+      // Our own close: never an individual-close intent (entries preserved).
+      closeIntent.markProgrammatic(win, sessionWindows.windowIdOf(win) ?? undefined)
       win.close()
     }
   }
@@ -14359,7 +14326,7 @@ async function runReopenQueue(entries: any[]) {
       if (!win.isDestroyed()) {
         // Not an explicit user close: its saved entry must survive (it is
         // retained for retry below).
-        suppressPersistOnClose.add(win)
+        closeIntent.markProgrammatic(win, sessionWindows.windowIdOf(win) ?? undefined)
         win.destroy()
       }
 
