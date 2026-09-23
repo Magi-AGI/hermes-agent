@@ -67,8 +67,61 @@ def save_state(data: Dict[str, Any]) -> None:
         logger.debug("Failed to save curator state: %s", e, exc_info=True)
 
 
+_state_thread_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _state_lock():
+    """Serialize curator-state read-modify-writes across threads AND processes (the routine review
+    fork flags skills while a scheduled pass writes its report; a stale snapshot saved late erased
+    the newer flags). Best-effort: if the lock file cannot be opened or locked, proceed unlocked."""
+    with _state_thread_lock:
+        path = _state_file().with_name(".curator_state.lock")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fh = open(path, "a+", encoding="utf-8")
+        except OSError:
+            yield
+            return
+        with fh:
+            locked = False
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)  # retries ~10s, then raises
+                else:
+                    import fcntl
+                    fcntl.flock(fh, fcntl.LOCK_EX)
+                locked = True
+            except OSError as e:
+                logger.debug("curator state lock unavailable, proceeding unlocked: %s", e)
+            try:
+                yield
+            finally:
+                if locked:
+                    with contextlib.suppress(OSError):
+                        if os.name == "nt":
+                            import msvcrt
+                            fh.seek(0)
+                            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                        else:
+                            import fcntl
+                            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def update_state(mutate: Callable[[Dict[str, Any]], None]) -> Dict[str, Any]:
+    """Load, mutate and save the curator state under ``_state_lock``, so concurrent writers never
+    save over each other's changes with a stale snapshot. Returns the saved state."""
+    with _state_lock():
+        state = load_state()
+        mutate(state)
+        save_state(state)
+        return state
+
+
 def set_paused(paused: bool) -> None:
-    save_state({**load_state(), "paused": bool(paused)})
+    update_state(lambda state: state.__setitem__("paused", bool(paused)))
 
 
 def is_paused() -> bool:
@@ -96,13 +149,16 @@ def flag_consolidation_recommended(name: str, *, size_bytes: int, ref_count: int
     """Called by the routine-pass size-ceiling guard on every refusal. Overwriting the
     fingerprint on each call is what re-arms ``previewed`` after further growth: a fresh
     fingerprint no longer matches whatever was already previewed."""
-    flags = _ceiling_flags()
-    existing = flags.get(name) or {}
     fingerprint = [int(size_bytes), int(ref_count)]
-    if existing.get("fingerprint") == fingerprint:
-        return  # unchanged since last flag/preview — do not clear a previewed=True marker
-    flags[name] = {"fingerprint": fingerprint, "previewed": False}
-    save_state({**load_state(), "_ceiling_flags": flags})
+
+    def _mutate(state: Dict[str, Any]) -> None:
+        flags = state.get("_ceiling_flags") if isinstance(state.get("_ceiling_flags"), dict) else {}
+        if (flags.get(name) or {}).get("fingerprint") == fingerprint:
+            return  # unchanged since last flag/preview — do not clear a previewed=True marker
+        flags[name] = {"fingerprint": fingerprint, "previewed": False}
+        state["_ceiling_flags"] = flags
+
+    update_state(_mutate)
 
 
 def skills_needing_consolidation_preview() -> List[str]:
@@ -111,21 +167,35 @@ def skills_needing_consolidation_preview() -> List[str]:
     return [name for name, entry in _ceiling_flags().items() if not entry.get("previewed")]
 
 
-def mark_consolidation_previewed(name: str) -> None:
-    """Record that a preview now exists for this skill's current fingerprint — suppresses
-    re-notifying on every idle cycle until the skill grows further."""
+def consolidation_flag_fingerprints(names: List[str]) -> Dict[str, Any]:
+    """Current fingerprint of each named flag, captured when a preview is started so its completion
+    can only mark the fingerprint that was actually previewed."""
     flags = _ceiling_flags()
-    if name in flags:
-        flags[name]["previewed"] = True
-        save_state({**load_state(), "_ceiling_flags": flags})
+    return {n: (flags.get(n) or {}).get("fingerprint") for n in names if n in flags}
+
+
+def mark_consolidation_previewed(name: str, fingerprint: Any = None) -> None:
+    """Record that a preview now exists for this skill's current fingerprint — suppresses
+    re-notifying on every idle cycle until the skill grows further. With *fingerprint*, only that
+    exact fingerprint is marked: a skill that grew while its preview ran stays armed."""
+    def _mutate(state: Dict[str, Any]) -> None:
+        flags = state.get("_ceiling_flags")
+        entry = flags.get(name) if isinstance(flags, dict) else None
+        if isinstance(entry, dict) and (fingerprint is None or entry.get("fingerprint") == fingerprint):
+            entry["previewed"] = True
+
+    update_state(_mutate)
 
 
 def clear_consolidation_flag(name: str) -> None:
     """Called after a real ``--consolidate`` apply actually changes the skill — the ceiling
     guard will re-flag it from scratch if it's ever oversized again."""
-    flags = _ceiling_flags()
-    if flags.pop(name, None) is not None:
-        save_state({**load_state(), "_ceiling_flags": flags})
+    def _mutate(state: Dict[str, Any]) -> None:
+        flags = state.get("_ceiling_flags")
+        if isinstance(flags, dict):
+            flags.pop(name, None)
+
+    update_state(_mutate)
 
 
 # --- Config access ---
@@ -216,9 +286,11 @@ def should_run_now(now: Optional[datetime] = None) -> bool:
     now = now or datetime.now(timezone.utc)
     if last is None:
         try:
-            state["last_run_at"] = now.isoformat()
-            state["last_run_summary"] = "deferred first run — curator seeded, will run after one interval; use `hermes curator run --dry-run` to preview now"
-            save_state(state)
+            def _seed(fresh: Dict[str, Any]) -> None:
+                if _parse_iso(fresh.get("last_run_at")) is None:  # another process may have seeded it
+                    fresh["last_run_at"] = now.isoformat()
+                    fresh["last_run_summary"] = "deferred first run — curator seeded, will run after one interval; use `hermes curator run --dry-run` to preview now"
+            update_state(_seed)
         except Exception as e:  # pragma: no cover — best-effort persistence
             logger.debug("Failed to seed curator last_run_at: %s", e)
         return False
@@ -875,7 +947,17 @@ def _render_report_markdown(p: Dict[str, Any]) -> str:
 
 # --- Orchestrator — spawn a forked AIAgent for the LLM review pass ---
 
-def _render_candidate_list() -> str:
+def _consolidation_candidate_rows() -> List[Dict[str, Any]]:
+    """Skills the LLM consolidation pass may review (see ``_render_candidate_list`` for why bundled
+    and disabled skills are excluded)."""
+    disabled = get_disabled_skill_names()
+    return [
+        r for r in skill_usage.curated_report()
+        if not skill_usage.is_bundled(r["name"]) and r["name"] not in disabled
+    ]
+
+
+def _render_candidate_list(rows: Optional[List[Dict[str, Any]]] = None) -> str:
     """Human/agent-readable list of LLM consolidation candidates.
 
     Bundled built-ins are excluded even when ``curator.prune_builtins`` is
@@ -890,11 +972,8 @@ def _render_candidate_list() -> str:
     path — refuses them, so the fork retries the same refused read until
     the same-tool-failure halt ends the run with zero findings.
     """
-    disabled = get_disabled_skill_names()
-    rows = [
-        r for r in skill_usage.curated_report()
-        if not skill_usage.is_bundled(r["name"]) and r["name"] not in disabled
-    ]
+    if rows is None:
+        rows = _consolidation_candidate_rows()
     if not rows:
         return "No agent-created skills to review."
     cron_referenced = _cron_referenced_skills()
@@ -928,7 +1007,8 @@ def _consolidation_pass(prefix: str, auto_summary: str, dry_run: bool, before_na
     """The LLM half of a run: fork (unless no candidates), then append the rename map (`old-name → umbrella`) so users
     needn't dig into REPORT.md. Returns ``(final_summary, llm_meta)``; never raises."""
     try:
-        candidate_list = _render_candidate_list()
+        candidate_rows = _consolidation_candidate_rows()
+        candidate_list = _render_candidate_list(candidate_rows)
         if "No agent-created skills" in candidate_list:
             final_summary = f"{prefix}{auto_summary}; llm: skipped (no candidates)"
             llm_meta = _llm_meta("skipped (no candidates)")
@@ -941,6 +1021,8 @@ def _consolidation_pass(prefix: str, auto_summary: str, dry_run: bool, before_na
             if dry_run:
                 prompt = f"{CURATOR_DRY_RUN_BANNER}\n\n{prompt}"
             llm_meta = _run_llm_review(prompt, dry_run=dry_run)
+            # The skills this fork actually reviewed: only these can be marked previewed.
+            llm_meta = {**llm_meta, "reviewed_candidates": [r["name"] for r in candidate_rows]}
             final_summary = f"{prefix}{auto_summary}; llm: {llm_meta.get('summary', 'no change')}"
     except Exception as e:
         logger.debug("Curator LLM pass failed: %s", e, exc_info=True)
@@ -1012,10 +1094,14 @@ def run_curator_review(
         prefix = "auto (llm preview only): "
     else:
         prefix = "auto: "
-    state = {**load_state(), "last_run_summary": f"{prefix}{auto_summary}"}
-    if not dry_run:
-        state.update(last_run_at=start.isoformat(), run_count=int(state.get("run_count", 0)) + 1)
-    save_state(state)
+    def _record_start(state: Dict[str, Any]) -> None:
+        state["last_run_summary"] = f"{prefix}{auto_summary}"
+        if not dry_run:
+            state.update(last_run_at=start.isoformat(), run_count=int(state.get("run_count", 0)) + 1)
+
+    update_state(_record_start)
+    # Fingerprints as of NOW: completion may only mark what this pass previewed, not a newer growth.
+    preview_fingerprints = consolidation_flag_fingerprints(list(mark_previewed_on_success or []))
 
     def _llm_pass():
         # Snapshot skill state BEFORE the LLM pass so the report can diff.
@@ -1028,7 +1114,7 @@ def run_curator_review(
             final_summary = f"{prefix}{auto_summary}; llm: skipped (consolidation off)"
             llm_meta = _llm_meta("skipped (consolidation off)")
         elapsed = (datetime.now(timezone.utc) - start).total_seconds()
-        state2 = {**load_state(), "last_run_duration_seconds": elapsed, "last_run_summary": final_summary}
+        run_updates: Dict[str, Any] = {"last_run_duration_seconds": elapsed, "last_run_summary": final_summary}
         # Per-run report, best-effort; path recorded for `hermes curator status`.
         report_path = None
         try:
@@ -1037,17 +1123,20 @@ def run_curator_review(
                 before_report=before_report, before_names=before_names, after_report=_safe_curated_report(), llm_meta=llm_meta,
             )
             if report_path is not None:
-                state2["last_report_path"] = str(report_path)
+                run_updates["last_report_path"] = str(report_path)
         except Exception as e:
             logger.debug("Curator report write failed: %s", e, exc_info=True)
-        save_state(state2)
-        # Only mark previewed once the report the human is meant to read actually exists — a
-        # thread crash or process exit before this point must leave the flag armed so the next
-        # scheduled pass retries, not silently drop the preview.
-        if mark_previewed_on_success and report_path is not None and not llm_meta.get("error"):
-            for _name in mark_previewed_on_success:
-                with contextlib.suppress(Exception):
-                    mark_consolidation_previewed(_name)
+        # Merge into the CURRENT state: flags set while this pass ran must survive.
+        update_state(lambda state: state.update(run_updates))
+        # Only mark previewed once the report the human is meant to read actually exists AND the fork
+        # really reviewed the skill — a crash, an error, a skipped fork ("no candidates") or a skill
+        # excluded from this fork (disabled meanwhile) leaves the flag armed for the next pass.
+        if preview_fingerprints and report_path is not None and not llm_meta.get("error"):
+            reviewed = set(llm_meta.get("reviewed_candidates") or [])
+            for _name, _fingerprint in preview_fingerprints.items():
+                if _name in reviewed:
+                    with contextlib.suppress(Exception):
+                        mark_consolidation_previewed(_name, _fingerprint)
         _notify(on_summary, f"curator: {final_summary}")
 
     if synchronous:
@@ -1264,8 +1353,17 @@ def maybe_run_curator(*, idle_for_seconds: Optional[float] = None, on_summary: O
         if not _claim_run():
             return None
         try:
+            # Recheck under the claim: a caller that saw the interval elapse before another pass
+            # claimed, ran and released would otherwise start a second pass (review: Codex #6).
+            if not should_run_now():
+                return None
             consolidate, llm_dry_run, mark_previewed = None, None, None
-            pending = skills_needing_consolidation_preview() if not get_consolidate() else []
+            pending = []
+            if not get_consolidate():
+                eligible = {r["name"] for r in _consolidation_candidate_rows()}
+                # A flagged skill that is not a candidate (disabled, bundled) cannot be previewed; it
+                # stays armed and triggers once it is eligible again (review: Codex #4).
+                pending = [n for n in skills_needing_consolidation_preview() if n in eligible]
             if pending:
                 consolidate, llm_dry_run, mark_previewed = True, True, pending
             return run_curator_review(

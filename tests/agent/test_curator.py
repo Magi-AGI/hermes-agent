@@ -1297,7 +1297,7 @@ def test_maybe_run_curator_triggers_a_preview_only_pass_when_a_skill_is_flagged(
     """The scheduled path: consolidate is OFF by default, but a flagged skill must still get
     exactly one preview-only consolidation fork — never a live apply."""
     curator = curator_env["curator"]
-    curator.flag_consolidation_recommended("big-skill", size_bytes=50_000, ref_count=3)
+    _flag_real_candidate(curator_env)  # must be an eligible candidate to trigger (review: Codex #4)
 
     captured = {}
 
@@ -1466,3 +1466,101 @@ def test_llm_dry_run_skips_only_the_llm_fork_not_the_deterministic_prune(curator
         "llm_dry_run=True incorrectly suppressed the real deterministic prune — an "
         "event-triggered preview must not cost the profile a cycle of stale/archive handling"
     )
+
+
+def _join_curator_threads():
+    import threading
+    for t in threading.enumerate():
+        if t.name == "curator-review" and t.is_alive():
+            t.join(timeout=10.0)
+
+
+def test_preview_leaves_a_flagged_skill_armed_when_it_was_excluded_from_the_fork(curator_env, monkeypatch):
+    """Codex #4: a flagged skill disabled before the pass is not a candidate, so it is not
+    previewed — completing a report for OTHER skills must not mark it, and it must not trigger a
+    preview on its own while ineligible."""
+    curator = curator_env["curator"]
+    _flag_real_candidate(curator_env)
+    _write_skill(curator_env["home"] / "skills", "other-skill")
+    curator_env["usage"].mark_agent_created("other-skill")
+    curator.flag_consolidation_recommended("other-skill", size_bytes=40_000, ref_count=2)
+    monkeypatch.setattr(curator, "get_disabled_skill_names", lambda: {"big-skill"})
+    monkeypatch.setattr(curator, "_run_llm_review", lambda prompt, **_kw: {
+        "final": "no change", "summary": "no change", "model": "", "provider": "",
+        "tool_calls": [], "error": None})
+    monkeypatch.setattr(curator, "should_run_now", lambda: True)
+
+    curator.maybe_run_curator()
+    _join_curator_threads()
+
+    assert curator.skills_needing_consolidation_preview() == ["big-skill"]
+
+
+def test_disabled_flagged_skill_alone_does_not_trigger_a_preview(curator_env, monkeypatch):
+    curator = curator_env["curator"]
+    _flag_real_candidate(curator_env)
+    monkeypatch.setattr(curator, "get_disabled_skill_names", lambda: {"big-skill"})
+    monkeypatch.setattr(curator, "should_run_now", lambda: True)
+    captured = {}
+    monkeypatch.setattr(curator, "run_curator_review", lambda **kw: captured.update(kw) or {"ok": True})
+
+    curator.maybe_run_curator()
+
+    assert captured.get("mark_previewed_on_success") is None
+    assert captured.get("llm_dry_run") is None
+
+
+def test_growth_during_the_preview_keeps_the_newer_fingerprint_armed(curator_env, monkeypatch):
+    """Codex #5a: completion marks only the fingerprint captured when the preview started."""
+    curator = curator_env["curator"]
+    _flag_real_candidate(curator_env)
+
+    def _fork_while_skill_grows(prompt, **_kw):
+        curator.flag_consolidation_recommended("big-skill", size_bytes=60_000, ref_count=3)
+        return {"final": "no change", "summary": "no change", "model": "", "provider": "",
+                "tool_calls": [], "error": None}
+
+    monkeypatch.setattr(curator, "_run_llm_review", _fork_while_skill_grows)
+    monkeypatch.setattr(curator, "should_run_now", lambda: True)
+
+    curator.maybe_run_curator()
+    _join_curator_threads()
+
+    assert curator.skills_needing_consolidation_preview() == ["big-skill"]
+
+
+def test_a_flag_set_while_the_report_is_written_survives_the_run(curator_env, monkeypatch):
+    """Codex #5b: the run's final state write merges into the current state instead of saving a
+    snapshot taken before the report was written."""
+    curator = curator_env["curator"]
+    _flag_real_candidate(curator_env)
+    real_write = curator._write_run_report
+
+    def _write_while_flagging(**kwargs):
+        curator.flag_consolidation_recommended("late-skill", size_bytes=45_000, ref_count=1)
+        return real_write(**kwargs)
+
+    monkeypatch.setattr(curator, "_write_run_report", _write_while_flagging)
+    monkeypatch.setattr(curator, "_run_llm_review", lambda prompt, **_kw: {
+        "final": "no change", "summary": "no change", "model": "", "provider": "",
+        "tool_calls": [], "error": None})
+    monkeypatch.setattr(curator, "should_run_now", lambda: True)
+
+    curator.maybe_run_curator()
+    _join_curator_threads()
+
+    assert "late-skill" in curator.skills_needing_consolidation_preview()
+    assert "big-skill" not in curator.skills_needing_consolidation_preview()
+
+
+def test_admission_is_rechecked_after_the_run_claim(curator_env, monkeypatch):
+    """Codex #6: a caller that saw the interval elapse, but claims only after another pass ran and
+    released, must re-check and not start a second pass."""
+    curator = curator_env["curator"]
+    answers = iter([True, False])  # due before the claim, no longer due after it
+    monkeypatch.setattr(curator, "should_run_now", lambda: next(answers))
+    started = []
+    monkeypatch.setattr(curator, "run_curator_review", lambda **kw: started.append(kw) or {"ok": True})
+
+    assert curator.maybe_run_curator() is None
+    assert started == []
