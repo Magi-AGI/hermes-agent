@@ -64,7 +64,11 @@ def is_unattended_review() -> bool:
 
 
 def is_foreground() -> bool:
-    return get_current_write_origin() == "foreground"
+    """Any writer that is not an autonomous review/curator fork: a normal turn binds its agent's
+    ``_memory_write_origin`` ("assistant_tool"), the unbound default is "foreground", and a
+    user-started side question uses "side_question". Keyed on "not autonomous" rather than one
+    string, so a new foreground origin cannot silently escape the ceiling (review: Codex)."""
+    return get_current_write_origin() not in _AUTONOMOUS_ORIGINS
 
 
 def is_size_ceiling_bound() -> bool:

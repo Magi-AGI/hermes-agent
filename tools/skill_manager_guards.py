@@ -318,12 +318,18 @@ def _background_review_size_ceiling_guard(
     over_refs = adds_reference and effective_ref_count > max_refs
     if not (over_size or over_refs):
         return None
-    with suppress(Exception):
-        _curator.flag_consolidation_recommended(name, size_bytes=size_bytes, ref_count=effective_ref_count)
+    if action != "create":  # a refused create leaves nothing on disk to consolidate
+        with suppress(Exception):
+            _curator.flag_consolidation_recommended(name, size_bytes=size_bytes, ref_count=effective_ref_count)
     reason = ", ".join(
         r for r, cond in ((f"{target.name} would be {written_bytes / 1024:.1f}KB "
                            f"(ceiling {max_kb}KB)", over_size),
                           (f"references/ has {effective_ref_count} files (ceiling {max_refs})", over_refs)) if cond)
+    if action == "create":
+        return _refusal(
+            f"Refusing create for skill '{name}': {reason}. A new skill must start under the size "
+            f"ceiling: keep SKILL.md to the essential steps and move detail into references/ files "
+            f"with write_file after creating it.")
     if is_foreground():
         return _refusal(
             f"Refusing {action} for skill '{name}': {reason}, and this write would grow it further. "

@@ -357,3 +357,72 @@ class TestSizeCeilingGuard:
                     old_string="Do the thing.", new_string="Do the new thing, and here's more.")
         from agent import curator
         assert "big-skill" in curator.skills_needing_consolidation_preview()
+
+
+# ---------------------------------------------------------------------------
+# Review (Codex, sync bucket D): the REAL foreground origin, and creation
+# ---------------------------------------------------------------------------
+
+def _turn_bound_origin() -> str:
+    """The origin a normal turn binds: turn_context binds ``agent._memory_write_origin``, whose
+    AIAgent default comes from agent_init's session-state defaults ("assistant_tool")."""
+    from agent.agent_init import _SESSION_STATE
+    return _SESSION_STATE["_memory_write_origin"]
+
+
+def test_a_normal_turns_origin_is_ceiling_bound_foreground():
+    from tools.skill_provenance import is_foreground, is_size_ceiling_bound
+    assert _turn_bound_origin() == "assistant_tool"
+    for origin in (_turn_bound_origin(), "foreground", "side_question"):
+        token = set_current_write_origin(origin)
+        try:
+            assert is_foreground() and is_size_ceiling_bound(), origin
+        finally:
+            reset_current_write_origin(token)
+    for origin in (CURATOR_CONSOLIDATION_DRY_RUN, CURATOR_CONSOLIDATION):
+        token = set_current_write_origin(origin)
+        try:
+            assert not is_foreground() and not is_size_ceiling_bound(), origin
+        finally:
+            reset_current_write_origin(token)
+
+
+def test_normal_turn_growth_of_an_oversized_skill_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    with _skill_dir(tmp_path):
+        _oversized_skill(tmp_path)
+        token = set_current_write_origin(_turn_bound_origin())
+        try:
+            raw = skill_manage(
+                action="patch", name="big-skill",
+                old_string="Do the thing.", new_string="Do the new thing, and here's a whole extra sentence.")
+        finally:
+            reset_current_write_origin(token)
+    result = json.loads(raw)
+    assert result["success"] is False
+    assert "may be corrected or condensed but not enlarged" in json.dumps(result)
+
+
+@pytest.mark.parametrize("origin", ["assistant_tool", BACKGROUND_REVIEW])
+def test_creating_a_skill_over_the_ceiling_is_refused_before_anything_is_written(tmp_path, monkeypatch, origin):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    oversized = VALID_SKILL_CONTENT + f"\n<!-- {'x' * 50_000} -->\n"  # over the 40KB default, under 100k chars
+    with _skill_dir(tmp_path), _as_origin(origin):
+        raw = skill_manage(action="create", name="huge-new-skill", content=oversized)
+    result = json.loads(raw)
+    assert result["success"] is False
+    assert "must start under the size ceiling" in result["error"]
+    assert not (tmp_path / "huge-new-skill").exists()
+    from agent import curator
+    assert "huge-new-skill" not in curator.skills_needing_consolidation_preview()
+
+
+def test_creating_a_skill_under_the_ceiling_still_works(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    with _skill_dir(tmp_path):
+        token = set_current_write_origin(_turn_bound_origin())
+        try:
+            raw = skill_manage(action="create", name="small-skill", content=VALID_SKILL_CONTENT)
+        finally:
+            reset_current_write_origin(token)
+    assert json.loads(raw)["success"] is True

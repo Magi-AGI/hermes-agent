@@ -428,9 +428,13 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     if existing := _find_skill(name):
         return _err(f"A skill named '{name}' already exists at {existing['path']}.")
     skill_dir = _resolve_skill_dir(name, category)
+    skill_md = skill_dir / "SKILL.md"
+    # The size ceiling binds creation too (before anything is written): otherwise a new skill could
+    # start above it, bounded only by MAX_SKILL_CONTENT_CHARS (review: Codex).
+    if ceiling_guard := _background_review_size_ceiling_guard(name, skill_dir, skill_md, "create", content, None):
+        return ceiling_guard
     from hermes_constants import mkdir_under_hermes_home
     mkdir_under_hermes_home(skill_dir)
-    skill_md = skill_dir / "SKILL.md"
     atomic_write_text(skill_md, content, preserve_mode=True, create_mode=0o644)
     if scan_error := _security_scan_skill(skill_dir):
         shutil.rmtree(skill_dir, ignore_errors=True)
