@@ -95,6 +95,9 @@ model-options/listing never wait on probes (cdacc2bcf1, cb24121a8e).
 | A3 | df65e59b80 (d33fec0394 route guard; no upstream equivalent; credential walk rewritten to upstream's resolver order) + 214c3bb682 oneshot test follow-up | in triad |
 | extra | 8e188195ef git probes GIT_OPTIONAL_LOCKS=0 (stale index.lock hazard; not fixed upstream) | in triad |
 
+## Decisions log
+- 2026-09-23 R1 (registry lag after a mid-turn rotation; second window can claim the new id in active_sessions.json while the durable turn lease still serializes its turns): Lake chose option (c), accept and document. Both reviewers endorsed (c) or (a) and rejected (b) (synchronous handoff: deadlock risk, no data-safety gain). Revisit (a) (async re-anchor frame) only if it shows up in practice.
+
 ## Order
 0 → A1, A2 → B (48bb63b8d6; ca86781a91 residual only) → D → A3 → A4 (+ window fixes) → C (analysis
 started early) → phase 2b auth redesign → Group 2. Each bucket: triad before the next.
