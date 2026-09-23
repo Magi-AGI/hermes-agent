@@ -97,10 +97,13 @@ export function createSavedWindowLayout<T extends SavedWindow>(deps: {
   live: () => T[]
   log?: (message: string) => void
 }) {
-  const pendingForgets = new Set<string>()
+  // Every window id forgotten this run (Codex A4 round 3 #2). Never cleared:
+  // re-applying a forget is idempotent, and it guarantees nothing — a late live
+  // snapshot, a retained pending snapshot, a reopen queue — re-adds a
+  // forgotten window. New windows always get fresh ids, so this never blocks
+  // one. A failed read or write simply leaves the removal for the next write.
+  const forgotten = new Set<string>()
 
-  // Pending forgets are cleared ONLY after a write succeeds (or is a no-op); a
-  // failed read or write retains them for the next attempt.
   // The latest state of every window seen live since the last successful write
   // (Codex A4 round 3 #5). Additions/updates are retained exactly like pending
   // forgets: while the file is unreadable, a window opened and then closed must
@@ -110,10 +113,12 @@ export function createSavedWindowLayout<T extends SavedWindow>(deps: {
 
   function persist(): boolean {
     for (const entry of deps.live()) {
-      pendingSnapshots.set(entry.windowId, entry)
+      if (!forgotten.has(entry.windowId)) {
+        pendingSnapshots.set(entry.windowId, entry)
+      }
     }
 
-    const forgets = Array.from(pendingForgets)
+    const forgets = Array.from(forgotten)
     const snapshots = Array.from(pendingSnapshots.values())
 
     try {
@@ -127,10 +132,6 @@ export function createSavedWindowLayout<T extends SavedWindow>(deps: {
 
       if (plan.write !== null) {
         deps.write(plan.write)
-      }
-
-      for (const id of forgets) {
-        pendingForgets.delete(id)
       }
 
       for (const entry of snapshots) {
@@ -151,11 +152,12 @@ export function createSavedWindowLayout<T extends SavedWindow>(deps: {
     persist,
     /** "Close and Forget This Window": the only way a saved entry is removed. */
     forget(windowId: string): boolean {
-      pendingForgets.add(windowId)
+      forgotten.add(windowId)
+      pendingSnapshots.delete(windowId)
 
       return persist()
     },
-    isForgotten: (windowId: string) => pendingForgets.has(windowId),
+    isForgotten: (windowId: string) => forgotten.has(windowId),
     /** Any close, for any reason: records the layout as it stands; never removes. */
     onWindowClosed(_windowId: string, _reason: WindowCloseReason): void {
       persist()

@@ -3279,6 +3279,8 @@ function forgetAndCloseWindow(win: BrowserWindow | null | undefined) {
 
   forgottenWindows.add(win)
   savedWindowLayout.forget(windowId)
+  // An active or halted reopen queue may still hold this window's entry.
+  reopenQueue.forget(windowId)
   win.close()
 }
 
@@ -14243,6 +14245,7 @@ function notifyReopenHalted(payload: {
 const reopenQueue = createReopenQueue<any>({
   runEntry: runReopenEntry,
   onHalt: notifyReopenHalted,
+  isForgotten: windowId => savedWindowLayout.isForgotten(windowId),
   settle: () => new Promise(resolve => setTimeout(resolve, REOPEN_WINDOW_SETTLE_MS))
 })
 

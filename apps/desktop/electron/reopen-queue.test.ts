@@ -9,6 +9,7 @@ const e = (windowId: string) => ({ windowId })
 // A queue whose runEntry blocks until the test releases that window, so the
 // test can observe how many windows are being opened at the same moment.
 function harness(verdicts: Record<string, ReopenStep> = {}) {
+  const forgotten = new Set<string>()
   const opening = new Set<string>()
   const log: string[] = []
   const halts: ReopenHalt[] = []
@@ -30,13 +31,15 @@ function harness(verdicts: Record<string, ReopenStep> = {}) {
 
       return verdict
     },
-    onHalt: halt => halts.push(halt)
+    onHalt: halt => halts.push(halt),
+    isForgotten: id => forgotten.has(id)
   })
 
   const tick = () => new Promise(resolve => setTimeout(resolve, 0))
 
   return {
     queue,
+    forgotten,
     log,
     halts,
     maxConcurrent: () => maxConcurrent,
@@ -146,4 +149,82 @@ test('a fresh Reopen discards a halted queue', async () => {
   assert.deepEqual(h.queue.haltedIds, [])
   await h.release('z')
   await second
+})
+
+// ─── Codex A4 round 3 #2: Forget invalidates captured entries ────────────────
+
+test('a window forgotten while an active queue runs is never opened', async () => {
+  const h = harness()
+
+  const run = h.queue.reopen([e('a'), e('b'), e('c')])
+
+  // a is opening; the user forgets b (its entry was already captured).
+  h.forgotten.add('b')
+  h.queue.forget('b')
+  await h.release('a')
+  await h.release('c')
+  await run
+
+  assert.deepEqual(h.log, ['a', 'c'])
+})
+
+test('each entry re-checks Forget immediately before opening', async () => {
+  const h = harness()
+
+  const run = h.queue.reopen([e('a'), e('b')])
+
+  // Only the forgotten predicate changes (no queue.forget call): the captured
+  // entry must still not be opened.
+  h.forgotten.add('b')
+  await h.release('a')
+  await run
+
+  assert.deepEqual(h.log, ['a'])
+})
+
+test('a window forgotten from a halted queue is not reopened by Resume', async () => {
+  const h = harness({ b: { ok: false, profile: null, reason: 'unready' } })
+
+  const first = h.queue.reopen([e('a'), e('b'), e('c')])
+
+  await h.release('a')
+  await h.release('b')
+  await first
+
+  h.forgotten.add('c')
+  h.queue.forget('c')
+  assert.deepEqual(h.queue.haltedIds, ['b'])
+
+  const resume = h.queue.resume()
+
+  await h.release('b')
+  await resume
+  assert.deepEqual(h.log, ['a', 'b', 'b'])
+})
+
+test('forgetting the window being verified does not halt the queue on it', async () => {
+  const h = harness({ a: { ok: false, profile: null, reason: 'window closed' } })
+
+  const run = h.queue.reopen([e('a'), e('b')])
+
+  h.forgotten.add('a')
+  h.queue.forget('a')
+  await h.release('a')
+  await h.release('b')
+  await run
+
+  assert.deepEqual(h.halts, [])
+  assert.deepEqual(h.log, ['a', 'b'])
+})
+
+test('a Reopen never enqueues a forgotten window', async () => {
+  const h = harness()
+
+  h.forgotten.add('a')
+
+  const run = h.queue.reopen([e('a'), e('b')])
+
+  await h.release('b')
+  await run
+  assert.deepEqual(h.log, ['b'])
 })

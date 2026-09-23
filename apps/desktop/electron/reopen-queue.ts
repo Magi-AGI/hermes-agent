@@ -22,7 +22,10 @@ export function createReopenQueue<E extends { windowId: string }>(deps: {
   runEntry: (entry: E) => Promise<ReopenStep>
   onHalt: (halt: ReopenHalt) => void
   settle?: () => Promise<void>
+  /** "Close and Forget This Window" (Codex A4 round 3 #2): never (re)opened. */
+  isForgotten?: (windowId: string) => boolean
 }) {
+  const cancelled = (windowId: string) => deps.isForgotten?.(windowId) === true
   let pending: E[] = []
   let halted: E[] | null = null
   let active: Promise<void> | null = null
@@ -33,7 +36,7 @@ export function createReopenQueue<E extends { windowId: string }>(deps: {
     const queued = new Set(pending.map(entry => entry.windowId))
 
     for (const entry of entries) {
-      if (!queued.has(entry.windowId)) {
+      if (!queued.has(entry.windowId) && !cancelled(entry.windowId)) {
         queued.add(entry.windowId)
         pending.push(entry)
         total += 1
@@ -44,9 +47,21 @@ export function createReopenQueue<E extends { windowId: string }>(deps: {
   async function drain() {
     while (pending.length > 0) {
       const entry = pending.shift() as E
+
+      // Re-checked immediately before opening: the entry was captured earlier,
+      // and its window may have been forgotten since (during a settle or while
+      // an earlier window was being verified).
+      if (cancelled(entry.windowId)) {
+        total -= 1
+
+        continue
+      }
+
       const step = await deps.runEntry(entry)
 
-      if (step !== 'skipped' && 'reason' in step) {
+      // A window forgotten while it was being verified closed on purpose: that
+      // is not a failure to halt on (nor an entry to keep for Resume).
+      if (step !== 'skipped' && 'reason' in step && !cancelled(entry.windowId)) {
         halted = [entry, ...pending]
         pending = []
         deps.onHalt({ restoredCount: restored, totalCount: total, profile: step.profile, reason: step.reason })
@@ -108,6 +123,17 @@ export function createReopenQueue<E extends { windowId: string }>(deps: {
       await start()
 
       return { ok: true }
+    },
+    /** A forgotten window leaves the active AND the halted queue. */
+    forget(windowId: string) {
+      const before = pending.length
+
+      pending = pending.filter(entry => entry.windowId !== windowId)
+      total -= before - pending.length
+
+      if (halted) {
+        halted = halted.filter(entry => entry.windowId !== windowId)
+      }
     },
     get isActive() {
       return active !== null

@@ -128,7 +128,33 @@ test('Forget on an unreadable state file writes nothing and keeps the forget pen
   h.file.unreadable = false
   assert.equal(h.layout.persist(), true)
   assert.deepEqual(h.saved(), ['a'], 'applied on the next successful write')
-  assert.equal(h.layout.isForgotten('b'), false)
+})
+
+// ─── Codex A4 round 3 #2: a forgotten id is never re-added ───────────────────
+
+test('a forgotten window that comes back live under its id is never re-saved', () => {
+  const h = harness([w('a'), w('b')])
+
+  h.forgetAndClose('b')
+  assert.deepEqual(h.saved(), ['a'])
+
+  // e.g. a reopen queue that had already captured b's entry recreates it.
+  h.open(w('b'))
+  h.layout.persist()
+  assert.deepEqual(h.saved(), ['a'])
+  assert.equal(h.layout.isForgotten('b'), true)
+})
+
+test('a snapshot retained while the file is unreadable is dropped when that window is forgotten', () => {
+  const h = harness([w('a')])
+
+  h.file.unreadable = true
+  h.open(w('c'))
+  h.forgetAndClose('c')
+
+  h.file.unreadable = false
+  h.layout.persist()
+  assert.deepEqual(h.saved(), ['a'])
 })
 
 // ─── merge / plan ────────────────────────────────────────────────────────────
