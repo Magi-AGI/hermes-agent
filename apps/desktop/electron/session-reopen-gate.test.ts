@@ -5,6 +5,7 @@ import { test } from 'vitest'
 import {
   createSingleFlight,
   createWindowReadinessTracker,
+  reopenedWindowPolicy,
   reopenProbeTarget,
   waitForSessionWindowFunctionallyReady
 } from './session-reopen-gate'
@@ -546,6 +547,96 @@ test('concurrent Reopen requests share one queue', async () => {
   release()
   await third
   assert.equal(runs, 2, 'a request after the queue finished starts a new one')
+})
+
+// ─── Codex A4 round 3 #1: current readiness; never destroy a user window ─────
+
+test('an already-open window that moved to another session (/new) is judged on its CURRENT verdict', async () => {
+  const ipcMain = makeFakeIpcMain()
+  const readiness = createWindowReadinessTracker(ipcMain)
+  const win = makeFakeWindow()
+
+  // Launched on s-a, then /new moved it to s-b: it re-reported pending, then ready on s-b.
+  ipcMain.emit('hermes:window:functional-ready', { sender: { id: 1 } }, { ok: true, profile: 'default', sessionId: 's-a' })
+  ipcMain.emit(
+    'hermes:window:functional-ready',
+    { sender: { id: 1 } },
+    { ok: false, pending: true, profile: 'default', sessionId: 's-b' }
+  )
+  ipcMain.emit('hermes:window:functional-ready', { sender: { id: 1 } }, { ok: true, profile: 'default', sessionId: 's-b' })
+
+  const result = await waitForSessionWindowFunctionallyReady(
+    win as any,
+    { profile: 'default', sessionId: 's-b', ...reopenedWindowPolicy(false) },
+    { ipcMain, probeBackendHealth: () => Promise.resolve(), knownVerdict: readiness.get(1), timeoutMs: 500 }
+  )
+
+  assert.deepEqual(result, { ok: true })
+})
+
+test('an already-open window is judged on being functional, not on a saved entry that lags it', async () => {
+  const ipcMain = makeFakeIpcMain()
+  const win = makeFakeWindow()
+
+  // e.g. a pop-out on a fresh draft after /new: its saved entry still names s-a.
+  const result = await waitForSessionWindowFunctionallyReady(
+    win as any,
+    { profile: 'default', sessionId: 's-a', identity: reopenedWindowPolicy(false).identity },
+    {
+      ipcMain,
+      probeBackendHealth: () => Promise.resolve(),
+      knownVerdict: { ok: true, profile: 'default', sessionId: null },
+      timeoutMs: 500
+    }
+  )
+
+  assert.deepEqual(result, { ok: true })
+})
+
+test('a window the queue created must still come up on the saved session', async () => {
+  const ipcMain = makeFakeIpcMain()
+  const win = makeFakeWindow()
+
+  const result = await waitForSessionWindowFunctionallyReady(
+    win as any,
+    { profile: 'default', sessionId: 's-a', identity: reopenedWindowPolicy(true).identity },
+    {
+      ipcMain,
+      probeBackendHealth: () => Promise.resolve(),
+      knownVerdict: { ok: true, profile: 'default', sessionId: 's-other' },
+      timeoutMs: 500
+    }
+  )
+
+  assert.equal(result.ok, false)
+})
+
+test('a pending verdict is not a verdict: the gate waits for the real one', async () => {
+  const ipcMain = makeFakeIpcMain()
+  const readiness = createWindowReadinessTracker(ipcMain)
+  const win = makeFakeWindow()
+
+  ipcMain.emit(
+    'hermes:window:functional-ready',
+    { sender: { id: 1 } },
+    { ok: false, pending: true, profile: 'default', sessionId: 's1' }
+  )
+
+  const pending = waitForSessionWindowFunctionallyReady(
+    win as any,
+    { profile: 'default', sessionId: 's1' },
+    { ipcMain, probeBackendHealth: () => Promise.resolve(), knownVerdict: readiness.get(1), timeoutMs: 500 }
+  )
+
+  await new Promise(resolve => setTimeout(resolve, 5))
+  ipcMain.emit('hermes:window:functional-ready', { sender: { id: 1 } }, { ok: true, profile: 'default', sessionId: 's1' })
+
+  assert.deepEqual(await pending, { ok: true })
+})
+
+test('only a window the queue created is torn down on failure', () => {
+  assert.equal(reopenedWindowPolicy(true).destroyOnFailure, true)
+  assert.equal(reopenedWindowPolicy(false).destroyOnFailure, false)
 })
 
 // ─── Codex A4 #7: the probe checks the exact route the window was opened on ──

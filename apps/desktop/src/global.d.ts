@@ -557,6 +557,7 @@ declare global {
       reportWindowSession?: (report: { connectionId: null | string; profile: null | string; sessionId: null | string }) => void
       signalSessionFunctionalReady?: (payload: {
         ok: boolean
+        pending?: boolean
         phase?: string
         profile?: string | null
         sessionId?: string | null

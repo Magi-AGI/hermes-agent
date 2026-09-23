@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import { bootFunctionalState } from '@/app/contrib/hooks/use-reopen-ready-signal'
 
-import { reopenReadyVerdict } from './reopen-ready'
+import { createReopenReadySignaller, reopenReadyVerdict } from './reopen-ready'
 
 const base = { boot: 'ready' as const, target: 's1', selected: null, runtime: null, exhausted: null, profile: 'work' }
 
@@ -37,6 +37,50 @@ describe('reopenReadyVerdict (Codex A4 #3)', () => {
 
   it('a window with no target session (a restored peer on a fresh chat) is ready after boot', () => {
     expect(reopenReadyVerdict({ ...base, target: null })).toEqual({ ok: true, phase: 'boot', profile: 'work', sessionId: null })
+  })
+})
+
+describe('createReopenReadySignaller (Codex A4 round 3 #1)', () => {
+  it('re-reports for the CURRENT session after /new moves the window', () => {
+    const sent: unknown[] = []
+    const signal = createReopenReadySignaller(payload => sent.push(payload))
+
+    signal({ ...base, target: 's-a', selected: 's-a', runtime: 'r1' })
+    // /new: the window now routes to s-b, which is still loading.
+    signal({ ...base, target: 's-b', selected: 's-a', runtime: 'r1' })
+    signal({ ...base, target: 's-b', selected: 's-b', runtime: 'r2' })
+
+    expect(sent).toEqual([
+      { ok: true, phase: 'session', profile: 'work', sessionId: 's-a' },
+      { ok: false, pending: true, phase: 'pending', profile: 'work', sessionId: 's-b' },
+      { ok: true, phase: 'session', profile: 'work', sessionId: 's-b' }
+    ])
+  })
+
+  it('re-reports a boot retry (ready -> pending -> ready) and a route change', () => {
+    const sent: { ok: boolean; phase: string; profile: null | string }[] = []
+    const signal = createReopenReadySignaller(payload => sent.push(payload))
+
+    signal({ ...base, target: null })
+    signal({ ...base, target: null, boot: 'pending' })
+    signal({ ...base, target: null })
+    signal({ ...base, target: null, profile: 'other' })
+
+    expect(sent.map(p => [p.phase, p.profile])).toEqual([
+      ['boot', 'work'],
+      ['pending', 'work'],
+      ['boot', 'work'],
+      ['boot', 'other']
+    ])
+  })
+
+  it('does not re-send an unchanged verdict', () => {
+    const sent: unknown[] = []
+    const signal = createReopenReadySignaller(payload => sent.push(payload))
+
+    signal({ ...base, target: null })
+    signal({ ...base, target: null })
+    expect(sent).toHaveLength(1)
   })
 })
 

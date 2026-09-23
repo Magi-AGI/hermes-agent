@@ -28,7 +28,8 @@ export interface ReopenReadyInputs {
 
 export interface ReopenReadyPayload {
   ok: boolean
-  phase: 'boot' | 'session'
+  pending?: true
+  phase: 'boot' | 'pending' | 'session'
   profile: null | string
   sessionId: null | string
   error?: string
@@ -58,4 +59,32 @@ export function reopenReadyVerdict(inputs: ReopenReadyInputs): null | ReopenRead
   }
 
   return null
+}
+
+// Keeps main's record of this window CURRENT (Codex A4 round 3 #1). The window
+// used to report once, for its launch session; after /new moved it to another
+// session, Reopen compared the saved new session with that stale launch verdict
+// and destroyed a healthy window. Now the target is the window's current
+// session, and every change of verdict — including back to pending while a new
+// session, route or boot attempt is being established — is sent; an unchanged
+// one is not re-sent.
+export function createReopenReadySignaller(send: (payload: ReopenReadyPayload) => void) {
+  let last: null | string = null
+
+  return (inputs: ReopenReadyInputs) => {
+    const payload = reopenReadyVerdict(inputs) ?? {
+      ok: false,
+      pending: true as const,
+      phase: 'pending' as const,
+      profile: inputs.profile,
+      sessionId: inputs.target
+    }
+
+    const key = JSON.stringify(payload)
+
+    if (key !== last) {
+      last = key
+      send(payload)
+    }
+  }
 }

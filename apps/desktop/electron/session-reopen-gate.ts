@@ -23,6 +23,9 @@ const FUNCTIONAL_READY_CHANNEL = 'hermes:window:functional-ready'
 
 export interface FunctionalReadyPayload {
   ok: boolean
+  // The window is (re)establishing its current target — a new session after
+  // /new, a boot retry. Not a verdict: the gate keeps waiting.
+  pending?: boolean
   phase?: string
   profile?: string | null
   sessionId?: string | null
@@ -50,6 +53,22 @@ export function reopenProbeTarget(
   }
 
   return { profile: entry.profile || fallbackProfile, connectionId: null }
+}
+
+// How the queue treats the window a saved entry resolved to (Codex A4 round 3
+// #1). A window the queue CREATED must come up on the saved entry's exact
+// session/profile, and if it fails it is torn down so a retry recreates it.
+// A window that was ALREADY OPEN is the user's live window: its saved entry can
+// lag what it shows now (e.g. just after /new), so it is judged only on being
+// functional (its latest verdict for its CURRENT target + its route probe), and
+// on failure the queue halts WITHOUT closing it.
+export type ReopenIdentityCheck = 'exact' | 'functional'
+
+export function reopenedWindowPolicy(created: boolean): {
+  destroyOnFailure: boolean
+  identity: ReopenIdentityCheck
+} {
+  return created ? { identity: 'exact', destroyOnFailure: true } : { identity: 'functional', destroyOnFailure: false }
 }
 
 export interface ReopenGateResult {
@@ -90,9 +109,10 @@ export interface ReopenGateDeps {
 // Every window's latest functional-ready verdict, recorded for the life of the
 // app (Codex A4 #4). The reopen queue used to trust `created: false` (a window
 // it only focused) as ready, which is wrong for a window that is still booting
-// or already failed. A window reports once per load (useReopenReadySignal), so
-// an already-open window's verdict is looked up here; one that has not reported
-// yet is waited for like a new window.
+// or already failed. A window re-reports whenever its verdict changes — a new
+// session, route or boot attempt (useReopenReadySignal; Codex A4 round 3 #1) —
+// so the entry here is always its LATEST state; one that has not reported yet
+// (or is pending) is waited for like a new window.
 export function createWindowReadinessTracker(ipcMain: ReopenGateIpcMain) {
   const verdicts = new Map<number, FunctionalReadyPayload>()
 
@@ -130,8 +150,14 @@ export function waitForSessionWindowFunctionallyReady(
   {
     profile,
     sessionId,
-    probeTarget
-  }: { profile: string | null; sessionId?: null | string; probeTarget?: ReopenProbeTarget },
+    probeTarget,
+    identity = 'exact'
+  }: {
+    identity?: ReopenIdentityCheck
+    probeTarget?: ReopenProbeTarget
+    profile: string | null
+    sessionId?: null | string
+  },
   deps: ReopenGateDeps
 ): Promise<ReopenGateResult> {
   if (win.isDestroyed()) {
@@ -185,7 +211,7 @@ export function waitForSessionWindowFunctionallyReady(
     const expectedProfile = normalizeProfile(profile)
 
     const onReady = (event: { sender: { id: number } }, payload: FunctionalReadyPayload) => {
-      if (event.sender.id !== wcId) {
+      if (event.sender.id !== wcId || payload?.pending === true) {
         return
       }
 
@@ -206,7 +232,7 @@ export function waitForSessionWindowFunctionallyReady(
       // review round 2, Codex finding #3).
       const reportedProfile = normalizeProfile(payload.profile)
 
-      if (reportedProfile !== expectedProfile) {
+      if (identity === 'exact' && reportedProfile !== expectedProfile) {
         finish({
           ok: false,
           reason: `window reported ready for profile "${reportedProfile}", expected "${expectedProfile}"`
@@ -218,7 +244,7 @@ export function waitForSessionWindowFunctionallyReady(
       // The window must have come up on the session it was asked to open
       // (Codex A4 #3): a window that silently fell back to another session is
       // not a successful restore.
-      if (sessionId !== undefined && (payload.sessionId ?? null) !== (sessionId ?? null)) {
+      if (identity === 'exact' && sessionId !== undefined && (payload.sessionId ?? null) !== (sessionId ?? null)) {
         finish({
           ok: false,
           reason: `window reported ready on session "${payload.sessionId ?? 'none'}", expected "${sessionId ?? 'none'}"`

@@ -419,6 +419,7 @@ import { describeGitSpawnFailure, GIT_UNUSABLE, selectRunnableBinary } from './s
 import {
   createWindowReadinessTracker,
   REOPEN_WINDOW_SETTLE_MS,
+  reopenedWindowPolicy,
   type ReopenProbeTarget,
   reopenProbeTarget,
   waitForSessionWindowFunctionallyReady
@@ -14304,18 +14305,24 @@ async function runReopenEntry(entry: any): Promise<ReopenStep> {
     return 'skipped'
   }
 
-  const { win } = opened
+  const { win, created } = opened
 
   if (!win || win.isDestroyed()) {
     return 'skipped'
   }
+
+  // Created by this queue: verified against the saved entry and torn down on
+  // failure. Already open: the user's live window, judged on its CURRENT
+  // verdict and never closed by the queue (Codex A4 round 3 #1).
+  const policy = reopenedWindowPolicy(created)
 
   const result = await waitForSessionWindowFunctionallyReady(
     win,
     {
       profile: expectedProfile,
       sessionId: entry.sessionId ?? null,
-      probeTarget: reopenProbeTarget(entry, windowConnectionRoutes.get(win.webContents.id), expectedProfile)
+      probeTarget: reopenProbeTarget(entry, windowConnectionRoutes.get(win.webContents.id), expectedProfile),
+      identity: policy.identity
     },
     {
       ipcMain,
@@ -14329,17 +14336,13 @@ async function runReopenEntry(entry: any): Promise<ReopenStep> {
   if (!result.ok) {
     rememberLog(`[session-windows] reopen halted at ${entry.windowId} (profile "${expectedProfile}"): ${result.reason}`)
 
-    // Destroy the failed window before retaining its entry for retry: this
-    // window never proved itself functional, and leaving it open would let
-    // a retry's createSessionWindow() find it still registered and focus it
-    // (created: false) — which skips verification entirely via the exact
-    // fast-path this whole redesign exists to gate correctly (triad review
-    // round 2, Codex finding #2). Destroying it guarantees a retry always
-    // re-creates it fresh (created: true) and is genuinely re-verified, at
-    // the cost of a rare in-flight-but-about-to-succeed load being restarted.
-    if (!win.isDestroyed()) {
-      // Not an explicit user close: its saved entry must survive (it is
-      // retained for retry below).
+    // Only a window THIS QUEUE created is torn down, so a retry recreates it
+    // fresh and genuinely re-verifies it (triad review round 2, Codex #2). A
+    // window that was already open is never destroyed (Codex A4 round 3 #1):
+    // the queue halts and notifies, and a retry re-judges it from its latest
+    // recorded verdict (it is never assumed ready for being only focused).
+    // Either way this is not an explicit user close: the saved entry survives.
+    if (policy.destroyOnFailure && !win.isDestroyed()) {
       win.destroy()
     }
 
