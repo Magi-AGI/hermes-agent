@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { reportsWindowSession, windowSessionReport } from './window-session-report'
+import { establishedWindowSessionReport, reportsWindowSession, windowSessionReport } from './window-session-report'
 
 const active = { profile: 'work', connectionId: 'local' }
 
@@ -20,6 +20,25 @@ describe('windowSessionReport (Codex A4 #5)', () => {
   it('an unknown owner or a fresh draft falls back to the active route', () => {
     expect(windowSessionReport('s1', undefined, active)).toEqual({ sessionId: 's1', ...active })
     expect(windowSessionReport(null, { profile: 'x', connectionId: 'y' }, active)).toEqual({ sessionId: null, ...active })
+  })
+})
+
+describe('establishedWindowSessionReport (Codex A4 round 3 #4)', () => {
+  const defaults = { sessionId: null, profile: 'default', connectionId: null }
+
+  it('initial renderer defaults before boot establishes the route are not authoritative', () => {
+    expect(establishedWindowSessionReport(defaults, 'renderer.starting').established).toBe(false)
+    expect(establishedWindowSessionReport(defaults, 'renderer.config').established).toBe(false)
+    expect(establishedWindowSessionReport(defaults, undefined).established).toBe(false)
+    expect(establishedWindowSessionReport(defaults, 'renderer.error').established).toBe(false)
+  })
+
+  it('is authoritative once boot completed on the requested route', () => {
+    expect(establishedWindowSessionReport({ sessionId: 's1', ...active }, 'renderer.ready')).toEqual({
+      sessionId: 's1',
+      ...active,
+      established: true
+    })
   })
 })
 

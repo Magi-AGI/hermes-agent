@@ -9,7 +9,12 @@ import { $diskPluginsScanPending } from '@/contrib/runtime-loader'
 import { resolveDeepLinkAction } from '@/lib/deeplink-routes'
 import { pathFromHermesDeepLink, resolveHermesOpenPath } from '@/lib/hermes-open-target'
 import { storedSessionIdForNotification } from '@/lib/session-ids'
-import { reportsWindowSession, windowSessionReport } from '@/lib/window-session-report'
+import {
+  establishedWindowSessionReport,
+  reportsWindowSession,
+  windowSessionReport
+} from '@/lib/window-session-report'
+import { $desktopBoot } from '@/store/boot'
 import { announceNewSessionDraftKey } from '@/store/composer'
 import { $activeConnectionId } from '@/store/connections'
 import { requestMcpInstallFromDeepLink } from '@/store/mcp-deeplink-install'
@@ -124,8 +129,12 @@ export function useDesktopIntegrations({
   //
   // The session travels with its resolved OWNER route (connection/profile) as
   // one unit (lib/window-session-report.ts), re-reported when the window's
-  // active route changes too.
+  // active route changes too. Only once boot has ESTABLISHED the window's
+  // requested route is a report authoritative (Codex A4 round 3 #4): before
+  // that, profile/connection are initial defaults, and main keeps the launch
+  // route.
   const activeConnectionId = useStore($activeConnectionId)
+  const bootPhase = useStore($desktopBoot).phase
 
   useEffect(() => {
     // Every restorable window reports: peers AND session pop-outs (a pop-out
@@ -143,7 +152,10 @@ export function useDesktopIntegrations({
       .then(owner => {
         if (current) {
           window.hermesDesktop?.reportWindowSession?.(
-            windowSessionReport(sessionId, owner, { profile: activeProfile || null, connectionId: activeConnectionId })
+            establishedWindowSessionReport(
+              windowSessionReport(sessionId, owner, { profile: activeProfile || null, connectionId: activeConnectionId }),
+              bootPhase
+            )
           )
         }
       })
@@ -151,7 +163,7 @@ export function useDesktopIntegrations({
     return () => {
       current = false
     }
-  }, [activeConnectionId, activeProfile, routedSessionId])
+  }, [activeConnectionId, activeProfile, bootPhase, routedSessionId])
 
   const restoredRef = useRef(false)
   const diskPluginsScanPending = useStore($diskPluginsScanPending)

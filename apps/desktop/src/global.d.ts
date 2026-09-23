@@ -554,7 +554,12 @@ declare global {
       removeDesktopPlugin?: (payload: { name: string }) => Promise<{ ok: boolean; path?: string; error?: string }>
       signalSessionGatewayReady?: () => void
       // The session a restorable window shows + its resolved owner route, as one unit.
-      reportWindowSession?: (report: { connectionId: null | string; profile: null | string; sessionId: null | string }) => void
+      reportWindowSession?: (report: {
+        connectionId: null | string
+        established: boolean
+        profile: null | string
+        sessionId: null | string
+      }) => void
       signalSessionFunctionalReady?: (payload: {
         ok: boolean
         pending?: boolean

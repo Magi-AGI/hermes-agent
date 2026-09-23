@@ -35,6 +35,17 @@ export function windowSessionReport(
   return { sessionId, profile: owner.profile || active.profile, connectionId: owner.connectionId ?? null }
 }
 
+// A report is an authoritative route only once this window's boot has
+// ESTABLISHED the route it was launched on (Codex A4 round 3 #4). Before that the
+// renderer holds initial defaults (default profile, no connection); main keeps
+// the launch route it recorded and ignores reports that are not established.
+export function establishedWindowSessionReport(
+  report: WindowSessionReport,
+  bootPhase: string | undefined
+): WindowSessionReport & { established: boolean } {
+  return { ...report, established: bootPhase === 'renderer.ready' }
+}
+
 // Which windows report: every RESTORABLE kind — full peer windows and session
 // pop-outs (a pop-out can move to another session, e.g. via /new; Codex A4 #6).
 // Main ignores windows it does not save (watch windows).

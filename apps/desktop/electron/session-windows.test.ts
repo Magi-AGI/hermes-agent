@@ -401,8 +401,8 @@ test('a peer window is saved with its route and the session it is showing (crite
   const peer = makeFakeWindow()
 
   registry.openOrFocus('peer-1', () => peer, { kind: 'peer', profile: 'work', connectionId: 'c1', profileWindow: true })
-  assert.equal(registry.setRoute(peer, { sessionId: 's9', profile: 'work', connectionId: 'c1' }), true)
-  assert.equal(registry.setRoute(peer, { sessionId: 's9', profile: 'work', connectionId: 'c1' }), false, 'no-op when unchanged')
+  assert.equal(registry.setRoute(peer, { established: true, sessionId: 's9', profile: 'work', connectionId: 'c1' }), true)
+  assert.equal(registry.setRoute(peer, { established: true, sessionId: 's9', profile: 'work', connectionId: 'c1' }), false, 'no-op when unchanged')
 
   const [saved] = registry.entries().map(e => toSavedWindowEntry(e, BOUNDS, true))
 
@@ -485,7 +485,7 @@ test('switching a window to a session on another backend updates session AND rou
   const peer = makeFakeWindow()
 
   registry.openOrFocus('peer-1', () => peer, { kind: 'peer', profile: 'work', connectionId: 'c1', sessionId: 's1' })
-  assert.equal(registry.setRoute(peer, { sessionId: 's2', profile: 'remote-prof', connectionId: 'c2' }), true)
+  assert.equal(registry.setRoute(peer, { established: true, sessionId: 's2', profile: 'remote-prof', connectionId: 'c2' }), true)
 
   const [saved] = registry.entries().map(e => toSavedWindowEntry(e, BOUNDS, false))
 
@@ -500,7 +500,7 @@ test('a route-only change (same session, owner now resolved elsewhere) is saved 
   const peer = makeFakeWindow()
 
   registry.openOrFocus('peer-1', () => peer, { kind: 'peer', profile: 'work', connectionId: null, sessionId: 's1' })
-  assert.equal(registry.setRoute(peer, { sessionId: 's1', profile: 'work', connectionId: 'c9' }), true)
+  assert.equal(registry.setRoute(peer, { established: true, sessionId: 's1', profile: 'work', connectionId: 'c9' }), true)
   assert.equal(registry.entries()[0].connectionId, 'c9')
 })
 
@@ -511,7 +511,7 @@ test('a session pop-out moving to another session (e.g. via /new) is saved on th
   const pop = makeFakeWindow()
 
   registry.openOrFocus('pop-1', () => pop, { kind: 'session', sessionId: 's1', profile: 'work' })
-  assert.equal(registry.setRoute(pop, { sessionId: 's2', profile: 'work', connectionId: null }), true)
+  assert.equal(registry.setRoute(pop, { established: true, sessionId: 's2', profile: 'work', connectionId: null }), true)
   assert.equal(registry.entries()[0].sessionId, 's2')
 })
 
@@ -520,14 +520,14 @@ test('a pop-out passing through a fresh draft keeps its saved session until the 
   const pop = makeFakeWindow()
 
   registry.openOrFocus('pop-1', () => pop, { kind: 'session', sessionId: 's1', profile: 'work' })
-  assert.equal(registry.setRoute(pop, { sessionId: null, profile: 'work', connectionId: null }), false)
+  assert.equal(registry.setRoute(pop, { established: true, sessionId: null, profile: 'work', connectionId: null }), false)
 
   const [kept] = registry.entries().map(e => toSavedWindowEntry(e, BOUNDS, false))
 
   assert.equal(kept.sessionId, 's1')
   assert.equal(readSavedWindowEntries([kept]).length, 1, 'still a valid, reopenable saved entry')
 
-  registry.setRoute(pop, { sessionId: 's3', profile: 'work', connectionId: null })
+  registry.setRoute(pop, { established: true, sessionId: 's3', profile: 'work', connectionId: null })
   assert.equal(registry.entries()[0].sessionId, 's3')
 })
 
@@ -536,6 +536,30 @@ test('a peer on a fresh chat is recorded as such', () => {
   const peer = makeFakeWindow()
 
   registry.openOrFocus('peer-1', () => peer, { kind: 'peer', sessionId: 's1', profile: 'work' })
-  assert.equal(registry.setRoute(peer, { sessionId: null, profile: 'work', connectionId: null }), true)
+  assert.equal(registry.setRoute(peer, { established: true, sessionId: null, profile: 'work', connectionId: null }), true)
   assert.equal(registry.entries()[0].sessionId, null)
+})
+
+// ─── Codex A4 round 3 #4: initial renderer defaults are never a route ────────
+
+test("a fresh peer's initial renderer defaults never overwrite its launch route", () => {
+  const registry = createSessionWindowRegistry()
+  const peer = makeFakeWindow()
+
+  registry.openOrFocus('peer-1', () => peer, { kind: 'peer', profile: 'work', connectionId: 'c1', sessionId: null })
+
+  // Before boot establishes the requested route: default profile, no connection.
+  assert.equal(registry.setRoute(peer, { sessionId: null, profile: 'default', connectionId: null }), false)
+  assert.equal(
+    registry.setRoute(peer, { established: false, sessionId: null, profile: 'default', connectionId: null }),
+    false
+  )
+  assert.deepEqual(
+    { profile: registry.entries()[0].profile, connectionId: registry.entries()[0].connectionId },
+    { profile: 'work', connectionId: 'c1' }
+  )
+
+  // Boot established the route: now it is authoritative.
+  assert.equal(registry.setRoute(peer, { established: true, sessionId: 's1', profile: 'work', connectionId: 'c1' }), true)
+  assert.equal(registry.entries()[0].sessionId, 's1')
 })

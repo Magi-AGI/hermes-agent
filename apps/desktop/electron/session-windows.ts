@@ -293,14 +293,24 @@ function createSessionWindowRegistry() {
     // (connection/profile) are one unit (Codex A4 #5): they are always updated
     // together, so a saved entry can never pair a session with another
     // backend's route. Returns true when anything changed.
+    //
+    // Only an ESTABLISHED route is authoritative (Codex A4 round 3 #4): until
+    // the window's boot has established the route it was launched on, its
+    // renderer still holds initial defaults (the default profile, no
+    // connection). Those never overwrite the launch route main recorded.
     setRoute: (
       win,
-      report: { connectionId?: null | string; profile?: null | string; sessionId?: null | string }
+      report: {
+        connectionId?: null | string
+        established?: boolean
+        profile?: null | string
+        sessionId?: null | string
+      }
     ): boolean => {
       const key = windowIdOf(win)
       const entry = key ? windows.get(key) : null
 
-      if (!entry) {
+      if (!entry || report?.established !== true) {
         return false
       }
 
