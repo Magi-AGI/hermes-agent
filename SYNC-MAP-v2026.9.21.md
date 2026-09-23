@@ -91,9 +91,14 @@ model-options/listing never wait on probes (cdacc2bcf1, cb24121a8e).
 | B | 30d3fa1599 (48bb63b8d6) + 3982518f82 (curator preview bookkeeping, Codex #4-#6); ca86781a91 residual: afc54d5e6a reverted (75df8f6ce5), replaced by 9bcc841ff1 (model.save_key + recommended-default cache-only, bounded single-provider wait) | round 2 in triad |
 | D | 42c5344382..5cafcfff1d (16 picks + sync adaptations; ccb1168f23 split: ceiling part 42398eca41, EOF nit in 0e1b43f781, auth markers deferred to 2b) | in triad |
 | C | DECIDED 2026-09-22 (Lake; Codex + Antigravity agree): adopt upstream's ownership model, do not port the 19 commits. G1-G4 are RELEASE GATES. Codex's bar: G2 = new id owned before any continuation write, failure stops the turn; G3 = takeover waits for / fences the old executor. Implementation in progress | in progress |
-| C impl | 85a7b52b87 telemetry, 666ea9081e G1, e7c851631e G4, 4a6518a070 G2/G3 (durable turn lease already meets Codex's bar for transcript writes; residuals R1-R4 documented), bc7d17986d salvaged scenarios; 37fd1d3aaf test adaptations; b7c9d156af fallback-session AttributeError fix | in triad |
-| A3 | df65e59b80 (d33fec0394 route guard; no upstream equivalent; credential walk rewritten to upstream's resolver order) + 214c3bb682 oneshot test follow-up | in triad |
-| extra | 8e188195ef git probes GIT_OPTIONAL_LOCKS=0 (stale index.lock hazard; not fixed upstream) | in triad |
+| C impl | 85a7b52b87..bc7d17986d (telemetry, G1, G4, G2/G3 design, scenarios) + fencing follow-ups 332888e317..33b6fe52b2, 69d1d3e9a4, 67017165b8, cc24078df1, 2b0723622a, 986a4a8441, 912e489a0a, 8711773970 (7 Codex rounds: compression commits lease-fenced; one effective ownership token; sticky loss; ACP metadata/transcript split; lease-loss interrupt parked on the committing thread's own fence) | APPROVED 2026-09-23 (Codex + Antigravity) |
+| A3 | df65e59b80 + 214c3bb682; follow-ups 01f6d79802 (effective-auth screen), 2ce27e8d6a (native compaction), 7caa28fc2e (case-variant headers) | APPROVED 2026-09-23 (Codex + Antigravity) |
+| extra | 8e188195ef git probes GIT_OPTIONAL_LOCKS=0; b7c9d156af compute-host fallback AttributeError; 01f6d79802 side-find: route-guard test file was hanging (0 tests) | APPROVED |
+
+## Open items
+- Fallback-session full-turn stall (compute host, upstream): not diagnosed.
+- Yuanbao recall redaction: whole-transcript rewrite, unfenced (see BUCKET-C doc); Lake does not use the adapter.
+- Next: A4 (desktop session windows + e5b7b1d336, 7f39779443, 82972e687a), then phase 2b auth redesign, Group 2, Pass A remainder, Pass B.
 
 ## Decisions log
 - 2026-09-23 R1 (registry lag after a mid-turn rotation; second window can claim the new id in active_sessions.json while the durable turn lease still serializes its turns): Lake chose option (c), accept and document. Both reviewers endorsed (c) or (a) and rejected (b) (synchronous handoff: deadlock risk, no data-safety gain). Revisit (a) (async re-anchor frame) only if it shows up in practice.
