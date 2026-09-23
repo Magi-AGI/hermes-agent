@@ -24,6 +24,11 @@ def isolate_skills(tmp_path, monkeypatch):
     monkeypatch.setattr("tools.skill_manager_tool.SKILLS_DIR", skills_dir)
     monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", skills_dir)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # These tests pin the MAX_SKILL_CONTENT_CHARS limit on its own. The (Magi) byte ceiling binds
+    # foreground writes too and is lower by default, so lift it out of the way here; it has its own
+    # tests in test_skill_size_ceiling_and_curator_dry_run.py.
+    from agent import curator
+    monkeypatch.setattr(curator, "get_max_skill_size_kb", lambda: 10_000)
     return skills_dir
 
 

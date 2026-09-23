@@ -257,9 +257,9 @@ def get_consolidate() -> bool:
 
 
 def get_max_skill_size_kb() -> int:
-    """Ceiling on a curator-managed skill's SKILL.md size before the routine self-improvement
-    pass is mechanically refused further additive writes to it. Foreground (user-directed) edits
-    are never affected; only the autonomous per-session review is capped."""
+    """Byte ceiling on a skill file: past it, additive writes are mechanically refused for the
+    routine self-improvement pass AND (Magi) foreground turns, and creation cannot start above it.
+    The curator's own consolidation forks are exempt (see tools.skill_provenance)."""
     return _config_number("max_skill_size_kb", DEFAULT_MAX_SKILL_SIZE_KB, int)
 
 
