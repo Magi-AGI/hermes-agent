@@ -373,9 +373,11 @@ def _(rid, params: dict) -> dict:
         from hermes_cli.free_tier_bootstrap import reconcile_record
         reconcile_record()
     # Shared inventory builder (lock-step with model.options / dashboard); picker_hints carries `authenticated`.
-    from hermes_cli.inventory import build_models_payload
-    payload = build_models_payload(_model_picker_context(_session_agent(params)), picker_hints=True, max_models=50)
-    provider_data = next((p for p in payload["providers"] if p["slug"] == slug), None)
+    # Cache-only read with a bounded wait for this provider only: this runs on a tui-rpc worker, and a
+    # blocking inventory build could hang it on any degraded provider (09-08 pool exhaustion).
+    from hermes_cli.inventory import build_models_payload_for_provider
+    _payload, provider_data = build_models_payload_for_provider(
+        _model_picker_context(_session_agent(params)), slug, picker_hints=True, max_models=50)
     if provider_data is None:  # key saved but provider didn't appear — still success
         provider_data = {"slug": slug, "name": pconfig.name, "is_current": False, "models": [], "total_models": 0}
     provider_data["authenticated"] = True  # synthetic fallback bypasses picker_hints

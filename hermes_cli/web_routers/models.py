@@ -156,17 +156,17 @@ def get_recommended_default_model(provider: str = "", profile: Optional[str] = N
             return {"provider": "nous", "model": "", "free_tier": None}
 
     try:
-        from hermes_cli.inventory import build_models_payload, load_picker_context
+        from hermes_cli.inventory import build_models_payload_for_provider, load_picker_context
         from hermes_cli.models import pick_silent_default_model
 
         # build_models_payload -> list_authenticated_providers -> _save_discovered_models_to_config:
         # this GET lazily PERSISTS discovered custom-provider models, so it needs the scope too.
+        # Cache-only read with a bounded wait for this provider only (no live probe of the others).
         with _config_profile_scope(profile):
-            payload = build_models_payload(load_picker_context())
-        for row in payload.get("providers", []):
-            if str(row.get("slug", "")).lower() == slug:
-                models = [str(m) for m in (row.get("models") or [])]
-                return {"provider": slug, "model": pick_silent_default_model(models, provider=slug), "free_tier": None}
+            _payload, row = build_models_payload_for_provider(load_picker_context(), slug)
+        if row is not None:
+            models = [str(m) for m in (row.get("models") or [])]
+            return {"provider": slug, "model": pick_silent_default_model(models, provider=slug), "free_tier": None}
         return {"provider": slug, "model": "", "free_tier": None}
     except Exception:
         _log.exception("GET /api/model/recommended-default failed")

@@ -565,6 +565,35 @@ def _raw_config_has_enabled_moa_preset() -> bool:
     return any(key in moa for key in legacy_keys) and bool(moa.get("enabled", True))
 
 
+# Magi: bounded wait for the one provider a caller just authenticated (model.save_key,
+# /api/model/recommended-default). Long enough for a healthy /v1/models round-trip.
+_AUTHENTICATED_PROVIDER_CATALOG_WAIT_S = 10.0
+
+
+def build_models_payload_for_provider(ctx: ConfigContext, slug: str, **kwargs) -> tuple[dict, dict | None]:
+    """``build_models_payload`` on the cache-only read path, plus that payload's row for *slug*.
+
+    Every provider row is read without a live probe (``non_blocking_catalogs``, no synchronous
+    custom-provider probes), so a degraded provider cannot hold the caller: these run on an RPC /
+    request worker. Only *slug*, when its catalog is still cold, gets a bounded wait on its own
+    single-flight background refresh before the cache is read again."""
+    from hermes_cli.models import wait_for_provider_catalog_refresh
+
+    kwargs.update(non_blocking_catalogs=True, probe_custom_providers=False)
+    wanted = str(slug or "").strip().lower()
+
+    def _build() -> tuple[dict, dict | None]:
+        payload = build_models_payload(ctx, **kwargs)
+        row = next((r for r in payload.get("providers", []) if str(r.get("slug", "")).lower() == wanted), None)
+        return payload, row
+
+    payload, row = _build()
+    if row is not None and (not row.get("models") or row.get("catalog_pending")):
+        wait_for_provider_catalog_refresh(wanted, _AUTHENTICATED_PROVIDER_CATALOG_WAIT_S)
+        payload, row = _build()
+    return payload, row
+
+
 def _apply_picker_hints(rows: list[dict]) -> None:
     """Add ``authenticated``/``auth_type``/``key_env``/``warning`` per row."""
     for row in rows:

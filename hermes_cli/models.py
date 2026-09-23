@@ -1706,6 +1706,28 @@ def _spawn_swr_refresh(cache_key: str, refresh_fn=None) -> None:
     threading.Thread(target=lambda: ctx.run(_refresh), daemon=True, name=f"model-cache-swr-{cache_key}").start()
 
 
+def wait_for_provider_catalog_refresh(provider: str, timeout_s: float) -> None:
+    """Bounded wait for *provider*'s in-flight background refresh (the one a ``non_blocking`` read
+    spawned) to finish, so a caller that just authenticated one provider can serve its fresh catalog
+    without a blocking live probe. Never fetches itself, never waits past *timeout_s*: a hanging
+    provider holds only its own daemon thread, and the single-flight set stops repeat calls from
+    piling up more fetches."""
+    from hermes_constants import get_hermes_home_override, hermes_home_key
+    cache_key = _normalized_cache_slug(provider)
+    if not cache_key:
+        return
+    inflight_key = cache_key if get_hermes_home_override() is None else (hermes_home_key(), cache_key)
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while True:
+        with _swr_refresh_lock:
+            if inflight_key not in _swr_refresh_inflight:
+                return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.1, remaining))
+
+
 def _provider_models_cache_path() -> Path:
     from hermes_constants import get_hermes_home
     return get_hermes_home() / "provider_models_cache.json"
