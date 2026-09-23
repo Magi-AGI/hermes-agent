@@ -406,6 +406,7 @@ import { missingRendererAssets } from './renderer-bundle'
 import { planLaunchSwitches, readDesktopLaunchConfig } from './renderer-heap-flags'
 import { loadRendererLoadErrorPage } from './renderer-load-error-page'
 import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './renderer-log'
+import { createReopenQueue, type ReopenStep } from './reopen-queue'
 import { fetchRosterSourceData } from './roster-source-fetch'
 import {
   classifyStoredSecret,
@@ -416,7 +417,6 @@ import {
 } from './secret-storage-policy'
 import { describeGitSpawnFailure, GIT_UNUSABLE, selectRunnableBinary } from './select-runnable-binary'
 import {
-  createSingleFlight,
   createWindowReadinessTracker,
   REOPEN_WINDOW_SETTLE_MS,
   type ReopenProbeTarget,
@@ -14206,7 +14206,6 @@ function closeAllSessionWindows() {
 // A window that fails to become functional halts the REMAINING queue (does
 // not silently continue into an unhealthy backend) and is kept for a later
 // resumeReopenSessionWindows() call — see notifyReopenHalted below.
-let pendingReopenEntries: any[] | null = null
 
 // Every window's functional-ready verdict (see createWindowReadinessTracker).
 const windowReadiness = createWindowReadinessTracker(ipcMain)
@@ -14236,130 +14235,115 @@ function notifyReopenHalted(payload: {
   mainWindow?.webContents?.send('hermes:window:reopen-halted', payload)
 }
 
-// Explicit-action entry point: "Reopen Saved Session Windows" always starts
-// fresh from the current disk state, discarding any halted queue left over
-// from a previous attempt (that's what resumeReopenSessionWindows is for).
-// One reopen at a time: a second Reopen (menu, palette, IPC) while one runs
-// joins it rather than starting an overlapping queue.
-const reopenSessionWindows = createSingleFlight(async () => {
-  pendingReopenEntries = null
-  await runReopenQueue(readSessionWindowsState())
+// ONE queue for both "Reopen Saved Session Windows" and "Retry remaining
+// windows" (Codex A4 round 3 #3): a Reopen while a queue runs merges its
+// entries into it and a Resume joins it, so two commands can never each admit
+// an unready window at the same time. A Reopen with no queue running starts
+// fresh from the current disk state, discarding any halted queue.
+const reopenQueue = createReopenQueue<any>({
+  runEntry: runReopenEntry,
+  onHalt: notifyReopenHalted,
+  settle: () => new Promise(resolve => setTimeout(resolve, REOPEN_WINDOW_SETTLE_MS))
 })
 
-// Continues a queue a previous reopenSessionWindows() call halted partway
-// through (see notifyReopenHalted). A no-op if there's nothing pending.
-const resumeReopenSessionWindows = createSingleFlight(async (): Promise<{ ok: boolean; error?: string }> => {
-  if (!pendingReopenEntries || pendingReopenEntries.length === 0) {
-    return { ok: false, error: 'nothing to resume' }
+function reopenSessionWindows(): Promise<void> {
+  return reopenQueue.reopen(readSessionWindowsState())
+}
+
+// Continues a queue a previous Reopen halted partway through (see
+// notifyReopenHalted). A no-op if there's nothing pending.
+function resumeReopenSessionWindows(): Promise<{ ok: boolean; error?: string }> {
+  return reopenQueue.resume()
+}
+
+async function runReopenEntry(entry: any): Promise<ReopenStep> {
+  const displays = screen.getAllDisplays()
+  const bounds = computeSessionWindowOptions(entry, displays)
+  // A missing/null profile on the SAVED ENTRY does not mean the window
+  // boots against "default" — createSessionWindow's URL-building (below)
+  // correctly leaves it unset so the window adopts whatever the PRIMARY
+  // profile currently is (session-windows.ts: buildSessionWindowUrl's own
+  // doc comment; use-gateway-boot.ts: adoptPrimaryProfile). The gate/probe
+  // need that SAME resolved value, not a hardcoded "default" — triad
+  // review round 3, Codex finding: for a user whose primary profile isn't
+  // literally "default" (e.g. claudetriad), every entry with no stored
+  // profile would otherwise fail validation and get destroyed.
+  const expectedProfile = entry.profile ?? primaryProfileKey()
+
+  let opened: { win: any; created: boolean }
+
+  try {
+    opened =
+      entry.kind === 'peer'
+        ? openInstanceWindow(
+            entry.profile ? { profile: entry.profile, connectionId: entry.connectionId ?? null } : undefined,
+            null,
+            {
+              windowId: entry.windowId,
+              sessionId: entry.sessionId ?? null,
+              profileWindow: entry.profileWindow === true,
+              bounds: computeWindowOptions(entry, displays),
+              isMaximized: entry.isMaximized === true
+            }
+          )
+        : createSessionWindow(entry.sessionId, {
+            watch: false,
+            bounds,
+            isMaximized: entry.isMaximized === true,
+            profile: entry.profile ?? null,
+            windowId: entry.windowId
+          })
+  } catch (err) {
+    // An unresolvable saved route (e.g. a removed connection) skips this one
+    // window; its saved entry is kept (never pruned for being stale).
+    rememberLog(`[session-windows] reopen skipped ${entry.windowId}: ${err instanceof Error ? err.message : err}`)
+
+    return 'skipped'
   }
 
-  const entries = pendingReopenEntries
+  const { win } = opened
 
-  pendingReopenEntries = null
-  await runReopenQueue(entries)
+  if (!win || win.isDestroyed()) {
+    return 'skipped'
+  }
+
+  const result = await waitForSessionWindowFunctionallyReady(
+    win,
+    {
+      profile: expectedProfile,
+      sessionId: entry.sessionId ?? null,
+      probeTarget: reopenProbeTarget(entry, windowConnectionRoutes.get(win.webContents.id), expectedProfile)
+    },
+    {
+      ipcMain,
+      probeBackendHealth: probeWindowRouteHealth,
+      // An already-open window is judged by what it actually reported, not
+      // assumed ready because the registry only focused it.
+      knownVerdict: windowReadiness.get(win.webContents.id)
+    }
+  )
+
+  if (!result.ok) {
+    rememberLog(`[session-windows] reopen halted at ${entry.windowId} (profile "${expectedProfile}"): ${result.reason}`)
+
+    // Destroy the failed window before retaining its entry for retry: this
+    // window never proved itself functional, and leaving it open would let
+    // a retry's createSessionWindow() find it still registered and focus it
+    // (created: false) — which skips verification entirely via the exact
+    // fast-path this whole redesign exists to gate correctly (triad review
+    // round 2, Codex finding #2). Destroying it guarantees a retry always
+    // re-creates it fresh (created: true) and is genuinely re-verified, at
+    // the cost of a rare in-flight-but-about-to-succeed load being restarted.
+    if (!win.isDestroyed()) {
+      // Not an explicit user close: its saved entry must survive (it is
+      // retained for retry below).
+      win.destroy()
+    }
+
+    return { ok: false, profile: expectedProfile, reason: result.reason }
+  }
 
   return { ok: true }
-})
-
-async function runReopenQueue(entries: any[]) {
-  const displays = screen.getAllDisplays()
-
-  for (let i = 0; i < entries.length; i++) {
-    const entry = entries[i]
-    const bounds = computeSessionWindowOptions(entry, displays)
-    // A missing/null profile on the SAVED ENTRY does not mean the window
-    // boots against "default" — createSessionWindow's URL-building (below)
-    // correctly leaves it unset so the window adopts whatever the PRIMARY
-    // profile currently is (session-windows.ts: buildSessionWindowUrl's own
-    // doc comment; use-gateway-boot.ts: adoptPrimaryProfile). The gate/probe
-    // need that SAME resolved value, not a hardcoded "default" — triad
-    // review round 3, Codex finding: for a user whose primary profile isn't
-    // literally "default" (e.g. claudetriad), every entry with no stored
-    // profile would otherwise fail validation and get destroyed.
-    const expectedProfile = entry.profile ?? primaryProfileKey()
-
-    let opened: { win: any; created: boolean }
-
-    try {
-      opened =
-        entry.kind === 'peer'
-          ? openInstanceWindow(
-              entry.profile ? { profile: entry.profile, connectionId: entry.connectionId ?? null } : undefined,
-              null,
-              {
-                windowId: entry.windowId,
-                sessionId: entry.sessionId ?? null,
-                profileWindow: entry.profileWindow === true,
-                bounds: computeWindowOptions(entry, displays),
-                isMaximized: entry.isMaximized === true
-              }
-            )
-          : createSessionWindow(entry.sessionId, {
-              watch: false,
-              bounds,
-              isMaximized: entry.isMaximized === true,
-              profile: entry.profile ?? null,
-              windowId: entry.windowId
-            })
-    } catch (err) {
-      // An unresolvable saved route (e.g. a removed connection) skips this one
-      // window; its saved entry is kept (never pruned for being stale).
-      rememberLog(`[session-windows] reopen skipped ${entry.windowId}: ${err instanceof Error ? err.message : err}`)
-
-      continue
-    }
-
-    const { win } = opened
-
-    if (!win || win.isDestroyed()) {
-      continue
-    }
-
-    const result = await waitForSessionWindowFunctionallyReady(
-      win,
-      {
-        profile: expectedProfile,
-        sessionId: entry.sessionId ?? null,
-        probeTarget: reopenProbeTarget(entry, windowConnectionRoutes.get(win.webContents.id), expectedProfile)
-      },
-      {
-        ipcMain,
-        probeBackendHealth: probeWindowRouteHealth,
-        // An already-open window is judged by what it actually reported, not
-        // assumed ready because the registry only focused it.
-        knownVerdict: windowReadiness.get(win.webContents.id)
-      }
-    )
-
-    if (!result.ok) {
-      const totalCount = entries.length
-
-      rememberLog(
-        `[session-windows] reopen halted at ${i + 1}/${totalCount} (profile "${expectedProfile}"): ${result.reason}`
-      )
-
-      // Destroy the failed window before retaining its entry for retry: this
-      // window never proved itself functional, and leaving it open would let
-      // a retry's createSessionWindow() find it still registered and focus it
-      // (created: false) — which skips verification entirely via the exact
-      // fast-path this whole redesign exists to gate correctly (triad review
-      // round 2, Codex finding #2). Destroying it guarantees a retry always
-      // re-creates it fresh (created: true) and is genuinely re-verified, at
-      // the cost of a rare in-flight-but-about-to-succeed load being restarted.
-      if (!win.isDestroyed()) {
-        // Not an explicit user close: its saved entry must survive (it is
-        // retained for retry below).
-        win.destroy()
-      }
-
-      pendingReopenEntries = entries.slice(i)
-      notifyReopenHalted({ restoredCount: i, totalCount, profile: expectedProfile, reason: result.reason })
-
-      return
-    }
-
-    await new Promise(resolve => setTimeout(resolve, REOPEN_WINDOW_SETTLE_MS))
-  }
 }
 
 // Popped-out in-app Browser: same webview + address bar as a docked Browser
