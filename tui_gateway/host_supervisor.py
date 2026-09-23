@@ -21,7 +21,6 @@ from typing import Any
 
 from hermes_constants import get_hermes_home
 from tools.environments.local import hermes_subprocess_env
-from tui_gateway.relay_buffer import RelayBuffer
 
 logger = logging.getLogger(__name__)
 
@@ -121,24 +120,6 @@ def is_compute_host_identity(pid: int) -> bool:
     return "tui_gateway.compute_host" in _pid_command(pid)
 
 
-class _SupervisorRelayDelivery:
-    """Adapts HostSupervisor methods to the RelayDelivery Protocol (names differ):
-    the supervisor has ``rpc_sink`` (matches) but ``_complete_turn`` /
-    ``_fail_session_turns``, not the Protocol's ``complete_turn`` / ``fail_session``."""
-
-    def __init__(self, sup: "HostSupervisor") -> None:
-        self._sup = sup
-
-    def rpc_sink(self, message: dict) -> None:
-        self._sup.rpc_sink(message)
-
-    def complete_turn(self, frame: dict) -> None:
-        self._sup._complete_turn(frame)
-
-    def fail_session(self, sid: str, reason: str, message: str) -> None:
-        self._sup._fail_session_turns(sid, reason, message)
-
-
 class HostSupervisor:
     """Own one persistent compute-host child and relay its frames."""
 
@@ -190,28 +171,16 @@ class HostSupervisor:
                                _cfg, self._hb_timeout_secs, self.heartbeat_secs)
         else:
             self._hb_timeout_secs = 0.0
-
-        # H1: off-drain-thread WS delivery. Constructed BEFORE start()/autostart so
-        # the drain thread always has a relay to enqueue into. The supervisor is
-        # adapted to the RelayDelivery Protocol (its method names differ).
-        self._relay = RelayBuffer(_SupervisorRelayDelivery(self))
-
         if self._hb_timeout_secs > 0:
             threading.Thread(target=self._heartbeat_watchdog_loop,
-                              name="compute-host-hb-watchdog", daemon=True).start()
+                             name="compute-host-hb-watchdog", daemon=True).start()
         if autostart:
             try:
                 self.start()
             except Exception:
-                # Startup failed → the caller gets no object to shut down, so the
-                # threads we already started (relay + opt-in watchdog) would leak.
-                # Tear them down before re-raising: _closing stops the watchdog loop
-                # (`while not self._closing`) and relay.stop() joins the relay thread.
+                # Startup failed → the caller gets no object to shut down; _closing stops
+                # the opt-in watchdog loop (`while not self._closing`) so it cannot leak.
                 self._closing = True
-                try:
-                    self._relay.stop()
-                except Exception:
-                    logger.exception("relay stop during failed startup failed")
                 raise
 
     @property
@@ -239,8 +208,8 @@ class HostSupervisor:
         with self._lock:
             self._closing = True
             proc = self._proc
-        # H4/R4: registry removal AND relay stop must run even on the proc-is-None
-        # path, so both live in an OUTER finally (an early return would skip them).
+        # Registry removal must run even on the proc-is-None path, so it lives in an
+        # OUTER finally (an early return would skip it).
         try:
             if proc is not None:
                 try:
@@ -251,7 +220,6 @@ class HostSupervisor:
                     self._terminate_process(proc)
         finally:
             self._remove_registry()
-            self._relay.stop()
 
     def reconcile_startup_orphan(self) -> str:
         """Terminate a stale registered host, guarding against PID reuse."""
@@ -373,8 +341,8 @@ class HostSupervisor:
             raise RuntimeError("compute host respawn disabled after crash loop")
         self._hello_event.clear()
         self._hello = {}
-        self._last_hb_monotonic = 0.0   # a dead host's timestamp must not arm the watchdog against the fresh one
-        env = {**hermes_subprocess_env(inherit_credentials=True), **os.environ, **(self.env or {})}
+        self._last_hb_monotonic = 0.0
+        env ={**hermes_subprocess_env(inherit_credentials=True), **os.environ, **(self.env or {})}
         env["HERMES_COMPUTE_HOST_HEARTBEAT_SECS"] = str(self.heartbeat_secs)
         root = str(_repo_root())
         env.setdefault("PYTHONPATH", root)
@@ -461,42 +429,25 @@ class HostSupervisor:
         request_id = str(frame.get("request_id") or "")
         if ftype in _CONTROL_REPLY_TYPES or (ftype == "error" and request_id):
             self._deliver_control_frame(request_id, frame)
-            return
-        if ftype == "hello":
+        elif ftype == "hello":
             self._hello = dict(frame)
             self._last_hb_monotonic = time.monotonic()
             self._hello_event.set()
-            return
-        if ftype == "hb":
+        elif ftype == "hb":
             self._last_progress_counter = int(frame.get("progress_counter") or self._last_progress_counter)
             self._last_hb_monotonic = time.monotonic()
             logger.debug("compute host heartbeat: %s", frame)
-            return
-        if ftype == "orphan":
+        elif ftype == "orphan":
             logger.warning("compute host reported orphan (parent gone): old_ppid=%s confirmations=%s pid=%s",
                            frame.get("old_ppid"), frame.get("confirmations"), self.pid)
-            return
-        if ftype == "rpc":
-            # H2: WS-bound → enqueue for the relay thread. NEVER call rpc_sink here —
-            # a blocking/throwing WS write on the drain thread wedges stdout drain.
-            self._relay.enqueue("rpc", frame)
-            return
-        if ftype in ("turn.end", "turn.error"):
-            # _complete_turn → on_complete emits message.complete / session.info
-            # (WS-bound). Route through the relay so it never blocks the drain and
-            # stays ordered behind this session's already-queued rpc frames.
-            self._relay.enqueue("turn_complete", frame)
-            return
-
-    def _complete_turn(self, frame: dict[str, Any]) -> None:
-        request_id = str(frame.get("request_id") or "")
-        with self._lock:
-            pending = self._pending_turns.pop(request_id, None)
-        if pending is None:
-            return
-        _sid, cb = pending
-        if cb is not None:
-            _call_logged(cb, frame, "compute host turn completion callback failed")
+        elif ftype == "rpc":
+            if isinstance(frame.get("message"), dict):
+                self.rpc_sink(frame["message"])
+        elif ftype in ("turn.end", "turn.error"):
+            with self._lock:
+                pending = self._pending_turns.pop(request_id, None)
+            if pending is not None and pending[1] is not None:
+                _call_logged(pending[1], frame, "compute host turn completion callback failed")
 
     @staticmethod
     def _classify_exit(code: int) -> tuple[str, str]:
@@ -515,65 +466,33 @@ class HostSupervisor:
                 return
             self._proc = None
         self._remove_registry()
-        reason, message = self._classify_exit(code)  # KEEP: 18=orphan / 0=clean / else=crash
+        reason, message = self._classify_exit(code)
         (logger.warning if reason == "crash" else logger.info)(
             "compute host exited: code=%s reason=%s", code, reason)
+        # _fail_pending_turns also drains late control handlers: the host is gone whatever
+        # the reason, so no late ack can arrive for host_exit / host_orphan_exit either.
         self._fail_pending_turns(reason=reason, message=message)
+        self._maybe_respawn_after_crash()
 
     def _fail_pending_turns(self, *, reason: str, message: str) -> None:
-        # R5: snapshot+clear BEFORE anything else so turns submitted to a fresh host
-        # cannot be mis-failed.
         with self._lock:
             pending = self._pending_turns
             self._pending_turns = {}
-        # R5 three-pass ordering (guarantees old-turn errors precede any fresh-host
-        # frame on the WS, and no callback can stall recovery):
-        # (2) enqueue ALL old-turn error WS events FIRST — non-blocking, ahead of any
-        #     fresh-host frame in each session's relay FIFO.
+        failure = {"reason": reason, "message": message}
         for request_id, (sid, cb) in pending.items():
-            self._relay.enqueue(
-                "rpc",
-                {"type": "rpc", "sid": sid,
-                 "message": {"jsonrpc": "2.0", "method": "event",
-                             "params": {"type": "error", "session_id": sid,
-                                        "payload": {"message": message, "reason": reason}}}})
-        # (2.5) The host is gone regardless of WHY it exited (crash, clean exit, or a
-        # self-reported orphan exit) — a late control.ack/error can never arrive for
-        # any of the three, so drain and fail every registered late-control handler
-        # here too, not just on "crash". Upstream (aa80626764) only ever reaches this
-        # step via a single unconditional "crash" path and never had to consider a
-        # clean/orphan exit; without this, a host_exit/host_orphan_exit leaves late
-        # control waiters (e.g. a late compression ack) hanging until
-        # _LATE_CONTROL_TTL_SECS (1800s) expires instead of failing fast. See #97948.
+            self.rpc_sink({"jsonrpc": "2.0", "method": "event",
+                           "params": {"type": "error", "session_id": sid, "payload": dict(failure)}})
+            if cb is not None:
+                frame = {"type": "turn.error", "sid": sid, "request_id": request_id, **failure}
+                _call_logged(cb, frame, "compute host error callback failed")
+        # A crashed host never emits the late acks timed-out control waiters still expect; fail
+        # them too so the client's "still running" notice can't hang.
         with self._lock:
             late = self._late_control_handlers
             self._late_control_handlers = {}
-        failure = {"reason": reason, "message": message}
         for request_id, (_registered_at, handler) in late.items():
             frame = {"type": "control.error", "request_id": request_id, **failure}
             _call_logged(handler, frame, "compute host late control error handler failed")
-        # (3) schedule respawn BEFORE any (possibly blocking) callback can matter.
-        self._maybe_respawn_after_crash()
-        # (4) invoke completion callbacks after respawn is scheduled.
-        for request_id, (sid, cb) in pending.items():
-            if cb is not None:
-                _call_logged(
-                    cb, {"type": "turn.error", "sid": sid, "request_id": request_id, **failure},
-                    "compute host error callback failed")
-
-    def _fail_session_turns(self, sid: str, reason: str, message: str) -> None:
-        """Fail one session's pending turns (relay-driven overflow / delivery failure).
-        Serves as the RelayDelivery.fail_session sink via _SupervisorRelayDelivery."""
-        with self._lock:
-            matching = {rid: v for rid, v in self._pending_turns.items() if v[0] == sid}
-            for rid in matching:
-                self._pending_turns.pop(rid, None)
-        for request_id, (msid, cb) in matching.items():
-            if cb is not None:
-                _call_logged(
-                    cb, {"type": "turn.error", "sid": msid, "request_id": request_id,
-                         "reason": reason, "message": message},
-                    "compute host session-fail callback failed")
 
     def _maybe_respawn_after_crash(self) -> None:
         now = time.monotonic()
