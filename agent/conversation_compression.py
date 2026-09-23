@@ -3347,8 +3347,15 @@ def _publish_rotated_compaction(
     _foreign_tail_ceiling = None
     with contextlib.suppress(Exception):
         _foreign_tail_ceiling = agent._session_db.get_active_message_watermark(agent.session_id)
-    with contextlib.suppress(Exception):  # best-effort — don't block compression on a flush error
+    # Best-effort for ordinary DB errors, but a lost turn lease stops publication: the successor owns
+    # the conversation now (Magi sync, bucket C; the publish below re-checks it in its own txn too).
+    from hermes_state_errors import SessionTurnLeaseLostError
+    try:
         agent._flush_messages_to_session_db(messages, conversation_history=persisted_history)
+    except SessionTurnLeaseLostError:
+        raise
+    except Exception as exc:
+        logger.warning("Pre-publication flush failed; publishing the handoff anyway: %s", exc)
     # Publish closure + child + handoff in one transaction so no reader sees an
     # empty child. Child stays on the parent's profile ("default" persists as NULL);
     # publish also COALESCEs from the parent row for threads lacking HERMES_HOME.
@@ -3370,6 +3377,7 @@ def _publish_rotated_compaction(
         require_lease_refresh=lease.holder is not None, lease_ttl_seconds=lease.ttl,
         watermark=(lease.watermark if _foreign_tail_ceiling is not None else None),
         watermark_ceiling=_foreign_tail_ceiling,
+        turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
     )
     # `already_present` stamping is done by run_agent's _sync_persisted_markers;
     # this branch covers inserted/merged only; direct callers must use that wrapper.
@@ -3673,6 +3681,7 @@ def _commit_compaction(
                     agent.session_id, compressed, model_config_patch={PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None},
                     watermark=lease.watermark, lock_holder=lease.holder,
                     tail_count=sum(1 for m in compressed if id(m) in _tail_tagged_ids),
+                    turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
                 )
                 split_status = "in_place_committed"
                 # compress() returned marker-swept copies; stamp them as persisted or the next

@@ -1953,6 +1953,13 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
     if callable(_bind_session_state):
         with suppress(Exception):
             _bind_session_state(session_db=session_db, session_id=agent.session_id)
+    # Compression commits inside a turn are fenced by that turn's durable lease; the compressor reads
+    # the holder through a weak reference (no agent<->compressor cycle). Magi sync, bucket C.
+    with suppress(Exception):
+        import weakref
+        _agent_ref = weakref.ref(agent)
+        agent.context_compressor._turn_lease_holder_source = (
+            lambda: getattr(_agent_ref(), "_active_session_turn_lease_holder", None))
     agent.compression_enabled = cs.enabled
     agent.compression_in_place = cs.in_place
     _cc = agent.context_compressor

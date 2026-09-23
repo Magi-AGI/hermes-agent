@@ -231,7 +231,8 @@ class SessionCompressionMixin:
         system_prompt: str = None, cwd: str = None, profile_name: str = None,
         compression_lock_holder: str = None, require_compression_lease: bool = True,
         require_lease_refresh: bool = False, lease_ttl_seconds: float = 300.0,
-        watermark: Optional[int] = None, watermark_ceiling: Optional[int] = None) -> None:
+        watermark: Optional[int] = None, watermark_ceiling: Optional[int] = None,
+        turn_lease_holder: Optional[str] = None) -> None:
         """Atomically close a parent and publish its durable compression child: closure, child row, and
         handoff commit in one transaction, so readers see the live parent or a complete child, never an
         ended parent with a missing/empty child. *watermark* (parent's ``get_active_message_watermark`` at compression start): parent rows with ``id
@@ -241,6 +242,10 @@ class SessionCompressionMixin:
         watermark_ceiling]`` is foreign tail (``None`` = unbounded). *require_lease_refresh* +
         *compression_lock_holder* refreshes the lease on the same ``conn`` before the expiry check (no
         TOCTOU window), so a refresher that died on transient DB errors gets one last chance.
+        *turn_lease_holder*: the publishing turn's durable turn lease, verified in this transaction
+        exactly as transcript writes verify it; ``None`` (a turn-less compression) is refused while
+        another turn holds the conversation. The compression lock alone does not fence a taken-over
+        executor: it stays valid independently of the turn lease (Magi sync, bucket C).
 
         See #75316.
         ``None`` = unbounded (no internal flush happened). See #47202.
@@ -259,6 +264,7 @@ class SessionCompressionMixin:
             ):
                 raise CompressionSessionBusyError(
                     f"Compression lease lost before publication: {parent_session_id}")
+            self._check_compression_turn_fence(conn, parent_session_id, turn_lease_holder)
             parent = conn.execute(
                 """SELECT ended_at, end_reason, cwd, git_branch, git_repo_root,
                           user_id, session_key, chat_id, chat_type,

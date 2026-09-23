@@ -2143,6 +2143,14 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         self._compression_telemetry_seed = None
         self._reset_proactive_prune_rearm()
 
+    # Set by agent_init: returns the owning agent's durable turn-lease holder (None outside a turn).
+    _turn_lease_holder_source = None
+
+    def _current_turn_lease_holder(self) -> Optional[str]:
+        """The committing turn's lease holder for in-txn compression fencing (Magi sync, bucket C)."""
+        source = self._turn_lease_holder_source
+        return source() if callable(source) else None
+
     def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
         """Bind the current session row so durable cooldowns can round-trip."""
         self._session_db = session_db
@@ -3221,6 +3229,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
                 session_db.archive_and_compact(
                     session_id, pruned_msgs,
                     model_config_patch={PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: next_rearm_tokens},
+                    turn_lease_holder=self._current_turn_lease_holder(),
                 )
             except Exception as exc:
                 logger.warning("Proactive tool-result prune DB commit failed; keeping the original transcript: %s", exc)

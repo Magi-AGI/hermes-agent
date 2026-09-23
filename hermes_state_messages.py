@@ -249,6 +249,16 @@ class SessionMessagesMixin:
         if _ended_by_compression(conn.execute(_ENDED_ROW_SQL, (session_id,)).fetchone()) and not allow_closed_compression_parent:
             raise CompressionSessionClosedError(session_id)
 
+    def _check_compression_turn_fence(self, conn, session_id: str, turn_lease_holder: Optional[str]) -> None:
+        """Turn-lease admission for a compression COMMIT, in the commit's own transaction. A turn's
+        commit must still hold its lease (same rule and renewal as its transcript writes); a turn-less
+        commit is refused while another turn holds the conversation. Without this, a taken-over
+        executor whose compression lock was still valid could publish over the successor (Magi sync,
+        bucket C)."""
+        self._check_transcript_write_guards(
+            conn, session_id, None, turn_lease_holder=turn_lease_holder,
+            reject_active_turn_lease=not turn_lease_holder, allow_closed_compression_parent=True)
+
     def _message_row_params(self, session_id: str, role: str, msg: Dict[str, Any], tool_calls: Any,
         message_timestamp: float, *, keep_reasoning: bool) -> tuple:
         """Bind values for ``_INSERT_MESSAGE_SQL`` from one message dict (*tool_calls* already parsed;
@@ -664,7 +674,7 @@ class SessionMessagesMixin:
 
     def archive_and_compact(self, session_id: str, compacted_messages: List[Dict[str, Any]],
         model_config_patch: Optional[Dict[str, Any]] = None, watermark: Optional[int] = None,
-        lock_holder: Optional[str] = None, tail_count: int = 0) -> int:
+        lock_holder: Optional[str] = None, tail_count: int = 0, turn_lease_holder: Optional[str] = None) -> int:
         """Non-destructive in-place compaction under ONE session id: soft-archive the active rows (``active=0,
         compacted=1``: summarized away, still searchable) and insert *compacted_messages* as fresh active
         rows, atomically; returns the new ACTIVE count (= ``message_count``). *watermark* (compression
@@ -674,6 +684,8 @@ class SessionMessagesMixin:
         rows are the verbatim carried tail; their originals and the clones' originals are superseded
         duplicates and get rewind flags (``active=0, compacted=0``) so search doesn't return each carried
         message once per compaction. ``model_config_patch`` merges in the same txn (``None`` removes a key).
+        *turn_lease_holder*: the committing turn's durable turn lease, verified in-txn; ``None`` is
+        refused while another turn holds the conversation (see :meth:`_check_compression_turn_fence`).
 
         Concurrent-append safety (#75316): when *watermark* is provided (the value of
         :meth:`get_active_message_watermark` captured at compression START), rows that arrived during the
@@ -690,6 +702,7 @@ class SessionMessagesMixin:
                 if lock_row is None or lock_row["holder"] != lock_holder or float(lock_row["expires_at"]) <= time.time():
                     raise SessionCompressionInProgressError(
                         f"Compression lease for {session_id!r} lost before commit; refusing to publish a stale compaction")
+            self._check_compression_turn_fence(conn, session_id, turn_lease_holder)
             patch = model_config_patch is not None
             # on_missing="raise": never commit against a vanished session row (caller keeps the original).
             patched_model_config = self._merge_model_config_json(

@@ -349,7 +349,10 @@ class MicroCompactionMixin:
             return
         try:
             # Every row except the marker is a carried-forward original: archive rewind-style.
-            session_db.archive_and_compact(session_id, compacted_messages, tail_count=max(0, len(compacted_messages) - 1))
+            holder_fn = getattr(self, "_current_turn_lease_holder", None)
+            session_db.archive_and_compact(
+                session_id, compacted_messages, tail_count=max(0, len(compacted_messages) - 1),
+                turn_lease_holder=holder_fn() if callable(holder_fn) else None)
             # Shared post-commit stamp site with batch commit and proactive prune.
             # See #98450.
             _cc().stamp_db_persisted_markers(compacted_messages)

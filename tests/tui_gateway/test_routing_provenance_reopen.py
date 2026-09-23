@@ -111,9 +111,12 @@ def test_a_registered_stale_close_is_cleared_before_the_turn_and_rotation_publis
     assert agent.turns == ["go"]
     assert agent.stamp_seen_by_turn == [None], "the stamp must be cleared before the worker starts"
     assert db.try_acquire_compression_lock("row-1", "holder")
+    # The rotation belongs to the turn, which (in this fake) still holds its durable lease: publish as
+    # that turn. A holder-less publish is refused while a turn holds the conversation (Magi sync, bucket C).
     db.publish_compression_child(
         parent_session_id="row-1", child_session_id="row-1-child", source="tui",
-        messages=[{"role": "user", "content": "go"}], model="m", compression_lock_holder="holder")
+        messages=[{"role": "user", "content": "go"}], model="m", compression_lock_holder="holder",
+        turn_lease_holder=TURN)
     assert db.get_session("row-1")["end_reason"] == "compression"
 
 
