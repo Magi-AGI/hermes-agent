@@ -3421,6 +3421,12 @@ def _compression_auth_override_problem(client: Any) -> Optional[str]:
     token = getattr(client, "api_key", None)
     if not isinstance(token, str) or not token.strip():
         return "unverifiable_auth"
+    names = [str(k).lower() for k, v in headers.items() if isinstance(v, str)]
+    # Case variants of one credential header (``Authorization`` + ``authorization``) are all SENT;
+    # collapsing them would inspect only one. Exactly one effective credential or refuse (review:
+    # Codex, sync A3).
+    if any(names.count(n) > 1 for n in set(names) if _is_credential_header(n)):
+        return "auth_override"
     live = {str(k).lower(): v for k, v in headers.items() if isinstance(v, str)}
     if live.get("authorization") != f"Bearer {token}":
         return "auth_override"

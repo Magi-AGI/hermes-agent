@@ -100,3 +100,19 @@ def test_codex_per_request_authorization_override_is_refused():
 def test_per_request_credential_headers_are_fine_outside_compaction(monkeypatch):
     """Scoped to the compaction guard: other auxiliary tasks keep upstream's behaviour."""
     ac._refuse_compaction_auth_override_headers({"x-api-key": METERED_KEY})  # no guard -> no raise
+
+
+def test_conflicting_case_variants_of_authorization_refuse():
+    """Review (Codex, sync A3): ``Authorization: Bearer old`` alongside ``authorization: Bearer
+    <selected>`` are BOTH sent; collapsing names inspected only the selected token."""
+    from types import SimpleNamespace
+    client = SimpleNamespace(
+        api_key=OAUTH_TOKEN,
+        _real_client=SimpleNamespace(default_headers={
+            "Authorization": "Bearer sk-ant-oat01-someone-else",
+            "authorization": f"Bearer {OAUTH_TOKEN}",
+        }))
+    assert ac._compression_auth_override_problem(client) == "auth_override"
+    single = SimpleNamespace(api_key=OAUTH_TOKEN,
+                             _real_client=SimpleNamespace(default_headers={"authorization": f"Bearer {OAUTH_TOKEN}"}))
+    assert ac._compression_auth_override_problem(single) is None
