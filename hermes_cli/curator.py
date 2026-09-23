@@ -154,6 +154,13 @@ def _cmd_run(args) -> int:
     if not curator.is_enabled():
         print("curator: disabled via config; enable with `curator.enabled: true`")
         return 1
+    # Same per-home exclusion as the scheduled pass: an explicit run bypasses the idle and interval
+    # gates, never a review that is already running (review: Codex).
+    claim = curator._claim_run()
+    if claim is None:
+        print("curator: a review is already running for this profile; try again when it finishes "
+              "(`hermes curator status`)")
+        return 1
     dry = bool(getattr(args, "dry_run", False))
     background = bool(getattr(args, "background", False))
     synchronous = bool(getattr(args, "synchronous", False)) or not background
@@ -168,8 +175,13 @@ def _cmd_run(args) -> int:
             "curator: consolidation is off — running prune-only "
             "(deterministic stale/archive). Pass --consolidate or set "
             "`curator.consolidate: true` to enable the LLM merge pass.")
-    result = curator.run_curator_review(
-        on_summary=print, synchronous=synchronous, dry_run=dry, consolidate=consolidate)
+    try:
+        result = curator.run_curator_review(
+            on_summary=print, synchronous=synchronous, dry_run=dry, consolidate=consolidate,
+            on_finished=claim.release)
+    except BaseException:
+        claim.release()
+        raise
     auto = result.get("auto_transitions", {})
     if auto and dry:
         print(

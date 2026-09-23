@@ -9,6 +9,7 @@ all auto-transitions; the fork uses the auxiliary client and never touches the m
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -1156,7 +1157,10 @@ def run_curator_review(
     if synchronous:
         _llm_pass_then_finish()
     else:
-        threading.Thread(target=_llm_pass_then_finish, daemon=True, name="curator-review").start()
+        # A fresh copy of the caller's context: the fork's report and state writes must land in the
+        # profile that started the review, not the launch profile (review: Codex).
+        ctx = contextvars.copy_context()
+        threading.Thread(target=ctx.run, args=(_llm_pass_then_finish,), daemon=True, name="curator-review").start()
     return {"started_at": start.isoformat(), "auto_transitions": counts, "summary_so_far": auto_summary}
 
 
@@ -1311,63 +1315,68 @@ def _run_llm_review(prompt: str, dry_run: bool = False) -> Dict[str, Any]:
 
 # --- Public entrypoint for the session-start hook ---
 
-_CLAIM_STALE_SECONDS = 3600.0
-
-
 def _run_claim_path() -> Path:
     return get_hermes_home() / "skills" / ".locks" / "curator-run"
 
 
-def _claim_run() -> bool:
-    """One automatic pass per home across processes: two CLIs launched seconds apart both saw the
-    weekly interval elapsed and both pruned the tree. O_EXCL create wins the claim; a claim older than
-    an hour is a crashed holder and is taken over. When the lock dir cannot be created, run anyway."""
-    lock = _run_claim_path()
+def _lock_nonblocking(fh) -> bool:
     try:
-        lock.parent.mkdir(parents=True, exist_ok=True)
-    except OSError:
+        if os.name == "nt":
+            import msvcrt
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return True
-    try:
-        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        try:
-            if time.time() - lock.stat().st_mtime > _CLAIM_STALE_SECONDS:
-                lock.unlink()
-                return _claim_run()
-        except OSError:
-            pass
+    except OSError:
         return False
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(str(os.getpid()))
-    return True
 
 
-def _release_run_claim() -> None:
-    with contextlib.suppress(OSError):
-        _run_claim_path().unlink()
+class _RunClaim:
+    """One review per home across processes: an OS lock on the claim file, held for the review's
+    whole lifetime (its async fork included). A crashed holder's lock is released by the OS, so
+    there is no age-based takeover to race (two contenders could both "take over" one expired
+    O_EXCL claim) and no heartbeat. The path is fixed at acquisition, so release never depends on
+    which profile context the releasing thread runs in (review: Codex)."""
+
+    def __init__(self, path: Path, fh) -> None:
+        self.path = path
+        self._fh = fh
+        self._lock = threading.Lock()
+
+    def release(self) -> None:
+        with self._lock:
+            fh, self._fh = self._fh, None
+        if fh is None:
+            return
+        with contextlib.suppress(OSError):
+            if os.name == "nt":
+                import msvcrt
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh, fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            fh.close()
 
 
-_CLAIM_HEARTBEAT_SECONDS = 300.0
-
-
-def _hold_run_claim() -> Callable[[], None]:
-    """Keep a held claim fresh while its review runs (a live review longer than
-    ``_CLAIM_STALE_SECONDS`` must not look crashed); returns the release callback. A dead process
-    stops refreshing, so its claim still goes stale and is taken over."""
-    stop = threading.Event()
-
-    def _beat() -> None:
-        while not stop.wait(_CLAIM_HEARTBEAT_SECONDS):
-            with contextlib.suppress(OSError):
-                os.utime(_run_claim_path())
-
-    threading.Thread(target=_beat, daemon=True, name="curator-claim-heartbeat").start()
-
-    def _release() -> None:
-        stop.set()
-        _release_run_claim()
-
-    return _release
+def _claim_run() -> Optional[_RunClaim]:
+    """The claim for the CURRENT profile's home, or None when another review holds it. Fails
+    closed: a claim that cannot be created refuses admission rather than running unclaimed."""
+    path = _run_claim_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(path, "a+", encoding="utf-8")
+    except OSError as e:
+        logger.warning("curator run claim unavailable (%s); not starting a review", e)
+        return None
+    if not _lock_nonblocking(fh):
+        with contextlib.suppress(OSError):
+            fh.close()
+        return None
+    return _RunClaim(path, fh)
 
 
 def maybe_run_curator(*, idle_for_seconds: Optional[float] = None, on_summary: Optional[Callable[[str], None]] = None) -> Optional[Dict[str, Any]]:
@@ -1387,9 +1396,9 @@ def maybe_run_curator(*, idle_for_seconds: Optional[float] = None, on_summary: O
         # Idle gating: only enforce when the caller provided a measurement.
         if not should_run_now() or (idle_for_seconds is not None and idle_for_seconds < get_min_idle_hours() * 3600.0):
             return None
-        if not _claim_run():
+        claim = _claim_run()
+        if claim is None:
             return None
-        release_claim = _hold_run_claim()
         handed_off = False
         try:
             # Recheck under the claim: a caller that saw the interval elapse before another pass
@@ -1406,16 +1415,15 @@ def maybe_run_curator(*, idle_for_seconds: Optional[float] = None, on_summary: O
             if pending:
                 consolidate, llm_dry_run, mark_previewed = True, True, pending
             # The claim is held until the review itself finishes (its async fork included), so one
-            # automatic review runs per home at a time; a crashed holder is taken over after
-            # _CLAIM_STALE_SECONDS (review: Codex).
+            # review runs per home at a time (review: Codex).
             result = run_curator_review(
                 on_summary=on_summary, consolidate=consolidate, llm_dry_run=llm_dry_run,
-                mark_previewed_on_success=mark_previewed, on_finished=release_claim)
+                mark_previewed_on_success=mark_previewed, on_finished=claim.release)
             handed_off = True
             return result
         finally:
             if not handed_off:
-                release_claim()
+                claim.release()
     except Exception as e:
         logger.debug("maybe_run_curator failed: %s", e, exc_info=True)
         return None
