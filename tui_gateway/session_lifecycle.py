@@ -118,6 +118,13 @@ def _install_borrowed_lease(sid: str, session: dict, frame: dict) -> None:
         surface=str(frame.get("source") or "desktop"), enabled=False)
 
 
+def _holds_borrowed_lease(session: dict) -> bool:
+    """True when this session runs on an inert token borrowed from another runtime's real lease."""
+    lease = session.get("active_session_lease")
+    return (lease is not None and getattr(lease, "enabled", True) is False
+            and str(getattr(lease, "lease_id", "")).startswith("borrowed:"))
+
+
 def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
     """Claim this session's cap slot on its first real turn; None when ok. session.create/resume deliberately
     do NOT claim: tile paints, reconnect-resumes and abandoned drafts would hold invisible slots (no DB row)
@@ -362,6 +369,8 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         history_ready.set()
     _desktop_automatic_cleanup = (
         end_reason in _AUTOMATIC_SESSION_END_REASONS and _session_source(session).strip().lower() == "desktop")
+    # Read before the release below detaches the token (bucket C G1).
+    _borrowed_lifecycle = _holds_borrowed_lease(session)
     # Automatic Desktop cleanup releases its lease inside the lifecycle guard below; other paths keep force/end semantics.
     if not _desktop_automatic_cleanup:
         _release_active_session_slot(session)
@@ -402,7 +411,10 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     if _desktop_automatic_cleanup and not session_id:
         _release_active_session_slot(session)
     # ``_lease_taken_over``: a new runtime for the same chat owns the row and its delegations now.
-    _lifecycle_guard = (_other_runtime_lease_guard(session_id, session)
+    # A borrowed token (compute-host child running an isolated turn): the parent holds the real lease and
+    # owns the lifecycle, so the child's shutdown must not end its live row (bucket C G1).
+    _lifecycle_guard = (contextlib.nullcontext(True) if _borrowed_lifecycle
+                        else _other_runtime_lease_guard(session_id, session)
                         if _desktop_automatic_cleanup and session_id
                         else contextlib.nullcontext(bool(session.get("_lease_taken_over"))))
     with _lifecycle_guard as _other_runtime_owns_lifecycle:
