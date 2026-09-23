@@ -70,9 +70,14 @@ an older completion could land after a newer compression. With RelayBuffer dropp
 covers turn callbacks, late control handlers and `_adopt_late_compute_host_compress_ack`. The two
 premises of the race also fail on upstream's shape:
 
-- **"A restarted host starts at history_version 0."** A new child builds each session from the turn
-  frame's `history_version` (`compute_host.py:368`, sent from the parent's mirror at
-  `compute_host_bridge.py:56-63`), so versions continue from the parent's value.
+- **"A restarted host starts at history_version 0."** CORRECTED (Codex review of this doc): the
+  premise holds. `_init_session` (`server.py:2479`) sets `history_version` to 0 on the normal path;
+  only the exception fallback (`compute_host.py:384`) copies the frame's value. The parent adopts
+  `max(parent, frame)` (`compute_host_bridge.py:113-116`), so the parent's version never goes
+  backwards and no stale frame can roll it back. The real consequence is the opposite one, see G4:
+  after a restart, the child's bumps stay below the parent's value and are ignored until they catch
+  up. Removing RelayBuffer removes its particular reordering mechanism, which is what made the
+  equal-version stale frame dangerous.
 - **"Equal-version stale frames after compression bumps the version before rotating the key."** Both
   happen in the child (`session_compression.py:259` and `:281`) before it emits `_history_meta`, so
   a single ordered stream cannot deliver the pre-rotation frame after the post-rotation one.
@@ -134,3 +139,15 @@ compresses inline while a late child compress-ack is still outstanding.
 - **The A1 debounce widens G3's window**: the 3-confirmation parent guard lengthens the time before
   an orphaned child notices. This matters only if G3 is accepted.
 - **Registry schema carry-over at deploy** (see step 5).
+
+## G4 (added after Codex's review): a restarted host's version bumps are masked
+
+Upstream behaviour, not reproduced live. A restarted compute host builds each session with
+`history_version = 0` (`server.py:2479` via `compute_host.py:372`), while the parent holds N and
+adopts `max(parent, frame)`. The child's next bumps (1, 2, ...) are ignored until they exceed N,
+so a compression on the new host does not move the parent's version, and anything keyed on
+version changes can miss it. The session_key rotation itself is still adopted, since it is
+compared separately. Proposed fix: after `_init_session` on the normal path, seed
+`session["history_version"]` from the frame, as the fallback already does. Failing-first test:
+respawn the host, compress, and assert the parent's version increases. Belongs with the bucket C
+gap fixes (G1-G3), in the same order and under the same decision.
