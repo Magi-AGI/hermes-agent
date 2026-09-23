@@ -14321,7 +14321,14 @@ async function runReopenEntry(entry: any): Promise<ReopenStep> {
     {
       profile: expectedProfile,
       sessionId: entry.sessionId ?? null,
-      probeTarget: reopenProbeTarget(entry, windowConnectionRoutes.get(win.webContents.id), expectedProfile),
+      // Existing window: its current established route. Created: the saved
+      // opening route (Codex A4 round 4 #2).
+      probeTarget: reopenProbeTarget(
+        entry,
+        windowConnectionRoutes.get(win.webContents.id),
+        expectedProfile,
+        created ? null : sessionWindows.routeOf(win)
+      ),
       identity: policy.identity
     },
     {

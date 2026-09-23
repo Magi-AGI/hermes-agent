@@ -37,15 +37,27 @@ export interface ReopenProbeTarget {
   profile: null | string
 }
 
-// The route the reopen probe must check for one saved window: a peer's route
-// recorded when it was spawned (exact connection + profile) when available,
-// else its saved route; a session pop-out boots by profile (its URL carries no
-// connection), so it is probed on that profile's route.
+// The route the reopen probe must check for one saved window.
+//
+// An ALREADY-OPEN window (`current`) is probed on its current established
+// session-owner route, whatever its kind (Codex A4 round 4 #2): a pop-out that
+// moved to a session on profile B is working on B, and must not halt the queue
+// because its saved profile A is offline.
+//
+// A window the queue just CREATED is probed on its saved opening route: a
+// peer's route recorded when it was spawned (exact connection + profile) when
+// available, else its saved route; a session pop-out boots by profile (its URL
+// carries no connection), so it is probed on that profile's route.
 export function reopenProbeTarget(
   entry: { connectionId?: null | string; kind?: string; profile?: null | string },
   recorded: { connectionId?: null | string; profile?: null | string } | null,
-  fallbackProfile: string
+  fallbackProfile: string,
+  current?: { connectionId?: null | string; profile?: null | string } | null
 ): ReopenProbeTarget {
+  if (current) {
+    return { profile: current.profile || fallbackProfile, connectionId: current.connectionId ?? null }
+  }
+
   if (entry.kind === 'peer') {
     const route = recorded ?? entry
 

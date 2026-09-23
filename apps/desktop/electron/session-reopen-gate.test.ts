@@ -655,6 +655,59 @@ test('a peer is probed on its recorded connection+profile, a pop-out on its prof
   })
 })
 
+test('an EXISTING window is probed on its current session-owner route, whatever its kind (Codex A4 r4 #2)', () => {
+  // A pop-out saved on profile A that has since moved to a session on profile B.
+  const pop = { kind: 'session', profile: 'prof-a', connectionId: null }
+  const current = { profile: 'prof-b', connectionId: 'conn-b' }
+
+  assert.deepEqual(reopenProbeTarget(pop, null, 'default', current), { profile: 'prof-b', connectionId: 'conn-b' })
+
+  // ...and a peer: its current route wins over the route recorded at spawn.
+  const peer = { kind: 'peer', profile: 'work', connectionId: 'saved-c' }
+
+  assert.deepEqual(reopenProbeTarget(peer, { profile: 'work', connectionId: 'spawn-c' }, 'default', current), {
+    profile: 'prof-b',
+    connectionId: 'conn-b'
+  })
+})
+
+test('a NEWLY created window is probed on its saved opening route (Codex A4 r4 #2)', () => {
+  const pop = { kind: 'session', profile: 'prof-a', connectionId: null }
+
+  assert.deepEqual(reopenProbeTarget(pop, null, 'default', null), { profile: 'prof-a', connectionId: null })
+})
+
+test('a healthy existing pop-out on profile B is not halted because saved profile A is offline', async () => {
+  const ipcMain = makeFakeIpcMain()
+  const win = makeFakeWindow()
+
+  const probe = (target: { profile: null | string }) =>
+    target.profile === 'prof-b' ? Promise.resolve() : Promise.reject(new Error('prof-a backend down'))
+
+  const result = await waitForSessionWindowFunctionallyReady(
+    win as any,
+    {
+      profile: 'prof-a',
+      sessionId: 's-a',
+      identity: reopenedWindowPolicy(false).identity,
+      probeTarget: reopenProbeTarget(
+        { kind: 'session', profile: 'prof-a', connectionId: null },
+        null,
+        'default',
+        { profile: 'prof-b', connectionId: null }
+      )
+    },
+    {
+      ipcMain,
+      probeBackendHealth: probe,
+      knownVerdict: { ok: true, profile: 'prof-b', sessionId: 's-b' },
+      timeoutMs: 500
+    }
+  )
+
+  assert.deepEqual(result, { ok: true })
+})
+
 test('a ready REMOTE peer is not failed because the local backend of the same profile is down', async () => {
   const ipcMain = makeFakeIpcMain()
   const win = makeFakeWindow()

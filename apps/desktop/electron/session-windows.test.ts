@@ -563,3 +563,17 @@ test("a fresh peer's initial renderer defaults never overwrite its launch route"
   assert.equal(registry.setRoute(peer, { established: true, sessionId: 's1', profile: 'work', connectionId: 'c1' }), true)
   assert.equal(registry.entries()[0].sessionId, 's1')
 })
+
+// ─── Codex A4 round 4 #2: an open window's CURRENT route ─────────────────────
+
+test("routeOf is a window's current established session-owner route (any kind)", () => {
+  const registry = createSessionWindowRegistry()
+  const pop = makeFakeWindow()
+
+  registry.openOrFocus('pop-1', () => pop, { kind: 'session', sessionId: 's-a', profile: 'prof-a' })
+  assert.deepEqual(registry.routeOf(pop), { profile: 'prof-a', connectionId: null })
+
+  registry.setRoute(pop, { established: true, sessionId: 's-b', profile: 'prof-b', connectionId: 'conn-b' })
+  assert.deepEqual(registry.routeOf(pop), { profile: 'prof-b', connectionId: 'conn-b' })
+  assert.equal(registry.routeOf(makeFakeWindow()), null, 'not a registered window')
+})

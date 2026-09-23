@@ -282,6 +282,15 @@ function createSessionWindowRegistry() {
   return {
     openOrFocus,
     windowIdOf,
+    // An open window's current route: its launch route until its renderer
+    // reports an ESTABLISHED one (setRoute), then the session-owner route it
+    // is on now (Codex A4 round 4 #2). Null for an unregistered window.
+    routeOf: (win): null | { connectionId: null | string; profile: null | string } => {
+      const key = windowIdOf(win)
+      const entry = key ? windows.get(key) : null
+
+      return entry ? { profile: entry.profile ?? null, connectionId: entry.connectionId ?? null } : null
+    },
     get: key => windows.get(key)?.win,
     has: key => windows.has(key),
     get size() {
