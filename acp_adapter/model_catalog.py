@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextvars
-import hashlib
 import logging
 import os
 import threading
@@ -29,10 +28,16 @@ _discovery_inflight: set[tuple] = set()
 _discovery_lock = threading.Lock()
 
 
-def _discovery_key(provider_key: str, base_url: str, api_key: str) -> tuple:
+def _discovery_key(slug: str, base_url: str, native_provider: str, preserve: bool,
+                   api_key: Any, api_mode: Any, headers: Any) -> tuple:
+    """The complete discovery identity: the profile, the entry itself (``slug`` is unique per named
+    entry, legacy ones included, which have no provider_key), what is probed and how, and
+    upstream's endpoint fingerprint (API key, api_mode, headers), so two entries sharing a URL and
+    key never share a result, and a changed credential/header/mode is a new key (review: Codex)."""
+    from hermes_cli.models import _custom_endpoint_fingerprint
     from hermes_constants import hermes_home_key
-    return (hermes_home_key(), provider_key.lower(), base_url.rstrip("/").lower(),
-            hashlib.sha256(api_key.encode("utf-8")).hexdigest() if api_key else "")
+    return (hermes_home_key(), slug, base_url.rstrip("/").lower(), native_provider, bool(preserve),
+            _custom_endpoint_fingerprint(api_key, api_mode, headers))
 
 
 def _discovered_models_nonblocking(key: tuple, fetch: Callable[[], Any]) -> Any:
@@ -124,7 +129,8 @@ def _named_custom_provider_catalogs() -> list[tuple[str, str, list[tuple[str, st
             native_provider = provider_key if is_native_ollama and is_ollama_key else "custom"
             preserve = _models_config_is_allowlist(models_cfg, _entry_models_discovered(entry))
             live = _discovered_models_nonblocking(
-                _discovery_key(provider_key, base_url, api_key),
+                _discovery_key(slug, base_url, native_provider, preserve,
+                               api_key, entry.get("api_mode"), native_headers),
                 lambda: _fetch_picker_live_models(
                     api_key, base_url, native_provider, preserve,
                     headers=native_headers, timeout=1.5, api_mode=entry.get("api_mode")))

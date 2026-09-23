@@ -103,3 +103,49 @@ def test_refresh_runs_in_the_callers_profile_context(tmp_path):
         reset_hermes_home_override(token)
     assert _wait_until(lambda: bool(seen))
     assert seen[0] == home_b
+
+
+def _legacy_pair(tenant_b_headers=None, api_mode_b=None):
+    b = {"name": "Tenant Beta", "base_url": "https://shared.example/v1", "key_env": "SOME_KEY",
+         "model": "beta-declared", "extra_headers": tenant_b_headers or {"X-Tenant": "beta"}}
+    if api_mode_b:
+        b["api_mode"] = api_mode_b
+    return {"custom_providers": [
+        {"name": "Tenant Alpha", "base_url": "https://shared.example/v1", "key_env": "SOME_KEY",
+         "model": "alpha-declared", "extra_headers": {"X-Tenant": "alpha"}},
+        b]}
+
+
+def _fetch_by_tenant(api_key, base_url, *_a, headers=None, **_k):
+    return [f"{(headers or {}).get('X-Tenant', 'none')}-live"]
+
+
+def _models_by_label(catalogs):
+    return {label: [m for m, _ in models] for _slug, label, models in catalogs}
+
+
+def test_legacy_entries_sharing_url_and_key_keep_their_own_discovery(monkeypatch):
+    """Review (Codex): legacy entries have no provider_key, so a (url, key) cache key made two
+    tenants of one proxy share the first tenant's models and the second's discovery never ran."""
+    monkeypatch.setenv("SOME_KEY", "k")
+    with patch("hermes_cli.config.load_config", return_value=_legacy_pair()), \
+         patch("hermes_cli.model_switch_providers._fetch_picker_live_models", side_effect=_fetch_by_tenant):
+        model_catalog._named_custom_provider_catalogs()
+        assert _wait_until(lambda: not model_catalog._discovery_inflight)
+        by_label = _models_by_label(model_catalog._named_custom_provider_catalogs())
+    assert "alpha-live" in by_label["Tenant Alpha"] and "beta-live" not in by_label["Tenant Alpha"]
+    assert "beta-live" in by_label["Tenant Beta"] and "alpha-live" not in by_label["Tenant Beta"]
+
+
+@pytest.mark.parametrize("change", [{"tenant_b_headers": {"X-Tenant": "gamma"}}, {"api_mode_b": "responses"}])
+def test_a_header_or_api_mode_change_is_a_fresh_discovery(monkeypatch, change):
+    monkeypatch.setenv("SOME_KEY", "k")
+    with patch("hermes_cli.model_switch_providers._fetch_picker_live_models", side_effect=_fetch_by_tenant) as fetch:
+        with patch("hermes_cli.config.load_config", return_value=_legacy_pair()):
+            model_catalog._named_custom_provider_catalogs()
+            assert _wait_until(lambda: not model_catalog._discovery_inflight)
+        before = fetch.call_count
+        with patch("hermes_cli.config.load_config", return_value=_legacy_pair(**change)):
+            model_catalog._named_custom_provider_catalogs()
+            assert _wait_until(lambda: not model_catalog._discovery_inflight)
+    assert fetch.call_count == before + 1, "only the changed entry is rediscovered, and it is"
