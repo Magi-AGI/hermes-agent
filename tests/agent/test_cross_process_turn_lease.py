@@ -732,76 +732,152 @@ def test_flush_messages_to_session_db_fences_stale_holder_on_live_db(tmp_path):
     second.close()
 
 
-def test_concurrent_first_turns_on_brand_new_id_are_serialized(tmp_path, monkeypatch):
-    """Invariant (Magi sync, bucket C R3): two first turns on the SAME brand-new session id, each
-    through its own SessionDB on one state.db (two processes, e.g. two desktop windows or desktop +
-    relay), never run load/run/flush concurrently. The loser waits, then reloads what the winner
-    persisted; the winner keeps its in-memory seed."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setattr(
-        "agent.turn_liveness.resolve_turn_liveness_settings", lambda cfg: (None, 1.0)
-    )
-    path = tmp_path / "state.db"
-    dbs = [SessionDB(path), SessionDB(path)]
-    sid = "brand-new-session"
-    assert dbs[0].get_session(sid) is None
+def _wait_for_path(predicate, timeout_s: float, what: str) -> None:
+    """Poll the filesystem barrier ``predicate`` (a deadlock guard, not a synchronization sleep)."""
+    deadline = time.monotonic() + timeout_s
+    while not predicate():
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"barrier never reached: {what}")
+        time.sleep(0.02)
 
-    lock = threading.Lock()
-    inside = []
-    max_inside = [0]
-    first_inside = threading.Event()
-    second_entered = threading.Event()
-    observed = {}
+
+_RACE_SID = "brand-new-first-turn"
+
+
+def _first_turn_race_worker(name: str, other: str, directory: str) -> None:
+    """Child PROCESS for the first-turn race: its own SessionDB on the shared state.db, the production
+    admission (``AIAgent.run_conversation``), lazy row creation (``_ensure_db_session``) and the fenced
+    flush (``_flush_messages_to_session_db``). Only the provider loop is replaced."""
+    import json
+    import os
+    from pathlib import Path
+
+    import agent.conversation_loop as conversation_loop
+
+    root = Path(directory)
+
+    class _BarrierDB(SessionDB):
+        _probed = False
+
+        def get_session(self, session_id):
+            row = super().get_session(session_id)
+            if session_id == _RACE_SID and not self._probed:
+                # Admission's first row probe: publish what we saw, then hold until the parent has
+                # seen BOTH workers observe the row absent (neither has admitted anything yet).
+                self._probed = True
+                (root / f"{'absent' if row is None else 'present'}-{name}").touch()
+                _wait_for_path((root / "go").exists, 60, "go")
+            return row
+
+        def try_acquire_session_turn_lease(self, session_id, holder, **kwargs):
+            acquired = super().try_acquire_session_turn_lease(session_id, holder, **kwargs)
+            if not acquired:
+                (root / f"refused-{name}").touch()  # attempted admission while the other held it
+            return acquired
+
+    db = _BarrierDB(root / "state.db")
+    agent = _agent_with_db(db, session_id=_RACE_SID, platform="desktop")
+    agent._session_db_created = False
+    agent._session_init_model_config = {}
+    agent._cached_system_prompt = "system"
+    for attr, value in (
+        ("_session_persist_lock", None), ("_flushed_db_message_ids", set()),
+        ("_flushed_db_message_session_id", None), ("_last_flushed_db_idx", 0),
+        ("_db_flush_scan_prefix", None), ("_persist_user_message_idx", None),
+        ("_persist_user_message_override", None), ("_persist_user_message_timestamp", None),
+        ("_pending_cli_user_message", None), ("_last_persistence_error_cause", None),
+    ):
+        setattr(agent, attr, value)
 
     def fake_run(_agent, message, _system, history, *_args, **_kwargs):
-        with lock:
-            inside.append(message)
-            max_inside[0] = max(max_inside[0], len(inside))
-            order = len(observed)
-            observed[message] = list(history or [])
-        if order == 0:
-            # Winner: the first turn creates the row lazily and persists (_ensure_db_session + flush).
-            first_inside.set()
-            _agent._session_db.create_session(sid, source="desktop")
-            _agent._session_db.append_message(sid, role="user", content=message)
-            second_entered.wait(1.5)  # base code: the loser is already in here with us
-        else:
-            second_entered.set()
-        with lock:
-            inside.remove(message)
-        return {"final_response": "ok", "messages": history, "failed": False}
-
-    monkeypatch.setattr("agent.conversation_loop.run_conversation", fake_run)
-    agents = [_agent_with_db(db, session_id=sid) for db in dbs]
-    for agent in agents:
-        agent._session_db_created = False
-    errors = []
-
-    def run(agent, message, history):
+        history = list(history or [])
         try:
-            AIAgent.run_conversation(agent, message, conversation_history=history)
-        except BaseException as exc:  # pragma: no cover - surfaced below
-            errors.append(exc)
+            os.close(os.open(root / "first-inside", os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            first = True
+        except FileExistsError:
+            first = False
+        (root / f"inside-{name}").touch()
+        (root / f"history-{name}.json").write_text(json.dumps([m.get("content") for m in history]))
+        _agent._ensure_db_session()  # production lazy row creation
+        if first:
+            # Hold the turn until the other worker either was refused admission (fixed) or entered
+            # its own turn alongside this one (the unserialized base behaviour).
+            _wait_for_path(
+                lambda: (root / f"refused-{other}").exists() or (root / f"inside-{other}").exists(),
+                60, f"{other} attempted admission")
+            if (root / f"inside-{other}").exists():
+                (root / "overlap").touch()
+        messages = [*history, {"role": "user", "content": message},
+                    {"role": "assistant", "content": f"reply {name}"}]
+        ok = _agent._flush_messages_to_session_db(messages, history)
+        (root / f"flush-{name}.json").write_text(json.dumps(
+            {"ok": ok, "holder": bool(getattr(_agent, "_active_session_turn_lease_holder", None))}))
+        return {"final_response": "ok", "messages": messages, "failed": False}
 
-    seed = [{"role": "user", "content": "caller seed"}]
-    t1 = threading.Thread(target=run, args=(agents[0], "turn A", seed))
-    t1.start()
-    assert first_inside.wait(10)
-    t2 = threading.Thread(target=run, args=(agents[1], "turn B", []))
-    t2.start()
-    t1.join(30)
-    t2.join(30)
+    conversation_loop.run_conversation = fake_run
+    AIAgent.run_conversation(agent, f"turn {name}", conversation_history=[])
+    db.close()
+
+
+def test_concurrent_first_turns_on_brand_new_id_are_serialized_across_processes(tmp_path):
+    """Invariant (Magi sync, bucket C R3; review: Codex, A10 round 1): two OS processes, each with its
+    own SessionDB on one state.db, race the first turn of one brand-new session id through the
+    production admission, lazy row creation and fenced flush. Barriers prove (a) both observed the
+    row absent before either admitted, and (b) the loser attempted admission while the winner held
+    the turn; the turns never overlap, both exit cleanly, and the transcript holds both turns in order
+    with the loser having reloaded the winner's turn."""
+    import json
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[2]
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {**os.environ, "HERMES_HOME": str(home),
+           "PYTHONPATH": os.pathsep.join(filter(None, [str(repo_root), os.environ.get("PYTHONPATH")]))}
+    procs = {
+        name: subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), name, other, str(tmp_path)],
+            cwd=str(repo_root), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        for name, other in (("A", "B"), ("B", "A"))
+    }
     try:
-        assert not errors
-        assert max_inside[0] == 1, "two first turns on one new id ran concurrently"
-        assert observed["turn A"] == seed  # winner's in-memory seed survived admission
-        assert [m["content"] for m in observed["turn B"]] == ["turn A"]  # loser reloaded durable
-        assert agents[1]._session_db_created is True
-        # Both leases released: a third turn acquires at once.
-        assert dbs[0].try_acquire_session_turn_lease(sid, "pid=3:turn=next", ttl_seconds=5)
+        _wait_for_path(
+            lambda: all((tmp_path / f"absent-{n}").exists() for n in procs)
+            or any(p.poll() is not None for p in procs.values()),
+            120, "both workers probed the row")
+        assert all((tmp_path / f"absent-{n}").exists() for n in procs), "a worker exited before probing"
+        (tmp_path / "go").touch()
+        outputs = {name: proc.communicate(timeout=180)[0].decode("utf-8", "replace")
+                   for name, proc in procs.items()}
     finally:
-        for db in dbs:
-            db.close()
+        for proc in procs.values():
+            if proc.poll() is None:
+                proc.kill()
+    for name, proc in procs.items():
+        assert proc.returncode == 0, f"worker {name} failed:\n{outputs[name]}"
+
+    assert not (tmp_path / "overlap").exists(), "two first turns on one new id ran concurrently"
+    refused = [n for n in procs if (tmp_path / f"refused-{n}").exists()]
+    assert len(refused) == 1, refused  # exactly the loser attempted admission while the winner held it
+    loser = refused[0]
+    winner = "A" if loser == "B" else "B"
+    assert json.loads((tmp_path / f"history-{winner}.json").read_text()) == []
+    # The loser reloaded the durable turn the winner persisted before its own turn ran.
+    assert json.loads((tmp_path / f"history-{loser}.json").read_text()) == [f"turn {winner}", f"reply {winner}"]
+    for name in procs:
+        assert json.loads((tmp_path / f"flush-{name}.json").read_text()) == {"ok": True, "holder": True}
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        assert db.get_session(_RACE_SID) is not None  # created lazily by the winner's turn
+        assert [m["content"] for m in db.get_messages(_RACE_SID)] == [
+            f"turn {winner}", f"reply {winner}", f"turn {loser}", f"reply {loser}"]
+        # Both leases released.
+        assert db.try_acquire_session_turn_lease(_RACE_SID, "pid=1:turn=after", ttl_seconds=5)
+    finally:
+        db.close()
 
 
 def test_fresh_row_that_appears_before_admission_is_reloaded_but_empty_keeps_seed():
@@ -970,3 +1046,9 @@ def test_caller_authoritative_admission_skips_reload_after_wait():
         assert admission.conversation_history == expected
         assert [e[0] for e in db.events] == events
         assert agent.session_id == ("shared" if authoritative else "compressed-tip")
+
+
+if __name__ == "__main__":
+    import sys
+
+    _first_turn_race_worker(sys.argv[1], sys.argv[2], sys.argv[3])
