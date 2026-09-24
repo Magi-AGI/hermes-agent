@@ -480,114 +480,6 @@ def refresh_codex_oauth_pure(
     return updated
 
 
-# Magi sync (phase 2b). Codex refresh tokens are single-use: once the endpoint has rotated one, the
-# ONLY copy of its successor is in memory. If persisting it then fails, the next process replays
-# the consumed token and OpenAI revokes the family. The rotated pair is written to a separate rescue
-# file (its own atomic write, no auth.json contention), keyed by what it belongs to ("singleton"
-# or "pool:<entry id>"), and adopted BEFORE the next refresh of that credential.
-_CODEX_SAVE_ATTEMPTS = 3
-_CODEX_SAVE_RETRY_DELAY_S = 0.05
-
-
-def _codex_rotation_rescue_path() -> Path:
-    from hermes_cli.auth import _auth_file_path
-    return _auth_file_path().parent / "auth.codex-rotation-rescue.json"
-
-
-def _read_codex_rotation_rescue() -> Dict[str, Any]:
-    path = _codex_rotation_rescue_path()
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return {}
-    except Exception:
-        logger.warning("Codex rotation rescue at %s is unreadable; leaving it in place", path, exc_info=True)
-        return {}
-    entries = data.get("entries") if isinstance(data, dict) else None
-    return entries if isinstance(entries, dict) else {}
-
-
-def _write_codex_rotation_rescue(tokens: Dict[str, Any], key: str = "singleton") -> Path:
-    from utils import atomic_json_write
-    path = _codex_rotation_rescue_path()
-    entries = _read_codex_rotation_rescue()
-    entries[key] = {"access_token": tokens.get("access_token"), "refresh_token": tokens.get("refresh_token"),
-                    "rescued_at": _utc_now_iso()}
-    atomic_json_write(path, {"entries": entries}, mode=0o600)
-    return path
-
-
-def _clear_codex_rotation_rescue(key: str) -> None:
-    from utils import atomic_json_write
-    path = _codex_rotation_rescue_path()
-    entries = _read_codex_rotation_rescue()
-    if key not in entries:
-        return
-    entries.pop(key)
-    try:
-        if entries:
-            atomic_json_write(path, {"entries": entries}, mode=0o600)
-        else:
-            path.unlink()
-    except OSError:
-        logger.debug("Could not clear Codex rotation rescue entry %s", key, exc_info=True)
-
-
-def _utc_now_iso() -> str:
-    from datetime import datetime, timezone
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _save_codex_tokens_bounded(tokens: Dict[str, str]) -> None:
-    """``_save_codex_tokens`` with a short bounded retry (transient lock/replace/torn-read failures)."""
-    from hermes_cli.auth import _save_codex_tokens
-    for attempt in range(1, _CODEX_SAVE_ATTEMPTS + 1):
-        try:
-            _save_codex_tokens(tokens, write_through=True)
-            return
-        except Exception:
-            if attempt == _CODEX_SAVE_ATTEMPTS:
-                raise
-            time.sleep(_CODEX_SAVE_RETRY_DELAY_S * attempt)
-
-
-def _persist_rotated_codex_tokens(tokens: Dict[str, str], key: str, save: Any) -> None:
-    """Persist a JUST-ROTATED pair; on failure keep it in the rescue file. Raises only when neither
-    the store nor the rescue could be written (the caller must surface that)."""
-    try:
-        save(tokens)
-        _clear_codex_rotation_rescue(key)
-        return
-    except Exception as exc:
-        save_exc = exc
-    try:
-        rescue = _write_codex_rotation_rescue(tokens, key)
-    except Exception as rescue_exc:
-        raise AuthError(
-            "Codex refresh token was rotated but could not be persisted anywhere "
-            f"(store: {save_exc}; rescue: {rescue_exc}). Re-authenticate if the next request fails.",
-            provider="openai-codex", code="codex_rotation_persist_failed",
-            relogin_required=False) from save_exc
-    logger.error(
-        "Codex refresh token rotated but auth.json could not be saved (%s); the new token is kept in %s "
-        "and adopted before the next refresh", save_exc, rescue)
-
-
-def _adopt_codex_rotation_rescue() -> Optional[Dict[str, str]]:
-    """Persist a rescued singleton pair into the store (clearing the rescue on success); returns it."""
-    rescued = _read_codex_rotation_rescue().get("singleton")
-    if not (isinstance(rescued, dict) and _stripped(rescued.get("access_token"))
-            and _stripped(rescued.get("refresh_token"))):
-        return None
-    tokens = {"access_token": rescued["access_token"], "refresh_token": rescued["refresh_token"]}
-    try:
-        _save_codex_tokens_bounded(tokens)
-        _clear_codex_rotation_rescue("singleton")
-    except Exception:
-        logger.warning("Codex rotation rescue could not be persisted yet; still using it", exc_info=True)
-    return tokens
-
-
 def _refresh_codex_auth_tokens(tokens: Dict[str, str], timeout_seconds: float) -> Dict[str, str]:
     """Refresh Codex access token using the refresh token.
 
@@ -600,10 +492,6 @@ def _refresh_codex_auth_tokens(tokens: Dict[str, str], timeout_seconds: float) -
     from hermes_cli.auth import _provider_state_transaction, _save_codex_tokens, refresh_codex_oauth_pure
     lock_timeout = max(float(AUTH_LOCK_TIMEOUT_SECONDS), float(timeout_seconds) + 5.0)
     with _provider_state_transaction("openai-codex", lock_timeout) as (_store, state, _source):
-        rescued = _adopt_codex_rotation_rescue()
-        if rescued and rescued["refresh_token"] != _stripped(tokens.get("refresh_token")):
-            logger.info("Codex: adopting a rotated token pair kept by a failed save — not replaying the old one.")
-            return {**tokens, **rescued}
         stored = (state or {}).get("tokens")
         stored = stored if isinstance(stored, dict) else {}
         stored_at, stored_rt = _stripped(stored.get("access_token")), _stripped(stored.get("refresh_token"))
@@ -633,7 +521,7 @@ def _refresh_codex_auth_tokens(tokens: Dict[str, str], timeout_seconds: float) -
             **tokens, "access_token": refreshed["access_token"],
             "refresh_token": refreshed["refresh_token"]}
         # Nested transaction: the per-path lock is reentrant, and it re-reads under the held locks.
-        _persist_rotated_codex_tokens(updated_tokens, "singleton", _save_codex_tokens_bounded)
+        _save_codex_tokens(updated_tokens, write_through=True)
     return updated_tokens
 
 
@@ -898,32 +786,19 @@ def _probe_codex_pool_entry_quota_restored(entry: Dict[str, Any]) -> Optional[bo
     """``_probe_codex_quota_restored`` for a persisted pool entry, refreshing an expired token first."""
     from hermes_cli.auth import _auth_store_lock, _load_auth_store, _save_auth_store
     token = _stripped(entry.get("access_token"))
-    rescue_key = f"pool:{entry.get('id')}"
-    rescued = _read_codex_rotation_rescue().get(rescue_key)
-    if isinstance(rescued, dict) and _stripped(rescued.get("refresh_token")):
-        # A previous rotation of this entry could not be saved: never spend the consumed token.
-        entry = {**entry, "access_token": rescued.get("access_token"), "refresh_token": rescued["refresh_token"]}
-        token = _stripped(entry.get("access_token"))
     fresh = _refresh_expired_codex_probe_token(token, entry.get("refresh_token"))
-    pending = fresh or (rescued if isinstance(rescued, dict) and rescued.get("refresh_token") else None)
-    if pending:
-        token = _stripped(pending.get("access_token"))
-
-        def _save_pool_entry(pair: Dict[str, Any]) -> None:
+    if fresh:
+        token = fresh["access_token"]
+        try:
             with _auth_store_lock():
                 auth_store = _load_auth_store()
                 for disk_entry in _codex_pool_dicts(_pool_entries(auth_store, "openai-codex")):
                     if disk_entry.get("id") == entry.get("id"):
-                        disk_entry.update({"access_token": pair["access_token"],
-                                           "refresh_token": pair["refresh_token"]})
+                        disk_entry.update(fresh)
                         _save_auth_store(auth_store)
                         break
-
-        try:
-            _persist_rotated_codex_tokens(pending, rescue_key, _save_pool_entry)
-        except AuthError:
-            logger.error("Codex pool entry %s: rotated token could not be persisted", entry.get("id"),
-                         exc_info=True)
+        except Exception:
+            logger.debug("Failed to persist refreshed Codex pool tokens", exc_info=True)
     if not token:
         return None
     return _probe_codex_quota_restored(token, base_url=entry.get("base_url"))

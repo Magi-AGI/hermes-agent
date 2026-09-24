@@ -48,8 +48,7 @@ def test_read_failure_raises_and_leaves_the_store_alone(store_file, monkeypatch,
     from pathlib import Path
 
     before = store_file.read_bytes()
-    # The store is read through the share-delete reader (Magi sync, phase 2b), not Path.read_text.
-    monkeypatch.setattr(auth, "_read_auth_store_text", lambda _p: _fail_read(exc)(None))
+    monkeypatch.setattr(Path, "read_text", _fail_read(exc))
 
     with pytest.raises(OSError):
         auth._load_auth_store(store_file)
@@ -65,9 +64,6 @@ def test_unparseable_json_still_degrades_and_preserves_a_copy(store_file):
 
     result = auth._load_auth_store(store_file)
 
-    # The empty store now carries a private marker so it can never be saved over a store that
-    # parses again (Magi sync, phase 2b); it is never persisted.
-    assert result.pop(auth._DEGRADED_READ_KEY, None) is not None
     assert result == {"version": auth.AUTH_STORE_VERSION, "providers": {}}
     corrupt = store_file.with_suffix(".json.corrupt")
     assert corrupt.exists(), "genuine corruption must still be preserved"
@@ -91,16 +87,10 @@ def test_log_does_not_claim_a_backup_that_was_not_written(
         raise OSError(errno.EMFILE, "Too many open files")
 
     monkeypatch.setattr(shutil, "copy2", _no_copy)
-    # The copy is now written from the bytes already read (Magi sync, phase 2b).
-    from pathlib import Path
-    real_write_bytes = Path.write_bytes
-    monkeypatch.setattr(Path, "write_bytes", lambda self, data: _no_copy() if ".corrupt" in self.name
-                        else real_write_bytes(self, data))
 
     with caplog.at_level(logging.WARNING, logger="hermes_cli.auth"):
         result = auth._load_auth_store(store_file)
 
-    result.pop(auth._DEGRADED_READ_KEY, None)
     assert result == {"version": auth.AUTH_STORE_VERSION, "providers": {}}
     assert not store_file.with_suffix(".json.corrupt").exists()
     text = caplog.text

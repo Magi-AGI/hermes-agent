@@ -229,46 +229,6 @@ def _is_contended_windows_replace_error(exc: OSError) -> bool:
     return _IS_WINDOWS and getattr(exc, "winerror", None) in _WINDOWS_CONTENDED_REPLACE_ERRORS
 
 
-def _posix_semantics_rename(tmp_str: str, real_path: str) -> bool:
-    """Windows 10 1809+ NTFS: rename with FILE_RENAME_FLAG_POSIX_SEMANTICS, which (unlike
-    MoveFileEx / ``os.replace``) replaces a target that readers hold open WITH FILE_SHARE_DELETE,
-    atomically. False on any failure (older Windows, non-NTFS, a reader without share-delete), so
-    the caller's existing recovery still applies (Magi sync, phase 2b)."""
-    if not _IS_WINDOWS:
-        return False
-    try:
-        import ctypes
-        from ctypes import wintypes
-
-        class _RenameInfoEx(ctypes.Structure):
-            _fields_ = [("Flags", wintypes.DWORD), ("RootDirectory", wintypes.HANDLE),
-                        ("FileNameLength", wintypes.DWORD), ("FileName", wintypes.WCHAR * 32768)]
-
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
-                                         wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
-        kernel32.CreateFileW.restype = wintypes.HANDLE
-        kernel32.SetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
-                                                        wintypes.DWORD]
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        target_abs = os.path.abspath(real_path)
-        if len(target_abs) >= 32768:
-            return False
-        # DELETE access; FILE_SHARE_READ|WRITE|DELETE; OPEN_EXISTING; FILE_ATTRIBUTE_NORMAL
-        handle = kernel32.CreateFileW(tmp_str, 0x00010000, 0x7, None, 3, 0x80, None)
-        if handle is None or handle == ctypes.c_void_p(-1).value:
-            return False
-        try:
-            info = _RenameInfoEx(Flags=0x1 | 0x2, RootDirectory=None,  # REPLACE_IF_EXISTS | POSIX_SEMANTICS
-                                 FileNameLength=len(target_abs) * 2, FileName=target_abs)
-            return bool(kernel32.SetFileInformationByHandle(
-                handle, 22, ctypes.byref(info), ctypes.sizeof(info)))  # 22 = FileRenameInfoEx
-        finally:
-            kernel32.CloseHandle(handle)
-    except Exception:
-        return False
-
-
 def _rewrite_in_place(tmp_str: str, real_path: str) -> None:
     """Overwrite *real_path* through the existing file — last resort for a still-held target.
 
@@ -320,10 +280,6 @@ def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
         contended = _is_contended_windows_replace_error(exc)
         if exc.errno not in _CROSS_DEVICE_ERRNOS and not contended:
             raise
-        if contended and _posix_semantics_rename(tmp_str, real_path):
-            # A reader that opened with FILE_SHARE_DELETE (Hermes's auth.json readers do) no longer
-            # forces the retries and the non-atomic in-place fallback below.
-            return real_path
         if contended:
             # Lazy: keeps ``utils`` free of a package-level dependency on ``agent``.
             from agent.retry_utils import jittered_backoff

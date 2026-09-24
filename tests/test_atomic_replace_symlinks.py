@@ -305,44 +305,9 @@ def _sharing_error(winerror: int = 5) -> PermissionError:
 
 @pytest.fixture()
 def fast_replace_retries(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Collapse the jittered backoff so retry tests don't sleep for ~1.2s. These tests model a holder
-    WITHOUT FILE_SHARE_DELETE, which the POSIX-semantics rename cannot bypass either (Magi sync)."""
+    """Collapse the jittered backoff so retry tests don't sleep for ~1.2s."""
     monkeypatch.setattr("utils._REPLACE_RETRY_BASE_DELAY_S", 0.001)
     monkeypatch.setattr("utils._REPLACE_RETRY_MAX_DELAY_S", 0.001)
-    monkeypatch.setattr("utils._posix_semantics_rename", lambda *_a: False)
-
-
-def test_a_posix_semantics_rename_wins_before_any_retry_or_rewrite(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A holder WITH FILE_SHARE_DELETE (Hermes's auth.json readers): the POSIX-semantics rename
-    replaces atomically, so neither the retries nor the non-atomic in-place rewrite run (Magi sync)."""
-    target = tmp_path / "state.json"
-    target.write_text("old", encoding="utf-8")
-    tmp = tmp_path / "state.tmp"
-    tmp.write_text("new", encoding="utf-8")
-    calls = []
-
-    def contended(*_a, **_k):
-        calls.append("replace")
-        raise _sharing_error(5)
-
-    def forbid(*_a, **_k):
-        raise AssertionError("fallback ran")
-
-    def posix(src, dst):
-        calls.append("posix")
-        Path(dst).write_bytes(Path(src).read_bytes())
-        Path(src).unlink()
-        return True
-
-    monkeypatch.setattr("utils.os.replace", contended)
-    monkeypatch.setattr("utils._IS_WINDOWS", True)
-    monkeypatch.setattr("utils._posix_semantics_rename", posix)
-    monkeypatch.setattr("utils._rewrite_in_place", forbid)
-    atomic_replace(tmp, target)
-    assert calls == ["replace", "posix"]
-    assert target.read_text(encoding="utf-8") == "new"
 
 
 # ── cross-platform: the retry/fallback state machine ──────────────────────
