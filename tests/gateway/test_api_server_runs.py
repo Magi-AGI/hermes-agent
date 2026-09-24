@@ -289,6 +289,25 @@ class TestStartRun:
         assert captured.get("turn_author", "absent") == expected
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("body, authoritative", [
+        ({"input": "hello", "conversation_history": [{"role": "user", "content": "mine"}]}, True),
+        ({"input": "hello", "session_id": "explicit-session"}, "absent"),
+        ({"input": "hello"}, "absent"),
+    ], ids=["caller history", "sessiondb continuation", "fresh run id"])
+    async def test_start_declares_caller_history_authority(self, adapter, body, authoritative):
+        """A caller-supplied history is authoritative for the turn (admission never swaps it for the
+        durable transcript); a SessionDB-loaded or fresh run keeps the call shape (review: Codex, A10)."""
+        app = _create_runs_app(adapter)
+        captured = {}
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", return_value=self._capturing_agent(captured)), \
+                    patch.object(adapter, "_conversation_history_for_session", new=AsyncMock(return_value=[])):
+                resp = await cli.post("/v1/runs", json=body)
+                assert resp.status == 202
+                await self._wait_completed(cli, (await resp.json())["run_id"])
+        assert captured.get("caller_history_authoritative", "absent") == authoritative
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("author", ["dixie", ["dixie"], 7])
     async def test_start_rejects_non_object_author(self, adapter, author):
         app = _create_runs_app(adapter)

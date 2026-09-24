@@ -309,9 +309,14 @@ def _recheck_row_under_lease(db, session_id: str) -> Optional[bool]:
 
 def admit_durable_turn_lease(
     agent, *, session_id: str, relay_turn_id: str, task_context: Dict[str, Any],
-    conversation_history: Optional[List[Dict[str, Any]]],
+    conversation_history: Optional[List[Dict[str, Any]]], caller_history_authoritative: bool = False,
 ) -> TurnLeaseAdmission:
     """Acquire the session turn lease; build (not start) its threads.
+
+    ``caller_history_authoritative`` (see ``TurnFacadeMixin.run_conversation``): the lease only
+    serializes; the caller's history is never replaced by (or merged with) the durable transcript. Two
+    API chats can share one derived session id, so a reload could hand one chat's model the OTHER
+    chat's context (review: Codex, A10 round 1).
 
     Mutates ``task_context["session_id"]`` and ``agent.session_id`` when the wait forced a resume-id
     reload. Returns an ``early_result`` (interrupted / timed out / session state unreadable) instead of
@@ -378,7 +383,10 @@ def admit_durable_turn_lease(
             if rechecked:
                 agent._session_db_created = True
                 row_appeared = True
-        if waited or row_appeared:
+        if caller_history_authoritative:
+            if waited:
+                agent._emit_status("Session is free; starting your turn...")
+        elif waited or row_appeared:
             if waited:
                 agent._emit_status("Session is free; loading the latest transcript...")
             if row_state is True or row_appeared:

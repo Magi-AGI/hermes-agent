@@ -874,3 +874,99 @@ def test_fresh_lease_key_is_stable_when_the_turn_creates_its_row(tmp_path):
     finally:
         db.close()
 
+
+def test_caller_authoritative_history_is_never_swapped_for_another_chats_transcript(tmp_path, monkeypatch):
+    """Invariant (review: Codex, A10 round 1): two header-less API chats with the same system prompt
+    and first message share one derived session id. The second waits on the lease while the first
+    persists ITS chat; the second's model must still see only the second chat's own history."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "agent.turn_liveness.resolve_turn_liveness_settings", lambda cfg: (None, 1.0)
+    )
+    sid = "api-0123456789abcdef"
+    loser_refused = threading.Event()
+
+    class _ObservedDB(SessionDB):
+        def try_acquire_session_turn_lease(self, session_id, holder, **kwargs):
+            acquired = super().try_acquire_session_turn_lease(session_id, holder, **kwargs)
+            if not acquired:
+                loser_refused.set()
+            return acquired
+
+    path = tmp_path / "state.db"
+    winner_db, loser_db = SessionDB(path), _ObservedDB(path)
+    winner_inside = threading.Event()
+    observed = {}
+
+    def fake_run(_agent, message, _system, history, *_args, **_kwargs):
+        observed[message] = [m["content"] for m in history or []]
+        if message == "chat A: second question":
+            winner_inside.set()
+            _agent._session_db.create_session(sid, source="api_server")
+            _agent._session_db.append_message(sid, role="user", content="chat A private context")
+            assert loser_refused.wait(30), "loser never attempted admission"
+        return {"final_response": "ok", "messages": history, "failed": False}
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", fake_run)
+    winner = _agent_with_db(winner_db, session_id=sid, platform="api_server")
+    loser = _agent_with_db(loser_db, session_id=sid, platform="api_server")
+    for agent in (winner, loser):
+        agent._session_db_created = False
+    chat_a = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "A reply"}]
+    chat_b = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "B reply"}]
+    errors = []
+
+    def run(agent, message, history):
+        try:
+            AIAgent.run_conversation(
+                agent, message, conversation_history=history, caller_history_authoritative=True)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    t1 = threading.Thread(target=run, args=(winner, "chat A: second question", chat_a))
+    t1.start()
+    assert winner_inside.wait(30)
+    t2 = threading.Thread(target=run, args=(loser, "chat B: second question", chat_b))
+    t2.start()
+    t1.join(60)
+    t2.join(60)
+    try:
+        assert not errors
+        assert loser_refused.is_set()  # the lease serialized the two chats
+        assert observed["chat B: second question"] == ["hi", "B reply"]
+        assert "chat A private context" not in observed["chat B: second question"]
+        assert loser._session_db_created is True  # row proven present under the lease
+    finally:
+        winner_db.close()
+        loser_db.close()
+
+
+def test_caller_authoritative_admission_skips_reload_after_wait():
+    """Unit: a waited admission of an EXISTING row keeps the caller's authoritative history (no
+    resolve/reload), while the default durable continuation still reloads."""
+    from agent.turn_facade_lease import admit_durable_turn_lease
+
+    class _WaitingDB(_DB):
+        def acquire_session_turn_lease(self, session_id, holder, **kwargs):
+            self.events.append(("acquire", session_id, holder))
+            kwargs["on_wait"](0.0)
+            return True
+
+    seed = [{"role": "user", "content": "client history"}]
+    for authoritative, expected, events in (
+        (True, seed, ["acquire", "release"]),
+        (False, [{"role": "user", "content": "durable latest"}], ["acquire", "resolve", "reload", "release"]),
+    ):
+        db = _WaitingDB()
+        agent = _agent_with_db(db, session_id="shared")
+        statuses = []
+        agent._emit_status = statuses.append
+        admission = admit_durable_turn_lease(
+            agent, session_id="shared", relay_turn_id="shared:t:1",
+            task_context={"session_id": "shared", "task_id": "t", "platform": "api_server"},
+            conversation_history=seed, caller_history_authoritative=authoritative,
+        )
+        admission.lease.release()
+        assert admission.conversation_history == expected
+        assert [e[0] for e in db.events] == events
+        assert agent.session_id == ("shared" if authoritative else "compressed-tip")

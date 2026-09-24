@@ -669,7 +669,10 @@ class OpenAICompatRoutesMixin:
             # and the client can resume the session by sending it again). A fingerprint-derived
             # id from a header-less client is NOT: delegate_task keeps its forced-sync fallback
             # there — the wake would hard-fail or land in history that client never reloads.
-            session_history_delivery=("1" if provided_session_id else ""))
+            session_history_delivery=("1" if provided_session_id else ""),
+            # The header path loaded ``history`` from SessionDB; a header-less client's messages are
+            # its own record of the chat, and its fingerprint-derived id can be shared by another chat.
+            caller_history_authoritative=not provided_session_id)
         # This is presentation only. The ordinary API-key/session authorization
         # above still applies; it grants no internal ingress or control authority.
         if provided_session_id and body.get("hermes_notification_category") == "diagnostic":
@@ -1046,7 +1049,9 @@ class OpenAICompatRoutesMixin:
             user_message=user_message, conversation_history=conversation_history,
             ephemeral_system_prompt=instructions, session_id=session_id,
             gateway_session_key=gateway_session_key, bind_declared_conversation=_declared_selected,
-            **agent_overrides, route=route, relay_metadata=relay_metadata)
+            **agent_overrides, route=route, relay_metadata=relay_metadata,
+            # Request input / conversation_history / previous_response_id snapshot: never SessionDB.
+            caller_history_authoritative=True)
         if stream:
             _stream_q = ThreadSafeAsyncQueue()
 

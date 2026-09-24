@@ -553,7 +553,7 @@ async def run_internal_session_turn(self, *, session_id: str, text: str, profile
             await self._run_agent(
                 user_message=text, conversation_history=history, session_id=resolved,
                 gateway_session_key=None, **overrides, route=route, requested_runtime={},
-                route_source="global", session_history_delivery="1",
+                route_source="global", session_history_delivery="1", caller_history_authoritative=False,
                 notification_category=notification_category,
             )
             return
@@ -774,6 +774,11 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
             _api_server._publish_turn_process_ownership(agent, effective_task_id)
             # Passed only when set: a human turn keeps today's call shape.
             author_kwargs = {"turn_author": run.turn_author} if run.turn_author is not None else {}
+            # A caller-supplied history or previous_response_id snapshot is authoritative for the turn
+            # (the same provenance that denies it the wake capability above): the lease serializes it but
+            # never swaps it for the durable transcript. Passed only when set (fakes keep the call shape).
+            if not run.session_history_delivery:
+                author_kwargs["caller_history_authoritative"] = True
             r = agent.run_conversation(
                 user_message=run.user_message, conversation_history=run.conversation_history,
                 task_id=effective_task_id, **author_kwargs)

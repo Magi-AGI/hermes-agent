@@ -3147,7 +3147,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             # #98619: the client addresses this session by construction — the id is in the
             # request path (/api/sessions/{session_id}/chat) — so a wake self-post lands where
             # the client will read it. The audited native-session opt-in.
-            session_history_delivery="1", **agent_overrides)
+            session_history_delivery="1", caller_history_authoritative=False, **agent_overrides)
         return {
             "gateway_session_key": gateway_session_key, "session_id": session_id, "body": body,
             "user_message": user_message, "runtime_request": runtime_request,
@@ -3922,7 +3922,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         confirmed_runtime_lock: bool = False, bind_declared_conversation: bool = False,
         session_history_delivery: str = "", turn_author: Optional[Dict[str, Any]] = None,
         relay_metadata: Optional[Dict[str, Any]] = None, notification_category: str = "result",
-        resume_unanswered_turn: bool = False) -> tuple:
+        resume_unanswered_turn: bool = False, caller_history_authoritative: bool = False) -> tuple:
         """Create an agent and run one turn in a thread executor -> ``(result, usage)``.
         ``agent_ref[0]`` receives the agent so SSE writers can interrupt it; ``active_run_id``
         registers it in ``_active_run_agents``. Under a confirmed model lock the actual
@@ -3934,7 +3934,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         ``resume_unanswered_turn`` marks a policy-gated re-run of a turn whose user row the failed attempt
         already persisted: the transcript's unanswered tail row is adopted from ``conversation_history``
         as THIS turn's user message instead of being appended a second time
-        (``agent.session_persistence.adopt_unanswered_turn``; #115325)."""
+        (``agent.session_persistence.adopt_unanswered_turn``; #115325).
+        ``caller_history_authoritative``: every route declares where ``conversation_history`` came
+        from. True = the client supplied it (header-less chat completions, /v1/responses input or a
+        ``previous_response_id`` snapshot): admission never swaps it for the durable transcript of a
+        session id another chat may share. False = the route LOADED it from SessionDB, so a turn that
+        waited on the session lease reloads the latest durable transcript (the default, and the call
+        shape run_conversation keeps)."""
         loop = asyncio.get_running_loop()
         # ContextVars do not follow run_in_executor threads: capture here, re-enter in _run().
         request_profile = _api_request_profile.get()
@@ -4000,6 +4006,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     )
                     if relay_metadata:
                         conversation_kwargs["relay_metadata"] = relay_metadata
+                    if caller_history_authoritative:
+                        conversation_kwargs["caller_history_authoritative"] = True
                     with notification_turn(agent, muted=muted, session_id=session_id or ""):
                         result = agent.run_conversation(**conversation_kwargs)
                     result, usage = self._finish_turn_result(

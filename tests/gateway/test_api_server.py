@@ -488,6 +488,21 @@ class TestAgentExecution:
         )
 
     @pytest.mark.asyncio
+    async def test_run_agent_forwards_caller_history_authority(self, adapter):
+        """A route that declares its history caller-authoritative reaches admission with it."""
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {"final_response": "ok"}
+        mock_agent.session_prompt_tokens = mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            await adapter._run_agent(
+                user_message="hello", conversation_history=[], session_id="session-123",
+                caller_history_authoritative=True)
+        mock_agent.run_conversation.assert_called_once_with(
+            user_message="hello", conversation_history=[], task_id="session-123",
+            caller_history_authoritative=True)
+
+    @pytest.mark.asyncio
     async def test_run_agent_sets_and_clears_process_ownership_markers(self, adapter):
         """#76188 review: this surface runs its own agent lifecycle outside
         TurnRunner, so it needs its own baseline snapshot/clear — verify the
@@ -2216,6 +2231,8 @@ class TestUsageCounting:
             assert data["usage"]["input_tokens"] == 100
             assert data["usage"]["output_tokens"] == 50
             assert data["usage"]["total_tokens"] == 150
+            # /v1/responses history is request input / a response snapshot, never SessionDB.
+            assert mock_run.call_args.kwargs["caller_history_authoritative"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -2510,6 +2527,33 @@ class TestSessionIdHeader:
             # History must come from DB, not from the request body
             assert call_kwargs["conversation_history"] == db_history
             assert call_kwargs["user_message"] == "new question"
+            # SessionDB-loaded continuation: a lease wait may reload the durable transcript.
+            assert call_kwargs["caller_history_authoritative"] is False
+
+    @pytest.mark.asyncio
+    async def test_headerless_chat_history_is_caller_authoritative(self, adapter):
+        """A header-less client's messages are its own record of the chat; the fingerprint-derived id
+        can be shared by another chat, so admission must never swap in the durable transcript
+        (review: Codex, A10 round 1)."""
+        mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post("/v1/chat/completions", json={
+                    "model": "hermes-agent",
+                    "messages": [
+                        {"role": "user", "content": "hi"},
+                        {"role": "assistant", "content": "client reply"},
+                        {"role": "user", "content": "next"},
+                    ],
+                })
+            assert resp.status == 200
+            call_kwargs = mock_run.call_args.kwargs
+            assert call_kwargs["session_id"].startswith("api-")
+            assert call_kwargs["conversation_history"] == [
+                {"role": "user", "content": "hi"}, {"role": "assistant", "content": "client reply"}]
+            assert call_kwargs["caller_history_authoritative"] is True
 
 
 # ---------------------------------------------------------------------------

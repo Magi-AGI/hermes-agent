@@ -28,8 +28,16 @@ class TurnFacadeMixin:
         persist_user_platform_id: Optional[str]=None, moa_config: Optional[dict[str, Any]]=None,
         turn_author: Optional[Dict[str, Any]] = None,
         relay_metadata: Optional[Dict[str, Any]] = None,
+        caller_history_authoritative: bool = False,
     ) -> Dict[str, Any]:
-        """Forwarder — see ``agent.conversation_loop.run_conversation``."""
+        """Forwarder — see ``agent.conversation_loop.run_conversation``.
+
+        ``caller_history_authoritative``: ``conversation_history`` is the CALLER's record of this
+        conversation (an API client's own messages, a ``previous_response_id`` snapshot), not a copy of
+        the durable transcript. Admission then never replaces it with the durable transcript after a
+        lease wait; the lease only serializes. Default False: the history is a durable continuation
+        (Desktop/TUI, messaging gateway, CLI, a SessionDB-loaded API turn) and a wait reloads the
+        latest durable transcript."""
         # A review shares this session_id for cache parity: fence review startup or interrupt
         # an admitted request and await its exit before opening live-turn instrumentation.
         # Foreground priority is retained if the review does not acknowledge within the bounded deadline
@@ -80,6 +88,7 @@ class TurnFacadeMixin:
             admission = admit_durable_turn_lease(
                 self, session_id=session_id, relay_turn_id=relay_turn_id, task_context=task_context,
                 conversation_history=conversation_history,
+                caller_history_authoritative=caller_history_authoritative,
             )
             if admission.early_result is not None:
                 carry_unadmitted_user_message(
