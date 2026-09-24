@@ -4810,6 +4810,10 @@ def _start_gateway_housekeeping(
             lambda _launch=_launch_sessions_dir(getattr(runner, "config", None)):
                 _housekeeping_state_db_maintenance(_launch))),
         (1, "Deferred FTS retry tick", _housekeeping_deferred_fts_retry),
+        # Every 5 min: finish an interrupted Codex login update / fence newly found legacy rescue
+        # files even when no request arrives (credential recovery protocol, §6).
+        (5, "Codex authority dispatch", lambda: __import__(
+            "hermes_cli.auth_codex_authority", fromlist=["startup_dispatch"]).startup_dispatch()),
         (1, "gateway housekeeping memory trim", _housekeeping_memory_trim),
         (1, "MCP config reconcile", _mcp_config_reconciler(runner)),
         # Last: a real prune can hold this thread for a while; every other chore of the tick runs first.

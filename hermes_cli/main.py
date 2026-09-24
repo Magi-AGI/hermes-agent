@@ -2714,6 +2714,9 @@ def cmd_dashboard(args):
     from hermes_cli.resource_limits import apply_nofile_soft_limit
 
     apply_nofile_soft_limit()
+    if not getattr(args, "stop", False) and not getattr(args, "status", False):
+        from hermes_cli.auth_codex_authority import startup_dispatch
+        startup_dispatch()
 
     _ssh_session_token = _read_ssh_session_token_file(_token_file) if _token_file else None
     _mcp_discovery_after_bind = _dashboard_prepare_runtime(args, _headless_backend)
@@ -2926,6 +2929,10 @@ def _prepare_agent_startup(args) -> None:
 
     if not (args.command in _AGENT_COMMANDS or _agent_subcommand_selected(args)):
         return
+    # Runtime modes only (never status/doctor/pickers): bootstrap the Codex login registry or finish
+    # an interrupted Codex login update before anything resolves credentials (design §6).
+    from hermes_cli.auth_codex_authority import startup_dispatch
+    startup_dispatch()
 
     _accept_hooks = bool(getattr(args, "accept_hooks", False))
     if not _is_tui_chat_launch(args):
