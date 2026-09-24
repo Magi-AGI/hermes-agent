@@ -227,6 +227,9 @@ def test_codex_pool_refresh_holds_auth_store_lock_across_post(monkeypatch, tmp_p
         access_token="stale-access",
         refresh_token="stale-refresh",
     )
+    # The row lives on disk (the refresh transaction refreshes registered rows only).
+    _write_store(profile_path, {"version": 1, "providers": {},
+                                "credential_pool": {provider: [entry.to_dict()]}})
     pool = CredentialPool(provider, [entry])
 
     refreshed = pool._refresh_entry(entry, force=True)
@@ -252,7 +255,9 @@ def test_write_through_fires_on_every_refresh_not_just_first(
 
     The fix skips ``_store_provider_state`` entirely when the grant was
     resolved from root, so the profile never accrues a shadowing key and
-    ``_load_provider_state_with_source`` always resolves from root.
+    ``_load_provider_state_with_source`` always resolves from root. (Exercised on xAI: a Codex
+    refresh is written by the refresh transaction to every row of its chain in the owner store —
+    ``tests/hermes_cli/test_codex_refresh_transaction.py``.)
     """
     profile_path, root_path = profile_and_root
     _write_store(
@@ -260,14 +265,14 @@ def test_write_through_fires_on_every_refresh_not_just_first(
         {
             "version": 1,
             "providers": {
-                "openai-codex": {
+                "xai-oauth": {
                     "tokens": {"access_token": "root-ac", "refresh_token": "root-rf"}
                 }
             },
         },
     )
 
-    provider = "openai-codex"
+    provider = "xai-oauth"
     # After patching A's module-level attributes, the bare-name imports in
     # credential_pool.py still hold references to the original functions
     # (``from X import Y`` creates a local binding that does not update when
@@ -290,7 +295,7 @@ def test_write_through_fires_on_every_refresh_not_just_first(
 
     # Verify root was updated with the rotated tokens from refresh 1.
     root_store = _read_store(root_path)
-    root_tokens = root_store["providers"]["openai-codex"]["tokens"]
+    root_tokens = root_store["providers"]["xai-oauth"]["tokens"]
     assert root_tokens["access_token"] == "ac1"
     assert root_tokens["refresh_token"] == "rf1"
 
@@ -298,7 +303,7 @@ def test_write_through_fires_on_every_refresh_not_just_first(
     # block (the fix skipped _store_provider_state because the grant came
     # from root).  This prevents the self-sealing that broke refresh 2+.
     profile_store = _read_store(profile_path)
-    assert "openai-codex" not in profile_store.get("providers", {}), (
+    assert "xai-oauth" not in profile_store.get("providers", {}), (
         "profile must NOT accrue a shadowing providers.<id> block when the "
         "grant was resolved from root — that key would disable write-through "
         "on the next refresh (#74339)"
@@ -314,7 +319,7 @@ def test_write_through_fires_on_every_refresh_not_just_first(
     # Verify root was updated with the rotated tokens from refresh 2.
     # The old key-presence check would have silently skipped this write.
     root_store = _read_store(root_path)
-    root_tokens = root_store["providers"]["openai-codex"]["tokens"]
+    root_tokens = root_store["providers"]["xai-oauth"]["tokens"]
     assert root_tokens["access_token"] == "ac2", (
         "refresh 2: root must carry the rotated token pair. "
         "The old code self-disabled write-through here (#74339)"

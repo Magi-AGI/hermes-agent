@@ -1054,6 +1054,14 @@ def write_credential_pool(
             for e in entries]
         existing_list = pool.get(provider_id)
         existing_list = existing_list if isinstance(existing_list, list) else []
+        if provider_id == "openai-codex":
+            # Metadata-only save (RULE-T4/T5, credential recovery protocol): tokens and provenance
+            # come from disk; governed rows are created/removed only by ownership ops.
+            from hermes_cli.auth_codex_rows import merge_codex_pool_rows
+            pool[provider_id] = merge_codex_pool_rows(
+                existing_list, sanitized, removed_ids=removed, status_cleared_ids=status_cleared_ids or (),
+                merge_cooldowns=lambda e, d: _merge_disk_cooldown_state(e, d, provider_id))
+            return _save_auth_store(auth_store)
         existing_by_id = _entry_ids(existing_list)
         new_ids = set(_entry_ids(sanitized))
         status_cleared = {cid for cid in (status_cleared_ids or ()) if cid}
@@ -1298,6 +1306,11 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
 def clear_provider_auth(provider_id: Optional[str] = None) -> bool:
     """Clear auth state for a provider (the active one when *provider_id* is None). Used by
     ``hermes logout``. Returns True if something was cleared."""
+    target = provider_id or _load_auth_store().get("active_provider")
+    if target == "openai-codex":
+        # Removing Codex rows is an ownership operation (credential recovery protocol, RULE-K1).
+        from hermes_cli.auth_codex_authority import logout_active_store
+        return logout_active_store()
     with _auth_store_lock():
         auth_store = _load_auth_store()
         target = provider_id or auth_store.get("active_provider")

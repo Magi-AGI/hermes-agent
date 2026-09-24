@@ -506,7 +506,9 @@ def test_dead_manual_entry_pruned_after_24h(tmp_path, monkeypatch):
     Manual entries (``manual:*``) are independent credentials with no
     singleton to re-seed from, so we can clean them up after a quiet
     window without losing recoverability — the user can always re-add
-    via ``hermes auth add``.
+    via ``hermes auth add``. (Codex rows are never pruned at runtime: their removal is an
+    ownership operation of the credential recovery protocol — see
+    ``tests/hermes_cli/test_codex_authority_bootstrap.py``.)
     """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     # DEAD entry from > 24h ago
@@ -516,7 +518,7 @@ def test_dead_manual_entry_pruned_after_24h(tmp_path, monkeypatch):
         {
             "version": 1,
             "credential_pool": {
-                "openai-codex": [
+                "xai-oauth": [
                     {
                         "id": "cred-old-dead",
                         "label": "ancient-dead",
@@ -546,7 +548,7 @@ def test_dead_manual_entry_pruned_after_24h(tmp_path, monkeypatch):
 
     from agent.credential_pool import load_pool
 
-    pool = load_pool("openai-codex")
+    pool = load_pool("xai-oauth")
     # Trigger _available_entries via select; that runs the prune.
     selected = pool.select()
     assert selected is not None
@@ -554,7 +556,7 @@ def test_dead_manual_entry_pruned_after_24h(tmp_path, monkeypatch):
 
     # On-disk pool should have the dead entry removed.
     auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
-    persisted = auth_payload["credential_pool"]["openai-codex"]
+    persisted = auth_payload["credential_pool"]["xai-oauth"]
     assert len(persisted) == 1
     assert persisted[0]["id"] == "cred-ok"
 

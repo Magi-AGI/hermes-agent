@@ -20,6 +20,19 @@ def isolated_external_auth_stores(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_SHARED_AUTH_DIR", str(tmp_path / "shared"))
 
 
+def _seed_codex_rows(rows):
+    """Codex rows are created only by sign-in (ownership op); tests seed them on disk directly."""
+    from hermes_cli.auth import _auth_file_path
+    path = _auth_file_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"version": 1, "providers": {},
+                                "credential_pool": {"openai-codex": rows}}), encoding="utf-8")
+
+
+def _without_chain(row):
+    return {k: v for k, v in row.items() if k != "chain_id"}
+
+
 def _rows():
     return [dict(id=f"row{i}", label=f"account{i}", source="manual:device_code",
                  auth_type="oauth", access_token=f"fixture-access-{i}",
@@ -53,7 +66,7 @@ def test_refresh_uses_target_grant_and_preserves_sibling(monkeypatch, status):
     monkeypatch.setattr(auth_codex, "CODEX_OAUTH_TOKEN_URL", f"http://127.0.0.1:{server.server_port}/token")
     from agent.credential_pool import PooledCredential
     rows = [PooledCredential.from_dict("openai-codex", row).to_dict() for row in _rows()]
-    write_credential_pool("openai-codex", rows)
+    _seed_codex_rows(rows)
     before = read_credential_pool("openai-codex")
     try:
         args = SimpleNamespace(provider="openai-codex", target="row1")
@@ -65,7 +78,7 @@ def test_refresh_uses_target_grant_and_preserves_sibling(monkeypatch, status):
         after = {e["id"]: e for e in read_credential_pool("openai-codex")}
         assert requests == [{"grant_type": ["refresh_token"], "refresh_token": ["fixture-refresh-1"],
                              "client_id": [auth_codex.CODEX_OAUTH_CLIENT_ID]}]
-        assert after["row0"] == before[0], (after["row0"], before[0])
+        assert _without_chain(after["row0"]) == before[0], (after["row0"], before[0])
         target = after["row1"]
         if status == 200:
             assert target["access_token"] == "fixture-new-access"
@@ -73,11 +86,11 @@ def test_refresh_uses_target_grant_and_preserves_sibling(monkeypatch, status):
             assert target.get("last_error_reset_at") is None
             assert target["last_status"] == "ok"
         else:
-            # Manual grants remain in the pool on failure; only singleton-seeded grants are removed
-            # by the quarantine. A transient 503 benches the row ('exhausted'); a terminal 401
-            # invalid_grant marks it 'dead' so it leaves rotation until re-auth instead of
-            # replaying the dead token every TTL.
-            assert target["last_status"] == ("dead" if status == 401 else "exhausted")
+            # Manual grants remain in the pool on failure. A 401 invalid_grant is a rejection; a
+            # 503 AFTER the request was sent is an unknown outcome (the server may have consumed the
+            # token; decision 4). Either way the login pauses — the row is DEAD, its chain fenced —
+            # and the token is never replayed.
+            assert target["last_status"] == "dead"
             assert target["access_token"] == before[1]["access_token"]
     finally:
         server.shutdown()
@@ -103,7 +116,7 @@ def test_add_priority_places_reauthenticated_row_in_multi_entry_pool(monkeypatch
 
 def test_refresh_rejects_ambiguous_and_non_oauth_targets():
     rows = _rows()
-    write_credential_pool("openai-codex", rows)
+    _seed_codex_rows(rows)
     with pytest.raises(SystemExit, match="pass an index"):
         auth_commands.auth_refresh_command(SimpleNamespace(provider="openai-codex", target=None))
     with pytest.raises(SystemExit, match="No credential matching"):

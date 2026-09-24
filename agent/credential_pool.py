@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from agent.credential_pool_admin import CredentialPoolAdminMixin
+from agent.credential_pool_codex import CodexAuthorityPoolMixin
 from agent.credential_pool_model_cooldowns import CredentialPoolModelCooldownMixin, model_cooldown_until
 
 import logging
@@ -29,6 +30,7 @@ from agent.credential_persistence import (
     sanitize_borrowed_credential_payload,
 )
 import hermes_cli.auth as auth_mod
+from hermes_cli.auth_codex_registry import NeedsAuthorityRepair
 from hermes_cli.auth import (
     CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
     PROVIDER_REGISTRY,
@@ -873,6 +875,18 @@ def _update_root_pool_rows(
             store["credential_pool"] = pool
         existing = pool.get(provider)
         existing_list = existing if isinstance(existing, list) else []
+        if provider == "openai-codex":
+            # Metadata-only write-back of the root's rows (RULE-T4/T5); never adds or removes.
+            from hermes_cli.auth_codex_rows import merge_codex_pool_rows
+            known = {e.get("id") for e in existing_list if isinstance(e, dict)}
+            merged_rows = merge_codex_pool_rows(
+                existing_list, [p for p in payloads if isinstance(p, dict) and p.get("id") in known],
+                removed_ids=(), status_cleared_ids=status_cleared_ids or (),
+                merge_cooldowns=lambda e, d: auth_mod._merge_disk_cooldown_state(e, d, provider))
+            if merged_rows != existing_list:
+                pool[provider] = merged_rows
+                _save_auth_store(store, target_path=global_path)
+            return
         incoming_by_id = {p.get("id"): p for p in payloads if isinstance(p, dict) and p.get("id")}
         cleared = {cid for cid in (status_cleared_ids or ()) if cid}
         merged: List[Dict[str, Any]] = []
@@ -979,7 +993,7 @@ class _RefreshDone(Exception):
         self.result = result
 
 
-class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin):
+class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin, CodexAuthorityPoolMixin):
     def __init__(self, provider: str, entries: List[PooledCredential]):
         self.provider = provider
         self._entries = sorted(entries, key=lambda entry: entry.priority)
@@ -1137,6 +1151,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         DEFERRED refresh path (outside the pool lock), so take the RLock here;
         still-locked callers re-enter safely.
         """
+        if self.provider == "openai-codex":
+            return  # Codex rows leave only through an ownership op (credential recovery protocol)
         with self._lock:
             removed_ids = [item.id for item in self._entries if item.source in sources]
             self._entries = [item for item in self._entries if item.source not in sources]
@@ -1420,7 +1436,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         """
         # Only singleton-seeded entries sync back; ``manual:*`` entries are
         # independent credentials and must not write to the singleton.
-        if entry.source != "device_code" or self.provider not in ("nous", *_TOKENS_SINGLETON_PROVIDERS):
+        if (entry.source != "device_code" or self.provider not in ("nous", *_TOKENS_SINGLETON_PROVIDERS)
+                or self.provider == "openai-codex"):
             return
         try:
             with _auth_store_lock():
@@ -1473,6 +1490,10 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             if force:
                 self._mark_exhausted(entry, None)
             return None
+        if self.provider == "openai-codex":
+            # The refresh transaction (credential recovery protocol, P3): admission by the chain
+            # authority, owner-store locks, intent before the POST, no automatic replay.
+            return self._refresh_codex_entry(entry, force=force)
         # Plugin providers with a ``refresh_credential`` hook are treated as single-use by default:
         # the pool cannot know their grant semantics, and a needless in-lock re-read is cheaper than
         # a ``refresh_token_reused`` login loss. Eligibility comes from the hook, never a name set.
@@ -1690,6 +1711,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                 return entry
         except _RefreshDone as done:
             return done.result
+        except NeedsAuthorityRepair:
+            raise
         except Exception as exc:
             logger.debug("Credential refresh failed for %s/%s: %s", self.provider, entry.id, exc)
             return self._recover_failed_refresh(entry, exc)
@@ -1901,19 +1924,11 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             return False
         try:
             # An exhausted entry is skipped by the refresh chain, so its stored token is usually
-            # expired by probe time (401 -> None -> cooldown kept, #89415): refresh it first.
-            fresh = auth_mod._refresh_expired_codex_probe_token(token, entry.refresh_token)
-            if fresh:
-                # Persist the rotated pair on both sides the way ``_refresh_entry`` does:
-                # ``last_refresh`` plus the singleton write-back, or the next selection's
-                # auth-store sync re-adopts the consumed pair from ``providers.openai-codex``
-                # and clears the cooldown with it.
-                entry = self._adopt(
-                    entry, access_token=fresh["access_token"], refresh_token=fresh["refresh_token"],
-                    last_refresh=fresh.get("last_refresh") or entry.last_refresh,
-                )
-                self._sync_device_code_entry_to_auth_store(entry)
-                token = entry.access_token or token
+            # expired by probe time (401 -> None -> cooldown kept, #89415). That refresh is
+            # deferred to the refresh transaction outside the pool mutex
+            # (``_codex_probe_needs_refresh`` -> pending); the probe answers once it has run.
+            if _codex_access_token_is_expiring(token, 0):
+                return False
             return bool(auth_mod._probe_codex_quota_restored(token, base_url=entry.base_url))
         except Exception:
             logger.debug("Codex quota-restored probe failed", exc_info=True)
@@ -1958,9 +1973,13 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
 
         Each refresh takes the cross-process ``_auth_store_lock`` (20+ s
         possible) and merges into the pool through the self-locking mutation
-        primitives; failures are silently skipped.
+        primitives; failures are silently skipped. A Codex row refreshed only so
+        its quota can be probed keeps its exhaustion status.
         """
         for entry in pending:
+            if self.provider == "openai-codex" and entry.last_status == STATUS_EXHAUSTED:
+                self._refresh_codex_entry(entry, force=False, mark_ok=False, probe=True)
+                continue
             self._refresh_entry(entry, force=False)
 
     def _reset_cleared_after(self, entry: PooledCredential) -> Optional[float]:
@@ -1988,6 +2007,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         cleared_at = self._reset_cleared_after(entry)
         if cleared_at is not None:
             return self._adopt(entry, persist=False, **_MARK_OK, status_cleared_at=cleared_at)
+        if self.provider == "openai-codex":
+            return self._sync_codex_entry_from_disk(entry)
         if entry.source != _RESYNC_SOURCE.get(self.provider):
             return entry
         if self.provider == "anthropic":
@@ -2029,7 +2050,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                 # singleton-seeded ones stay (audit trail, and the seeder would
                 # re-create them anyway). DEAD never re-enters via TTL — only a
                 # write-side re-auth sync clears it.
-                if _is_manual_source(entry.source):
+                if _is_manual_source(entry.source) and self.provider != "openai-codex":
                     dead_at = entry.last_status_at or 0
                     if dead_at and now - dead_at > DEAD_MANUAL_PRUNE_TTL_SECONDS:
                         logger.warning(
@@ -2046,6 +2067,9 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             if model_cooldown_until(entry, model) is not None:
                 continue
             if entry.last_status == STATUS_EXHAUSTED:
+                if clear_expired and self._codex_probe_needs_refresh(entry):
+                    pending_refresh.append(entry)
+                    continue
                 exhausted_until = _exhausted_until(entry, sole_credential=sole_credential)
                 # Codex quota windows can reopen EARLY; a throttled live probe
                 # lifts a stale cooldown (issue #43747).
@@ -2349,6 +2373,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
     # ---- explicit refresh / admin ------------------------------------------
 
     def try_refresh_current(self) -> Optional[PooledCredential]:
+        if self.provider == "openai-codex":
+            return self._refresh_codex_selected(self.current())
         with self._lock:
             return self._try_refresh_current_unlocked()
 
@@ -2374,7 +2400,9 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             if entry is None:
                 return None
             self._current_id = entry.id
-            return self._try_refresh_current_unlocked()
+            if self.provider != "openai-codex":
+                return self._try_refresh_current_unlocked()
+        return self._refresh_codex_selected(entry)
 
     def _try_refresh_current_unlocked(self) -> Optional[PooledCredential]:
         entry = self._current_unlocked()
@@ -2984,7 +3012,11 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
 
 def load_pool(provider: str) -> CredentialPool:
     provider = (provider or "").strip().lower()
-    if provider in SINGLE_USE_REFRESH_POOL_PROVIDERS:
+    if provider == "openai-codex":
+        # Codex consolidation moves ownership: stage 2 of the credential recovery protocol runs
+        # it as an ownership op. Until then it is refused here (other providers keep the heal).
+        logger.debug("openai-codex: forked-grant consolidation deferred to ownership ops")
+    elif provider in SINGLE_USE_REFRESH_POOL_PROVIDERS:
         # One-time heal for installs that forked this grant across profiles
         # before the clone-strip / root write-through existed (#100339).
         auth_mod.heal_forked_single_use_oauth_grants(provider)
@@ -3010,7 +3042,12 @@ def load_pool(provider: str) -> CredentialPool:
         active_entries = active_pool.get(provider) if isinstance(active_pool, dict) else None
         changed |= bool(active_entries)
 
-    if provider.startswith(CUSTOM_POOL_PREFIX):
+    if provider == "openai-codex":
+        # Aliases are materialized by bootstrap migration / sign-in (RULE-K1): the rows on disk,
+        # as they are. A missing or unregistered row is reported, never created or pruned here.
+        from hermes_cli.auth_codex_authority import report_unregistered_rows
+        report_unregistered_rows()
+    elif provider.startswith(CUSTOM_POOL_PREFIX):
         custom_changed, custom_sources = _seed_custom_pool(provider, entries)
         changed |= custom_changed
         changed |= _prune_stale_seeded_entries(entries, custom_sources)

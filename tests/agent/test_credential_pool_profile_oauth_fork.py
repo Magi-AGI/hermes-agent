@@ -459,6 +459,9 @@ def test_heal_preserves_independent_grants_for_same_account(fleet, shape, claims
     assert (root.read_bytes(), profile.read_bytes()) == before
     if claims:
         from agent.credential_pool import load_pool
+        from hermes_cli.auth_codex_authority import authority_dispatch
+        authority_dispatch()  # runtime startup: the singleton's pool alias is materialized here
+        before = (root.read_bytes(), profile.read_bytes())
         for _ in range(3):
             selected = load_pool("openai-codex").select()
             assert selected is not None
