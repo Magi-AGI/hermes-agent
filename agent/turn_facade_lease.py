@@ -274,21 +274,37 @@ class TurnLeaseAdmission:
     conversation_history: Optional[List[Dict[str, Any]]] = None
 
 
-def _durable_session_exists(db, session_id: str) -> bool:
+_ROW_UNKNOWN = None  # probe could not read the row: neither present nor absent is proven
+_ROW_RECHECK_ATTEMPTS = 3
+_ROW_RECHECK_BACKOFF_S = 0.2
+
+
+def _probe_durable_session(db, session_id: str) -> Optional[bool]:
+    """Three-state row probe: True present, False absent, ``None`` unknown (the read failed).
+
+    A locked / non-WAL read is not proof the row is absent, and it is not proof the row EXISTS either:
+    treating it as present suppressed the lazy row create (``_session_db_created``) for a brand-new
+    session. ``get_session`` returns None — it does not raise — when the row is missing (#84234)."""
     try:
         return db.get_session(session_id) is not None
     except Exception:
-        # A locked / non-WAL read is not proof the row is absent; treating probe failure as "fresh"
-        # ran fail-open at the exact contention point. Acquire, or fail closed.
         logger.warning(
-            # Acquire (or fail closed if acquire itself cannot) rather than start load/run/flush
-            # unsynchronized. get_session returns None — it does not raise — when the row is missing. See
-            # #84234.
-            "Could not check durable session before turn lease; "
-            "will acquire rather than run without serialization",
-            exc_info=True,
+            "Could not check durable session %s before the turn lease; "
+            "acquiring and rechecking under the lease", session_id, exc_info=True,
         )
-        return True
+        return _ROW_UNKNOWN
+
+
+def _recheck_row_under_lease(db, session_id: str) -> Optional[bool]:
+    """Bounded re-probe while holding the lease; ``None`` only if every attempt failed."""
+    import time as _time
+    for attempt in range(_ROW_RECHECK_ATTEMPTS):
+        state = _probe_durable_session(db, session_id)
+        if state is not _ROW_UNKNOWN:
+            return state
+        if attempt + 1 < _ROW_RECHECK_ATTEMPTS:
+            _time.sleep(_ROW_RECHECK_BACKOFF_S)
+    return _ROW_UNKNOWN
 
 
 def admit_durable_turn_lease(
@@ -298,8 +314,8 @@ def admit_durable_turn_lease(
     """Acquire the session turn lease; build (not start) its threads.
 
     Mutates ``task_context["session_id"]`` and ``agent.session_id`` when the wait forced a resume-id
-    reload. Returns an ``early_result`` (interrupted / timed out) instead of a lease when admission
-    fails; the caller returns it verbatim."""
+    reload. Returns an ``early_result`` (interrupted / timed out / session state unreadable) instead of
+    a lease when admission fails; the caller returns it verbatim."""
     db = getattr(agent, "_session_db", None)
     admission = TurnLeaseAdmission(conversation_history=conversation_history)
     if db is None or not session_id:
@@ -310,13 +326,14 @@ def admit_durable_turn_lease(
         or not callable(getattr(type(db), "acquire_session_turn_lease", None))
     ):
         return admission
-    # A FRESH id (no row yet) is leased too: the lease row does not need the session row (the key walk
-    # falls back to the id itself), and two first turns on one brand-new id (two windows, desktop +
-    # relay, an API double-submit) would otherwise both run load/run/flush unserialized (Magi sync,
-    # bucket C R3). The row is still created lazily by the turn, so ``_session_db_created`` is set only
-    # on proof the row exists, and a caller's in-memory seed survives unless durable state replaced it.
-    row_existed = _durable_session_exists(db, session_id)
-    if row_existed:
+    # Every turn is leased, whether or not the row exists yet: the lease row does not need the session
+    # row (the key walk falls back to the id itself), and two first turns on one brand-new id (two
+    # windows, desktop + relay, an API double-submit) would otherwise both run load/run/flush
+    # unserialized (Magi sync, bucket C R3). The row is still created lazily by the turn, so
+    # ``_session_db_created`` is set only on a POSITIVE lookup, and a caller's in-memory seed survives
+    # unless durable state replaced it.
+    row_state = _probe_durable_session(db, session_id)
+    if row_state is True:
         # Row proven to exist — suppress the redundant create attempt.
         agent._session_db_created = True
     holder = (
@@ -347,18 +364,27 @@ def admit_durable_turn_lease(
     agent._active_session_turn_lease_holder = holder
     agent._active_session_turn_lease_ttl_seconds = LEASE_TTL_SECONDS
     try:
-        # A fresh id whose row appeared before we owned the lease was created (and possibly run) by
-        # another turn: re-probe UNDER the lease, so even an immediate acquisition reloads it.
-        row_appeared = not row_existed and _durable_session_exists(db, session_id)
-        if row_appeared:
-            agent._session_db_created = True
+        # Not proven present at arrival: re-probe UNDER the lease. A row that appeared meanwhile was
+        # created (and possibly run) by another turn, so even an immediate acquisition reloads it; a
+        # row still unreadable refuses the turn rather than guess either way.
+        row_appeared = False
+        if row_state is not True:
+            rechecked = _recheck_row_under_lease(db, session_id)
+            if rechecked is _ROW_UNKNOWN:
+                lease.release()
+                admission.early_result = _session_state_unreadable_result(
+                    agent, session_id, conversation_history)
+                return admission
+            if rechecked:
+                agent._session_db_created = True
+                row_appeared = True
         if waited or row_appeared:
             if waited:
                 agent._emit_status("Session is free; loading the latest transcript...")
-            if row_existed or row_appeared:
+            if row_state is True or row_appeared:
                 admission.conversation_history = _reload_latest_transcript(
                     agent, db, session_id, task_context, conversation_history,
-                    keep_seed_if_empty=not row_existed,
+                    keep_seed_if_empty=row_state is not True,
                 )
             # else: still no row after the wait — nothing durable to reload; keep the caller's seed.
         lease.build_threads()
@@ -434,6 +460,25 @@ def carry_unadmitted_user_message(
     if platform_id is not None:
         deferred_user["platform_message_id"] = platform_id
     append_message(early_result["messages"], deferred_user, timestamp=timestamp)
+
+
+def _session_state_unreadable_result(agent, session_id: str, conversation_history) -> Dict[str, Any]:
+    """Fail closed (retryable) when the session row stayed unreadable under the lease: running would
+    either skip the lazy row create or reload/replace history on a guess."""
+    message = (
+        "⏳ Hermes could not read this session's saved state right now. Your message was not "
+        "processed - send it again in a moment."
+    )
+    logger.error("session row unreadable under the turn lease for %s", session_id)
+    try:
+        agent._emit_warning(message)
+    except Exception:
+        logger.debug("Failed to emit session-state-unreadable warning", exc_info=True)
+    return {
+        "final_response": message, "messages": list(conversation_history or []), "api_calls": 0,
+        "completed": False, "failed": True, "error": f"session_state_unreadable:{session_id}",
+        "failure_reason": "session_busy", "failure_retryable": True,
+    }
 
 
 def _lease_not_acquired_result(agent, session_id: str, conversation_history) -> Dict[str, Any]:

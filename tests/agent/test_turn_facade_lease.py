@@ -78,6 +78,55 @@ def test_fresh_session_is_leased_but_keeps_seed_and_lazy_row_creation(monkeypatc
     assert [e[0] for e in db.events] == ["acquire", "release"]
 
 
+class _FlakyProbeDb(_Db):
+    """get_session raises for the first ``failures`` calls, then reports ``exists``."""
+
+    def __init__(self, failures, exists):
+        super().__init__(exists=exists)
+        self.failures = failures
+        self.probes = 0
+
+    def get_session(self, session_id):
+        self.probes += 1
+        if self.probes <= self.failures:
+            raise RuntimeError("database is locked")
+        return super().get_session(session_id)
+
+
+def test_unreadable_probe_never_marks_a_new_session_created(monkeypatch):
+    """A14: a transient read failure is not proof the row exists. The lease is still taken, the row is
+    rechecked under it, and a row proven absent keeps the lazy create (``_session_db_created`` False)
+    and the caller's seed."""
+    monkeypatch.setattr(
+        "agent.turn_liveness.resolve_turn_liveness_settings", lambda cfg: (None, 1.0)
+    )
+    seed = [{"role": "user", "content": "seed"}]
+    db = _FlakyProbeDb(failures=1, exists=False)
+    agent = _agent(db, _session_db_created=False)
+    admission = _admit(agent, seed)
+    assert isinstance(admission.lease, DurableTurnLease)
+    assert agent._session_db_created is False
+    assert admission.conversation_history is seed
+    assert db.probes == 2
+    admission.lease.release()
+
+
+def test_row_unreadable_under_the_lease_refuses_the_turn(monkeypatch):
+    monkeypatch.setattr("agent.turn_facade_lease._ROW_RECHECK_BACKOFF_S", 0.0)
+    seed = [{"role": "user", "content": "seed"}]
+    db = _FlakyProbeDb(failures=100, exists=True)
+    agent = _agent(db, _session_db_created=False)
+    admission = _admit(agent, seed)
+    assert admission.lease is None
+    result = admission.early_result
+    assert result["failed"] is True and result["failure_retryable"] is True
+    assert result["error"] == "session_state_unreadable:s1"
+    assert result["messages"] == seed
+    assert agent._session_db_created is False
+    assert [e[0] for e in db.events] == ["acquire", "release"]
+    assert getattr(agent, "_active_session_turn_lease_holder", None) is None
+
+
 def test_no_lease_when_persist_disabled():
     seed = [{"role": "user", "content": "hi"}]
     db = _Db()

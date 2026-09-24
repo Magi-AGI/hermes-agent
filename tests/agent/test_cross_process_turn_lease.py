@@ -129,11 +129,15 @@ def test_run_conversation_acquires_then_reloads_latest_tip(monkeypatch):
 
 
 def test_run_conversation_acquires_lease_when_session_probe_raises(monkeypatch):
-    """A locked / non-WAL get_session must not skip the durable lease."""
+    """A locked / non-WAL get_session must not skip the durable lease; the row is rechecked under it."""
     db = _DB()
+    probes = []
 
-    def locked_get_session(_session_id):
-        raise sqlite3.OperationalError("database is locked")
+    def locked_get_session(session_id):
+        probes.append(session_id)
+        if len(probes) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return {"id": session_id}
 
     db.get_session = locked_get_session
     agent = _agent_with_db(db)
