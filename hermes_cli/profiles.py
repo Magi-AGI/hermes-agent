@@ -1519,6 +1519,7 @@ def delete_profile(name: str, yes: bool = False) -> Path:
     if canon == "default":
         raise ValueError("Cannot delete the default profile (~/.hermes).\nTo remove everything, use: hermes uninstall")
     canon, profile_dir = _existing_profile_dir(canon)
+    _refuse_codex_owner_store(profile_dir, "deleting the profile")
     gw_running = _check_gateway_running(profile_dir)
     wrapper_path = _get_wrapper_dir() / canon
     has_wrapper = wrapper_path.exists()
@@ -2052,6 +2053,17 @@ def _record_profile_rename(new_dir: Path, old_canon: str) -> None:
         logger.debug("profile rename: could not record previous name %r in %s: %s", old_canon, new_dir, exc)
 
 
+def _refuse_codex_owner_store(profile_dir: Path, action: str) -> None:
+    """Credential recovery protocol stage 1 (RULE-P1): a profile whose store owns a Codex chain or
+    holds registered Codex rows cannot be moved or deleted until profile lifecycle ops exist."""
+    from hermes_cli.auth_codex_authority import refuse_if_registered_store
+    from hermes_cli.auth_codex_registry import CodexAuthorityRefused
+    try:
+        refuse_if_registered_store(profile_dir / "auth.json", action)
+    except CodexAuthorityRefused as exc:
+        raise ValueError(str(exc)) from exc
+
+
 def rename_profile(old_name: str, new_name: str) -> Path:
     """Rename a profile: directory, wrapper script, service, active_profile. The default
     profile's home IS the installation root, so "renaming" it sets a presentation-only
@@ -2072,6 +2084,7 @@ def rename_profile(old_name: str, new_name: str) -> Path:
         raise _unknown_profile_error(old_canon)
     if new_dir.exists():
         raise _profile_exists_error(new_canon)
+    _refuse_codex_owner_store(old_dir, "renaming the profile")
 
     # 1. Stop gateway if running
     if _check_gateway_running(old_dir):

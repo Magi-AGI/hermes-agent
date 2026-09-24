@@ -83,4 +83,17 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
         help="Do not attempt to open the browser automatically")
     auth_spotify.add_argument(
         "--timeout", type=float, help="Callback/token exchange timeout in seconds")
+    auth_codex = auth_subparsers.add_parser(
+        "codex", help="Sign in to OpenAI Codex for this profile (fresh browser or device-code login)")
+    auth_codex.add_argument(
+        "--retry-refresh", action="store_true",
+        help="Retry ONE paused Codex refresh whose outcome was unknown — only if you're sure the "
+             "earlier refresh never reached OpenAI")
+    auth_codex.add_argument("--browser", action="store_true", help="Use the browser (PKCE) sign-in flow")
+    auth_codex.add_argument("--no-browser", action="store_true", help="Do not auto-open a browser")
+    auth_subparsers.add_parser(
+        "migrate", help="Create the Codex login registry / finish interrupted Codex login updates")
+    auth_recovery = auth_subparsers.add_parser(
+        "recovery", help="Inspect the Codex login registry, or clear ARCHIVED recovery files")
+    auth_recovery.add_argument("recovery_action", nargs="?", choices=["list", "clear"], default="list")
     auth_parser.set_defaults(func=cmd_auth)

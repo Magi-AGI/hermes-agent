@@ -424,6 +424,8 @@ def _add_credential(args, provider: str, pool, requested_type: str) -> PooledCre
     token = spec.token(creds)
     label = (getattr(args, "label", None) or "").strip() or label_from_token(
         token, f"{provider}-oauth-{len(pool.entries()) + 1}")
+    if provider == "openai-codex":
+        return _add_codex_credential(provider, pool, spec, creds, token, label)
     # Every account gets a distinct, self-contained pool entry instead of routing through a
     # singleton save path (which collapsed every added account into the latest login).
     # ``manual:*`` entries refresh from their own token pair, so they need no singleton shadow.
@@ -440,6 +442,23 @@ def _add_credential(args, provider: str, pool, requested_type: str) -> PooledCre
     print(f'Added {provider} OAuth credential #{len(pool.entries())}: "{entry.label}"')
     if provider == "openai-codex":
         _warn_same_codex_account(token, existing)
+    return entry
+
+
+def _add_codex_credential(provider: str, pool, spec: _OAuthAddSpec, creds: dict, token: str,
+                          label: str) -> PooledCredential:
+    """A new independent Codex account: a sign-in ownership op owned by this profile's store."""
+    from hermes_cli.auth_codex_authority import sign_in
+    existing = pool.entries()
+    fields = spec.fields(creds, provider)
+    result = sign_in(token, fields.get("refresh_token") or "", kind="pool", last_refresh=fields.get("last_refresh"),
+                     label=label, source=spec.source(creds), base_url=fields.get("base_url"),
+                     set_active=False, activate_if_unset=not existing)
+    entry_id = result["rows"][0].split(":", 1)[1]
+    fresh = load_pool(provider)
+    entry = next(e for e in fresh.entries() if e.id == entry_id)
+    print(f'Added {provider} OAuth credential #{len(fresh.entries())}: "{entry.label}"')
+    _warn_same_codex_account(token, existing)
     return entry
 
 
@@ -567,6 +586,9 @@ def auth_remove_command(args) -> None:
     index, matched, error = pool.resolve_target(target)
     if matched is None or index is None:
         raise SystemExit(f"{error} Provider: {provider}.")
+    if provider == "openai-codex" and matched.refresh_token:
+        _remove_codex_credential(pool, index, matched)
+        return
     removed = pool.remove_index(index)
     if removed is None:
         raise SystemExit(f'No credential matching "{target}" for provider {provider}.')
@@ -585,6 +607,72 @@ def auth_remove_command(args) -> None:
     if result.suppress:
         auth_mod.suppress_credential_source(provider, removed.source)
     for line in result.hints:
+        print(line)
+
+
+def _remove_codex_credential(pool, index: int, matched) -> None:
+    from agent.credential_sources import find_removal_step
+    from hermes_cli.auth_codex_authority import remove_rows
+    step = find_removal_step("openai-codex", matched.source)
+    # A profile never deletes the root rows it borrows (upstream: root write-back is update-only);
+    # only its own rows and its own singleton go.
+    rows = [] if matched.id in getattr(pool, "_borrowed_root_ids", ()) else [f"pool:{matched.id}"]
+    suppress = []
+    if step is not None and step.source_id == "device_code":
+        rows.append("singleton")  # the device_code alias IS the singleton (upstream removal step)
+        suppress.append("device_code")
+    if step is not None and matched.source not in suppress:
+        suppress.append(matched.source)
+    remove_rows(rows, suppress=suppress)
+    print(f"Removed openai-codex credential #{index} ({matched.label})")
+    if "singleton" in rows:
+        print("Cleared openai-codex OAuth tokens from auth store")
+        print("Suppressed openai-codex device_code source — it will not be re-seeded.")
+        print("Note: Codex CLI credentials still live in ~/.codex/auth.json")
+        print("Run `hermes auth add openai-codex` to re-enable if needed.")
+
+
+def auth_codex_command(args) -> None:
+    """`hermes auth codex [--retry-refresh]`: fresh Codex sign-in for this profile, or the one-shot
+    retry override for a login paused after an unconfirmed refresh (RULE-O1)."""
+    from hermes_cli.auth_codex_authority import grant_retry_override
+    if getattr(args, "retry_refresh", False):
+        try:
+            result = grant_retry_override()
+        except auth_mod.AuthError as exc:
+            raise SystemExit(auth_mod.format_auth_error(exc)) from exc
+        print("Codex refresh will be retried ONCE on the next request "
+              f"(override {result['grant_id'][:8]} for attempt {result['for_attempt'][:8]}).")
+        print("If that refresh's outcome is unknown again, the login pauses again; sign in with "
+              "`hermes auth codex` in that case.")
+        return
+    from hermes_cli.auth import PROVIDER_REGISTRY, _login_openai_codex
+    _login_openai_codex(args, PROVIDER_REGISTRY["openai-codex"], force_new_login=True)
+
+
+def auth_migrate_command(args) -> None:
+    """`hermes auth migrate`: create the Codex authority registry / finish interrupted updates, and
+    register Codex credentials that are not registered yet."""
+    from hermes_cli.auth_codex_authority import migrate
+    try:
+        report = migrate()
+    except auth_mod.AuthError as exc:
+        raise SystemExit(auth_mod.format_auth_error(exc)) from exc
+    print(f"Codex login registry: {report['chains']} login(s); {report['registered']} newly registered.")
+    if report["legacy_fenced"]:
+        print(f"Paused {len(report['legacy_fenced'])} login(s) that an older Hermes left unconfirmed; "
+              "sign in again with `hermes auth codex`.")
+
+
+def auth_recovery_command(args) -> None:
+    """`hermes auth recovery list|clear`: inspect the Codex authority, or delete ARCHIVED recovery
+    files (never live state; archives are never pruned automatically)."""
+    from hermes_cli.auth_codex_recovery import clear_archives, list_recovery
+    if getattr(args, "recovery_action", "list") == "clear":
+        removed = clear_archives()
+        print(f"Removed {removed} archived Codex recovery file(s).")
+        return
+    for line in list_recovery():
         print(line)
 
 
@@ -893,7 +981,8 @@ def auth_upgrade_command(args) -> None:
 _AUTH_ACTIONS = {
     "add": auth_add_command, "list": auth_list_command, "remove": auth_remove_command,
     "reset": auth_reset_command, "priority": auth_priority_command, "refresh": auth_refresh_command, "status": auth_status_command,
-    "logout": auth_logout_command, "upgrade": auth_upgrade_command,
+    "logout": auth_logout_command, "upgrade": auth_upgrade_command, "codex": auth_codex_command,
+    "migrate": auth_migrate_command, "recovery": auth_recovery_command,
     "spotify": auth_spotify_command}
 
 

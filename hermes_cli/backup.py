@@ -990,6 +990,22 @@ def _import_members(
     return restored, restored_external, errors, skipped_runtime, db_shrunk
 
 
+def _refuse_registered_codex_stores(members: List[str], prefix: str, hermes_root: Path) -> None:
+    """Credential-bearing restore (RULE-P1, stage 1): importing an auth.json over a store that owns
+    or holds a registered Codex login would roll its refresh chain back."""
+    from hermes_cli.auth_codex_authority import refuse_if_registered_store
+    from hermes_cli.auth_codex_registry import CodexAuthorityRefused
+    for name in members:
+        rel = name[len(prefix):] if prefix and name.startswith(prefix) else name
+        if rel.replace("\\", "/").split("/")[-1] != "auth.json":
+            continue
+        try:
+            refuse_if_registered_store(hermes_root / rel, "restoring its auth.json from a backup")
+        except CodexAuthorityRefused as exc:
+            print(f"Error: {exc}")
+            sys.exit(1)
+
+
 def run_import(args) -> None:
     """Restore a Hermes backup from a zip file."""
     zip_path = Path(args.zipfile).expanduser().resolve()
@@ -1009,6 +1025,7 @@ def run_import(args) -> None:
             sys.exit(1)
         prefix = _detect_prefix(zf)
         members = [n for n in zf.namelist() if not n.endswith("/")]
+        _refuse_registered_codex_stores(members, prefix, hermes_root)
         file_count = len(members)
         print(f"Backup contains {file_count} files\nTarget: {display_hermes_home()}")
         if prefix:
@@ -1341,6 +1358,16 @@ def restore_quick_snapshot(snapshot_id: str, hermes_home: Optional[Path] = None)
     with open(manifest_path, encoding="utf-8") as f:
         meta = json.load(f)
     snap_res, home_res = snap_dir.resolve(), home.resolve()
+    if "auth.json" in meta.get("files", {}):
+        # Credential-bearing restore (RULE-P1, stage 1): rolling a registered Codex store back
+        # would replay spent refresh tokens.
+        from hermes_cli.auth_codex_authority import refuse_if_registered_store
+        from hermes_cli.auth_codex_registry import CodexAuthorityRefused
+        try:
+            refuse_if_registered_store(home / "auth.json", "restoring its auth.json from a snapshot")
+        except CodexAuthorityRefused as exc:
+            logger.error("%s", exc)
+            return False
     restored = 0
     for rel in meta.get("files", {}):
         src = snap_dir / rel
