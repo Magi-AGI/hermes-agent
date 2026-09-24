@@ -24,7 +24,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from hermes_cli.auth_codex_registry import RECORDS_DIR_NAME, pair_fp, token_sha, utc_now
 from hermes_cli.auth_credential_io import (
-    WriteResult, encode_json, read_witnessed_bytes, require_committed, write_credential_file)
+    WriteResult, encode_json, read_bytes_retrying, read_witnessed_bytes, require_committed, unlink_retrying,
+    write_credential_file)
 
 logger = logging.getLogger("hermes_cli.auth")
 
@@ -72,13 +73,13 @@ def archive_record(owner_store: Path, chain_id: str, reason: str) -> Optional[Pa
     """RULE-A3: retirement archives the record + history (never pruned). Idempotent."""
     src = record_path(owner_store, chain_id)
     try:
-        raw = src.read_bytes()
+        raw = read_bytes_retrying(src)
     except FileNotFoundError:
         return None
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     target = records_dir(owner_store) / "archive" / f"{chain_id}.{reason}.{stamp}.json"
     require_committed(write_credential_file(target, raw), f"archive of chain record {chain_id}")
-    src.unlink()
+    unlink_retrying(src)
     return target
 
 

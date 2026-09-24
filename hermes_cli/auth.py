@@ -33,7 +33,8 @@ from agent.credential_persistence import sanitize_borrowed_credential_payload
 from utils import atomic_json_write, atomic_yaml_write, env_float, file_signature, is_truthy_value  # noqa: F401  (env_float: agent.credential_pool reads auth_mod.env_float)
 from hermes_cli.auth_credential_io import (  # noqa: F401  (CredentialWrite*: raised by _save_auth_store)
     CredentialWriteError, CredentialWriteUncertain, Witness, WitnessedStore, WriteOutcome, attach_witness,
-    encode_json, read_witnessed_bytes, require_committed, store_key, witness_of, write_credential_file)
+    encode_json, is_contended_error, read_witnessed_bytes, require_committed, store_key, witness_of,
+    write_credential_file)
 from hermes_cli.auth_zai_kimi import (  # noqa: F401  re-exported
     KIMI_CODE_BASE_URL, ZAI_ENDPOINTS, _normalize_lmstudio_runtime_base_url, _resolve_kimi_base_url,
     _resolve_zai_base_url, detect_zai_endpoint)
@@ -590,6 +591,18 @@ def _kernel_lock(lock_file: Any, acquire: bool) -> None:
         msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK if acquire else msvcrt.LK_UNLCK, 1)
 
 
+def _open_lock_file(lock_path: Path, mode: str, deadline: float):
+    """Open the lock file, retrying a Windows sharing violation from a peer creating/writing it
+    (WinError 5/32/33) until *deadline*; after it the last error is raised unchanged."""
+    while True:
+        try:
+            return lock_path.open(mode, encoding="utf-8")
+        except OSError as exc:
+            if not is_contended_error(exc) or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+
+
 @contextmanager
 def _file_lock(
     lock_path: Path, holder: threading.local, timeout_seconds: float, timeout_message: str):
@@ -619,8 +632,8 @@ def _file_lock(
                     lock_path.write_text(" ", encoding="utf-8")
                 except (OSError, PermissionError):
                     pass
-            lock_file = stack.enter_context(lock_path.open("r+" if msvcrt else "a+", encoding="utf-8"))
             deadline = time.monotonic() + max(1.0, timeout_seconds)
+            lock_file = stack.enter_context(_open_lock_file(lock_path, "r+" if msvcrt else "a+", deadline))
             while True:
                 try:
                     _kernel_lock(lock_file, True)

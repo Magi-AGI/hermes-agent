@@ -184,7 +184,8 @@ def sign_in(access: str, refresh: str, *, kind: str = "singleton", last_refresh:
         if view is None:
             preserve_unreadable_registry()
             from hermes_cli.auth_codex_registry import registry_path
-            registry_path().unlink()
+            from hermes_cli.auth_credential_io import unlink_retrying
+            unlink_retrying(registry_path())
             _bootstrap(fence_all="registry-rebuilt")
             view = read_registry()
             snaps = load_snapshots([s.path for s in snaps.values()])

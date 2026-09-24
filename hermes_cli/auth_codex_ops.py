@@ -33,7 +33,8 @@ from hermes_cli.auth_codex_registry import (
     RegistryView, RepairRequest, empty_registry, migration_lock, migration_lock_held, new_id, ops_dir,
     read_registry, store_locks, store_path_of, utc_now, validate_registry, write_registry)
 from hermes_cli.auth_credential_io import (
-    encode_json, read_witnessed_bytes, require_committed, sha256_hex, write_credential_file)
+    encode_json, read_bytes_retrying, read_witnessed_bytes, require_committed, sha256_hex, unlink_retrying,
+    write_credential_file)
 
 logger = logging.getLogger("hermes_cli.auth")
 
@@ -67,13 +68,13 @@ def _payload_path(op_id: str) -> Path:
 
 def _archive_payload(path: Path, label: str) -> None:
     try:
-        raw = path.read_bytes()
+        raw = read_bytes_retrying(path)
     except FileNotFoundError:
         return
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     target = ops_dir() / "archive" / f"{path.stem}.{label}.{stamp}.json"
     require_committed(write_credential_file(target, raw), f"archive of ownership payload {path.name}")
-    path.unlink()
+    unlink_retrying(path)
 
 
 # ── G4 reservations ───────────────────────────────────────────────────────────────────────────

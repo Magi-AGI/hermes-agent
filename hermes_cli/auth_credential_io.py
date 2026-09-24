@@ -89,9 +89,34 @@ def _is_contended(exc: OSError) -> bool:
     return os.name == "nt" and getattr(exc, "winerror", None) in _WINDOWS_CONTENDED
 
 
+is_contended_error = _is_contended
+
+
+def retry_contended(action, *, attempts: int = REPLACE_ATTEMPTS):
+    """Run *action* (an open/read/unlink of a credential file); a Windows sharing/lock violation from
+    another process's handle or rename is retried within the same bounded budget as the writer's
+    rename (jittered 20..100 ms). After the budget the LAST error is raised unchanged: a real
+    permission error is never turned into a silent success. Any other error raises at once."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return action()
+        except OSError as exc:
+            if not _is_contended(exc) or attempt == attempts:
+                raise
+            time.sleep(random.uniform(*_REPLACE_DELAY_RANGE_S))
+
+
+def read_bytes_retrying(path: Union[str, Path]) -> bytes:
+    return retry_contended(Path(path).read_bytes)
+
+
+def unlink_retrying(path: Union[str, Path]) -> None:
+    retry_contended(Path(path).unlink)
+
+
 def _read_back(path: Path) -> Optional[bytes]:
     try:
-        return path.read_bytes()
+        return read_bytes_retrying(path)
     except OSError:
         return None
 
@@ -214,7 +239,7 @@ def read_witnessed_bytes(path: Union[str, Path]) -> Tuple[Optional[bytes], Optio
 
     Other ``OSError``s propagate: an unreadable file is not an absent one."""
     try:
-        data = Path(path).read_bytes()
+        data = read_bytes_retrying(path)
     except FileNotFoundError:
         return None, None
     return data, sha256_hex(data)

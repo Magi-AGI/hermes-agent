@@ -30,7 +30,8 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from hermes_cli.auth_constants import AUTH_LOCK_TIMEOUT_SECONDS, AuthError
 from hermes_cli.auth_credential_io import (
-    encode_json, read_witnessed_bytes, require_committed, sha256_hex, store_key, write_credential_file)
+    encode_json, read_bytes_retrying, read_witnessed_bytes, require_committed, sha256_hex, store_key,
+    write_credential_file)
 
 logger = logging.getLogger("hermes_cli.auth")
 
@@ -329,12 +330,12 @@ def preserve_unreadable_registry() -> Optional[Path]:
     """RULE-G3: keep a timestamped copy of an unreadable registry (once per distinct content)."""
     path = registry_path()
     try:
-        raw = path.read_bytes()
+        raw = read_bytes_retrying(path)
     except OSError:
         return None
     for existing in path.parent.glob(f"{REGISTRY_NAME}.corrupt.*"):
         try:
-            if existing.read_bytes() == raw:
+            if read_bytes_retrying(existing) == raw:
                 return existing
         except OSError:
             continue
@@ -395,7 +396,9 @@ def try_migration_lock(budget_seconds: float = 0.0) -> Iterator[bool]:
                 lock_path.write_text(" ", encoding="utf-8")
             except OSError:
                 pass
-        handle = lock_path.open("r+" if os.name == "nt" else "a+", encoding="utf-8")
+        from hermes_cli.auth import _open_lock_file
+        handle = _open_lock_file(lock_path, "r+" if os.name == "nt" else "a+",
+                                 time.monotonic() + max(0.2, budget_seconds))
     except OSError:
         yield False
         return
