@@ -525,15 +525,29 @@ def _run_after_agent_ready(
 _TRUNCATION_PARAMS = (
     "truncate_before_user_ordinal", "truncate_before_row_id", "truncate_before_message_id")
 
+# ``_lock_in_submit_turn`` lost the claim: another submit marked the session running after this one's
+# busy check. The caller routes back through the busy handling (queue / steer / 4009).
+_SUBMIT_CLAIM_LOST = object()
+
 
 def _lock_in_submit_turn(
     rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind):
     """Under ``history_lock``: refuse watch-child races / malformed truncation, apply the
-    cut, mark the turn running + in flight.  Returns ``(err, survivor_fields)``."""
+    cut, mark the turn running + in flight.  Returns ``(err, survivor_fields)``; ``err`` is
+    ``_SUBMIT_CLAIM_LOST`` when the session is already running.
+
+    The ``running`` check and the claim are ONE critical section. prompt.submit's busy check
+    takes ``history_lock`` separately, so two submits (a second socket reader, a bot-relay
+    delivery on the pool thread) could both observe ``running`` False there and both claim,
+    each overwriting the other's in-flight state and worker handles, and one worker's cleanup
+    clearing ``running`` under the other (review: Codex, A13). The recheck runs before any
+    truncation or in-flight change, so the loser leaves the session untouched."""
     fields = {}
     with _session_turn_admission(session) as admitted:
         if not admitted:
             return _err(rid, 5035, "backend is retiring; reconnect to continue"), fields
+        if session.get("running"):
+            return _SUBMIT_CLAIM_LOST, fields
         # A watch session's run lives in the PARENT turn (own running flag False); typing
         # mid-run would build a second agent racing the child on the same stored session.
         if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
@@ -628,36 +642,40 @@ def _(rid, params: dict) -> dict:
             return refusal
         if (t := current_transport()) is not None:
             _rebind_live_transport(sid, session, t)
-    # Claim the turn against a possibly-running session (busy/queued reply, else fall
-    # through once ``running`` is observed False).  The provider interrupt happens after
-    # history_lock is released (a non-interruptible tool may hold it); if the old turn
-    # finished between the two acquisitions, retry the claim rather than strand this
-    # prompt in a queue whose drain already ran.
-    while True:
-        with session["history_lock"]:
-            if not session.get("running"):
-                break
-            if internal_hosted_submit:
-                return _err(rid, 4091, "hosted room member session is busy")
-            busy_transport = t or session.get("transport")
-        if has_truncation:
-            # A rewind/edit/restore/regenerate must land as a truncation, never as a
-            # steered correction or a plain follow-up queued to run after the live
-            # turn — either would silently drop the history cut the user asked for.
-            # Signal busy so the caller's own interrupt-then-retry loop (already
-            # built for exactly this race — see desktop's `runRewindSubmit`) waits
-            # for `running` to clear and resubmits with the truncation intact.
-            return _err(rid, 4009, "session busy")
-        busy_response = _handle_busy_submit(
-            rid, sid, session, text, busy_transport, queued=bool(params.get("queued")), turn_author=turn_author)
-        if busy_response is not None:
-            return busy_response
     raw_rebind_ids = params.get("rebind_survivor_row_ids")
     requested_rebind_ids = (
         {r for r in raw_rebind_ids if isinstance(r, int) and not isinstance(r, bool)}
         if isinstance(raw_rebind_ids, list) else None)
-    err, survivor_fields = _lock_in_submit_turn(
-        rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind)
+    # Claim the turn against a possibly-running session (busy/queued reply, else fall
+    # through once ``running`` is observed False).  The provider interrupt happens after
+    # history_lock is released (a non-interruptible tool may hold it); if the old turn
+    # finished between the two acquisitions, retry the claim rather than strand this
+    # prompt in a queue whose drain already ran.  The claim itself rechecks ``running`` in
+    # the same critical section; a submit that lost it goes back through the busy handling.
+    while True:
+        while True:
+            with session["history_lock"]:
+                if not session.get("running"):
+                    break
+                if internal_hosted_submit:
+                    return _err(rid, 4091, "hosted room member session is busy")
+                busy_transport = t or session.get("transport")
+            if has_truncation:
+                # A rewind/edit/restore/regenerate must land as a truncation, never as a
+                # steered correction or a plain follow-up queued to run after the live
+                # turn — either would silently drop the history cut the user asked for.
+                # Signal busy so the caller's own interrupt-then-retry loop (already
+                # built for exactly this race — see desktop's `runRewindSubmit`) waits
+                # for `running` to clear and resubmits with the truncation intact.
+                return _err(rid, 4009, "session busy")
+            busy_response = _handle_busy_submit(
+                rid, sid, session, text, busy_transport, queued=bool(params.get("queued")), turn_author=turn_author)
+            if busy_response is not None:
+                return busy_response
+        err, survivor_fields = _lock_in_submit_turn(
+            rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind)
+        if err is not _SUBMIT_CLAIM_LOST:
+            break
     if err is not None:
         return err
     if turn_isolation:
