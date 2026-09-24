@@ -5,6 +5,8 @@ found and fixed too. Past passes shipped with issues that became blockers for hi
 Every line below must be CLOSED (fixed + reviewed + tested) or explicitly re-scoped BY LAKE. Reviewers: please audit
 this list for anything missing, not only the status of what's here.
 
+Audits: Antigravity 2026-09-24 (complete; notes applied to B1/A7/D1). Codex: pending.
+
 Status key: DONE (on sync branch, triad-approved) / OPEN / IN PROGRESS / VERIFY (needs live evidence) / LAKE (needs his action).
 
 ## A. Upstream sync (magi/sync-v2026.9.21)
@@ -16,14 +18,14 @@ Status key: DONE (on sync branch, triad-approved) / OPEN / IN PROGRESS / VERIFY 
 | A4 | A4 residual R-A4-2: null report token passes when no document is current | OPEN |
 | A5 | Yuanbao recall redaction rewrites the whole transcript unfenced (targeted, fenced redaction) | OPEN |
 | A6 | Compute-host fallback session: a full turn through it stalls after message.start | OPEN (under G1) |
-| A7 | Upstream `test_shell_hooks` writes mangled-name files into the working tree on Windows | OPEN |
+| A7 | Upstream `test_shell_hooks` writes mangled-name files into the working tree on Windows (recurs on every run, incl. reviewers'; must force all temp paths under the sandbox TEMP) | OPEN |
 | A8 | Source scans (`test_model_alias_credentials`, config-read guard) trip on nested `.claude/worktrees` | OPEN (worktree cleanup, Lake OK'd "later") |
 | A9 | Flaky under load: fast-lane first-chunk timing, late-ack TTL, update-handoff-marker PowerShell | OPEN (fix or de-flake) |
 
 ## B. Phase 2b — credential recovery (Codex only)
 | # | item | status |
 |---|---|---|
-| B1 | Design (DESIGN-CREDENTIAL-RECOVERY-PROTOCOL-2026-09-24.md) cleared by both reviewers | IN PROGRESS (rev 5) |
+| B1 | Design (DESIGN-CREDENTIAL-RECOVERY-PROTOCOL-2026-09-24.md) cleared by both reviewers | IN PROGRESS (rev 7: Antigravity ratified, Codex 1 blocker + 2 should-fix on stage-2 lifecycle; rev 8 drafting) |
 | B2 | Stage 1: strict writer, witnessed reads, metadata-only saves, chain registry, migration, refresh admission, dispatcher; stage-1 interception of everything awaiting stage 2 | OPEN |
 | B3 | Stage 2: transfers, legacy rescues, retirement, profile rename/delete/restore | OPEN |
 | B4 | Benchmark (24 proc x 4 threads, shared ledger, fault matrix) passes per stage | OPEN |
@@ -47,7 +49,7 @@ Status key: DONE (on sync branch, triad-approved) / OPEN / IN PROGRESS / VERIFY 
 ## D. Memory-noted fronts not explicitly in the plan (audit each)
 | # | item | status |
 |---|---|---|
-| D1 | Backend-pool disown recurrence: orphaned `gateway run` squatting :8642 through quit-all (hermes-desktop-backend-pool-bug) | OPEN — not in plan |
+| D1 | Backend-pool disown recurrence: orphaned `gateway run` squatting :8642 through quit-all (hermes-desktop-backend-pool-bug) | OPEN — not in plan; cross-link G1: child-process lifecycle (kill-on-close job object or explicit PID tracking) |
 | D2 | Terminal-tool 420s hang across compute-host respawns (hermes-terminal-tool-hang), never root-caused | OPEN — not in plan |
 | D3 | Post-tool-hook wedge + subprocess pipe leak | OPEN — check vs G10 |
 | D4 | Session-ownership lease race ("already has a live owner") — re-verify on the synced lease model | VERIFY |
