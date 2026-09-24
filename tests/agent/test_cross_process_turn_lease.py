@@ -175,7 +175,7 @@ def test_run_conversation_acquires_lease_when_session_probe_raises(monkeypatch):
     ]
 
 
-def test_fresh_session_keeps_caller_seed_without_durable_lease(monkeypatch):
+def test_fresh_session_keeps_caller_seed_under_durable_lease(monkeypatch):
     db = _DB(session_exists=False)
     agent = _agent_with_db(db, session_id="fresh", platform="subagent")
     agent._session_db_created = False
@@ -193,8 +193,10 @@ def test_fresh_session_keeps_caller_seed_without_durable_lease(monkeypatch):
 
     AIAgent.run_conversation(agent, "work", conversation_history=seed)
 
+    # Leased (a fresh id is serialized too) but never reloaded: the seed is the only history.
     assert observed["history"] is seed
-    assert db.events == []
+    assert [event[0] for event in db.events] == ["acquire", "release"]
+    assert agent._session_db_created is False
 
 
 def test_run_conversation_lease_timeout_returns_resend_notice(monkeypatch):
@@ -724,3 +726,147 @@ def test_flush_messages_to_session_db_fences_stale_holder_on_live_db(tmp_path):
     second.release_session_turn_lease("shared", next_holder)
     first.close()
     second.close()
+
+
+def test_concurrent_first_turns_on_brand_new_id_are_serialized(tmp_path, monkeypatch):
+    """Invariant (Magi sync, bucket C R3): two first turns on the SAME brand-new session id, each
+    through its own SessionDB on one state.db (two processes, e.g. two desktop windows or desktop +
+    relay), never run load/run/flush concurrently. The loser waits, then reloads what the winner
+    persisted; the winner keeps its in-memory seed."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "agent.turn_liveness.resolve_turn_liveness_settings", lambda cfg: (None, 1.0)
+    )
+    path = tmp_path / "state.db"
+    dbs = [SessionDB(path), SessionDB(path)]
+    sid = "brand-new-session"
+    assert dbs[0].get_session(sid) is None
+
+    lock = threading.Lock()
+    inside = []
+    max_inside = [0]
+    first_inside = threading.Event()
+    second_entered = threading.Event()
+    observed = {}
+
+    def fake_run(_agent, message, _system, history, *_args, **_kwargs):
+        with lock:
+            inside.append(message)
+            max_inside[0] = max(max_inside[0], len(inside))
+            order = len(observed)
+            observed[message] = list(history or [])
+        if order == 0:
+            # Winner: the first turn creates the row lazily and persists (_ensure_db_session + flush).
+            first_inside.set()
+            _agent._session_db.create_session(sid, source="desktop")
+            _agent._session_db.append_message(sid, role="user", content=message)
+            second_entered.wait(1.5)  # base code: the loser is already in here with us
+        else:
+            second_entered.set()
+        with lock:
+            inside.remove(message)
+        return {"final_response": "ok", "messages": history, "failed": False}
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", fake_run)
+    agents = [_agent_with_db(db, session_id=sid) for db in dbs]
+    for agent in agents:
+        agent._session_db_created = False
+    errors = []
+
+    def run(agent, message, history):
+        try:
+            AIAgent.run_conversation(agent, message, conversation_history=history)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    seed = [{"role": "user", "content": "caller seed"}]
+    t1 = threading.Thread(target=run, args=(agents[0], "turn A", seed))
+    t1.start()
+    assert first_inside.wait(10)
+    t2 = threading.Thread(target=run, args=(agents[1], "turn B", []))
+    t2.start()
+    t1.join(30)
+    t2.join(30)
+    try:
+        assert not errors
+        assert max_inside[0] == 1, "two first turns on one new id ran concurrently"
+        assert observed["turn A"] == seed  # winner's in-memory seed survived admission
+        assert [m["content"] for m in observed["turn B"]] == ["turn A"]  # loser reloaded durable
+        assert agents[1]._session_db_created is True
+        # Both leases released: a third turn acquires at once.
+        assert dbs[0].try_acquire_session_turn_lease(sid, "pid=3:turn=next", ttl_seconds=5)
+    finally:
+        for db in dbs:
+            db.close()
+
+
+def test_fresh_row_that_appears_before_admission_is_reloaded_but_empty_keeps_seed():
+    """The row probe runs before the lease; a racer may create (and run) the session in between.
+    Re-probing UNDER the lease reloads it even on an immediate acquisition, while an empty durable
+    transcript never erases the caller's seed."""
+    from agent.turn_facade_lease import admit_durable_turn_lease
+
+    class _AppearingDB(_DB):
+        def __init__(self, reloaded):
+            super().__init__(session_exists=False)
+            self._reloaded = reloaded
+
+        def acquire_session_turn_lease(self, session_id, holder, **kwargs):
+            self.session_exists = True  # the racer created the row and released
+            return super().acquire_session_turn_lease(session_id, holder, **kwargs)
+
+        def resolve_resume_session_id(self, session_id):
+            self.events.append(("resolve", session_id))
+            return session_id
+
+        def get_messages_as_conversation(self, session_id, **kwargs):
+            self.events.append(("reload", session_id))
+            return list(self._reloaded)
+
+    seed = [{"role": "user", "content": "seed"}]
+    for reloaded, expected in (
+        ([{"role": "user", "content": "racer turn"}], [{"role": "user", "content": "racer turn"}]),
+        ([], seed),
+    ):
+        db = _AppearingDB(reloaded)
+        agent = _agent_with_db(db, session_id="fresh")
+        agent._session_db_created = False
+        agent._emit_status = lambda *_a, **_k: None
+        admission = admit_durable_turn_lease(
+            agent, session_id="fresh", relay_turn_id="fresh:t:1",
+            task_context={"session_id": "fresh", "task_id": "t", "platform": "desktop"},
+            conversation_history=seed,
+        )
+        try:
+            assert admission.lease is not None
+            assert admission.conversation_history == expected
+            assert agent._session_db_created is True
+            assert [e[0] for e in db.events] == ["acquire", "resolve", "reload"]
+        finally:
+            if admission.lease is not None:
+                admission.lease.release()
+
+
+def test_fresh_lease_key_is_stable_when_the_turn_creates_its_row(tmp_path):
+    """The fresh lease is keyed on the bare id (no row to walk). The rows a first turn creates must
+    keep that key, or refresh/release/fenced writes would miss mid-turn: a plain row, and a delegated
+    child (``_delegate_from`` fork marker) whose parent already ended by compression."""
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        db.create_session("parent", source="desktop")
+        db.end_session("parent", "compression")
+        for sid, kwargs in (
+            ("plain-first-turn", {}),
+            ("delegated-child", {"parent_session_id": "parent",
+                                 "model_config": {"_delegate_from": "parent"}}),
+        ):
+            holder = f"pid=1:turn={sid}"
+            assert db.try_acquire_session_turn_lease(sid, holder, ttl_seconds=5)
+            db.create_session(sid, source="subagent" if kwargs else "desktop", **kwargs)
+            assert db._session_turn_lease_key(sid) == sid
+            assert db.refresh_session_turn_lease(sid, holder, ttl_seconds=5)
+            db.release_session_turn_lease(sid, holder)
+            assert db.try_acquire_session_turn_lease(sid, "pid=2:turn=next", ttl_seconds=5)
+    finally:
+        db.close()
+

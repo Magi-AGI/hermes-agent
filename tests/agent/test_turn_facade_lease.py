@@ -59,12 +59,27 @@ def _admit(agent, history=None):
     )
 
 
-def test_no_lease_without_durable_row_or_when_persist_disabled():
+def test_fresh_session_is_leased_but_keeps_seed_and_lazy_row_creation(monkeypatch):
+    """A brand-new id (no row yet) is still serialized: two first turns on it must not both run
+    unleased (Magi sync, bucket C R3). The caller's in-memory seed survives, and the row is left
+    for the turn to create lazily (``_session_db_created`` is not faked to True)."""
+    monkeypatch.setattr(
+        "agent.turn_liveness.resolve_turn_liveness_settings", lambda cfg: (None, 1.0)
+    )
     seed = [{"role": "user", "content": "hi"}]
-    admission = _admit(_agent(_Db(exists=False)), seed)
-    assert admission.lease is None and admission.early_result is None
+    db = _Db(exists=False)
+    agent = _agent(db, _session_db_created=False)
+    admission = _admit(agent, seed)
+    assert isinstance(admission.lease, DurableTurnLease) and admission.early_result is None
     assert admission.conversation_history is seed
+    assert agent._session_db_created is False
+    assert agent._active_session_turn_lease_holder == admission.lease.holder
+    admission.lease.release()
+    assert [e[0] for e in db.events] == ["acquire", "release"]
 
+
+def test_no_lease_when_persist_disabled():
+    seed = [{"role": "user", "content": "hi"}]
     db = _Db()
     admission = _admit(_agent(db, _persist_disabled=True), seed)
     assert admission.lease is None and db.events == []

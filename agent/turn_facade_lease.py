@@ -295,7 +295,7 @@ def admit_durable_turn_lease(
     agent, *, session_id: str, relay_turn_id: str, task_context: Dict[str, Any],
     conversation_history: Optional[List[Dict[str, Any]]],
 ) -> TurnLeaseAdmission:
-    """Acquire the session turn lease when the session is durable; build (not start) its threads.
+    """Acquire the session turn lease; build (not start) its threads.
 
     Mutates ``task_context["session_id"]`` and ``agent.session_id`` when the wait forced a resume-id
     reload. Returns an ``early_result`` (interrupted / timed out) instead of a lease when admission
@@ -304,17 +304,21 @@ def admit_durable_turn_lease(
     admission = TurnLeaseAdmission(conversation_history=conversation_history)
     if db is None or not session_id:
         return admission
-    # A fresh session id has no durable transcript to race over, and callers may supply an
-    # in-memory seed before the row exists — reloading would erase it. Check the concrete type:
-    # MagicMock-style shims accept any attribute without the protocol.
+    # Check the concrete type: MagicMock-style shims accept any attribute without the protocol.
     if (
         getattr(agent, "_persist_disabled", False)
-        or not _durable_session_exists(db, session_id)
         or not callable(getattr(type(db), "acquire_session_turn_lease", None))
     ):
         return admission
-    # Row proven to exist — suppress the redundant create attempt.
-    agent._session_db_created = True
+    # A FRESH id (no row yet) is leased too: the lease row does not need the session row (the key walk
+    # falls back to the id itself), and two first turns on one brand-new id (two windows, desktop +
+    # relay, an API double-submit) would otherwise both run load/run/flush unserialized (Magi sync,
+    # bucket C R3). The row is still created lazily by the turn, so ``_session_db_created`` is set only
+    # on proof the row exists, and a caller's in-memory seed survives unless durable state replaced it.
+    row_existed = _durable_session_exists(db, session_id)
+    if row_existed:
+        # Row proven to exist — suppress the redundant create attempt.
+        agent._session_db_created = True
     holder = (
         f"pid={os.getpid()}:turn={relay_turn_id}:platform={task_context['platform'] or 'unknown'}"
     )
@@ -343,26 +347,20 @@ def admit_durable_turn_lease(
     agent._active_session_turn_lease_holder = holder
     agent._active_session_turn_lease_ttl_seconds = LEASE_TTL_SECONDS
     try:
-        if waited:
-            agent._emit_status("Session is free; loading the latest transcript...")
-            # The holder may have compressed/rotated the session while we waited: reload only
-            # AFTER admission; an immediate acquisition skips this (needless prompt-cache miss).
-            latest_session_id = db.resolve_resume_session_id(session_id)
-            if latest_session_id:
-                agent.session_id = latest_session_id
-                task_context["session_id"] = latest_session_id
-            reloaded = db.get_messages_as_conversation(
-                agent.session_id, repair_alternation=True, include_row_ids=True
-            )
-            # A follow-up that aborted an earlier wait carries that turn's never-persisted input
-            # only in memory (see carry_unadmitted_user_message); the reload would drop it.
-            from agent.session_persistence import _PERSIST_AFTER_ADMISSION_INTERRUPT
-            reloaded.extend(
-                m for m in (conversation_history or [])
-                if isinstance(m, dict) and m.get(_PERSIST_AFTER_ADMISSION_INTERRUPT)
-                and "_row_id" not in m
-            )
-            admission.conversation_history = reloaded
+        # A fresh id whose row appeared before we owned the lease was created (and possibly run) by
+        # another turn: re-probe UNDER the lease, so even an immediate acquisition reloads it.
+        row_appeared = not row_existed and _durable_session_exists(db, session_id)
+        if row_appeared:
+            agent._session_db_created = True
+        if waited or row_appeared:
+            if waited:
+                agent._emit_status("Session is free; loading the latest transcript...")
+            if row_existed or row_appeared:
+                admission.conversation_history = _reload_latest_transcript(
+                    agent, db, session_id, task_context, conversation_history,
+                    keep_seed_if_empty=not row_existed,
+                )
+            # else: still no row after the wait — nothing durable to reload; keep the caller's seed.
         lease.build_threads()
     except BaseException:
         # The façade never saw this lease; release here so an admitted row is not leaked. Any recorded
@@ -373,6 +371,35 @@ def admit_durable_turn_lease(
     agent._turn_lease_lost_holder = None
     admission.lease = lease
     return admission
+
+
+def _reload_latest_transcript(
+    agent, db, session_id: str, task_context: Dict[str, Any],
+    conversation_history: Optional[List[Dict[str, Any]]], *, keep_seed_if_empty: bool,
+) -> Optional[List[Dict[str, Any]]]:
+    """Reload the durable transcript AFTER admission (the previous holder may have compressed/rotated
+    the session); an immediate acquisition of an existing row skips this (needless prompt-cache miss).
+
+    ``keep_seed_if_empty``: the id had no row when this turn arrived, so the caller's history can only
+    be an in-memory seed — an empty durable transcript must not erase it."""
+    latest_session_id = db.resolve_resume_session_id(session_id)
+    if latest_session_id:
+        agent.session_id = latest_session_id
+        task_context["session_id"] = latest_session_id
+    reloaded = db.get_messages_as_conversation(
+        agent.session_id, repair_alternation=True, include_row_ids=True
+    )
+    if keep_seed_if_empty and not reloaded:
+        return conversation_history
+    # A follow-up that aborted an earlier wait carries that turn's never-persisted input
+    # only in memory (see carry_unadmitted_user_message); the reload would drop it.
+    from agent.session_persistence import _PERSIST_AFTER_ADMISSION_INTERRUPT
+    reloaded.extend(
+        m for m in (conversation_history or [])
+        if isinstance(m, dict) and m.get(_PERSIST_AFTER_ADMISSION_INTERRUPT)
+        and "_row_id" not in m
+    )
+    return reloaded
 
 
 def carry_unadmitted_user_message(
