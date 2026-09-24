@@ -90,3 +90,15 @@ def test_lock_file_open_raises_after_its_deadline(tmp_path, monkeypatch, content
     with pytest.raises(PermissionError):
         with auth._file_lock(tmp_path / "auth.lock", threading.local(), 1.0, "timeout"):
             pytest.fail("the lock must not be granted without its file")
+
+
+@pytest.mark.windows_only
+def test_open_during_a_peers_replace_counts_as_contention():
+    """``open()`` on a file in a peer's delete-pending rename window raises a bare EACCES (errno 13,
+    no winerror) — the error Antigravity's 24x4 run hit; it is retried within the budget."""
+    assert io._is_contended(PermissionError(13, "Permission denied"))
+    held = PermissionError(13, "Access is denied")
+    held.winerror = 5
+    assert io._is_contended(held)
+    other = OSError(2, "missing")
+    assert not io._is_contended(other)

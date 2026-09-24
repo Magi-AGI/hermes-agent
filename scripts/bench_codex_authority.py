@@ -185,6 +185,9 @@ def worker_progress(args) -> None:
                 outcome = "refused"
             except Exception as exc:  # pragma: no cover - reported
                 outcome = type(exc).__name__
+                import traceback
+                with lock:
+                    stats.setdefault("tracebacks", []).append(traceback.format_exc()[-3000:])
             with lock:
                 stats["attempts"] += 1
                 stats["lat"].append(time.perf_counter() - t0)
@@ -359,6 +362,7 @@ def run_progress(args) -> int:
     report["fenced_outcomes"] = sum(r.get("fenced", 0) for r in results)
     report["worker_errors"] = [r.get("errors") for r in results if r.get("errors")]
     report["worker_crashes"] = [r["crash"] for r in results if "crash" in r]
+    report["error_tracebacks"] = [t for r in results for t in r.get("tracebacks", [])][:5]
     lat = [x for r in results for x in r.get("lat", [])]
     report["entry_latency_ms"] = {"p50": round(_pct(lat, .5) * 1000, 1), "p99": round(_pct(lat, .99) * 1000, 1)} if lat else None
 

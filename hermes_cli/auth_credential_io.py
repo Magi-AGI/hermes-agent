@@ -86,7 +86,13 @@ def store_key(path: Union[str, Path]) -> str:
 
 
 def _is_contended(exc: OSError) -> bool:
-    return os.name == "nt" and getattr(exc, "winerror", None) in _WINDOWS_CONTENDED
+    """A Windows error another process's handle or in-flight rename can cause. ``open()`` reports a
+    file in the delete-pending window of a peer's ``os.replace`` as a bare EACCES (errno 13, no
+    winerror: the CRT maps ERROR_ACCESS_DENIED), so that counts too — bounded like the rest."""
+    if os.name != "nt":
+        return False
+    winerror = getattr(exc, "winerror", None)
+    return winerror in _WINDOWS_CONTENDED or (winerror is None and isinstance(exc, PermissionError))
 
 
 is_contended_error = _is_contended
