@@ -207,14 +207,18 @@ def test_late_failure_from_a_replaced_login_cannot_mark_the_replacement_dead(cod
     from agent.credential_pool import load_pool
 
     root, endpoint = codex_home
-    write_store(root, singleton=endpoint.issue())
+    old = endpoint.issue()
+    # A manual:device_code copy of the singleton: upstream's reauth sync keeps its id and rewrites it.
+    write_store(root, singleton=old, pool=[pool_row("copy01", old, source="manual:device_code")])
     _bootstrap()
     stale_pool = load_pool("openai-codex")
-    (entry,) = stale_pool.entries()
-    _sign_in(endpoint.issue())  # re-login: the row keeps its id, moves to a new chain
-    stale_pool.mark_exhausted_and_rotate(status_code=401, credential_id=entry.id,
+    new = endpoint.issue()
+    _sign_in(new)  # re-login: the row keeps its id, moves to a new chain
+    stale_pool.mark_exhausted_and_rotate(status_code=401, credential_id="copy01",
                                          error_context={"reason": "invalid_grant"})
-    row = read_json(root / "auth.json")["credential_pool"]["openai-codex"][0]
+    row = next(r for r in read_json(root / "auth.json")["credential_pool"]["openai-codex"]
+               if r["id"] == "copy01")
+    assert row["refresh_token"] == new[1]
     assert row.get("last_status") in (None, "ok"), "the replacement login was marked dead by a stale save"
 
 
