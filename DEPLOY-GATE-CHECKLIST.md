@@ -25,7 +25,7 @@ Status key: DONE (on sync branch, triad-approved) / OPEN / IN PROGRESS / VERIFY 
 ## B. Phase 2b — credential recovery (Codex only)
 | # | item | status |
 |---|---|---|
-| B1 | Design (DESIGN-CREDENTIAL-RECOVERY-PROTOCOL-2026-09-24.md) cleared by both reviewers | IN PROGRESS (rev 7: Antigravity ratified, Codex 1 blocker + 2 should-fix on stage-2 lifecycle; rev 8 drafting) |
+| B1 | Design (DESIGN-CREDENTIAL-RECOVERY-PROTOCOL-2026-09-24.md) cleared by both reviewers | IN PROGRESS (rev 8 drafted: reservations RULE-G4, compensating abandonment RULE-P4, lock-taking readers join lifecycle; awaiting both reviews) |
 | B2 | Stage 1: strict writer, witnessed reads, metadata-only saves, chain registry, migration, refresh admission, dispatcher; stage-1 interception of everything awaiting stage 2 | OPEN |
 | B3 | Stage 2: transfers, legacy rescues, retirement, profile rename/delete/restore | OPEN |
 | B4 | Benchmark (24 proc x 4 threads, shared ledger, fault matrix) passes per stage | OPEN |
