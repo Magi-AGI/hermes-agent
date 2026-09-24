@@ -31,6 +31,9 @@ from urllib.parse import urlparse
 from hermes_constants import OPENROUTER_BASE_URL, hermes_home_key, secure_parent_dir
 from agent.credential_persistence import sanitize_borrowed_credential_payload
 from utils import atomic_json_write, atomic_yaml_write, env_float, file_signature, is_truthy_value  # noqa: F401  (env_float: agent.credential_pool reads auth_mod.env_float)
+from hermes_cli.auth_credential_io import (  # noqa: F401  (CredentialWrite*: raised by _save_auth_store)
+    CredentialWriteError, CredentialWriteUncertain, Witness, WitnessedStore, WriteOutcome, attach_witness,
+    encode_json, read_witnessed_bytes, require_committed, store_key, witness_of, write_credential_file)
 from hermes_cli.auth_zai_kimi import (  # noqa: F401  re-exported
     KIMI_CODE_BASE_URL, ZAI_ENDPOINTS, _normalize_lmstudio_runtime_base_url, _resolve_kimi_base_url,
     _resolve_zai_base_url, detect_zai_endpoint)
@@ -658,12 +661,37 @@ def _empty_auth_store() -> Dict[str, Any]:
     return {"version": AUTH_STORE_VERSION, "providers": {}}
 
 
-def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
-    auth_file = auth_file or _auth_file_path()
-    if not auth_file.exists():
-        return _empty_auth_store()
+class AuthStoreStaleReadError(RuntimeError):
+    """A store derived from an unparseable read would overwrite a file that is no longer those bytes."""
+
+
+class StaleSnapshotError(RuntimeError):
+    """A store derived from one read would overwrite a newer ``auth.json`` (a lost update)."""
+
+
+def _preserve_corrupt_copy(auth_file: Path, raw_bytes: bytes) -> Optional[Path]:
+    """Keep every distinct corrupt copy, written from the bytes that failed to parse."""
+    base = auth_file.with_suffix(".json.corrupt")
+    target = base if not base.exists() else auth_file.with_suffix(
+        f".json.corrupt.{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}")
     try:
-        raw = json.loads(auth_file.read_text(encoding="utf-8-sig"))
+        target.write_bytes(raw_bytes)
+        return target
+    except Exception:
+        logger.debug("auth: could not preserve a copy of the corrupt store at %s", target, exc_info=True)
+        return None
+
+
+def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
+    """Parse ``auth.json`` from ONE read of its bytes; the result carries that read's witness.
+
+    ``_save_auth_store`` checks the witness (see the table there), so a store derived from an old
+    snapshot can never silently overwrite a newer file, and a store derived from unparseable bytes
+    can only replace those same bytes."""
+    auth_file = auth_file or _auth_file_path()
+    key = store_key(auth_file)
+    try:
+        raw_bytes, sha = read_witnessed_bytes(auth_file)
     except OSError:
         # Exists but unreadable (EMFILE, EACCES, EIO, stalled mount): contents are not bad, and this
         # module read-modify-writes everywhere, so an empty store here is one _save_auth_store()
@@ -673,37 +701,35 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
             "rather than degrading to an empty one",
             auth_file, exc_info=True)
         raise
+    if raw_bytes is None:
+        return attach_witness(WitnessedStore(_empty_auth_store()), Witness(key, None, True))
+    try:
+        raw = json.loads(raw_bytes.decode("utf-8-sig"))
     except Exception as exc:
-        # Genuine corruption: unparseable JSON or non-UTF-8 bytes. Preserve a copy, but never
-        # advertise a backup that was not written.
-        corrupt_path = auth_file.with_suffix(".json.corrupt")
-        try:
-            shutil.copy2(auth_file, corrupt_path)
-            preserved = True
-        except Exception:
-            preserved = False
-            logger.debug("auth: could not preserve a copy of the corrupt store at %s", corrupt_path,
-                         exc_info=True)
+        # Genuine corruption (or bytes another program left): keep a copy and hand back an empty
+        # store whose witness says so — it may only ever be saved over these same bytes.
+        preserved = _preserve_corrupt_copy(auth_file, raw_bytes)
         logger.warning(
-            "auth: failed to parse %s (%s), starting with empty store. %s %s",
+            "auth: failed to parse %s (%s), starting with empty store. %s",
             auth_file, exc,
-            "Corrupt file preserved at" if preserved else "A copy could NOT be preserved at",
-            corrupt_path)
-        return _empty_auth_store()
+            f"Corrupt file preserved at {preserved}" if preserved else "A copy could NOT be preserved")
+        return attach_witness(WitnessedStore(_empty_auth_store()), Witness(key, sha, False))
 
+    witness = Witness(key, sha, True)
     if isinstance(raw, dict) and (
         isinstance(raw.get("providers"), dict) or isinstance(raw.get("credential_pool"), dict)):
         raw.setdefault("providers", {})
         if isinstance(raw.get("providers"), dict):
             _migrate_stale_nous_portal_url(raw["providers"])
-        return raw
+        return attach_witness(WitnessedStore(raw), witness)
 
     if isinstance(raw, dict) and isinstance(raw.get("systems"), dict):  # legacy "systems" format
         systems = raw["systems"]
         providers = {"nous": systems["nous_portal"]} if "nous_portal" in systems else {}
-        return {**_empty_auth_store(), "providers": providers,
-                "active_provider": "nous" if providers else None}
-    return _empty_auth_store()
+        return attach_witness(WitnessedStore({
+            **_empty_auth_store(), "providers": providers,
+            "active_provider": "nous" if providers else None}), witness)
+    return attach_witness(WitnessedStore(_empty_auth_store()), witness)
 
 
 def _save_private_json(target: Path, data: Any, *, fsync_dir: bool = False, **dump_kwargs: Any) -> None:
@@ -715,18 +741,71 @@ def _save_private_json(target: Path, data: Any, *, fsync_dir: bool = False, **du
     atomic_json_write(target, data, mode=0o600, fsync_dir=fsync_dir, **dump_kwargs)
 
 
+# Sections an unwitnessed save merges key-by-key into the store on disk instead of replacing.
+_MERGED_SECTIONS = ("providers", "credential_pool", "suppressed_sources")
+
+
+def _merge_unwitnessed(disk: Dict[str, Any], mine: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(disk)
+    for key, value in mine.items():
+        if key in _MERGED_SECTIONS and isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = {**merged[key], **value}
+        else:
+            merged[key] = value
+    return merged
+
+
 def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = None) -> Path:
-    """Atomically persist *auth_store* (0o600, parent tightened to 0o700) to the active store, or to
-    an explicit *target_path* (e.g. the global-root write-through for rotating xAI OAuth grants)."""
+    """Persist *auth_store* to the active store (or *target_path*) with the strict writer.
+
+    Runs under that store's lock (taken reentrantly here). Witnessed saves (design §1 R):
+
+    | store came from                               | saved when                                  | otherwise                 |
+    |-----------------------------------------------|---------------------------------------------|---------------------------|
+    | no witness (constructed or copied dict)       | file missing: written as is; file present: reloaded under the lock and the caller's sections MERGED in (never a blind replace) | -- |
+    | witness, parsed_ok                            | the file's sha still equals the witness sha | ``StaleSnapshotError``    |
+    | witness, parsed_ok=False (degraded read)      | the same unparseable bytes are still there  | ``AuthStoreStaleReadError`` |
+    | witness invalidated (earlier uncertain write) | never                                       | ``StaleSnapshotError``    |
+
+    Outcome of the write: ``COMMITTED`` renews the witness (the dict now matches disk);
+    ``NOT_COMMITTED`` keeps it and raises ``CredentialWriteError``; ``COMMITTED_OR_UNCERTAIN``
+    invalidates it and raises ``CredentialWriteUncertain``.
+    """
     auth_file = target_path if target_path is not None else _auth_file_path()
-    auth_store["version"] = AUTH_STORE_VERSION
-    auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
-    _save_private_json(auth_file, auth_store, fsync_dir=True)
+    key = store_key(auth_file)
+    with _auth_store_lock(target_path=auth_file):
+        witness = witness_of(auth_store)
+        if witness is not None and witness.key != key:
+            witness = None  # read from another store: treat as constructed
+        disk_bytes, disk_sha = read_witnessed_bytes(auth_file)
+        payload: Dict[str, Any] = auth_store
+        if witness is None:
+            if disk_bytes is not None:
+                payload = _merge_unwitnessed(dict(_load_auth_store(auth_file)), auth_store)
+        elif not witness.valid:
+            raise StaleSnapshotError(
+                f"refusing to save {auth_file}: an earlier save of this snapshot was uncertain")
+        elif witness.parsed_ok:
+            if disk_sha != witness.sha:
+                raise StaleSnapshotError(
+                    f"refusing to save {auth_file}: it changed since this store was read")
+        elif disk_sha != witness.sha:
+            raise AuthStoreStaleReadError(
+                f"refusing to save {auth_file}: this store was built from an unreadable copy, "
+                "and the file on disk is no longer those bytes")
+        payload["version"] = AUTH_STORE_VERSION
+        payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+        result = write_credential_file(auth_file, encode_json(payload))
+        if result.outcome is WriteOutcome.COMMITTED:
+            attach_witness(auth_store, Witness(key, result.sha, True) if payload is auth_store else None)
+        elif result.outcome is WriteOutcome.COMMITTED_OR_UNCERTAIN:
+            attach_witness(auth_store, (witness or Witness(key, None, True)).invalidated())
     if target_path is not None:
         # A write-through to the global root must not be masked by the mtime memo: on coarse-mtime
         # filesystems a read-after-write in the same tick would keep serving the pre-write store.
         global _global_auth_store_cache
         _global_auth_store_cache = None
+    require_committed(result, f"auth store {auth_file}")
     return auth_file
 
 

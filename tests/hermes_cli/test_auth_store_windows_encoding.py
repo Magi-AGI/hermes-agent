@@ -146,19 +146,17 @@ class TestExplicitEncodingPassed:
     reintroduce the Windows data-loss bug.
     """
 
-    def test_load_auth_store_passes_utf8_encoding(self, hermes_home):
+    def test_load_auth_store_decodes_utf8_regardless_of_locale(self, hermes_home):
+        # The store is read ONCE as bytes (witnessed read) and decoded explicitly as UTF-8, so the
+        # locale default (cp1252 on Windows) never reaches it.
         auth_path = hermes_home / "auth.json"
-        _write_utf8(auth_path, {"version": auth.AUTH_STORE_VERSION, "providers": {}})
+        _write_utf8(auth_path, {"version": auth.AUTH_STORE_VERSION,
+                                "providers": {"nous": {"label": "café — 東京"}}})
 
-        with mock.patch.object(
-            Path, "read_text", wraps=Path.read_text
-        ) as spy:
-            auth._load_auth_store(auth_path)
+        with mock.patch.object(Path, "read_text", side_effect=AssertionError("locale-dependent read")):
+            store = auth._load_auth_store(auth_path)
 
-        assert spy.call_count == 1
-        kwargs = spy.call_args.kwargs
-        assert "encoding" in kwargs, "read_text() must pass an explicit encoding"
-        assert "utf-8" in str(kwargs["encoding"]).lower()
+        assert store["providers"]["nous"]["label"] == "café — 東京"
 
     def test_codex_store_reader_passes_utf8_encoding(self, tmp_path, monkeypatch):
         """The ~/.codex/auth.json reader must pass an explicit UTF-8 encoding."""

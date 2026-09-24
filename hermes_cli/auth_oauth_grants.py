@@ -57,7 +57,7 @@ def strip_cloned_single_use_oauth_grants(profile_dir: Path) -> Dict[str, Any]:
     "files": [...]}`` of what was stripped. Never raises: a clone must not fail because hygiene
     could not run — the caller logs the summary.
     """
-    from hermes_cli.auth import _same_path, _save_auth_store
+    from hermes_cli.auth import _auth_store_lock, _same_path
     stripped: Dict[str, Any] = {"pool": [], "providers": [], "files": []}
     profile_dir = Path(profile_dir)
     for name in SINGLE_USE_OAUTH_SINGLETON_FILES:
@@ -85,11 +85,19 @@ def strip_cloned_single_use_oauth_grants(profile_dir: Path) -> Dict[str, Any]:
     except Exception:
         return stripped
     try:
-        store = json.loads(auth_path.read_text(encoding="utf-8-sig"))
-    except (OSError, json.JSONDecodeError):
-        store = None
-    if not isinstance(store, dict):
-        return stripped
+        with _auth_store_lock(target_path=auth_path):
+            return _strip_cloned_store(auth_path, stripped)
+    except Exception:
+        logger.debug(
+            "Failed to strip cloned single-use OAuth grants from %s", auth_path, exc_info=True)
+    return stripped
+
+
+def _strip_cloned_store(auth_path: Path, stripped: Dict[str, Any]) -> Dict[str, Any]:
+    """Locked read-modify-write of the clone's store: a witnessed load, so the deletions below
+    are saved as deletions (an unwitnessed save merges into the file on disk)."""
+    from hermes_cli.auth import _load_auth_store, _save_auth_store
+    store = _load_auth_store(auth_path)
     changed = False
     pool = store.get("credential_pool")
     if isinstance(pool, dict):
@@ -117,13 +125,8 @@ def strip_cloned_single_use_oauth_grants(profile_dir: Path) -> Dict[str, Any]:
                 del providers[provider_id]
                 stripped["providers"].append(provider_id)
                 changed = True
-    if not changed:
-        return stripped
-    try:
+    if changed:
         _save_auth_store(store, target_path=auth_path)
-    except Exception:
-        logger.debug(
-            "Failed to strip cloned single-use OAuth grants from %s", auth_path, exc_info=True)
     return stripped
 
 

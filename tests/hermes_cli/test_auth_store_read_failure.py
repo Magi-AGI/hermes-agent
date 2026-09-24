@@ -48,11 +48,12 @@ def test_read_failure_raises_and_leaves_the_store_alone(store_file, monkeypatch,
     from pathlib import Path
 
     before = store_file.read_bytes()
-    monkeypatch.setattr(Path, "read_text", _fail_read(exc))
+    monkeypatch.setattr(Path, "read_bytes", _fail_read(exc))
 
     with pytest.raises(OSError):
         auth._load_auth_store(store_file)
 
+    monkeypatch.undo()
     assert store_file.read_bytes() == before, "the store on disk was modified"
     assert not store_file.with_suffix(".json.corrupt").exists(), (
         "a read failure is not corruption and must not write a .corrupt sidecar"
@@ -78,15 +79,16 @@ def test_healthy_store_is_returned_unchanged(store_file):
 def test_log_does_not_claim_a_backup_that_was_not_written(
     store_file, monkeypatch, caplog
 ):
-    """The old message advertised the .corrupt path even when copy2 failed."""
-    import shutil
+    """The old message advertised the .corrupt path even when the copy failed."""
+    from pathlib import Path
 
     store_file.write_text("{ not json", encoding="utf-8")
 
     def _no_copy(*args, **kwargs):
         raise OSError(errno.EMFILE, "Too many open files")
 
-    monkeypatch.setattr(shutil, "copy2", _no_copy)
+    # The copy is written from the bytes that failed to parse (one read), not re-read from disk.
+    monkeypatch.setattr(Path, "write_bytes", _no_copy)
 
     with caplog.at_level(logging.WARNING, logger="hermes_cli.auth"):
         result = auth._load_auth_store(store_file)
