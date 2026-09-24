@@ -25,7 +25,8 @@ def _contended() -> OSError:
 @pytest.fixture
 def contention(monkeypatch):
     monkeypatch.setattr(io, "_is_contended", lambda exc: getattr(exc, "winerror", None) in (5, 32, 33))
-    monkeypatch.setattr(auth, "is_contended_error", lambda exc: getattr(exc, "winerror", None) in (5, 32, 33))
+    monkeypatch.setattr(auth, "is_contended_error", lambda exc: getattr(exc, "winerror", None) in (5, 32, 33),
+                        raising=False)
     monkeypatch.setattr(io.time, "sleep", lambda _s: None)
     monkeypatch.setattr(auth.time, "sleep", lambda _s: None)
 
