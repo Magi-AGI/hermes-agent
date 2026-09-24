@@ -1,13 +1,11 @@
-"""Regression tests for Codex refresh_token self-heal (cross-store rotation).
+"""Codex self-heal from the Codex CLI's ``~/.codex/auth.json`` (and its limits).
 
-Hermes keeps its OWN copy of the Codex OAuth token (per profile + top-level),
-separate from the Codex CLI's ``~/.codex/auth.json``. OAuth refresh_tokens are
-single-use, so when the Codex CLI (or another Hermes process) rotates the shared
-token, the frozen copy's refresh_token goes stale and ``refresh_codex_oauth_pure``
-fails with a relogin-required error. ``_refresh_codex_auth_tokens`` must then
-recover by re-importing the canonical token from ``~/.codex/auth.json`` instead of
-surfacing a hard 401 — but ONLY for relogin-required failures, never for transient
-ones (e.g. 429 quota, where the stored token is still valid).
+Hermes keeps its OWN copy of the Codex OAuth token (per profile + top-level), separate from the
+Codex CLI's. Under the credential recovery protocol a REJECTED refresh token pauses the login
+(the chain is fenced) and is never papered over with an automatic Codex CLI import (decision 5:
+while a login is paused only a fresh browser / device-code sign-in is accepted). The CLI import
+still repairs a Hermes store whose singleton is MISSING token material — as an authorization
+decision (RULE-A1), compare-and-swapped against the credential it repairs.
 """
 
 import base64
@@ -23,36 +21,31 @@ from hermes_cli.auth import AuthError, _refresh_codex_auth_tokens, resolve_codex
 STALE = {"access_token": "stale-access", "refresh_token": "stale-refresh"}
 
 
-def test_self_heals_on_stale_refresh_token(monkeypatch):
-    """invalid_grant (relogin-required) → reimport from ~/.codex and persist it."""
-    saved = {}
-    fresh = {
-        "access_token": "fresh-access",
-        "refresh_token": "fresh-refresh",
-        "last_refresh": "2026-06-12T00:00:00Z",
-    }
+def test_rejected_refresh_token_pauses_instead_of_importing(tmp_path, monkeypatch):
+    """invalid_grant (relogin-required) -> the login is paused; the Codex CLI pair is NOT adopted."""
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "auth.json").write_text(json.dumps({"version": 1, "providers": {"openai-codex": {
+        "tokens": dict(STALE), "auth_mode": "chatgpt"}}}))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    fresh = {"access_token": "fresh-access", "refresh_token": "fresh-refresh"}
+    imported = []
 
     def _rejected(*_a, **_k):
-        raise AuthError(
-            "refresh token rejected",
-            provider="openai-codex",
-            code="invalid_grant",
-            relogin_required=True,
-        )
+        raise AuthError("refresh token rejected", provider="openai-codex", code="invalid_grant",
+                        relogin_required=True)
 
     monkeypatch.setattr(auth, "refresh_codex_oauth_pure", _rejected)
-    monkeypatch.setattr(auth_codex, "refresh_codex_oauth_pure", _rejected)
-    monkeypatch.setattr(auth, "_import_codex_cli_tokens", lambda: dict(fresh))
-    monkeypatch.setattr(auth_codex, "_import_codex_cli_tokens", lambda: dict(fresh))
-    monkeypatch.setattr(auth, "_save_codex_tokens", lambda t, *a, **k: saved.update(t))
-    monkeypatch.setattr(auth_codex, "_save_codex_tokens", lambda t, *a, **k: saved.update(t))
+    monkeypatch.setattr(auth, "_import_codex_cli_tokens", lambda: imported.append(1) or dict(fresh))
+    monkeypatch.setattr(auth_codex, "_import_codex_cli_tokens", lambda: imported.append(1) or dict(fresh))
 
-    out = _refresh_codex_auth_tokens(STALE, 20.0)
+    with pytest.raises(AuthError) as info:
+        _refresh_codex_auth_tokens(dict(STALE), 20.0)
 
-    assert out["access_token"] == "fresh-access"
-    assert out["refresh_token"] == "fresh-refresh"
-    # the recovered token was persisted to the Hermes auth store
-    assert saved["access_token"] == "fresh-access"
+    assert info.value.relogin_required
+    assert imported == []
+    tokens = json.loads((hermes_home / "auth.json").read_text())["providers"]["openai-codex"]["tokens"]
+    assert tokens == STALE
 
 
 
@@ -124,11 +117,14 @@ def test_opt_out_never_adopts_codex_cli_login(tmp_path, monkeypatch):
     def _rejected(*_a, **_k):
         raise AuthError("bad", provider="openai-codex", code="invalid_grant", relogin_required=True)
 
-    monkeypatch.setattr(auth_codex, "refresh_codex_oauth_pure", _rejected)
+    (hermes_home / "auth.json").write_text(json.dumps({"version": 1, "providers": {"openai-codex": {
+        "tokens": dict(STALE), "auth_mode": "chatgpt"}}}))
+    monkeypatch.setattr(auth, "refresh_codex_oauth_pure", _rejected)
     with pytest.raises(AuthError) as info:
         _refresh_codex_auth_tokens(dict(STALE), 5.0)
     assert info.value.relogin_required  # surfaced, not papered over with the CLI pair
-    assert json.loads((hermes_home / "auth.json").read_text()) == hermes_auth
+    tokens = json.loads((hermes_home / "auth.json").read_text())["providers"]["openai-codex"]["tokens"]
+    assert tokens == STALE
 
 
 def _codex_jwt(account_id: str, sub: str = "user-1") -> str:
@@ -182,8 +178,9 @@ def test_recovery_does_not_overwrite_concurrent_reauth(tmp_path, monkeypatch):
     monkeypatch.setattr(auth, "_import_codex_cli_tokens", _import_racing_with_reauth)
     monkeypatch.setattr(auth_codex, "_import_codex_cli_tokens", _import_racing_with_reauth)
 
-    with pytest.raises(AuthError):
-        resolve_codex_runtime_credentials(refresh_if_expiring=False)
+    # The recovery compare-and-swap loses to the concurrent re-auth; the re-auth's own login (its
+    # pool alias is materialized by the sign-in) is what resolution returns.
+    assert resolve_codex_runtime_credentials(refresh_if_expiring=False)["api_key"] == reauthed
 
     tokens = json.loads(auth_file.read_text())["providers"]["openai-codex"]["tokens"]
     assert tokens == {"access_token": reauthed, "refresh_token": "rt-reauthed"}

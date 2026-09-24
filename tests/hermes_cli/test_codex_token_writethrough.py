@@ -3,7 +3,8 @@
 Codex refresh tokens are single-use with rotation-family reuse detection: a profile that refreshed
 a root-borrowed grant must land the rotated chain in root — singleton AND ``credential_pool`` —
 or root keeps the consumed refresh token and the next reader gets the whole family revoked.
-Token values are synthetic placeholders.
+Under the credential recovery protocol the refresh transaction does this: the chain's OWNER store
+refreshes and every row of the chain there moves together. Token values are synthetic placeholders.
 """
 
 import json
@@ -41,7 +42,12 @@ def profile_env(tmp_path, monkeypatch):
     return profile / "auth.json", root / "auth.json"
 
 
-def test_profile_refresh_of_root_grant_writes_through_to_root(profile_env):
+def _endpoint(monkeypatch, rotated: dict) -> None:
+    monkeypatch.setattr(auth, "refresh_codex_oauth_pure",
+                        lambda a, r, **kw: {**rotated, "last_refresh": "2026-08-16T00:00:00Z"})
+
+
+def test_profile_refresh_of_root_grant_writes_through_to_root(profile_env, monkeypatch):
     profile_path, root_path = profile_env
     _write(root_path, {
         "version": 1,
@@ -52,7 +58,8 @@ def test_profile_refresh_of_root_grant_writes_through_to_root(profile_env):
     _write(profile_path, {"version": 1, "providers": {}})
 
     rotated = _pair("new")
-    auth._save_codex_tokens(rotated, last_refresh="2026-08-16T00:00:00Z", write_through=True)
+    _endpoint(monkeypatch, rotated)
+    auth._refresh_codex_auth_tokens(_pair("old"), 20.0)
 
     root = _read(root_path)
     assert root["providers"]["openai-codex"]["tokens"] == rotated
@@ -62,7 +69,7 @@ def test_profile_refresh_of_root_grant_writes_through_to_root(profile_env):
     assert "openai-codex" not in _read(profile_path).get("providers", {})
 
 
-def test_profile_owned_grant_stays_local(profile_env):
+def test_profile_owned_grant_stays_local(profile_env, monkeypatch):
     profile_path, root_path = profile_env
     _write(profile_path, {
         "version": 1,
@@ -71,7 +78,8 @@ def test_profile_owned_grant_stays_local(profile_env):
     _write(root_path, {"version": 1, "providers": {}})
 
     rotated = _pair("next")
-    auth._save_codex_tokens(rotated, last_refresh="2026-08-16T00:00:00Z", write_through=True)
+    _endpoint(monkeypatch, rotated)
+    auth._refresh_codex_auth_tokens(_pair("prof"), 20.0)
 
     assert _read(profile_path)["providers"]["openai-codex"]["tokens"] == rotated
     assert "openai-codex" not in _read(root_path).get("providers", {})
@@ -142,6 +150,7 @@ def test_concurrent_refreshes_of_shared_root_grant_submit_old_token_once(profile
 
     assert errors == {}
     assert endpoint.seen == ["old-rt"]
-    assert results == {"a": _pair("new"), "b": _pair("new")}
+    assert {k: {t: v[t] for t in ("access_token", "refresh_token")} for k, v in results.items()} == {
+        "a": _pair("new"), "b": _pair("new")}
     assert _read(root_path)["providers"]["openai-codex"]["tokens"] == _pair("new")
     assert "openai-codex" not in _read(profile_path).get("providers", {})

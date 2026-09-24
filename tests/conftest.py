@@ -681,6 +681,18 @@ def _neutralize_git_safe_directory_read(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _block_real_codex_token_endpoint(monkeypatch):
+    """No test may present a refresh token (fake or not) to OpenAI's real token endpoint: point the
+    module constant at a closed local port. Tests with a loopback endpoint set their own URL."""
+    try:
+        from hermes_cli import auth_codex as _auth_codex
+    except Exception:
+        return
+    monkeypatch.setattr(_auth_codex, "CODEX_OAUTH_TOKEN_URL",
+                        "http://127.0.0.1:9/codex-token-endpoint-blocked-in-tests", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _close_leaked_session_dbs():
     """Close every SessionDB a test constructed but forgot to close.
 
