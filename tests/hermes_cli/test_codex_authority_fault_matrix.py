@@ -147,3 +147,39 @@ def test_sign_in_crash_at_every_op_step(codex_home, monkeypatch, boundary, recov
     assert not reg["ops"], "no op left unfinished"
     active = [c for c in reg["chains"].values() if c["state"] == "active"]
     assert len(active) == 1
+
+
+@pytest.mark.parametrize("boundary", ["reconstruct-start", "payload", "decision", "apply-stores", "commit"])
+def test_registry_reconstruction_never_exposes_an_absent_registry(codex_home, monkeypatch, boundary):
+    """A sign-in over an UNREADABLE registry rebuilds it fenced (RULE-G3). A crash at any point of
+    that reconstruction must leave the registry damaged-or-fenced, never ABSENT: an absent one is
+    bootstrapped with ACTIVE chains from credentials whose refresh outcome was unknown."""
+    from hermes_cli import auth_codex_authority as authority
+    from hermes_cli import auth_codex_ops as ops
+
+    root, endpoint = codex_home
+    write_store(root, singleton=endpoint.issue())
+    assert authority.authority_dispatch() == "bootstrapped"
+    (root / "auth.chains.json").write_text("{ damaged", encoding="utf-8")
+    with monkeypatch.context() as crash:
+        if boundary == "reconstruct-start":
+            crash.setattr(authority, "_bootstrap", lambda **kw: (_ for _ in ()).throw(Killed("x")))
+        elif boundary == "payload":
+            crash.setattr(ops, "write_registry", lambda data: (_ for _ in ()).throw(Killed("x")))
+        elif boundary == "decision":
+            crash.setattr(ops, "apply_payload", lambda body: (_ for _ in ()).throw(Killed("x")))
+        elif boundary == "apply-stores":
+            crash.setattr(ops, "_apply_record_action", lambda action: (_ for _ in ()).throw(Killed("x")))
+        else:
+            crash.setattr(ops, "commit_op", lambda op_id: (_ for _ in ()).throw(Killed("x")))
+        with pytest.raises(Killed):
+            auth._save_codex_tokens(dict(zip(("access_token", "refresh_token"), endpoint.issue())))
+    assert (root / "auth.chains.json").exists(), "the registry was ABSENT after the crash"
+    with pytest.raises(AuthError):
+        auth.resolve_codex_runtime_credentials(force_refresh=True)
+    assert endpoint.calls == [], "the credential whose history was lost was refreshed"
+    fresh = endpoint.issue()
+    auth._save_codex_tokens({"access_token": fresh[0], "refresh_token": fresh[1]})
+    assert auth.resolve_codex_runtime_credentials()["api_key"] == fresh[0]
+    others = [c for c in registry(root)["chains"].values() if c["state"] == "active"]
+    assert len(others) == 1, "only the new sign-in is active"

@@ -172,7 +172,7 @@ def plan_registration(view: RegistryView, snaps: Dict[str, Snapshot], *, only_un
         root_rows = [m for m in members if is_root_store(m[0])]
         ambiguous = (
             len(fps_by_refresh[refresh]) > 1 or (access and len(fps_by_access[access]) > 1)
-            or (not root_rows and len(stores) > 1) or evidence.knows(access, refresh))
+            or (not root_rows and len(stores) > 1) or (not fence_all and evidence.knows(access, refresh)))
         unverified = not ambiguous and not fence_all and not evidence.complete
         units = [[m] for m in members] if ambiguous else [members]
         for unit in units:

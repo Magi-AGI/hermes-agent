@@ -183,10 +183,13 @@ def sign_in(access: str, refresh: str, *, kind: str = "singleton", last_refresh:
 
     def build(view, snaps):
         if view is None:
+            # The damaged file is copied, the old generation's records are folded into the
+            # retired-token index, and the fenced reconstruction's DECISION then atomically
+            # replaces the damaged registry: it is never ABSENT in between (an absent registry
+            # would be bootstrapped with active chains).
+            from hermes_cli.auth_codex_evidence import retain_orphan_records
             preserve_unreadable_registry()
-            from hermes_cli.auth_codex_registry import registry_path
-            from hermes_cli.auth_credential_io import unlink_retrying
-            unlink_retrying(registry_path())
+            retain_orphan_records([s.path for s in snaps.values()])
             _bootstrap(fence_all="registry-rebuilt")
             view = read_registry()
             snaps = load_snapshots([s.path for s in snaps.values()])
