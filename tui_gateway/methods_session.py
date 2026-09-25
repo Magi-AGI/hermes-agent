@@ -454,10 +454,16 @@ def _(rid, params: dict, db) -> dict:
         if title_lookup := _str_param(params, "title"):
             return _session_list_by_title(rid, db, title_lookup)
         limit = int(params.get("limit", 200) or 200)
-        # Over-fetch: per-source filtering + tip merging must not leave us short. ``include_hidden`` is for
-        # surfaces that OWN hidden sessions (Bots pane, pickers).
-        rows = _listing_rows(db, max(limit * 2, 200), include_hidden=_flag(params, "include_hidden"))[:limit]
-        return _ok(rid, {"sessions": [_session_row_summary(s) for s in rows]})
+        include_hidden = _flag(params, "include_hidden")
+
+        def summaries() -> list:
+            # Over-fetch: per-source filtering + tip merging must not leave us short. ``include_hidden`` is
+            # for surfaces that OWN hidden sessions (Bots pane, pickers).
+            rows = _listing_rows(db, max(limit * 2, 200), include_hidden=include_hidden)[:limit]
+            return [_session_row_summary(s) for s in rows]
+        from tui_gateway import rpc_coalesce
+        key = rpc_coalesce.session_list_key(db, limit=limit, include_hidden=include_hidden)
+        return _ok(rid, {"sessions": summaries() if key is None else rpc_coalesce.SESSION_LIST.run(key, summaries)})
     except Exception as e:
         return _err(rid, 5006, str(e))
 

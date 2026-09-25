@@ -337,11 +337,19 @@ def _session_agent(params: dict):
 @_catch(5033)
 def _(rid, params: dict) -> dict:
     from hermes_cli.inventory import build_model_options_payload
+    from hermes_constants import get_hermes_home
+    from tui_gateway import rpc_coalesce
     # A spawned agent owns the live provider/model/base_url; empty attributes must
     # NOT clobber disk config (with_overrides is truthy-only).
-    return _ok(rid, build_model_options_payload(
-        _model_picker_context(_session_agent(params)), explicit_only=bool(params.get("explicit_only")),
-        include_unconfigured=bool(params.get("include_unconfigured")), refresh=bool(params.get("refresh"))))
+    ctx = _model_picker_context(_session_agent(params))
+
+    def build() -> dict:
+        return build_model_options_payload(
+            ctx, explicit_only=bool(params.get("explicit_only")),
+            include_unconfigured=bool(params.get("include_unconfigured")), refresh=bool(params.get("refresh")))
+    # Windows opening the picker together share one build (rpc_coalesce); the payload is read-only.
+    key = rpc_coalesce.model_options_key(get_hermes_home(), ctx, params)
+    return _ok(rid, build() if key is None else rpc_coalesce.MODEL_OPTIONS.run(key, build))
 
 
 @method("model.save_key")
