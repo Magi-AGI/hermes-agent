@@ -797,13 +797,13 @@ class TestNoProductionCodeMutatesTheAliasCacheInPlace:
     )
 
     @staticmethod
-    def _production_sources(repo=None):
+    def _production_sources():
         import os
         import pathlib
 
         from tests.checkout_scan import is_other_checkout
 
-        repo = repo or pathlib.Path(__file__).resolve().parents[2]
+        repo = pathlib.Path(__file__).resolve().parents[2]
         skip = {".git", "node_modules", "tests", "build", "dist", ".venv"}
         # Pruned by name below the repo only: matching the absolute path skipped every file of a
         # checkout that lives under a directory named e.g. "build".

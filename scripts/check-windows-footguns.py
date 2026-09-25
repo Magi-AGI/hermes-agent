@@ -37,6 +37,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+if str(Path(__file__).resolve().parent) not in sys.path:  # scripts/ is not a package
+    sys.path.append(str(Path(__file__).resolve().parent))
+from checkout_scope import is_other_checkout  # noqa: E402
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 SUPPRESS_MARKER = re.compile(r"#\s*windows-footgun\s*:\s*ok\b", re.IGNORECASE)
@@ -464,7 +468,8 @@ def iter_files(paths: Iterable[Path]) -> Iterable[Path]:
         elif p.is_dir():
             for root, dirs, files in os.walk(p):
                 # prune excluded dirs in-place for speed
-                dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS]
+                dirs[:] = [d for d in dirs
+                           if d not in EXCLUDED_DIRS and not is_other_checkout(Path(root) / d)]
                 for fname in files:
                     fpath = Path(root) / fname
                     if should_scan_file(fpath):

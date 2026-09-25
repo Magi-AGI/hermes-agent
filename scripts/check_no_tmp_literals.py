@@ -52,6 +52,10 @@ import sys
 import warnings
 from pathlib import Path
 
+if str(Path(__file__).resolve().parent) not in sys.path:  # scripts/ is not a package
+    sys.path.append(str(Path(__file__).resolve().parent))
+from checkout_scope import is_other_checkout  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent.parent
 SELF = Path(__file__).resolve()
 
@@ -186,7 +190,8 @@ def iter_files(root: Path | None = None):
         rel_here = here.relative_to(root) if here != root else Path()
         excluded = SKIP_DIRS | (ROOT_SKIP_DIRS if here == root else set())
         dirnames[:] = sorted(
-            d for d in dirnames if d not in excluded and (rel_here / d) not in SKIP_REL_DIRS
+            d for d in dirnames
+            if d not in excluded and (rel_here / d) not in SKIP_REL_DIRS and not is_other_checkout(here / d)
         )
         for filename in sorted(filenames):
             path = here / filename

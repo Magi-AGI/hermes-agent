@@ -1,16 +1,16 @@
-"""Scope for whole-tree source guards: this checkout only.
+"""``scripts/checkout_scope.py`` for the whole-tree guards under ``tests/`` (see its docstring).
 
-A directory holding its own ``.git`` (a file for a git worktree, a directory for a clone or a
-submodule) is another checkout: ``.worktrees/``, ``.claude/worktrees/``, a scratch clone. Its
-files belong to another commit, so a guard that walks into it reports violations this tree does
-not have. Guards that walk the repo prune such directories with ``is_other_checkout``.
+``scripts/`` is not a package, so the module is loaded from its path.
 """
 
 from __future__ import annotations
 
-import os
+import importlib.util
 from pathlib import Path
 
+_PATH = Path(__file__).resolve().parents[1] / "scripts" / "checkout_scope.py"
+_spec = importlib.util.spec_from_file_location("checkout_scope", _PATH)
+checkout_scope = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(checkout_scope)
 
-def is_other_checkout(directory: Path) -> bool:
-    return os.path.lexists(directory / ".git")
+is_other_checkout = checkout_scope.is_other_checkout

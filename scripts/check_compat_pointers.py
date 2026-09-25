@@ -22,6 +22,10 @@ import re
 import sys
 from pathlib import Path
 
+if str(Path(__file__).resolve().parent) not in sys.path:  # scripts/ is not a package
+    sys.path.append(str(Path(__file__).resolve().parent))
+from checkout_scope import is_other_checkout  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "compat_manifest.json"
 DEPENDENCY_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__"}
@@ -33,10 +37,8 @@ ROOT_SKIP_DIRS = DEPENDENCY_DIRS | {
 def _py_files():
     for dirpath, dirnames, filenames in os.walk(ROOT):
         excluded = ROOT_SKIP_DIRS if Path(dirpath) == ROOT else DEPENDENCY_DIRS
-        # A directory with its own .git is another checkout (a nested worktree or clone) at
-        # another commit, not this tree's code.
         dirnames[:] = [name for name in dirnames
-                       if name not in excluded and not os.path.lexists(os.path.join(dirpath, name, ".git"))]
+                       if name not in excluded and not is_other_checkout(Path(dirpath) / name)]
         for filename in filenames:
             if not filename.endswith(".py") or filename == "check_compat_pointers.py":
                 continue
