@@ -114,7 +114,10 @@ def _transaction(row_store: Path, row: str, started: Tuple[str, str], *, force: 
                  refresh_fn: Callable, round_: int) -> RefreshResult:
     from hermes_cli import auth as auth_mod
 
-    # 1. lock-free admission (RULE-G1)
+    # 1. lock-free admission (RULE-G1); an unfinished restore is fenced by the dispatcher first
+    from hermes_cli.auth_codex_restore import restore_barrier_pending
+    if restore_barrier_pending():
+        _dispatch_once(round_)
     view = read_registry()
     if view.status == "absent":
         _dispatch_once(round_)

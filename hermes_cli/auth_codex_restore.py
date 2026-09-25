@@ -89,7 +89,8 @@ def authority_has_state() -> bool:
     of credential state could roll it back)."""
     from hermes_cli.auth_codex_evidence import retired_index_path
     from hermes_cli.auth_codex_records import records_dir
-    if registry_path().exists() or retired_index_path().exists() or ops_dir().exists():
+    if (registry_path().exists() or retired_index_path().exists() or ops_dir().exists()
+            or restore_barrier_path().exists()):
         return True
     return any(records_dir(p).is_dir() for p in all_store_paths())
 
@@ -132,15 +133,101 @@ def check_restore(targets: Iterable[Tuple[Path, Callable[[], bytes]]], action: s
                 f"{action} isn't supported for them yet. Sign in to Codex again instead.")
 
 
+def _brings_codex_material(targets: Iterable[Tuple[Path, Callable[[], bytes]]]) -> bool:
+    for target, load in targets:
+        kind = _classify(Path(target))
+        if kind == "protocol" or (kind == "store" and _has_codex_material(load)):
+            return True
+    return False
+
+
 @contextmanager
 def restore_guard(targets_fn: Callable[[], Iterable[Tuple[Path, Callable[[], bytes]]]],
                   action: str) -> Iterator[None]:
     """Hold the migration lock across the check and the restore's writes (only when the restore
-    touches credential state; otherwise no lock is taken)."""
+    touches credential state; otherwise no lock is taken).
+
+    A restore that brings Codex credential material in (Codex tokens in an auth.json, or any
+    protocol file) writes the RESTORE BARRIER before the first byte is extracted and fences every
+    restored chain afterwards (:func:`fence_restored`). Until the fence is durable the barrier
+    stays, and every dispatcher, ownership op and refresh admission resolves it first — so a crash
+    at any step never leaves a restored credential refreshable."""
     targets = list(targets_fn())
     if not any(is_credential_state(t) for t, _ in targets):
         yield
         return
     with migration_lock():
         check_restore(targets, action)
-        yield
+        barrier = _brings_codex_material(targets)
+        if barrier:
+            write_restore_barrier(action)
+        try:
+            yield
+        finally:
+            if barrier:
+                fence_restored()
+
+
+# ── the restore barrier (credential recovery protocol, restores are never trusted) ─────────────
+
+RESTORED_REASON = "restored-from-backup"
+
+
+def write_restore_barrier(action: str) -> None:
+    from hermes_cli.auth_codex_registry import utc_now
+    from hermes_cli.auth_credential_io import encode_json, require_committed, write_credential_file
+    require_committed(write_credential_file(restore_barrier_path(), encode_json(
+        {"version": 1, "action": action, "at": utc_now()})), "the Codex restore barrier")
+
+
+def restore_barrier_pending() -> bool:
+    return restore_barrier_path().exists()
+
+
+def fence_restored() -> None:
+    """Make every Codex chain the restore could have brought in durably FENCED
+    (``restored-from-backup``), then clear the barrier. Idempotent; the caller holds the migration
+    lock and no store lock. Nothing a backup holds proves its refresh tokens are still unspent, so
+    no restored chain is ever refreshed: the exit is a fresh sign-in (``--retry-refresh`` refuses
+    this fence). Ownership ops restored with the registry are never rolled forward: their entries
+    are dropped and their payloads archived as ``restored`` (their chains are fenced here)."""
+    import json as _json
+
+    from hermes_cli.auth_codex_authority import _bootstrap, _codex_material_present
+    from hermes_cli.auth_codex_evidence import retain_orphan_records
+    from hermes_cli.auth_codex_ops import _archive_payload, run_op
+    from hermes_cli.auth_codex_plans import load_snapshots, plan_registration
+    from hermes_cli.auth_codex_registry import (
+        STATE_RETIRED, preserve_unreadable_registry, read_registry, store_locks, write_registry)
+    from hermes_cli.auth_credential_io import unlink_retrying
+
+    paths = all_store_paths()
+    view = read_registry()
+    if view.status == "unreadable":
+        preserve_unreadable_registry()
+        retain_orphan_records(paths)
+        _bootstrap(fence_all=RESTORED_REASON)
+    elif view.status == "absent":
+        if _codex_material_present(paths):
+            _bootstrap(fence_all=RESTORED_REASON)
+    else:
+        data = _json.loads(_json.dumps(view.data))
+        for entry in data["chains"].values():
+            if entry.get("state") != STATE_RETIRED and (entry.get("fence") or {}).get("reason") != RESTORED_REASON:
+                entry.update(state="fenced", fence={"reason": RESTORED_REASON, "epoch": entry["epoch"]})
+        data["ops"] = {}
+        if data != view.data:
+            write_registry(data)
+        if ops_dir().is_dir():
+            for payload in sorted(ops_dir().glob("*.json")):
+                _archive_payload(payload, "restored")
+        with store_locks(paths):
+            view = read_registry()
+            payload = plan_registration(view, load_snapshots(paths), only_unregistered=True,
+                                        fence_all=RESTORED_REASON, kind="restore")
+            if payload.chains:
+                run_op(payload, view)
+    try:
+        unlink_retrying(restore_barrier_path())
+    except FileNotFoundError:
+        pass

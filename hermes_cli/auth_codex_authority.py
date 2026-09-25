@@ -78,8 +78,20 @@ def _codex_material_present(paths: Iterable[Path]) -> bool:
     return False
 
 
+def _resolve_restore_barrier() -> bool:
+    """A restore that brought Codex material in never completed its fence: finish it FIRST, before
+    any bootstrap could register the restored rows as active (auth_codex_restore)."""
+    from hermes_cli.auth_codex_restore import fence_restored, restore_barrier_pending
+    if not restore_barrier_pending():
+        return False
+    fence_restored()
+    return True
+
+
 def dispatch_locked() -> str:
     """The dispatcher body; caller holds the migration lock and no store lock."""
+    if _resolve_restore_barrier():
+        return "restore-fenced"
     view = read_registry()
     if view.status == "unreadable":
         preserve_unreadable_registry()
@@ -121,7 +133,8 @@ def dispatch_needed() -> bool:
     """Unfinished ops to roll forward (incl. an ``unrecoverable`` one whose payload may read again),
     or payloads left by an op that never reached its decision."""
     view = read_registry()
-    return (view.status == "absent"
+    from hermes_cli.auth_codex_restore import restore_barrier_pending
+    return (view.status == "absent" or restore_barrier_pending()
             or any(op.get("status") in ("running", "unrecoverable") for op in view.ops.values())
             or (ops_dir().is_dir() and any(ops_dir().glob("*.json"))))
 
@@ -132,7 +145,8 @@ def startup_dispatch() -> str:
         view = read_registry()
         paths = all_store_paths()
         if view.status == "absent":
-            if not _codex_material_present(paths) and not ops_dir().is_dir():
+            from hermes_cli.auth_codex_restore import restore_barrier_pending
+            if not _codex_material_present(paths) and not ops_dir().is_dir() and not restore_barrier_pending():
                 return "idle"
         elif not dispatch_needed() and not unrecorded_legacy_rescues(view, paths):
             return "idle"
@@ -144,7 +158,9 @@ def startup_dispatch() -> str:
 # ── Ownership entry points ───────────────────────────────────────────────────────────────────
 
 def _ready_view() -> RegistryView:
-    """Registry ready for an ownership op (bootstrapped, unfinished ops rolled forward)."""
+    """Registry ready for an ownership op (restore fenced, bootstrapped, unfinished ops rolled
+    forward)."""
+    _resolve_restore_barrier()
     recover_ops()
     view = read_registry()
     if view.status == "absent":

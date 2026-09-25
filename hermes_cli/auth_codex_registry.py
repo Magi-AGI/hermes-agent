@@ -69,6 +69,7 @@ _FENCE_REASON_TEXT = {
     "retired": "this login was replaced by a newer sign-in",
     "unregistered": "this credential is not registered yet",
     "unverified-history": "Hermes could not check this credential against its login history",
+    "restored-from-backup": "this login was restored from a backup and its refresh token may already have been used",
 }
 
 
