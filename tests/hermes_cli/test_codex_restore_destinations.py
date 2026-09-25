@@ -56,10 +56,14 @@ def _alias_dir(link, target):
         os.symlink(target, link, target_is_directory=True)
 
 
-@pytest.mark.parametrize("member", ["external-registry", "upper-case-store", "aliased-records-dir"])
+def _auth_files(root):
+    return {p.name: p.read_bytes() for p in root.iterdir() if p.is_file() and p.name.startswith("auth")}
+
+
+@pytest.mark.parametrize("member", ["external-registry", "aliased-records-dir"])
 def test_a_member_is_classified_by_its_real_destination(home_root, tmp_path, member):
-    root, endpoint = home_root
-    before = {p.name: p.read_bytes() for p in root.iterdir() if p.is_file() and p.name.startswith("auth")}
+    root, _endpoint = home_root
+    before = _auth_files(root)
     forged = registry(root)
     for chain in forged["chains"].values():
         chain.update(state="active", fence=None)
@@ -73,10 +77,15 @@ def test_a_member_is_classified_by_its_real_destination(home_root, tmp_path, mem
         _import(tmp_path, {f"notes/{cid}.json": json.dumps(record)})
         on_disk = (root / "auth.recovery" / f"{cid}.json").read_bytes()
         assert on_disk != json.dumps(record).encode(), "the chain record was overwritten through a directory alias"
-    else:
-        spent = endpoint.issue()
-        store = {"version": 1, "providers": {"openai-codex": {"tokens": {
-            "access_token": spent[0], "refresh_token": spent[1]}}}, "active_provider": "openai-codex"}
-        _import(tmp_path, {"AUTH.JSON": json.dumps(store)})
-    after = {p.name: p.read_bytes() for p in root.iterdir() if p.is_file() and p.name.startswith("auth")}
-    assert after == before, "Codex credential state was overwritten through an unguarded destination"
+    assert _auth_files(root) == before, "Codex credential state was overwritten through an unguarded destination"
+
+
+@pytest.mark.windows_only  # NTFS is case-insensitive: AUTH.JSON IS auth.json there
+def test_a_differently_cased_store_name_is_the_same_store(home_root, tmp_path):
+    root, endpoint = home_root
+    before = _auth_files(root)
+    spent = endpoint.issue()
+    store = {"version": 1, "providers": {"openai-codex": {"tokens": {
+        "access_token": spent[0], "refresh_token": spent[1]}}}, "active_provider": "openai-codex"}
+    _import(tmp_path, {"AUTH.JSON": json.dumps(store)})
+    assert _auth_files(root) == before, "auth.json was overwritten through a differently cased name"
