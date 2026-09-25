@@ -311,17 +311,42 @@ def logout_active_store() -> bool:
     return True
 
 
-def grant_retry_override(row: str = SINGLETON) -> Dict[str, Any]:
+def _override_target(view: RegistryView, snaps, target: str, chain: Optional[str]) -> str:
+    """The chain ``--retry-refresh`` applies to: ``chain`` (id or unique prefix) when given, else the
+    one login paused after an unconfirmed refresh that this store owns, holds rows of, or borrows
+    (a profile without its own Codex rows reads root's)."""
+    def paused(entry: Dict[str, Any]) -> bool:
+        return entry.get("state") == "fenced" and (entry.get("fence") or {}).get("reason") == "indeterminate"
+
+    if chain:
+        matches = [cid for cid in view.chains if cid.startswith(chain.strip())]
+        if len(matches) != 1:
+            raise CodexAuthorityRefused(
+                f"No single Codex login matches --chain {chain!r}; `hermes auth recovery list` shows them.")
+        return matches[0]
+    candidates = sorted(cid for cid in rescue_candidates(view.chains, snaps, target) if paused(view.chains[cid]))
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise CodexAuthorityRefused(
+            "No Codex login of this profile is paused after an unconfirmed refresh; "
+            "`hermes auth recovery list` shows every login.")
+    listed = ", ".join(c[:12] for c in candidates)
+    raise CodexAuthorityRefused(
+        f"Several Codex logins are paused after an unconfirmed refresh ({listed}); choose one with "
+        "`--chain <id>`.")
+
+
+def grant_retry_override(chain: Optional[str] = None) -> Dict[str, Any]:
+    """RULE-O1 (``hermes auth codex --retry-refresh [--chain <id>]``). The target is resolved and
+    the override decided under the migration lock + every store lock; it applies to the chain's
+    OWNER record wherever that is."""
     target = store_key(active_store_path())
 
     def build(view, snaps):
         if view is None:
             raise CodexRegistryUnreadable()
-        found = view.chain_for_row(target, row)
-        if not found:
-            root = store_key(store_path_of(target))
-            raise CodexAuthorityRefused(f"No registered Codex login for {row} in {root}.")
-        payload = plan_override(view, snaps, found[0])
+        payload = plan_override(view, snaps, _override_target(view, snaps, target, chain))
         run_op(payload, view)
         return payload.result
     return _run_with_all_stores(build)

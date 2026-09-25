@@ -79,12 +79,12 @@ def classify_refresh_failure(exc: BaseException) -> str:
     return "indeterminate"
 
 
-def _fenced_error(entry: dict) -> AuthError:
+def _fenced_error(cid: str, entry: dict) -> AuthError:
     reason = (entry.get("fence") or {}).get("reason") or "fenced"
     if entry.get("state") == STATE_RETIRED:
         return CodexRecoveryFenced("retired")
     if reason == "indeterminate":
-        return CodexRefreshIndeterminate()
+        return CodexRefreshIndeterminate(chain_id=cid)
     return CodexRecoveryFenced(reason)
 
 
@@ -135,7 +135,7 @@ def _transaction(row_store: Path, row: str, started: Tuple[str, str], *, force: 
             view, {row_store, store_path_of(entry["owner"])}):
         _dispatch_once(round_)
     if entry.get("state") in (STATE_FENCED, STATE_RETIRED):
-        raise _fenced_error(entry)
+        raise _fenced_error(cid, entry)
     owner = store_path_of(entry["owner"])
 
     # 2. store locks (owner; plus the borrowing caller's store), L1 order
@@ -166,7 +166,7 @@ def _transaction(row_store: Path, row: str, started: Tuple[str, str], *, force: 
                 observed = _write_attempt(owner, record, {**attempt, "state": ATTEMPT_INDETERMINATE}) or observed
             raise NeedsAuthorityRepair(
                 RepairRequest(cid, epoch, decision.reason, entry2["owner"], observed, attempt.get("attempt_id")),
-                CodexRefreshIndeterminate() if decision.reason == "indeterminate"
+                CodexRefreshIndeterminate(chain_id=cid) if decision.reason == "indeterminate"
                 else CodexRecoveryFenced(decision.reason))
         if decision.action == "adopt":
             succ = attempt["successor"]
@@ -216,7 +216,8 @@ def _transaction(row_store: Path, row: str, started: Tuple[str, str], *, force: 
             observed = _write_attempt(owner, record, marked)
             if not isinstance(exc, Exception):
                 raise  # interrupt / exit: the verdict is recorded, the interrupt still propagates
-            error = exc if kind == "rejected" and isinstance(exc, AuthError) else CodexRefreshIndeterminate()
+            error = (exc if kind == "rejected" and isinstance(exc, AuthError)
+                     else CodexRefreshIndeterminate(chain_id=cid))
             if kind == "rejected" and isinstance(error, AuthError):
                 error.relogin_required = True
             raise NeedsAuthorityRepair(
@@ -235,7 +236,7 @@ def _transaction(row_store: Path, row: str, started: Tuple[str, str], *, force: 
                 raise NeedsAuthorityRepair(
                     RepairRequest(cid, epoch, "indeterminate", entry2["owner"], check.sha, attempt_id,
                                   {"reason": "successor could not be recorded"}),
-                    CodexRefreshIndeterminate())
+                    CodexRefreshIndeterminate(chain_id=cid))
         store = auth_mod._load_auth_store(owner)
         for r in chain_rows:
             rows_mod.set_row_tokens(store, r, succ[0], succ[1], succ_refresh_at)

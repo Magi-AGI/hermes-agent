@@ -89,6 +89,9 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
         "--retry-refresh", action="store_true",
         help="Retry ONE paused Codex refresh whose outcome was unknown — only if you're sure the "
              "earlier refresh never reached OpenAI")
+    auth_codex.add_argument(
+        "--chain", help="With --retry-refresh: the paused login to retry (id or prefix, from the error "
+                        "message or `hermes auth recovery list`)")
     auth_codex.add_argument("--browser", action="store_true", help="Use the browser (PKCE) sign-in flow")
     auth_codex.add_argument("--no-browser", action="store_true", help="Do not auto-open a browser")
     auth_subparsers.add_parser(

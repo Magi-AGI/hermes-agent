@@ -33,7 +33,7 @@ def list_recovery() -> List[str]:
         fence = entry.get("fence") or {}
         detail = f" — {fence.get('reason')}" if fence.get("reason") else ""
         rows = ", ".join(r["row"] for r in entry.get("rows", ()))
-        lines.append(f"  {cid[:8]}  {entry.get('state')}{detail}  owner={entry.get('owner')}  rows=[{rows}]")
+        lines.append(f"  {cid[:12]}  {entry.get('state')}{detail}  owner={entry.get('owner')}  rows=[{rows}]")
     for op_id, op in view.ops.items():
         hint = (f" — `hermes auth recovery resolve {op_id[:8]}` releases it"
                 if op.get("status") == "unrecoverable" else "")

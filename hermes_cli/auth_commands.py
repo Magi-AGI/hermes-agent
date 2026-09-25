@@ -638,7 +638,7 @@ def auth_codex_command(args) -> None:
     from hermes_cli.auth_codex_authority import grant_retry_override
     if getattr(args, "retry_refresh", False):
         try:
-            result = grant_retry_override()
+            result = grant_retry_override(chain=getattr(args, "chain", None))
         except auth_mod.AuthError as exc:
             raise SystemExit(auth_mod.format_auth_error(exc)) from exc
         print("Codex refresh will be retried ONCE on the next request "

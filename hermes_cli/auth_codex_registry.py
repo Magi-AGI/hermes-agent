@@ -104,15 +104,17 @@ class CodexAuthorityBusy(CodexRecoveryFenced):
 
 
 class CodexRefreshIndeterminate(AuthError):
-    def __init__(self, message: Optional[str] = None) -> None:
+    def __init__(self, message: Optional[str] = None, *, chain_id: Optional[str] = None) -> None:
+        selector = f" --chain {chain_id[:12]}" if chain_id else ""
         super().__init__(
             message or (
                 "Couldn't confirm the Codex token refresh (the connection dropped after the request was "
                 "sent). Hermes won't retry automatically. Sign in again with "
                 f"`{_signin_command()}` (a fresh browser or device-code login), or run "
-                f"`{_signin_command()} --retry-refresh` only if you're sure the refresh never "
+                f"`{_signin_command()} --retry-refresh{selector}` only if you're sure the refresh never "
                 "reached OpenAI."),
             provider=PROVIDER, code="codex_refresh_indeterminate", relogin_required=True)
+        self.chain_id = chain_id
 
 
 class CodexRotationPersistFailed(AuthError):
