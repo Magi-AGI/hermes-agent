@@ -153,6 +153,19 @@ class AuthError(RuntimeError):
         self.retryable = retryable
 
 
+class ProfileStoreMissing(AuthError):
+    """A profile's auth store was reached through a path whose directory no longer exists (the
+    profile was renamed or deleted by another process). Transient for the caller: nothing was
+    created, the profile's credentials are wherever the profile now lives."""
+
+    def __init__(self, profile_dir: Any) -> None:
+        super().__init__(
+            f"The Hermes profile at {profile_dir} was moved or deleted; restart Hermes with the "
+            "profile's current name.", code="profile_store_missing", relogin_required=False,
+            retryable=True)
+        self.profile_dir = profile_dir
+
+
 def _provider_error_factory(provider: str) -> Callable[..., AuthError]:
     def factory(message: str, code: Optional[str] = None, *, relogin: bool = False) -> AuthError:
         return AuthError(message, provider=provider, code=code, relogin_required=relogin)

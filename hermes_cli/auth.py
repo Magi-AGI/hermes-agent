@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
 
-from hermes_constants import OPENROUTER_BASE_URL, hermes_home_key, secure_parent_dir
+from hermes_constants import OPENROUTER_BASE_URL, hermes_home_key, named_profile_home, secure_parent_dir
 from agent.credential_persistence import sanitize_borrowed_credential_payload
 from utils import atomic_json_write, atomic_yaml_write, env_float, file_signature, is_truthy_value  # noqa: F401  (env_float: agent.credential_pool reads auth_mod.env_float)
 from hermes_cli.auth_credential_io import (  # noqa: F401  (CredentialWrite*: raised by _save_auth_store)
@@ -106,7 +106,7 @@ from hermes_cli.auth_constants import (  # noqa: F401  re-exported
     XAI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS, QWEN_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
     DEFAULT_SPOTIFY_ACCOUNTS_BASE_URL, DEFAULT_SPOTIFY_API_BASE_URL, SPOTIFY_DOCS_URL,
     DEFAULT_SPOTIFY_SCOPE, SERVICE_PROVIDER_NAMES, LMSTUDIO_NOAUTH_PLACEHOLDER,
-    ACTUAL_LOCAL_NOAUTH_PLACEHOLDER, CODEX_RATE_LIMITED_CODE, AuthError, _nous_err, httpx)
+    ACTUAL_LOCAL_NOAUTH_PLACEHOLDER, CODEX_RATE_LIMITED_CODE, AuthError, ProfileStoreMissing, _nous_err, httpx)
 
 logger = logging.getLogger(__name__)
 
@@ -605,12 +605,14 @@ def _open_lock_file(lock_path: Path, mode: str, deadline: float):
 
 @contextmanager
 def _file_lock(
-    lock_path: Path, holder: threading.local, timeout_seconds: float, timeout_message: str):
+    lock_path: Path, holder: threading.local, timeout_seconds: float, timeout_message: str, *,
+    create_parent: bool = True):
     """Cross-process advisory flock helper, reentrant per-thread via ``holder.depth``.
 
     Falls back to a depth-only guard when neither ``fcntl`` nor ``msvcrt`` is available. Callers
     supply their own ``threading.local`` so independent locks (profile store vs global root vs the
-    shared Nous store) track reentrancy separately."""
+    shared Nous store) track reentrancy separately. ``create_parent=False`` (profile stores) never
+    creates the lock's directory: opening the lock then fails if it is gone."""
     if getattr(holder, "depth", 0) > 0:
         holder.depth += 1
         try:
@@ -619,7 +621,8 @@ def _file_lock(
             holder.depth -= 1
         return
 
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if create_parent:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
     with ExitStack() as stack:
         lock_file = None
         if fcntl is not None or msvcrt is not None:
@@ -664,11 +667,24 @@ def _auth_store_lock(
     reentrancy tracker and kernel lock. Lock ordering invariant: ``_auth_store_lock`` FIRST (outer),
     ``_nous_shared_store_lock`` SECOND (inner), else deadlock against a concurrent shared import."""
     auth_path = target_path if target_path is not None else _auth_file_path()
+    # A PROFILE store whose directory is gone was moved or deleted by another process: a stale
+    # caller must not recreate the old directory by locking it (design r9-3). Root / custom homes
+    # keep creating their directory on first use.
+    profile_dir = named_profile_home(auth_path.parent)
+    is_profile_store = profile_dir is not None and Path(profile_dir) == auth_path.parent
+    if is_profile_store and not auth_path.parent.is_dir():
+        raise ProfileStoreMissing(auth_path.parent)
     # The lock belongs to the store's canonical file: every alias of one store (a profile whose
     # auth.json is a symlink to root's) takes the same kernel lock (store identity, design §1).
-    with _file_lock(
-        canonical_path(auth_path).with_suffix(".lock"), _auth_lock_holder_for(auth_path), timeout_seconds,
-        "Timed out waiting for auth store lock"):
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(_file_lock(
+                canonical_path(auth_path).with_suffix(".lock"), _auth_lock_holder_for(auth_path),
+                timeout_seconds, "Timed out waiting for auth store lock", create_parent=not is_profile_store))
+        except FileNotFoundError:  # removed between the check and the open
+            if is_profile_store and not auth_path.parent.is_dir():
+                raise ProfileStoreMissing(auth_path.parent) from None
+            raise
         yield
 
 
