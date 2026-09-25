@@ -25,10 +25,13 @@ What this runner guarantees, and what it does not:
    identity, identity re-verified at open) are scanned for test markers. A hit fails the run (exit 3);
    any enumeration/stat/read failure, or a file truncated in place, makes the result INCONCLUSIVE
    (exit 4). A clean scan is not proof that nothing was written.
-5. CHECKOUT WRITES: untracked, non-ignored paths that appear in this checkout during the run are
-   listed and fail an otherwise green run (exit 5). Tests run with the checkout as CWD, so a
-   relative or mangled path (a Windows path handed to bash, an unexpanded ``%VAR%``, an empty
-   known-folder lookup) lands here. Editing the tree during a run trips it too.
+5. CHECKOUT WRITES: untracked paths that appear in this checkout during the run are listed and
+   fail an otherwise green run (exit 5). Tests run with the checkout as CWD, so a relative or
+   mangled path (a Windows path handed to bash, an unexpanded ``%VAR%``, an empty known-folder
+   lookup) lands here. Ignored paths count too (collapsed per directory, so a write inside an
+   already-present ignored directory is not seen), except the runner's own caches and durations
+   file; ``.claude/`` is agent tooling state that other sessions write, so it is not counted.
+   Editing the tree during a run trips it too.
 
 Usage: python scripts/run_tests_isolated.py [--timeout SECONDS] [--] [run_tests_parallel.py args]
 """
@@ -45,6 +48,9 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 LEAK_MARKERS = re.compile(r"pytest-of-|hermes_test|hermes-test-home-|isolated-run-")
+_NOT_A_CHECKOUT_WRITE = re.compile(
+    r"^\.claude/|(^|/)(__pycache__|\.pytest_cache|\.pytest-cache|\.ruff_cache|\.mypy_cache)(/|$)"
+    r"|^test_durations\.json$")
 # USERPROFILE / HOME / HOMEDRIVE / HOMEPATH are NOT forwarded: they are pointed into the sandbox, so
 # Path.home() in a test can never reach the real ~/.codex, ~/.claude, ~/.hermes, ... (Magi phase 2b: a
 # test that did not mock the home read the real ~/.codex/auth.json).
@@ -148,14 +154,30 @@ def _scan_appended(before: dict) -> tuple[list[str], list[str]]:
     return hits, problems
 
 
-def _untracked(problems: list[str]) -> set[str] | None:
+def _ls_others(problems: list[str], *flags: str) -> set[str] | None:
     try:
-        out = subprocess.run(["git", "-C", str(REPO), "ls-files", "--others", "--exclude-standard", "-z"],
+        out = subprocess.run(["git", "-C", str(REPO), "ls-files", "--others", "--exclude-standard", *flags, "-z"],
                              capture_output=True, check=True, timeout=120).stdout
     except (OSError, subprocess.SubprocessError) as exc:
         problems.append(f"cannot list untracked files: {exc}")
         return None
     return {p for p in out.decode("utf-8", "replace").split("\0") if p}
+
+
+def _untracked(problems: list[str]) -> set[str] | None:
+    """Untracked paths: non-ignored per file, ignored collapsed per directory (.venv stays one entry)."""
+    files, ignored = _ls_others(problems), _ls_others(problems, "--ignored", "--directory")
+    return None if files is None or ignored is None else files | ignored
+
+
+def _checkout_writes(before: set[str], after: set[str], problems: list[str]) -> list[str]:
+    written = []
+    for path in sorted(after - before):
+        # A new collapsed directory is judged by what is in it (pkg/ holding only __pycache__/).
+        inside = _ls_others(problems, "--ignored", "--", path) if path.endswith("/") else {path}
+        if inside is None or any(not _NOT_A_CHECKOUT_WRITE.search(p) for p in inside):
+            written.append(path)
+    return written
 
 
 class _Job:
@@ -302,7 +324,8 @@ def main() -> int:
         for line in hits[:20]:
             print("  " + line, file=sys.stderr)
         return rc or 3
-    written = sorted(tree_after - tree_before) if tree_before is not None and tree_after is not None else []
+    written = (_checkout_writes(tree_before, tree_after, problems)
+               if tree_before is not None and tree_after is not None else [])
     if written:
         print(f"[isolated-run] CHECKOUT WRITE: {len(written)} new untracked path(s) in {REPO} "
               "(a test wrote into the working tree, or the tree was edited during the run):", file=sys.stderr)

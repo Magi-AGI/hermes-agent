@@ -197,18 +197,27 @@ def test_powershell_under_the_sandbox_env_writes_nothing_into_its_cwd(tmp_path):
 
 
 @pytest.mark.windows_only
-@pytest.mark.parametrize("stray", [False, True], ids=["clean", "writes-into-checkout"])
-def test_a_run_that_writes_into_the_checkout_fails_and_names_the_path(tmp_path, monkeypatch, capsys, stray):
+@pytest.mark.parametrize(("stray", "counts"), [
+    (None, False),
+    ("stray-from-a-test.txt", True),
+    ("stray-from-a-test.db", True),              # matches .gitignore: still a write into the tree
+    (".claude/settings.local.json", False),      # agent tooling state, written by other sessions
+    ("pkg/__pycache__/stray.cpython-311.pyc", False),  # the runner's own kind of output
+], ids=["clean", "untracked", "ignored", "agent-tooling", "bytecode-cache"])
+def test_a_run_that_writes_into_the_checkout_fails_and_names_the_path(tmp_path, monkeypatch, capsys, stray, counts):
     """T5/A7: tests run with the checkout as CWD, so a relative or mangled path lands in the tree."""
     repo = tmp_path / "repo"
     (repo / "scripts").mkdir(parents=True)
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
-    body = "open('stray-from-a-test.txt', 'w').close()\n" if stray else ""
+    body = (f"import os\np = {stray!r}\nos.makedirs(os.path.dirname(p) or '.', exist_ok=True)\n"
+            "open(p, 'w').close()\n") if stray else ""
     (repo / "scripts" / "run_tests_parallel.py").write_text(body, encoding="utf-8")
-    (repo / ".gitignore").write_text("scripts/\n", encoding="utf-8")
+    (repo / ".gitignore").write_text("scripts/\n*.db\n__pycache__/\n", encoding="utf-8")
     monkeypatch.setattr(rti, "REPO", repo)
     monkeypatch.setattr(rti, "LIVE_ROOT", tmp_path / "live")
     monkeypatch.setattr(sys, "argv", ["run_tests_isolated.py", "--timeout", "120"])
     rc = rti.main()
     err = capsys.readouterr().err
-    assert (rc, "stray-from-a-test.txt" in err) == ((5, True) if stray else (0, False))
+    assert (repo / stray).exists() if stray else True
+    assert (rc, "CHECKOUT WRITE" in err, bool(stray) and stray.split("/")[0] in err) == (
+        (5, True, True) if counts else (0, False, False))
