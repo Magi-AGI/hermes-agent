@@ -3,7 +3,8 @@
 Every WS frame used to reach ``server.dispatch`` through ``asyncio.to_thread``: the loop's DEFAULT
 executor, shared with dashboard SQLite reads, skin resolution and disconnect teardown. Once that
 pool was busy, requests from every window waited before they could reach a free lane, including
-the interrupts and approval answers a user sends to unstick a turn. Drives the real ``handle_ws``.
+the interrupts and approval answers a user sends to unstick a turn. Drives the real ``/api/ws`` route
+(its pre-``handle_ws`` prerequisites included) with only the auth gate stubbed.
 """
 
 from __future__ import annotations
@@ -18,6 +19,14 @@ from tui_gateway import ws as ws_mod
 
 
 def test_rpc_and_approval_answers_are_served_while_the_default_executor_is_saturated(monkeypatch):
+    from hermes_cli import mcp_startup
+    from hermes_cli.web_routers import chat_ws
+
+    async def _allowed(_ws):
+        return True
+
+    monkeypatch.setattr(chat_ws, "_close_unless_sidecar_allowed", _allowed)
+    monkeypatch.setattr(mcp_startup, "start_deferred_mcp_discovery_now", lambda: None)
     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0)
     monkeypatch.setattr(server, "resolve_skin", lambda: {})
     monkeypatch.setitem(server._methods, "probe.inline", lambda rid, params: {"jsonrpc": "2.0", "id": rid, "result": {"ok": True}})
@@ -56,7 +65,8 @@ def test_rpc_and_approval_answers_are_served_while_the_default_executor_is_satur
         saturated = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         loop.set_default_executor(saturated)
         blockers = [loop.run_in_executor(None, release.wait, 30) for _ in range(4)]
-        session = asyncio.create_task(ws_mod.handle_ws(FakeWS()))
+        # The real /api/ws route: its connection prerequisites run before handle_ws.
+        session = asyncio.create_task(chat_ws.gateway_ws(FakeWS()))
         deadline = loop.time() + 5
         while loop.time() < deadline and not ({"inline-1", "inline-2"} <= _replies() and answered.is_set()):
             await asyncio.sleep(0.05)

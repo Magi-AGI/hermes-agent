@@ -6,6 +6,7 @@ after accept). Mount as ``@app.websocket("/api/ws") async def ws(ws): await hand
 from __future__ import annotations
 
 import asyncio
+import atexit
 import concurrent.futures
 import contextvars
 import functools
@@ -86,10 +87,19 @@ _TOKEN_COALESCE_S = 0.033
 # answers to the agent's own questions (approval, clarify, ...) get a reserved pool of their own.
 _INGRESS_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=48, thread_name_prefix="tui-ws-ingress")
 _CONTROL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="tui-ws-control")
+atexit.register(lambda: _INGRESS_EXECUTOR.shutdown(wait=False, cancel_futures=True))
+atexit.register(lambda: _CONTROL_EXECUTOR.shutdown(wait=False, cancel_futures=True))
 _CONTROL_METHODS = frozenset({
     "session.interrupt", "approval.respond", "connection.respond", "subagent.interrupt", "subagent.steer",
     "pet.cancel", "wake.stop",
 })
+
+
+async def run_on_ingress(fn, *args: Any) -> Any:
+    """Run a blocking connection prerequisite (before or inside ``handle_ws``) on the ingress pool,
+    never the loop's default executor, with the caller's contextvars (as ``asyncio.to_thread``)."""
+    ctx = contextvars.copy_context()
+    return await asyncio.get_running_loop().run_in_executor(_INGRESS_EXECUTOR, functools.partial(ctx.run, fn, *args))
 
 
 def _ingress_executor(req: Any) -> concurrent.futures.Executor:
@@ -314,7 +324,7 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
         transport = WSTransport(ws, asyncio.get_running_loop(), peer=peer, auth_identity=auth_identity)
         # resolve_skin() is sync I/O + CPU; off the loop so the read loop can drain the frontend's initial RPC
         # burst, and on the ingress pool so a saturated default executor cannot hold the handshake.
-        skin_payload = await asyncio.get_running_loop().run_in_executor(_INGRESS_EXECUTOR, server.resolve_skin)
+        skin_payload = await run_on_ingress(server.resolve_skin)
         # change_events: this backend broadcasts pet/cron/sessions.changed, so clients can demote legacy
         # polls to backstops. replay_epoch lets reconnecting clients detect a backend restart and reset
         # their per-session seq watermarks (event_replay).
