@@ -67,6 +67,13 @@ class CredentialWriteError(OSError):
     """A credential write did not commit (the destination is unchanged)."""
 
 
+class LockAcquisitionTimeout(TimeoutError):
+    """A LOCAL credential lock (store / migration / lifecycle) could not be ACQUIRED within its
+    budget. Raised only at the acquisition boundary, never after work started: it proves nothing
+    was done under that lock, so callers treat it as retryable busy — it is never a verdict on a
+    credential (unlike a timeout of a request already sent)."""
+
+
 class CredentialWriteUncertain(OSError):
     """A credential write may or may not have landed; re-read before deciding anything."""
 

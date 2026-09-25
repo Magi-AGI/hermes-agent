@@ -110,6 +110,15 @@ class CodexAuthorityBusy(CodexRecoveryFenced):
         self.retryable = True
 
 
+class CodexStoreLockBusy(CodexAuthorityBusy):
+    """Transient: the refresh could not acquire its store lock (another process held it). Nothing
+    was sent; the credential's status and cooldown are untouched; a later attempt retries."""
+
+    def __init__(self, detail: str = "") -> None:
+        super().__init__("Another Hermes process is updating this Codex login; it will be retried"
+                         + (f" ({detail})." if detail else "."))
+
+
 class CodexRefreshIndeterminate(AuthError):
     def __init__(self, message: Optional[str] = None, *, chain_id: Optional[str] = None) -> None:
         selector = f" --chain {chain_id[:12]}" if chain_id else ""

@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import logging
 import socket
+import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Tuple
@@ -35,12 +37,12 @@ from hermes_cli.auth_codex_records import (
     ATTEMPT_INDETERMINATE, ATTEMPT_PENDING, ATTEMPT_REJECTED, completed, history_entry, new_attempt,
     read_record, reconcile, write_record)
 from hermes_cli.auth_codex_registry import (
-    OP_UNRECOVERABLE, STATE_FENCED, STATE_RETIRED, CodexAuthorityBusy, CodexRecoveryFenced,
+    OP_UNRECOVERABLE, STATE_FENCED, STATE_RETIRED, CodexAuthorityBusy, CodexRecoveryFenced, CodexStoreLockBusy,
     CodexRefreshIndeterminate, CodexRegistryUnreadable, CodexRotationPersistFailed, NeedsAuthorityRepair,
     RepairRequest, RescueScanIncomplete, new_id, pair_fp, read_registry, store_locks, store_path_of,
     thread_holds_store_lock, unrecorded_legacy_rescues)
 from hermes_cli.auth_constants import AUTH_LOCK_TIMEOUT_SECONDS, AuthError, httpx
-from hermes_cli.auth_credential_io import CredentialWriteUncertain, WriteOutcome, store_key
+from hermes_cli.auth_credential_io import CredentialWriteUncertain, LockAcquisitionTimeout, WriteOutcome, store_key
 
 logger = logging.getLogger("hermes_cli.auth")
 
@@ -101,6 +103,23 @@ def _dispatch_once(round_: int) -> None:
     raise CodexAuthorityBusy()
 
 
+@contextmanager
+def _acquired_or_busy(lock_cm):
+    """Enter *lock_cm*; a :class:`LockAcquisitionTimeout` DURING ACQUISITION becomes
+    :class:`CodexStoreLockBusy`. Anything raised inside the body propagates unchanged."""
+    try:
+        lock_cm.__enter__()
+    except LockAcquisitionTimeout as exc:
+        raise CodexStoreLockBusy(str(exc)) from None
+    try:
+        yield
+    except BaseException:
+        if not lock_cm.__exit__(*sys.exc_info()):
+            raise
+    else:
+        lock_cm.__exit__(None, None, None)
+
+
 def _write_attempt(owner: Path, record: dict, attempt: Optional[dict], *, extra_history=None) -> Optional[str]:
     data = {**record, "attempt": attempt}
     if extra_history:
@@ -146,8 +165,9 @@ def _transaction(row_store: Path, row: str, started: Tuple[str, str], *, force: 
         raise _fenced_error(cid, entry)
     owner = store_path_of(entry["owner"])
 
-    # 2. store locks (owner; plus the borrowing caller's store), L1 order
-    with store_locks({owner, Path(row_store)}, timeout_seconds=timeout):
+    # 2. store locks (owner; plus the borrowing caller's store), L1 order. Failing to ACQUIRE them
+    # is local contention before anything was sent: retryable busy, never a credential verdict.
+    with _acquired_or_busy(store_locks({owner, Path(row_store)}, timeout_seconds=timeout)):
         # 3. revalidate
         again = read_registry()
         entry2 = again.chain(cid) if again.ok else None

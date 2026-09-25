@@ -33,8 +33,8 @@ from agent.credential_persistence import sanitize_borrowed_credential_payload
 from utils import atomic_json_write, atomic_yaml_write, env_float, file_signature, is_truthy_value  # noqa: F401  (env_float: agent.credential_pool reads auth_mod.env_float)
 from hermes_cli.auth_credential_io import (  # noqa: F401  (CredentialWrite*: raised by _save_auth_store)
     CredentialWriteError, CredentialWriteUncertain, Witness, WitnessedStore, WriteOutcome, attach_witness,
-    canonical_path, encode_json, is_contended_error, read_witnessed_bytes, require_committed, store_key, witness_of,
-    write_credential_file)
+    LockAcquisitionTimeout, canonical_path, encode_json, is_contended_error, read_witnessed_bytes,
+    require_committed, store_key, witness_of, write_credential_file)
 from hermes_cli.auth_zai_kimi import (  # noqa: F401  re-exported
     KIMI_CODE_BASE_URL, ZAI_ENDPOINTS, _normalize_lmstudio_runtime_base_url, _resolve_kimi_base_url,
     _resolve_zai_base_url, detect_zai_endpoint)
@@ -643,7 +643,7 @@ def _file_lock(
                     break
                 except (BlockingIOError, OSError, PermissionError):
                     if time.monotonic() >= deadline:
-                        raise TimeoutError(timeout_message)
+                        raise LockAcquisitionTimeout(timeout_message)
                     time.sleep(0.05)
 
         holder.depth = 1
