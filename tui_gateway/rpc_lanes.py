@@ -143,14 +143,16 @@ def _percentiles(values: list[float]) -> dict[str, float]:
 # reads or with minutes-long maintenance/relay work. Sizes are totals for the whole backend.
 RESUME = LaneSpec("resume", workers=4, max_queued=60, auto_retry=True, retry_after_ms=500)
 EXEC = LaneSpec("exec", workers=4, max_queued=16, auto_retry=False, retry_after_ms=1000)
+# Minutes-long model calls (manual /compress, one-shot LLM): never in front of a window's slash command.
+LLM = LaneSpec("llm", workers=4, max_queued=16, auto_retry=False, retry_after_ms=2000)
 CATALOG = LaneSpec("catalog", workers=4, max_queued=32, auto_retry=True, retry_after_ms=750)
 MAINTENANCE = LaneSpec("maintenance", workers=3, max_queued=16, auto_retry=False, retry_after_ms=2000)
 RELAY = LaneSpec("relay", workers=2, max_queued=8, auto_retry=False, retry_after_ms=2000)
 
 _METHOD_LANES: dict[str, LaneSpec] = {
     **dict.fromkeys(("session.resume", "session.branch"), RESUME),
-    **dict.fromkeys(("slash.exec", "command.dispatch", "shell.exec", "cli.exec", "llm.oneshot",
-                     "session.compress"), EXEC),
+    **dict.fromkeys(("slash.exec", "command.dispatch", "shell.exec", "cli.exec"), EXEC),
+    **dict.fromkeys(("session.compress", "llm.oneshot"), LLM),
     # Idempotent reads only: a full lane answers BUSY and the client retries on its own.
     **dict.fromkeys((
         "model.options", "session.list", "session.active_list", "setup.status", "setup.runtime_check",
@@ -170,7 +172,7 @@ def lane_spec_for(method: str) -> LaneSpec:
 
 
 class LaneSet:
-    def __init__(self, specs: tuple[LaneSpec, ...] = (RESUME, EXEC, CATALOG, MAINTENANCE, RELAY)) -> None:
+    def __init__(self, specs: tuple[LaneSpec, ...] = (RESUME, EXEC, LLM, CATALOG, MAINTENANCE, RELAY)) -> None:
         self._lanes = {spec.name: Lane(spec) for spec in specs}
 
     def for_method(self, method: str) -> Lane:

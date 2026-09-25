@@ -32,7 +32,7 @@ def server(monkeypatch):
     methods = dict(mod._methods)
     # Fresh lanes per test: a stuck handler from one test must not occupy the next test's lanes.
     monkeypatch.setattr(mod, "_lanes", LaneSet(), raising=False)
-    for name in ("model.options", "session.resume", "reload.mcp", "session.list"):
+    for name in ("model.options", "session.resume", "reload.mcp", "session.list", "session.compress", "slash.exec"):
         monkeypatch.delitem(mod._contracts.METHODS, name, raising=False)
     release = threading.Event()
     yield mod, release
@@ -168,3 +168,18 @@ def test_concurrent_identical_reads_share_one_computation():
     # Nothing is cached once the shared computation finishes: a later caller computes afresh.
     flight.run("k", compute)
     assert calls["n"] == 2
+
+
+def test_a_window_slash_command_is_served_while_compactions_run(server):
+    mod, release = server
+    transport = _Capture()
+    mod._methods["session.compress"] = _stuck(release)
+    mod._methods["slash.exec"] = lambda rid, params: {"jsonrpc": "2.0", "id": rid, "result": {"output": "ok"}}
+
+    # Several windows run a manual /compress at once; each is a minutes-long model call.
+    _fill(mod, transport, "session.compress", 6)
+
+    assert mod.dispatch({"id": "slash", "method": "slash.exec", "params": {}}, transport) is None
+    frame = transport.wait_for("slash", timeout=5)
+    assert frame is not None and frame["result"] == {"output": "ok"}, (
+        "a slash command waited behind other windows' compactions")
