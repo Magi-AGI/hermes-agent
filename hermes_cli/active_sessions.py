@@ -12,6 +12,7 @@ import logging
 import collections
 import math
 import os
+import threading
 import time
 import uuid
 from contextlib import contextmanager, suppress
@@ -189,12 +190,40 @@ def _lease_paths(
     return home / "runtime" / "active_sessions.json", home / "runtime" / "active_sessions.lock"
 
 
-def _flock(fh, *, lock: bool) -> None:
+# How long a claim/release waits for the registry lock before failing CLOSED. Windows'
+# msvcrt.LK_LOCK gives up after 10 one-second retries: with a dozen windows starting turns at once
+# the holder (starved of the GIL by agent builds) kept the lock past that, and every waiter was
+# refused "could not safely reserve this session" (4090) at the same instant. Threads of one
+# process now queue on a per-file thread lock (no polling among themselves), and the cross-process
+# file lock is polled every 50 ms up to this budget.
+_LOCK_WAIT_S = 30.0
+_LOCK_POLL_S = 0.05
+_THREAD_LOCKS: dict[str, threading.Lock] = {}
+_THREAD_LOCKS_GUARD = threading.Lock()
+
+
+def _thread_lock_for(path: Path) -> threading.Lock:
+    key = os.path.normcase(os.path.abspath(path))
+    with _THREAD_LOCKS_GUARD:
+        return _THREAD_LOCKS.setdefault(key, threading.Lock())
+
+
+def _flock(fh, *, lock: bool, deadline: float | None = None) -> None:
     """Exclusive whole-file lock/unlock on ``fh`` (fcntl on POSIX, msvcrt on Windows)."""
     if os.name == "nt":
         import msvcrt
         fh.seek(0)
-        msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK if lock else msvcrt.LK_UNLCK, 1)
+        if not lock:
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            return
+        while True:
+            try:
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                return
+            except OSError:
+                if deadline is None or time.monotonic() >= deadline:
+                    raise
+                time.sleep(_LOCK_POLL_S)
     else:
         import fcntl
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX if lock else fcntl.LOCK_UN)
@@ -204,24 +233,39 @@ class _FileLock:
     def __init__(self, path: Path):
         self.path = path
         self._fh = None
+        self._thread_lock: threading.Lock | None = None
 
     def __enter__(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._fh = open(self.path, "a+b")
+        deadline = time.monotonic() + _LOCK_WAIT_S
+        thread_lock = _thread_lock_for(self.path)
+        if not thread_lock.acquire(timeout=_LOCK_WAIT_S):
+            raise RuntimeError("active session file lock unavailable")
         try:
-            _flock(self._fh, lock=True)
-        except Exception as exc:
-            self._fh.close()
-            self._fh = None
-            raise RuntimeError("active session file lock unavailable") from exc
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._fh = open(self.path, "a+b")
+            try:
+                _flock(self._fh, lock=True, deadline=deadline)
+            except Exception as exc:
+                self._fh.close()
+                self._fh = None
+                raise RuntimeError("active session file lock unavailable") from exc
+        except BaseException:
+            thread_lock.release()
+            raise
+        self._thread_lock = thread_lock
         return self
 
     def __exit__(self, exc_type, exc, tb):
         fh, self._fh = self._fh, None
-        if fh is not None:
-            with suppress(Exception):
-                _flock(fh, lock=False)
-            fh.close()
+        thread_lock, self._thread_lock = self._thread_lock, None
+        try:
+            if fh is not None:
+                with suppress(Exception):
+                    _flock(fh, lock=False)
+                fh.close()
+        finally:
+            if thread_lock is not None:
+                thread_lock.release()
 
 
 def _read_entries(path: Path, *, strict: bool = False) -> list[dict[str, Any]]:
