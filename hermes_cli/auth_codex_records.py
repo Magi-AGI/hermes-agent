@@ -24,7 +24,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from hermes_cli.auth_codex_registry import RECORDS_DIR_NAME, pair_fp, token_sha, utc_now
 from hermes_cli.auth_credential_io import (
-    WriteResult, encode_json, read_bytes_retrying, read_witnessed_bytes, require_committed, unlink_retrying,
+    WriteResult, canonical_path, encode_json, read_bytes_retrying, read_witnessed_bytes, require_committed, unlink_retrying,
     write_credential_file)
 
 logger = logging.getLogger("hermes_cli.auth")
@@ -34,7 +34,9 @@ ATTEMPT_INDETERMINATE, ATTEMPT_REJECTED = "indeterminate", "rejected"
 
 
 def records_dir(owner_store: Path) -> Path:
-    return Path(owner_store).parent / RECORDS_DIR_NAME
+    """Beside the store's CANONICAL auth.json (store identity, §1): every alias of one store —
+    a profile whose auth.json is a symlink to root's — reads and writes the same records."""
+    return canonical_path(owner_store).parent / RECORDS_DIR_NAME
 
 
 def record_path(owner_store: Path, chain_id: str) -> Path:

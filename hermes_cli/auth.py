@@ -33,7 +33,7 @@ from agent.credential_persistence import sanitize_borrowed_credential_payload
 from utils import atomic_json_write, atomic_yaml_write, env_float, file_signature, is_truthy_value  # noqa: F401  (env_float: agent.credential_pool reads auth_mod.env_float)
 from hermes_cli.auth_credential_io import (  # noqa: F401  (CredentialWrite*: raised by _save_auth_store)
     CredentialWriteError, CredentialWriteUncertain, Witness, WitnessedStore, WriteOutcome, attach_witness,
-    encode_json, is_contended_error, read_witnessed_bytes, require_committed, store_key, witness_of,
+    canonical_path, encode_json, is_contended_error, read_witnessed_bytes, require_committed, store_key, witness_of,
     write_credential_file)
 from hermes_cli.auth_zai_kimi import (  # noqa: F401  re-exported
     KIMI_CODE_BASE_URL, ZAI_ENDPOINTS, _normalize_lmstudio_runtime_base_url, _resolve_kimi_base_url,
@@ -664,8 +664,10 @@ def _auth_store_lock(
     reentrancy tracker and kernel lock. Lock ordering invariant: ``_auth_store_lock`` FIRST (outer),
     ``_nous_shared_store_lock`` SECOND (inner), else deadlock against a concurrent shared import."""
     auth_path = target_path if target_path is not None else _auth_file_path()
+    # The lock belongs to the store's canonical file: every alias of one store (a profile whose
+    # auth.json is a symlink to root's) takes the same kernel lock (store identity, design §1).
     with _file_lock(
-        auth_path.with_suffix(".lock"), _auth_lock_holder_for(auth_path), timeout_seconds,
+        canonical_path(auth_path).with_suffix(".lock"), _auth_lock_holder_for(auth_path), timeout_seconds,
         "Timed out waiting for auth store lock"):
         yield
 
