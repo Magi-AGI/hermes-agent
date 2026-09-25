@@ -31,6 +31,15 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _probe_rootdir(tmp_path: Path) -> None:
+    """Root the nested pytest at the probe tree. Otherwise it takes the repo's pyproject.toml as
+    rootdir, and a probe outside the repo is collected through every parent directory, TEMP
+    included, where another run's temp dir vanishing mid-listing failed collection with
+    FileNotFoundError."""
+    (tmp_path / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+
+
 # Both tests share the same handoff file: the leaker writes here, the
 # verifier reads here. We park it in $TMPDIR with a unique-per-run name
 # so concurrent invocations of the suite don't clobber each other.
