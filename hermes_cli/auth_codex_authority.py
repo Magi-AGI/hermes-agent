@@ -94,14 +94,17 @@ def dispatch_locked() -> str:
     return "done"
 
 
-# A request that finds the registry absent / an unfinished op waits this long for the process
-# that is recovering (one attempt), then gets the transient "updating your Codex login" error.
+# A request that finds the registry absent / an unfinished op waits at most this long to ACQUIRE
+# the migration lock (one attempt) — i.e. for another process that is recovering to finish — and
+# otherwise gets the transient "updating your Codex login" error. It bounds the lock wait only: a
+# request that gets the lock runs the dispatch pass itself (bootstrap / roll-forward) to completion.
 REQUEST_DISPATCH_BUDGET_SECONDS = 5.0
 
 
 def authority_dispatch(*, read_only: bool = False, budget_seconds: float = 0.0) -> str:
-    """One bounded pass (§6). Returns ``skipped`` (read-only), ``busy`` (lock taken elsewhere, or
-    this thread holds a store lock), ``unreadable``, ``idle``, ``bootstrapped`` or ``done``."""
+    """One pass (§6); ``budget_seconds`` bounds the migration-lock acquisition, not the pass.
+    Returns ``skipped`` (read-only), ``busy`` (lock not acquired within the budget, or this thread
+    holds a store lock), ``unreadable``, ``idle``, ``bootstrapped``, ``done`` or ``failed``."""
     if read_only:
         return "skipped"
     with try_migration_lock(budget_seconds) as acquired:
