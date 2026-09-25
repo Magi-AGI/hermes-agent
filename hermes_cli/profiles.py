@@ -1519,7 +1519,8 @@ def delete_profile(name: str, yes: bool = False) -> Path:
     if canon == "default":
         raise ValueError("Cannot delete the default profile (~/.hermes).\nTo remove everything, use: hermes uninstall")
     canon, profile_dir = _existing_profile_dir(canon)
-    _refuse_codex_owner_store(profile_dir, "deleting the profile")
+    with _codex_owner_exclusion(profile_dir, "deleting the profile"):
+        pass  # early refusal, before the prompt; re-checked (and held) after the confirmation
     gw_running = _check_gateway_running(profile_dir)
     wrapper_path = _get_wrapper_dir() / canon
     has_wrapper = wrapper_path.exists()
@@ -1534,7 +1535,12 @@ def delete_profile(name: str, yes: bool = False) -> Path:
         if confirm != canon:
             print("Cancelled.")
             return profile_dir
+    with _codex_owner_exclusion(profile_dir, "deleting the profile"):
+        return _delete_confirmed_profile(canon, profile_dir, gw_running, wrapper_path, has_wrapper)
 
+
+def _delete_confirmed_profile(canon: str, profile_dir: Path, gw_running: bool, wrapper_path: Path,
+                              has_wrapper: bool) -> Path:
     # 1. Disable service (prevents auto-restart); drop the s6 slot on container (host no-op).
     _cleanup_gateway_service(canon, profile_dir)
     _maybe_unregister_gateway_service(canon)
@@ -2063,13 +2069,16 @@ def _record_profile_rename(new_dir: Path, old_canon: str) -> None:
         logger.debug("profile rename: could not record previous name %r in %s: %s", old_canon, new_dir, exc)
 
 
-def _refuse_codex_owner_store(profile_dir: Path, action: str) -> None:
+@contextlib.contextmanager
+def _codex_owner_exclusion(profile_dir: Path, action: str):
     """Credential recovery protocol stage 1 (RULE-P1): a profile whose store owns a Codex chain or
-    holds registered Codex rows cannot be moved or deleted until profile lifecycle ops exist."""
-    from hermes_cli.auth_codex_authority import refuse_if_registered_store
+    holds registered Codex rows cannot be moved or deleted until profile lifecycle ops exist. The
+    check runs under the migration lock, held for the body (``owner_store_exclusion``)."""
+    from hermes_cli.auth_codex_authority import owner_store_exclusion
     from hermes_cli.auth_codex_registry import CodexAuthorityRefused
     try:
-        refuse_if_registered_store(profile_dir / "auth.json", action)
+        with owner_store_exclusion(profile_dir / "auth.json", action):
+            yield
     except CodexAuthorityRefused as exc:
         raise ValueError(str(exc)) from exc
 
@@ -2094,8 +2103,11 @@ def rename_profile(old_name: str, new_name: str) -> Path:
         raise _unknown_profile_error(old_canon)
     if new_dir.exists():
         raise _profile_exists_error(new_canon)
-    _refuse_codex_owner_store(old_dir, "renaming the profile")
+    with _codex_owner_exclusion(old_dir, "renaming the profile"):
+        return _rename_checked_profile(old_canon, new_canon, old_dir, new_dir)
 
+
+def _rename_checked_profile(old_canon: str, new_canon: str, old_dir: Path, new_dir: Path) -> Path:
     # 1. Stop gateway if running
     if _check_gateway_running(old_dir):
         _cleanup_gateway_service(old_canon, old_dir)

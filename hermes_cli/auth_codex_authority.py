@@ -16,8 +16,9 @@ holds an auth-store lock; the dispatcher checks and returns ``"busy"`` instead.
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from hermes_cli import auth_codex_rows as rows_mod
 from hermes_cli.auth_codex_ops import recover_ops, record_legacy_rescues, run_op
@@ -354,6 +355,16 @@ def refuse_if_registered_store(store: Path, action: str) -> None:
         if entry.get("owner") == key or any(r.get("store") == key for r in entry.get("rows", ())):
             raise CodexAuthorityRefused(
                 f"This profile holds your Codex login; {action} isn't supported for it yet.")
+
+
+@contextmanager
+def owner_store_exclusion(store: Path, action: str) -> Iterator[None]:
+    """RULE-P1 for a profile move/delete/restore: the check runs under the migration lock, which is
+    then HELD through the caller's filesystem operation. Every sign-in / import / bootstrap takes
+    that lock first, so none can register a login in *store* between the check and the move."""
+    with migration_lock():
+        refuse_if_registered_store(store, action)
+        yield
 
 
 def report() -> Dict[str, Any]:
