@@ -20,6 +20,11 @@ TITLE_SOURCE_DERIVED = "derived"
 TITLE_SOURCE_LLM = "llm"
 TITLE_SOURCE_USER = "user"
 
+# A deliberate invalidation of the stored system prompt (model, provider or billing route changed, so
+# its footer would lie) stores '' with no hash; NULL stays "never stored". Readers treat both as
+# absent; the restore path uses the difference to tell a planned rebuild from a lost write.
+INVALIDATE_SYSTEM_PROMPT_SQL = "system_prompt = '', system_prompt_hash = NULL"
+
 
 # Session preview = head of the first user message (shown when a session has no title).  A /skill invocation
 # embeds the whole skill body, so scaffolded rows take a wider excerpt (whole message under budget, else head +

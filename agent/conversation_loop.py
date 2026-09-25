@@ -649,6 +649,8 @@ def _persist_system_prompt(agent, failure_message: str, *, persist_tools: bool =
         return
     try:
         agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
+        from agent.system_prompt import note_system_prompt_persisted
+        note_system_prompt_persisted(agent.session_id)
         if persist_tools:
             from tools.mcp_tool_agent import persist_agent_tool_names
             persist_agent_tool_names(agent)
@@ -684,7 +686,13 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
             session_row = agent._session_db.get_session(agent.session_id)
             if session_row is not None:
                 raw_prompt = session_row.get("system_prompt")
-                stored_state = "null" if raw_prompt is None else ("empty" if raw_prompt == "" else "present")
+                if raw_prompt is None:
+                    stored_state = "null"
+                elif raw_prompt == "":
+                    # '' with no hash is a deliberate invalidation (INVALIDATE_SYSTEM_PROMPT_SQL).
+                    stored_state = "invalidated" if session_row.get("system_prompt_hash") is None else "empty"
+                else:
+                    stored_state = "present"
                 stored_prompt = raw_prompt or None
         except Exception as exc:
             logger.warning(
@@ -761,15 +769,25 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
             agent.session_id, getattr(agent, "model", "") or "", getattr(agent, "provider", "") or "",
         )
 
-    if conversation_history and stored_state in ("null", "empty"):
-        # Continuing session with an unusable stored prompt: every turn now rebuilds
-        # and the prefix cache misses every time.
-        logger.warning(
-            "Stored system prompt for session %s is %s; rebuilding from scratch this turn. Prefix "
-            "cache will miss until the rebuild persists. Investigate the previous turn's "
-            "update_system_prompt write path.",
-            agent.session_id, stored_state,
-        )
+    if conversation_history and stored_state == "invalidated":
+        logger.info(
+            "Stored system prompt for session %s was invalidated by a model, provider or billing-route "
+            "change; rebuilding it this turn (one prefix-cache miss).", agent.session_id)
+    elif conversation_history and stored_state in ("null", "empty"):
+        from agent.system_prompt import system_prompt_persisted_here
+        if system_prompt_persisted_here(agent.session_id):
+            # This process wrote the prompt and it is gone: every turn would now rebuild and
+            # miss the prefix cache.
+            logger.warning(
+                "Stored system prompt for session %s is %s although this process persisted it "
+                "earlier; rebuilding from scratch this turn. Prefix cache will miss until the rebuild "
+                "persists. Investigate the update_system_prompt write path and what cleared the row.",
+                agent.session_id, stored_state,
+            )
+        else:
+            logger.info(
+                "Session %s has no stored system prompt yet (%s: a first turn in a pre-created row, "
+                "or a row this process never wrote); building it this turn.", agent.session_id, stored_state)
 
     # First turn of a new session (or recovering from a broken stored prompt).
     agent._cached_system_prompt = agent._build_system_prompt(system_message)

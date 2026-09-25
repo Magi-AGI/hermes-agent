@@ -16,7 +16,7 @@ from agent.session_activity import (
 )
 from hermes_startup_watchdog import report_startup_progress
 from hermes_state_common import (
-    _LISTABLE_CHILD_SQL, _PREVIEW_ELIGIBLE_SQL, _PREVIEW_RAW_SELECT, _RECOVERABLE_END_REASONS,
+    INVALIDATE_SYSTEM_PROMPT_SQL, _LISTABLE_CHILD_SQL, _PREVIEW_ELIGIBLE_SQL, _PREVIEW_RAW_SELECT, _RECOVERABLE_END_REASONS,
     _RECOVERABLE_END_REASONS_SQL, _RESET_CHILD_SQL, _RESET_END_REASONS, _legacy_reset_child_sql, _shape_preview,
     _sql_json_extract, _sql_session_last_active, _sql_session_last_active_by_id, escape_like as _escape_like,
     _SQL_IN_CHUNK, _id_chunks, _placeholders as _session_ids_placeholders,
@@ -687,7 +687,7 @@ class SessionSessionsMixin:
             patch["provider"] = provider
         self._write_model_config_patch(
             session_id, patch, "UPDATE sessions SET model = ?, model_config = ?, "
-            "system_prompt = NULL, system_prompt_hash = NULL WHERE id = ?",
+            f"{INVALIDATE_SYSTEM_PROMPT_SQL} WHERE id = ?",
             lambda merged: (model, merged, session_id),
         )
 
@@ -754,8 +754,7 @@ class SessionSessionsMixin:
             """UPDATE sessions SET
                    model_config = ?,
                    model = COALESCE(?, model),
-                   system_prompt = NULL,
-                   system_prompt_hash = NULL
+                   """ + INVALIDATE_SYSTEM_PROMPT_SQL + """
                    WHERE id = ?""",
             lambda merged: (merged, model, session_id),
         )

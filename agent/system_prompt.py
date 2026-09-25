@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -815,3 +816,26 @@ def __getattr__(name):  # PEP 562 — lazy so no import cycles
     warn_once(__name__, name, *target)
     return getattr(importlib.import_module(target[0]), target[1])
 # ---- END PLUGIN-COMPAT ----
+
+
+# Sessions whose system prompt this process has persisted (bounded LRU). A later restore that finds
+# that row's prompt missing is a genuinely lost write; a prompt never persisted here (first turn in
+# a pre-created row, a row another process owns) is not.
+_PERSISTED_PROMPT_SESSIONS_MAX = 4096
+_persisted_prompt_sessions: "dict[str, None]" = {}
+_persisted_prompt_lock = threading.Lock()
+
+
+def note_system_prompt_persisted(session_id) -> None:
+    if not session_id:
+        return
+    with _persisted_prompt_lock:
+        _persisted_prompt_sessions.pop(session_id, None)
+        _persisted_prompt_sessions[session_id] = None
+        while len(_persisted_prompt_sessions) > _PERSISTED_PROMPT_SESSIONS_MAX:
+            del _persisted_prompt_sessions[next(iter(_persisted_prompt_sessions))]
+
+
+def system_prompt_persisted_here(session_id) -> bool:
+    with _persisted_prompt_lock:
+        return session_id in _persisted_prompt_sessions

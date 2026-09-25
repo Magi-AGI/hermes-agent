@@ -11,6 +11,8 @@ import time
 import weakref
 from typing import Any, Dict, List, Optional, Tuple
 
+from hermes_state_common import INVALIDATE_SYSTEM_PROMPT_SQL
+
 # caplog tests pin the "hermes_state" logger name.
 logger = logging.getLogger("hermes_state")
 
@@ -99,8 +101,7 @@ class SessionUsageMixin:
                    billing_provider = ?,
                    billing_base_url = ?,
                    billing_mode = COALESCE(?, billing_mode),
-                   system_prompt = NULL,
-                   system_prompt_hash = NULL
+                   """ + INVALIDATE_SYSTEM_PROMPT_SQL + """
                    WHERE id = ?""", (provider, base_url, billing_mode, session_id))
             self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)

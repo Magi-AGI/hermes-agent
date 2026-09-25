@@ -597,12 +597,14 @@ class TestPerResponseSessionWritePath:
             db.append_message(session_id=session_id, role="user", content="hi")
 
             with caplog.at_level(
-                logging.WARNING, logger="agent.conversation_loop"
+                logging.INFO, logger="agent.conversation_loop"
             ):
                 _restore_or_build_system_prompt(
                     self._agent(db, session_id), None, history
                 )
-            assert "is null" in caplog.text
+            # Logged, but not as a lost write: nothing had been written yet.
+            assert "no stored system prompt yet" in caplog.text
+            assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
             caplog.clear()
             second = self._agent(db, session_id)
@@ -614,6 +616,55 @@ class TestPerResponseSessionWritePath:
             assert second._cached_system_prompt == "GROUP_PROMPT"
             second._build_system_prompt.assert_not_called()
             assert "is null" not in caplog.text
+
+
+class TestPromptNullSignal:
+    """The restore-time "stored prompt is null" signal names its cause (gate item G9).
+
+    It used to be one WARNING telling operators to investigate the write path, but a model,
+    provider or billing-route change nulls the row on purpose and a pre-created row has never
+    held a prompt: neither is a lost write. Only a prompt this process persisted and then
+    finds gone still warns.
+    """
+
+    HISTORY = [{"role": "user", "content": "hi"}]
+
+    def _restore(self, db, session_id, caplog, prompt="BUILT"):
+        agent = _make_agent(session_db=db, prebuilt_prompt=prompt)
+        agent.session_id = session_id
+        with caplog.at_level(logging.INFO, logger="agent.conversation_loop"):
+            _restore_or_build_system_prompt(agent, None, self.HISTORY)
+        return agent
+
+    @staticmethod
+    def _warnings(caplog):
+        return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_a_model_switch_rebuild_is_reported_as_planned(self, tmp_path, caplog):
+        from hermes_state import SessionDB
+
+        with SessionDB(db_path=tmp_path / "state.db") as db:
+            db.create_session("s-switch", source="cli")
+            self._restore(db, "s-switch", caplog)
+            db.update_session_model("s-switch", "other-model", provider="openrouter")
+            caplog.clear()
+            self._restore(db, "s-switch", caplog, prompt="REBUILT")
+            assert db.get_session("s-switch")["system_prompt"] == "REBUILT"
+        assert self._warnings(caplog) == []
+        assert "invalidated by a model, provider or billing-route change" in caplog.text
+
+    def test_a_prompt_this_process_persisted_and_then_lost_still_warns(self, tmp_path, caplog):
+        from hermes_state import SessionDB
+
+        with SessionDB(db_path=tmp_path / "state.db") as db:
+            db.create_session("s-lost", source="cli")
+            self._restore(db, "s-lost", caplog)
+            db._execute_write(lambda conn: conn.execute(
+                "UPDATE sessions SET system_prompt = NULL, system_prompt_hash = NULL WHERE id = ?",
+                ("s-lost",)))
+            caplog.clear()
+            self._restore(db, "s-lost", caplog)
+        assert any("although this process persisted it" in m for m in self._warnings(caplog))
 
 
 if __name__ == "__main__":
