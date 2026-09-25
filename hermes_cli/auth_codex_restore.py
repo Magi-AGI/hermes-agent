@@ -140,18 +140,60 @@ def _has_codex_material(load: Callable[[], bytes]) -> bool:
     return any(any(rows_mod.row_tokens(store, row)) for row in rows_mod.codex_rows(store))
 
 
-def _existing_codex_material(dest: Path) -> bool:
-    if not dest.exists():
-        return False
-    return _has_codex_material(lambda: dest.read_bytes())
+# Files whose presence makes a directory an INDEPENDENT Hermes authority (its own registry, lock,
+# evidence, barrier, ops or profiles): never part of the enclosing root's managed locations.
+_INDEPENDENT_ROOT_MARKERS = (REGISTRY_NAME, MIGRATION_LOCK_NAME, "auth.chains.retired.json", RESTORE_BARRIER_NAME,
+                             OPS_DIR_NAME, "profiles")
 
 
-def _inside_protected_root(dest: Path) -> bool:
-    """*dest* (resolved) lies inside the Hermes root whose authority this restore holds."""
+def _is_independent_root(directory: Path) -> bool:
+    for marker in _INDEPENDENT_ROOT_MARKERS:
+        try:
+            if os.path.lexists(directory / marker):
+                return True
+        except OSError:
+            return True  # cannot tell: treat as independent (refuse)
+    return False
+
+
+def _managed_kind(dest: Path) -> Optional[str]:
+    """``store`` / ``protocol`` when *dest* (resolved) is one of the PROTECTED authority's own managed
+    credential locations, else None. The authority's locations are its root's auth.json and protocol
+    files, and each profile store ``profiles/<id>/auth.json`` with its records and rescue file — a
+    profile directory that carries its own authority markers is an independent root, not a store of
+    this one. Membership is decided by this structure, never by directory containment."""
     from hermes_cli.auth_codex_registry import root_home
-    root = _norm(str(canonical_path(root_home())))
-    here = _norm(str(dest))
-    return here == root or here.startswith(root.rstrip(os.sep) + os.sep)
+    from hermes_constants import PROFILE_ID_RE
+    root = canonical_path(root_home())
+    root_parts = [_norm(p) for p in root.parts]
+    parts = [_norm(p) for p in dest.parts]
+    if parts[:len(root_parts)] != root_parts:
+        return None
+    rel = list(dest.parts[len(root_parts):])
+    norm_rel = parts[len(root_parts):]
+    if not rel:
+        return None
+
+    def classify_in(base_rel, allow_registry):
+        if base_rel == [_norm(AUTH_STORE_NAME)]:
+            return "store"
+        if len(base_rel) >= 2 and base_rel[0] == _norm(RECORDS_DIR_NAME):
+            return "protocol"
+        if base_rel == [_norm(LEGACY_RESCUE_NAME)]:
+            return "protocol"
+        if allow_registry:
+            if len(base_rel) >= 2 and base_rel[0] == _norm(OPS_DIR_NAME):
+                return "protocol"
+            if len(base_rel) == 1 and any(base_rel[0] == _norm(n) or base_rel[0].startswith(_norm(f"{n}."))
+                                          for n in _names()):
+                return "protocol"
+        return None
+
+    if norm_rel[0] == _norm("profiles"):
+        if len(rel) < 3 or not PROFILE_ID_RE.match(rel[1]) or _is_independent_root(root / rel[0] / rel[1]):
+            return None
+        return classify_in(norm_rel[2:], allow_registry=False)
+    return classify_in(norm_rel, allow_registry=True)
 
 
 def check_restore(targets: Iterable[Tuple[Path, Callable[[], bytes]]], action: str) -> None:
@@ -164,10 +206,10 @@ def check_restore(targets: Iterable[Tuple[Path, Callable[[], bytes]]], action: s
         if kind is None:
             continue
         target = _destination(Path(target))
-        if not _inside_protected_root(target) and (
-                kind == "protocol" or _has_codex_material(load) or _existing_codex_material(target)):
-            # The state check, lock, barrier and fence below protect THIS root only: Codex state
-            # bound for (or already in) another Hermes root would land there unprotected.
+        if _managed_kind(target) is None:
+            # The state check, lock, barrier and fence below protect THIS authority only: a
+            # credential store or protocol file anywhere else — another root, an independent root
+            # nested in this one, an unmanaged path — would land there unprotected.
             raise CodexAuthorityRefused(
                 f"The backup would write Hermes credentials outside this installation ({target}); "
                 f"{action} isn't supported for them.")

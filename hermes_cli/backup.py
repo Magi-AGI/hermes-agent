@@ -1389,11 +1389,13 @@ def restore_quick_snapshot(snapshot_id: str, hermes_home: Optional[Path] = None)
     snap_res, home_res = snap_dir.resolve(), home.resolve()
     # Codex credential state (auth.json and the authority's files) is never rolled back (credential
     # recovery protocol, stage 1): checked and written under the migration lock.
-    from hermes_cli.auth_codex_registry import CodexAuthorityRefused
+    from hermes_cli.auth_codex_registry import CodexAuthorityRefused, authority_scope
     from hermes_cli.auth_codex_restore import restore_guard
     targets = [(home / rel, (lambda r=rel: (snap_dir / r).read_bytes())) for rel in meta.get("files", {})]
     try:
-        with restore_guard(lambda: targets, "restoring it from a snapshot"):
+        # The guard runs under the authority that owns THIS home (its migration lock held from the
+        # check through the writes, its barrier and fence), whichever home the process runs in.
+        with authority_scope(home), restore_guard(lambda: targets, "restoring it from a snapshot"):
             restored = _restore_quick_snapshot_files(meta, snap_dir, home, snap_res, home_res)
     except CodexAuthorityRefused as exc:
         logger.error("%s", exc)

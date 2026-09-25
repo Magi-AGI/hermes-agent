@@ -115,3 +115,36 @@ def recover(tmp: Path, userhome: Path, *, budget: float = 5.0, refresh: bool = T
         raise AssertionError(f"recoverer failed: {err[-2000:]}") from exc
     result["presented"] = presented.read_text(encoding="utf-8").split() if presented.exists() else []
     return result
+
+
+# A quick-snapshot restore into an EXPLICIT hermes_home that pauses at a file barrier right after
+# the guard validated, before the first file is written.
+SNAPSHOT_RESTORER = r'''
+import sys, time
+from pathlib import Path
+snapshot_id, home, ready, gate = sys.argv[1:5]
+from hermes_cli import backup
+real = backup._restore_quick_snapshot_files
+def paused(*a, **k):
+    Path(ready).write_text("ready")
+    while not Path(gate).exists():
+        time.sleep(0.05)
+    return real(*a, **k)
+backup._restore_quick_snapshot_files = paused
+print("RESTORED" if backup.restore_quick_snapshot(snapshot_id, hermes_home=Path(home)) else "REFUSED")
+'''
+
+# A fresh Codex sign-in into whatever HERMES_HOME the child runs under.
+SIGNER = r'''
+import sys
+import hermes_cli.auth as auth
+auth._save_codex_tokens({"access_token": sys.argv[1], "refresh_token": sys.argv[2]})
+print("SIGNED-IN")
+'''
+
+
+def spawn_in(code: str, args, userhome: Path, hermes_home: Path) -> subprocess.Popen:
+    env = child_env(userhome)
+    env["HERMES_HOME"] = str(hermes_home)
+    return subprocess.Popen([sys.executable, "-c", code, *map(str, args)], cwd=str(REPO), env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

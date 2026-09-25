@@ -15,6 +15,7 @@ at most one chain). ``owner`` is the one store allowed to refresh it (RULE-G1).
 
 from __future__ import annotations
 
+import contextvars
 import errno
 import hashlib
 import json
@@ -170,7 +171,36 @@ class NeedsAuthorityRepair(Exception):
 
 # ── Paths and identity ─────────────────────────────────────────────────────────────────────────
 
+# The authority a protocol pass acts for: None = this process's own root (HERMES_HOME); set by
+# authority_scope() for an operation on ANOTHER home (an explicit quick-snapshot restore).
+_authority: "contextvars.ContextVar[Optional[Tuple[Path, Path]]]" = contextvars.ContextVar(
+    "codex_authority", default=None)
+
+
+def authority_root_for(home: Path) -> Path:
+    """The Hermes root that owns *home*: ``<root>/profiles/<name>`` -> ``<root>``, else *home*."""
+    from hermes_constants import named_profile_home
+    home = Path(home)
+    named = named_profile_home(home)
+    return home.parent.parent if named is not None and Path(named) == home else home
+
+
+@contextmanager
+def authority_scope(home: Path) -> Iterator[Path]:
+    """Run protocol code (registry, locks, barrier, fence, store enumeration) for the authority that
+    owns *home* instead of the process's own root. Yields that root."""
+    root = authority_root_for(home)
+    token = _authority.set((root, Path(home) / "auth.json"))
+    try:
+        yield root
+    finally:
+        _authority.reset(token)
+
+
 def root_home() -> Path:
+    scoped = _authority.get()
+    if scoped is not None:
+        return scoped[0]
     from hermes_constants import get_default_hermes_root
     return get_default_hermes_root()
 
@@ -180,8 +210,18 @@ def root_store_path() -> Path:
 
 
 def active_store_path() -> Path:
+    scoped = _authority.get()
+    if scoped is not None:
+        return scoped[1]
     from hermes_cli.auth import _auth_file_path
     return _auth_file_path()
+
+
+def profiles_root() -> Path:
+    if _authority.get() is not None:
+        return root_home() / "profiles"
+    from hermes_cli.profiles import _get_profiles_root
+    return _get_profiles_root()
 
 
 def registry_path() -> Path:
@@ -221,8 +261,14 @@ def all_store_paths() -> List[Path]:
         return list(cache["__all_store_paths__"])
     paths = [root_store_path(), active_store_path()]
     try:
-        from hermes_cli.profiles import _iter_named_profile_dirs
-        paths.extend(d / "auth.json" for d in _iter_named_profile_dirs() if (d / "auth.json").exists())
+        if _authority.get() is not None:  # another home's authority: its own profiles/ directory
+            directory = profiles_root()
+            profile_dirs = sorted(p for p in directory.iterdir() if p.is_dir() and not p.name.startswith(".")) \
+                if directory.is_dir() else []
+        else:
+            from hermes_cli.profiles import _iter_named_profile_dirs
+            profile_dirs = _iter_named_profile_dirs()
+        paths.extend(d / "auth.json" for d in profile_dirs if (d / "auth.json").exists())
     except Exception:
         logger.debug("codex authority: profile enumeration failed", exc_info=True)
     seen, unique = set(), []
@@ -512,17 +558,16 @@ def rescue_locations() -> List[Tuple[Path, Path]]:
     fences); a store whose link status, or a profiles directory whose listing, cannot be read
     raises :class:`RescueScanIncomplete`."""
     from hermes_cli.auth_credential_io import canonical_path
-    from hermes_cli.profiles import _get_profiles_root
     stores = [root_store_path(), active_store_path()]
-    profiles_root = _get_profiles_root()
+    directory = profiles_root()
     try:
-        with os.scandir(profiles_root) as entries:
+        with os.scandir(directory) as entries:
             for entry in entries:
                 if not entry.name.startswith(".") and entry.is_dir():
                     stores.append(Path(entry.path) / "auth.json")
     except OSError as exc:
         if not _missing(exc):
-            raise RescueScanIncomplete(exc.errno, f"cannot list {profiles_root}: {exc}") from exc
+            raise RescueScanIncomplete(exc.errno, f"cannot list {directory}: {exc}") from exc
     seen, out = set(), []
     for store in stores:
         candidates = [legacy_rescue_path(store)]
