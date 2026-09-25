@@ -308,6 +308,12 @@ export class JsonRpcRequestChannel {
         }
 
         await abortableDelay(delay, signal)
+
+        // Re-check after the backoff: a reconnect or the caller's deadline may have come meanwhile,
+        // and neither may turn into one more attempt.
+        if (this.transport !== transport || Date.now() >= deadline) {
+          throw error
+        }
       }
     }
   }

@@ -378,4 +378,56 @@ describe('JsonRpcRequestChannel backend-busy retry', () => {
       vi.useRealTimers()
     }
   })
+
+  it('never sends the retry on a transport attached during the backoff', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(Math, 'random').mockReturnValue(0.5)
+
+    try {
+      const channel = new JsonRpcRequestChannel()
+      const first = spyTransport()
+      channel.attach(first.transport)
+
+      const options = channel.request('model.options', {}, 10_000)
+      channel.handleFrame(busy(first.last().id, 'auto'))
+      const outcome = options.catch((e: unknown) => e)
+      // The reconnect lands while the retry is waiting out its delay.
+      await vi.advanceTimersByTimeAsync(10)
+      const replacement = spyTransport()
+      channel.attach(replacement.transport)
+      await vi.advanceTimersByTimeAsync(500)
+
+      expect(replacement.sent).toHaveLength(0)
+      expect(((await outcome) as JsonRpcGatewayError).code).toBe(JSON_RPC_BACKEND_BUSY)
+    } finally {
+      vi.restoreAllMocks()
+      vi.useRealTimers()
+    }
+  })
+
+  it('never sends the retry once the caller deadline passed during the backoff', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(Math, 'random').mockReturnValue(0.5)
+
+    try {
+      const channel = new JsonRpcRequestChannel()
+      const { sent, transport, last } = spyTransport()
+      channel.attach(transport)
+
+      // 100 ms backoff fits the 200 ms budget when it starts...
+      const options = channel.request('model.options', {}, 200)
+      channel.handleFrame(busy(last().id, 'auto'))
+      const outcome = options.catch((e: unknown) => e)
+      await vi.advanceTimersByTimeAsync(0)
+      // ...but the process stalls (or sleeps) past the deadline before the timer fires.
+      vi.setSystemTime(Date.now() + 1_000)
+      await vi.advanceTimersByTimeAsync(200)
+
+      expect(sent).toHaveLength(1)
+      expect(((await outcome) as JsonRpcGatewayError).code).toBe(JSON_RPC_BACKEND_BUSY)
+    } finally {
+      vi.restoreAllMocks()
+      vi.useRealTimers()
+    }
+  })
 })
