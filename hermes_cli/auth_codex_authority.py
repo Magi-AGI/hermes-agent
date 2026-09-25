@@ -69,9 +69,12 @@ def _codex_material_present(paths: Iterable[Path]) -> bool:
     """Any Codex row or legacy rescue file anywhere (an ABSENT registry with neither is trivially
     consistent: nothing to govern, so nothing is written until the first Codex sign-in)."""
     from hermes_cli.auth import _load_auth_store
-    from hermes_cli.auth_codex_registry import rescue_locations
-    if any(rescue.exists() for rescue, _store in rescue_locations()):
-        return True
+    from hermes_cli.auth_codex_registry import RescueScanIncomplete, rescue_locations
+    try:
+        if rescue_locations():
+            return True
+    except RescueScanIncomplete:
+        return True  # cannot tell: let the bootstrap (which fails closed) surface it
     for path in paths:
         try:
             if path.exists() and rows_mod.codex_rows(_load_auth_store(path)):

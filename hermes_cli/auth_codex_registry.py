@@ -15,10 +15,12 @@ at most one chain). ``owner`` is the one store allowed to refresh it (RULE-G1).
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import logging
 import os
+import stat
 import threading
 import time
 import uuid
@@ -474,6 +476,26 @@ def legacy_rescue_path(store: Path) -> Path:
     return Path(store).parent / LEGACY_RESCUE_NAME
 
 
+class RescueScanIncomplete(OSError):
+    """A rescue location could not be CHECKED (an access / I/O error, not a missing path). The
+    evidence may exist, so nothing may treat it as absent: refresh admission refuses (§7)."""
+
+
+def _missing(exc: OSError) -> bool:
+    return isinstance(exc, (FileNotFoundError, NotADirectoryError)) or exc.errno in (errno.ENOENT, errno.ENOTDIR)
+
+
+def _lstat_or_none(path: Path, what: str):
+    """``os.lstat`` result, None when the path genuinely does not exist; any other failure raises
+    :class:`RescueScanIncomplete` (fail closed)."""
+    try:
+        return os.lstat(path)
+    except OSError as exc:
+        if _missing(exc):
+            return None
+        raise RescueScanIncomplete(exc.errno, f"cannot check {what} {path}: {exc}") from exc
+
+
 def rescue_locations() -> List[Tuple[Path, Path]]:
     """``(rescue file, store path)`` at EVERY path a store is reached by, enumerated BEFORE store
     aliases are collapsed (§7): root, the active store, and every directory under profiles/ —
@@ -483,26 +505,36 @@ def rescue_locations() -> List[Tuple[Path, Path]]:
     Only EXISTING rescue files are returned, and only they are canonicalized: the scan runs on every
     refresh admission, so a location costs one ``lstat`` (plus one for a symlinked auth.json).
     Every directory under ``profiles/`` counts (identity markers are not required: a rescue beside a
-    marker-less directory is still evidence)."""
+    marker-less directory is still evidence).
+
+    FAIL CLOSED: only a genuinely missing path (ENOENT / ENOTDIR) is absent. A rescue file whose
+    metadata cannot be read is returned (its content check then records it ``unreadable`` and
+    fences); a store whose link status, or a profiles directory whose listing, cannot be read
+    raises :class:`RescueScanIncomplete`."""
     from hermes_cli.auth_credential_io import canonical_path
+    from hermes_cli.profiles import _get_profiles_root
     stores = [root_store_path(), active_store_path()]
+    profiles_root = _get_profiles_root()
     try:
-        from hermes_cli.profiles import _get_profiles_root
-        with os.scandir(_get_profiles_root()) as entries:
-            stores.extend(Path(e.path) / "auth.json" for e in entries
-                          if not e.name.startswith(".") and e.is_dir())
-    except OSError:
-        pass
-    except Exception:
-        logger.debug("codex authority: profile enumeration failed", exc_info=True)
+        with os.scandir(profiles_root) as entries:
+            for entry in entries:
+                if not entry.name.startswith(".") and entry.is_dir():
+                    stores.append(Path(entry.path) / "auth.json")
+    except OSError as exc:
+        if not _missing(exc):
+            raise RescueScanIncomplete(exc.errno, f"cannot list {profiles_root}: {exc}") from exc
     seen, out = set(), []
     for store in stores:
         candidates = [legacy_rescue_path(store)]
-        if os.path.islink(store):  # a file-level alias: its rescue may sit beside the target
+        st = _lstat_or_none(store, "credential store")
+        if st is not None and stat.S_ISLNK(st.st_mode):  # a file-level alias: its rescue may sit beside the target
             candidates.append(legacy_rescue_path(canonical_path(store)))
         for rescue in candidates:
-            if not os.path.lexists(rescue):
-                continue
+            try:
+                if _lstat_or_none(rescue, "rescue file") is None:
+                    continue
+            except RescueScanIncomplete:
+                pass  # present but unreadable: it is evidence (recorded ``unreadable`` below)
             key = store_key(rescue)
             if key not in seen:
                 seen.add(key)

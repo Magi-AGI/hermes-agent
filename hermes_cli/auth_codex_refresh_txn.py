@@ -37,8 +37,8 @@ from hermes_cli.auth_codex_records import (
 from hermes_cli.auth_codex_registry import (
     OP_UNRECOVERABLE, STATE_FENCED, STATE_RETIRED, CodexAuthorityBusy, CodexRecoveryFenced,
     CodexRefreshIndeterminate, CodexRegistryUnreadable, CodexRotationPersistFailed, NeedsAuthorityRepair,
-    RepairRequest, new_id, pair_fp, read_registry, store_locks, store_path_of, thread_holds_store_lock,
-    unrecorded_legacy_rescues)
+    RepairRequest, RescueScanIncomplete, new_id, pair_fp, read_registry, store_locks, store_path_of,
+    thread_holds_store_lock, unrecorded_legacy_rescues)
 from hermes_cli.auth_constants import AUTH_LOCK_TIMEOUT_SECONDS, AuthError, httpx
 from hermes_cli.auth_credential_io import CredentialWriteUncertain, WriteOutcome, store_key
 
@@ -134,7 +134,13 @@ def _transaction(row_store: Path, row: str, started: Tuple[str, str], *, force: 
     if touching and all(op.get("status") == OP_UNRECOVERABLE for _op_id, op in touching):
         # Kept until its payload reads again (the dispatcher retries it) or it is resolved.
         raise CodexRecoveryFenced("op-unrecoverable", _unrecoverable_message(touching[0][0]))
-    if touching or entry.get("lifecycle") or unrecorded_legacy_rescues(view):  # every alias path (§7)
+    try:
+        rescues = unrecorded_legacy_rescues(view)  # every alias path (§7)
+    except RescueScanIncomplete as exc:
+        raise CodexAuthorityBusy(
+            "Hermes couldn't check for leftover Codex recovery files, so it won't refresh this login "
+            f"until it can ({exc.strerror or exc}).") from None
+    if touching or entry.get("lifecycle") or rescues:
         _dispatch_once(round_)
     if entry.get("state") in (STATE_FENCED, STATE_RETIRED):
         raise _fenced_error(cid, entry)
