@@ -9,6 +9,7 @@ covered in ``test_shell_hooks_consent.py``.
 from __future__ import annotations
 
 import json
+import shlex
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,12 @@ def _write_script(tmp_path: Path, name: str, body: str) -> Path:
     path.write_text(body)
     path.chmod(0o755)
     return path
+
+
+def _sh_path(path: Path) -> str:
+    """``path`` as one bash word. Bash eats the backslashes of a bare Windows path, so the write
+    lands in the CWD (the repo root) under a mangled ``C:Users...`` name."""
+    return shlex.quote(path.as_posix())
 
 
 def _allowlist_pair(monkeypatch, tmp_path, event: str, command: str) -> None:
@@ -207,7 +214,7 @@ class TestCallbackSubprocess:
         script = _write_script(
             tmp_path, "log.sh",
             f"#!/usr/bin/env bash\n"
-            f"echo \"$(cat -)\" >> {calls}\n"
+            f"echo \"$(cat -)\" >> {_sh_path(calls)}\n"
             f"printf '{{}}\\n'\n",
         )
         spec = shell_hooks.ShellHookSpec(
@@ -227,7 +234,7 @@ class TestCallbackSubprocess:
         capture = tmp_path / "payload.json"
         script = _write_script(
             tmp_path, "capture.sh",
-            f"#!/usr/bin/env bash\ncat - > {capture}\nprintf '{{}}\\n'\n",
+            f"#!/usr/bin/env bash\ncat - > {_sh_path(capture)}\nprintf '{{}}\\n'\n",
         )
         spec = shell_hooks.ShellHookSpec(
             event="pre_tool_call", command=str(script),
