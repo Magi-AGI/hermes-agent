@@ -2245,6 +2245,13 @@ DEFAULT_CONFIG = {
         # Minimum hours between auto-maintenance runs (tracked in state.db state_meta, shared across
         # processes).
         "min_interval_hours": 24,
+        # Rotating state.db backups (VACUUM INTO images: consistent while sessions write, the live
+        # file untouched). Off by default: each image is about the size of state.db. The pre-update
+        # snapshot skips a state.db over 1 GiB, so a large install has no other copy of its history.
+        # Checked on the gateway / Desktop backend housekeeping ticks; `dir` defaults to
+        # <HERMES_HOME>/state-backups. Restore: stop Hermes, move state.db and its -wal/-shm aside,
+        # copy the chosen state-<UTC time>.db to state.db.
+        "backup": {"enabled": False, "interval_hours": 24, "keep": 3, "dir": ""},
 
         # Notice about the compact FTS layout (reclaims ~60%+ of state.db). OPT-IN: legacy indexes
         # stay until `hermes sessions optimize-storage` runs, since the rebuild is disk-heavy on

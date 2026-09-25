@@ -320,6 +320,8 @@ async def _auto_archive_ticker_loop(
     def _sweep() -> None:
         _maybe_auto_archive_for_profile(None)
         _maybe_run_skill_maintenance(started_at)
+        from hermes_state_backup import start_state_backup_if_enabled
+        start_state_backup_if_enabled()
 
     await asyncio.sleep(initial_delay_s)
     while True:

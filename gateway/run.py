@@ -4693,8 +4693,11 @@ def _housekeeping_state_db_maintenance(launch: Optional[Tuple[Path, Path]] = Non
     gateway owns (``web_server_sessions``). *launch* carries the launch home's configured transcript
     dir (:func:`_launch_sessions_dir`) so its override still governs its own profile."""
     from hermes_cli.config import load_config as _load_full_config
+    from hermes_state_backup import start_state_backup_if_enabled
     from hermes_state_registry import acquire, release_or_close
-    _sess_cfg = (_load_full_config().get("sessions") or {})
+    _full_cfg = _load_full_config()
+    start_state_backup_if_enabled(_full_cfg)
+    _sess_cfg = (_full_cfg.get("sessions") or {})
     if not (_sess_cfg.get("auto_archive", False) or _sess_cfg.get("auto_prune", False)):
         return
     _adb = acquire()
