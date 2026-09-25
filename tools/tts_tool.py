@@ -194,15 +194,19 @@ def _error_json(message: str) -> str:
     return json.dumps({"success": False, "error": message}, ensure_ascii=False)
 
 
+# Wall-clock bound on one Edge TTS synthesis. Enforced by ``run_bounded_sync``: a
+# ``with ThreadPoolExecutor()`` block's exit joins the still-running call, so it never bounded anything.
+_EDGE_TTS_TIMEOUT_S = 60.0
+
+
 def _run_edge_tts(text: str, file_str: str, tts_config: Dict[str, Any]) -> None:
-    """Run the async Edge generator from sync code (worker thread; direct run if that fails)."""
-    run = lambda: asyncio.run(_generate_edge_tts(text, file_str, tts_config))  # noqa: E731
-    try:
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            pool.submit(run).result(timeout=60)
-    except RuntimeError:
-        run()
+    """Run the async Edge generator from sync code on a bounded worker thread (the caller may already be
+    inside a running loop, where ``asyncio.run`` cannot nest). Raises ``DeadlineExpired`` past the bound."""
+    from agent.deadline import DeadlineExpired, run_bounded_sync
+    bounded = run_bounded_sync(lambda: asyncio.run(_generate_edge_tts(text, file_str, tts_config)),
+                               _EDGE_TTS_TIMEOUT_S, label="edge-tts")
+    if bounded.timed_out:
+        raise DeadlineExpired("edge-tts", _EDGE_TTS_TIMEOUT_S)
 
 
 def _select_builtin_engine(provider: str) -> tuple:

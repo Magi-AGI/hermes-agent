@@ -88,3 +88,36 @@ async def test_concurrent_preserves_output_contract(tmp_path):
     assert "CONTENT[https://two.example/q]" in res.message
     assert res.message.index("one.example") < res.message.index("two.example")
     assert res.injected_tokens > 0
+
+
+def test_hung_url_reference_fails_alone_at_the_expand_deadline(tmp_path):
+    """A fetch that never answers costs its own reference (a warning), not the prompt: the rest
+    still expands and the caller is released at ``timeouts.context_references.expand`` — even
+    when the stalled fetch holds a ``to_thread`` worker, as web extraction does (futures audit,
+    G10: the sync wrapper used to wait on the whole expansion with no bound at all)."""
+    import threading
+    import time
+
+    from agent.context_references import preprocess_context_references
+    from hermes_constants import get_hermes_home
+
+    (get_hermes_home() / "config.yaml").write_text(
+        "timeouts:\n  context_references:\n    expand: 0.5\n", encoding="utf-8")
+    release = threading.Event()
+
+    async def fetcher(url: str) -> str:
+        if "stalled" in url:
+            await asyncio.to_thread(release.wait, 6.0)
+        return f"CONTENT[{url}]"
+
+    start = time.monotonic()
+    try:
+        res = preprocess_context_references(
+            "see @url:https://stalled.example/x and @url:https://ok.example/y",
+            cwd=tmp_path, context_length=100_000, url_fetcher=fetcher)
+    finally:
+        release.set()
+    assert time.monotonic() - start < 4.0
+    assert not res.blocked
+    assert "CONTENT[https://ok.example/y]" in res.message
+    assert any("stalled.example" in w and "timed out" in w for w in res.warnings)

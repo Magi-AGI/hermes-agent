@@ -7,7 +7,6 @@ imported LAZILY inside each method — the mixin never imports ``cli`` at module
 
 from __future__ import annotations
 
-import concurrent.futures
 import logging
 import os
 import shutil
@@ -626,17 +625,20 @@ class CLIInfoMixin:
             return
         from agent.account_usage import redeem_codex_reset_credit
 
+        from agent.deadline import run_bounded_sync
+
         print("  ⏳ Checking banked reset credits...")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool:
-            try:
-                result = _pool.submit(
-                    redeem_codex_reset_credit, base_url=self._agent_or_self("base_url"),
-                    api_key=self._agent_or_self("api_key"), force=force,
-                ).result(timeout=45.0)
-            except concurrent.futures.TimeoutError:
-                print("  ❌ Timed out talking to the Codex backend — try again shortly.")
-                return
-        print(f"  {result.message}")
+        # A redemption is a mutation: past the bound the call keeps running and may still succeed, so the
+        # message must not invite a blind retry (a second --force redeem would spend another credit).
+        bounded = run_bounded_sync(
+            lambda: redeem_codex_reset_credit(base_url=self._agent_or_self("base_url"),
+                                              api_key=self._agent_or_self("api_key"), force=force),
+            45.0, label="codex-reset-redeem")
+        if bounded.timed_out:
+            print("  ❌ No answer from the Codex backend within 45s. The redemption may still complete;")
+            print("     check `/usage` before trying again.")
+            return
+        print(f"  {bounded.value.message}")
 
     def _show_context_breakdown(self, cmd_original: str = ""):
         """`/context [all]` — 5×20 glyph grid (cell ≈ 1% of the window) plus an estimated
@@ -765,15 +767,16 @@ class CLIInfoMixin:
         if not provider:
             return False
         from agent.account_usage import fetch_account_usage, render_account_usage_lines
+        from agent.deadline import run_bounded_sync
         account_snapshot = None
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool:
-            try:
-                account_snapshot = _pool.submit(
-                    fetch_account_usage, provider, base_url=self._agent_or_self("base_url"),
-                    api_key=self._agent_or_self("api_key"),
-                ).result(timeout=10.0)
-            except (concurrent.futures.TimeoutError, Exception):
-                account_snapshot = None
+        try:
+            bounded = run_bounded_sync(
+                lambda: fetch_account_usage(provider, base_url=self._agent_or_self("base_url"),
+                                            api_key=self._agent_or_self("api_key")),
+                10.0, label="account-usage")
+            account_snapshot = None if bounded.timed_out else bounded.value
+        except Exception:
+            account_snapshot = None
         account_lines = [f"  {line}" for line in render_account_usage_lines(account_snapshot)]
         if not account_lines:
             return False

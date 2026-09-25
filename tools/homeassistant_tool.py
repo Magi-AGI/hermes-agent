@@ -137,6 +137,11 @@ async def _async_list_services(domain: Optional[str] = None) -> Dict[str, Any]:
 
 
 # ── sync wrappers (handler signature: (args, **kw) -> str) ───────────────────
+# Bound on the side-thread hop below. A ``with ThreadPoolExecutor()`` block cannot enforce it: its
+# exit joins the still-running call, so a hung Home Assistant held the caller past the timeout.
+_ASYNC_BRIDGE_TIMEOUT_S = 30.0
+
+
 def _run_async(coro):
     """Run a coroutine from a sync handler; hops to a thread if a loop is already running."""
     try:
@@ -144,11 +149,12 @@ def _run_async(coro):
     except RuntimeError:
         loop = None
     if loop and loop.is_running():  # already inside a loop: asyncio.run() needs its own thread
-        import concurrent.futures
-        import contextvars
-        # Carry the caller's Context: the coroutine reads HASS_* via get_secret, which is profile-scoped.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(contextvars.copy_context().run, asyncio.run, coro).result(timeout=30)
+        from agent.deadline import DeadlineExpired, run_bounded_sync
+        # run_bounded_sync carries the caller's Context: HASS_* is read via profile-scoped get_secret.
+        bounded = run_bounded_sync(lambda: asyncio.run(coro), _ASYNC_BRIDGE_TIMEOUT_S, label="homeassistant")
+        if bounded.timed_out:
+            raise DeadlineExpired("homeassistant", _ASYNC_BRIDGE_TIMEOUT_S)
+        return bounded.value
     return asyncio.run(coro)
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -186,6 +187,14 @@ def _nous_logged_in() -> bool:
         return False
 
 
+# One in-flight portal fetch per profile home. The fetch resolves (and may REFRESH) the Nous token under
+# the shared store lock, and a caller that times out abandons only the result: the worker runs on and
+# completes the refresh. Without this, every /usage, /billing or session.usage call during a portal stall
+# started another refresh-capable worker queued on that lock behind the stuck one.
+_PORTAL_FETCH_LOCK = threading.RLock()
+_portal_fetch_inflight: dict = {}
+
+
 def _fetch_portal_account(timeout: float):
     """Wall-clock-bounded fresh portal account fetch (raises on any failure/timeout).
 
@@ -194,21 +203,33 @@ def _fetch_portal_account(timeout: float):
     answers would hold the caller until the provider's own timeout instead of
     ``timeout``. The abandoned daemon worker runs on to its own network timeout
     and never blocks the caller or process exit; its eventual exception is
-    drained so GC never logs "exception was never retrieved"."""
+    drained so GC never logs "exception was never retrieved". A caller arriving
+    while a fetch for the same profile is still running waits on that one."""
     import contextvars
     from hermes_cli.nous_account import get_nous_portal_account_info
+    from hermes_constants import hermes_home_key
     from tools.daemon_pool import DaemonThreadPoolExecutor
 
-    context = contextvars.copy_context()
-    pool = DaemonThreadPoolExecutor(max_workers=1)
-    future = pool.submit(context.run, get_nous_portal_account_info, force_fresh=True)
+    key = hermes_home_key()
+    with _PORTAL_FETCH_LOCK:
+        future = _portal_fetch_inflight.get(key)
+        if future is None:
+            pool = DaemonThreadPoolExecutor(max_workers=1)
+            future = pool.submit(contextvars.copy_context().run, get_nous_portal_account_info, force_fresh=True)
+            pool.shutdown(wait=False)
+            _portal_fetch_inflight[key] = future
+            future.add_done_callback(lambda done: _forget_portal_fetch(key, done))
     try:
         return future.result(timeout=timeout)
     except BaseException:
         future.add_done_callback(lambda f: f.exception())
         raise
-    finally:
-        pool.shutdown(wait=False)
+
+
+def _forget_portal_fetch(key, future) -> None:
+    with _PORTAL_FETCH_LOCK:
+        if _portal_fetch_inflight.get(key) is future:
+            del _portal_fetch_inflight[key]
 
 
 def nous_credits_lines(*, markdown: bool = False, timeout: float = 10.0) -> list[str]:

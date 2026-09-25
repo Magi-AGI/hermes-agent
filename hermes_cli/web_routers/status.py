@@ -5,7 +5,6 @@ Extracted from ``hermes_cli.web_server``; app state and helpers are late-bound t
 :mod:`hermes_cli.web_deps` (cycle-safe, monkeypatch-friendly).
 """
 
-import concurrent.futures
 import importlib
 import logging
 import re
@@ -239,16 +238,18 @@ def _bounded_health_probe():
     """Health probe with the route's blocking-call budget preserved. The resolver only
     reaches this rung when the local PID probe came up empty, so the timeout is paid at
     most once per request and only in the cross-container case that needs it."""
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(_probe_gateway_health)
-        try:
-            return future.result(timeout=_GATEWAY_HEALTH_ROUTE_TIMEOUT)
-        except concurrent.futures.TimeoutError:
-            _log.warning("/api/status gateway health probe exceeded %.2fs; using local status",
-                         _GATEWAY_HEALTH_ROUTE_TIMEOUT)
-            return False, None
-        except Exception:
-            return False, None
+    # Not a ``with ThreadPoolExecutor()`` block: its exit joins the still-running probe, so a gateway
+    # that accepts the connection and never answers held the route past the budget anyway.
+    from agent.deadline import run_bounded_sync
+    try:
+        bounded = run_bounded_sync(_probe_gateway_health, _GATEWAY_HEALTH_ROUTE_TIMEOUT, label="status-health-probe")
+    except Exception:
+        return False, None
+    if bounded.timed_out:
+        _log.warning("/api/status gateway health probe exceeded %.2fs; using local status",
+                     _GATEWAY_HEALTH_ROUTE_TIMEOUT)
+        return False, None
+    return bounded.value
 
 
 def _project_gateway_platforms(gateway_platforms: dict, configured: "set[str] | None",

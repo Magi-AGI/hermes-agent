@@ -4,6 +4,8 @@ Rebound onto server.py's globals at install time (``method_ctx.bind_module``), s
 bodies reference server globals bare (``_ok``, ``_err``, ``_sessions``, ...).
 """
 
+import threading
+
 from .method_ctx import HandlerRegistry, bind_module
 
 _registry = HandlerRegistry()
@@ -77,6 +79,11 @@ def _profile_mention_items(prefix: str) -> list[dict]:
     return out
 
 
+_PLUGIN_AUTOCOMPLETE_TIMEOUT_S = 5.0
+_plugin_autocomplete_lock = threading.Lock()
+_plugin_autocomplete_running: set[str] = set()
+
+
 def _plugin_reference_items(pfx: str, qval: str) -> list[dict] | None:
     """`@<prefix>:<query>` autocomplete for a plugin ContextReferenceProvider; None when
     no provider owns ``pfx`` or it fails."""
@@ -85,17 +92,27 @@ def _plugin_reference_items(pfx: str, qval: str) -> list[dict] | None:
         import asyncio
         if (prov := get_context_reference_providers().get(pfx)) is None:
             return None
-        coro = prov.autocomplete(qval, limit=20)
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            ac = asyncio.run(coro)
-        else:  # already inside a running loop: run the coroutine on a side thread
-            import concurrent.futures
-            import contextvars
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                ac = pool.submit(contextvars.copy_context().run, asyncio.run, coro).result()
-        return [{"text": f"@{pfx}:{it.text}", "display": it.display, "meta": it.meta} for it in ac]
+        from agent.deadline import run_bounded_sync
+        # Plugin code on an RPC worker: a provider that never answers would pin the worker for good
+        # (each keystroke queues another call). Past the bound the list is omitted, and while that
+        # abandoned call is still running the provider is skipped, so a wedged provider costs one
+        # thread, not one per keystroke.
+        with _plugin_autocomplete_lock:
+            if pfx in _plugin_autocomplete_running:
+                return None
+            _plugin_autocomplete_running.add(pfx)
+
+        def _complete():
+            try:
+                return asyncio.run(prov.autocomplete(qval, limit=20))
+            finally:
+                with _plugin_autocomplete_lock:
+                    _plugin_autocomplete_running.discard(pfx)
+
+        bounded = run_bounded_sync(_complete, _PLUGIN_AUTOCOMPLETE_TIMEOUT_S, label=f"autocomplete @{pfx}:")
+        if bounded.timed_out:
+            return None
+        return [{"text": f"@{pfx}:{it.text}", "display": it.display, "meta": it.meta} for it in bounded.value]
     except Exception:
         return None
 

@@ -376,3 +376,37 @@ def test_fetch_portal_account_returns_value_and_keeps_caller_context(monkeypatch
     finally:
         marker.reset(token)
     assert seen == {"force_fresh": True, "marker": "profile-scope"}
+
+
+def test_stalled_portal_fetch_is_shared_per_profile_not_restarted(monkeypatch, tmp_path):
+    """A caller that times out abandons the RESULT, never the credential refresh inside the fetch:
+    the worker runs on. Callers arriving meanwhile wait on that same fetch instead of queueing
+    another refresh-capable worker on the Nous store lock; another profile (other credentials)
+    still gets its own (gate item G10, account/billing refresh safety)."""
+    from hermes_constants import get_hermes_home, reset_hermes_home_override, set_hermes_home_override
+
+    release = threading.Event()
+    homes: list = []
+
+    def stalled_portal_fetch(*, force_fresh):
+        homes.append(get_hermes_home())
+        release.wait(timeout=6)
+        return object()
+
+    monkeypatch.setattr("hermes_cli.nous_account.get_nous_portal_account_info", stalled_portal_fetch)
+    other_home = tmp_path / "profiles" / "other"
+    other_home.mkdir(parents=True)
+    try:
+        for _ in range(3):
+            with pytest.raises(concurrent.futures.TimeoutError):
+                _fetch_portal_account(timeout=0.2)
+        token = set_hermes_home_override(other_home)
+        try:
+            with pytest.raises(concurrent.futures.TimeoutError):
+                _fetch_portal_account(timeout=0.2)
+        finally:
+            reset_hermes_home_override(token)
+    finally:
+        release.set()
+    assert len(homes) == 2
+    assert homes[1] == other_home and homes[0] != other_home

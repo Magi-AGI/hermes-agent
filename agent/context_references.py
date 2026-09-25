@@ -183,16 +183,35 @@ def preprocess_context_references(
     coro = preprocess_context_references_async(
         message, cwd=cwd, context_length=context_length, url_fetcher=url_fetcher, allowed_root=allowed_root
     )
+    # Always on a bounded worker (it carries the caller's Context, so the served profile's HERMES_HOME
+    # override reaches the credential-path guard). Each remote expansion has its own deadline; this one
+    # is the backstop for a synchronous fetcher that blocks the loop itself.
+    from agent.deadline import run_bounded_sync
+    limit = _expand_timeout()
+    bounded = run_bounded_sync(lambda: _run_detached(coro), limit and limit + _WRAPPER_GRACE_S,
+                               label="context-references")
+    if bounded.timed_out:
+        warning = f"Expanding @ references did not finish within {limit + _WRAPPER_GRACE_S:g}s."
+        return ContextReferenceResult(message=message, original_message=message, warnings=[warning],
+                                      blocked=True)
+    return bounded.value
+
+
+def _run_detached(coro):
+    """``asyncio.run`` without its executor join: an expansion abandoned at its deadline may still hold
+    a ``to_thread`` worker (web extraction does), and ``asyncio.run``'s teardown would wait for it."""
+    loop = asyncio.new_event_loop()
     try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coro)
-    import concurrent.futures
-    import contextvars
-    # The side thread starts with an empty Context: without the caller's copy the served profile's
-    # HERMES_HOME override is lost and the credential-path guard checks the launch profile's .env.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(contextvars.copy_context().run, asyncio.run, coro).result()
+        return loop.run_until_complete(coro)
+    finally:
+        try:
+            if pending := asyncio.all_tasks(loop):
+                for task in pending:
+                    task.cancel()
+                loop.run_until_complete(asyncio.wait(pending, timeout=_WRAPPER_GRACE_S))
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        finally:
+            loop.close()  # shuts the default executor down with wait=False
 
 
 async def preprocess_context_references_async(
@@ -266,7 +285,7 @@ async def _expand_reference(
             git_args = _GIT_REFERENCE_ARGS[ref.kind](ref)
             return _expand_git_reference(ref, cwd, git_args, "git " + " ".join(git_args))
         if ref.kind == "url":
-            content = await _fetch_url_content(ref.target, url_fetcher=url_fetcher)
+            content = await _bounded_expand(_fetch_url_content(ref.target, url_fetcher=url_fetcher), ref)
             if not content:
                 return f"{ref.raw}: no content extracted", None
             return None, f"🌐 {ref.raw} ({estimate_tokens_rough(content)} tokens)\n{content}"
@@ -275,7 +294,7 @@ async def _expand_reference(
     provider = _context_reference_providers.get(ref.kind)
     if provider is not None:
         try:
-            plugin_content = await provider.expand(ref.target)
+            plugin_content = await _bounded_expand(provider.expand(ref.target), ref)
             if plugin_content is not None:
                 return None, f"📌 {ref.raw} ({estimate_tokens_rough(plugin_content)} tokens)\n{plugin_content}"
         except Exception as exc:
@@ -424,6 +443,27 @@ def _expand_git_reference(ref: ContextReference, cwd: Path, args: list[str], lab
         return f"{ref.raw}: {(result.stderr or '').strip() or 'git command failed'}", None
     content = result.stdout.strip() or "(no output)"
     return None, f"🧾 {label} ({estimate_tokens_rough(content)} tokens)\n```diff\n{content}\n```"
+
+
+# Remote expansions (``@url:`` web extraction, plugin providers) run before the turn starts, so an
+# unanswered fetch held the prompt forever. Override with ``timeouts.context_references.expand``.
+_EXPAND_TIMEOUT_DEFAULT_S = 60.0
+_WRAPPER_GRACE_S = 10.0
+
+
+def _expand_timeout() -> float | None:
+    from agent.deadline import resolve_timeout
+    return resolve_timeout("context_references.expand", default=_EXPAND_TIMEOUT_DEFAULT_S)
+
+
+async def _bounded_expand(awaitable, ref: ContextReference):
+    """Await one remote expansion under the expand deadline; past it the ref fails with a warning."""
+    from agent.deadline import run_bounded_async
+    limit = _expand_timeout()
+    bounded = await run_bounded_async(awaitable, limit, label=f"context-reference {ref.kind}")
+    if bounded.timed_out:
+        raise TimeoutError(f"timed out after {limit:g}s")
+    return bounded.value
 
 
 async def _fetch_url_content(url: str, *, url_fetcher: UrlFetcher = None) -> str:
