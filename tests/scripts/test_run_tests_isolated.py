@@ -173,3 +173,35 @@ def test_the_user_home_is_sandboxed_too(tmp_path, monkeypatch):
         [sys.executable, "-c", "from pathlib import Path; print(Path.home())"],
         env=env, capture_output=True, text=True, check=True).stdout.strip()
     assert Path(child_home).is_relative_to(box) and Path(child_home) != real_home
+
+
+@pytest.mark.windows_only
+def test_powershell_under_the_sandbox_env_writes_nothing_into_its_cwd(tmp_path):
+    """T5/A7: .NET resolves LocalApplicationData from USERPROFILE and returns "" for a missing
+    folder, so PowerShell 5.1 wrote Microsoft\Windows\PowerShell\ModuleAnalysisCache relative to
+    its CWD, i.e. into the checkout."""
+    cwd = tmp_path / "checkout"
+    cwd.mkdir()
+    env = rti._sandbox_env(tmp_path / "box")
+    powershell = Path(os.environ["SYSTEMROOT"]) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    subprocess.run([str(powershell), "-NoProfile", "-Command", "Get-Command Get-HermesNoSuchCommand -ErrorAction SilentlyContinue"],
+                   env=env, cwd=str(cwd), capture_output=True, timeout=180, check=False)
+    assert list(cwd.iterdir()) == []
+
+
+@pytest.mark.windows_only
+@pytest.mark.parametrize("stray", [False, True], ids=["clean", "writes-into-checkout"])
+def test_a_run_that_writes_into_the_checkout_fails_and_names_the_path(tmp_path, monkeypatch, capsys, stray):
+    """T5/A7: tests run with the checkout as CWD, so a relative or mangled path lands in the tree."""
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    body = "open('stray-from-a-test.txt', 'w').close()\n" if stray else ""
+    (repo / "scripts" / "run_tests_parallel.py").write_text(body, encoding="utf-8")
+    (repo / ".gitignore").write_text("scripts/\n", encoding="utf-8")
+    monkeypatch.setattr(rti, "REPO", repo)
+    monkeypatch.setattr(rti, "LIVE_ROOT", tmp_path / "live")
+    monkeypatch.setattr(sys, "argv", ["run_tests_isolated.py", "--timeout", "120"])
+    rc = rti.main()
+    err = capsys.readouterr().err
+    assert (rc, "stray-from-a-test.txt" in err) == ((5, True) if stray else (0, False))
