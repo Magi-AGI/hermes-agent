@@ -313,3 +313,46 @@ def test_broken_probe_never_kills_the_pass(watcher_home, monkeypatch):
 
     # The broken cron probe is skipped; sessions still broadcasts.
     assert ("sessions.changed", {}) in events
+
+
+_SIBLING_WRITER = """
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from hermes_state import SessionDB
+db = SessionDB(db_path=Path(sys.argv[2]))
+db.create_session("seed-session", "cli")
+print("ready", flush=True)
+sys.stdin.readline()
+db.create_session("relay-session", "api_server")  # the connection stays open, like the relay's
+print("wrote", flush=True)
+sys.stdin.readline()
+"""
+
+
+def test_a_sibling_process_writing_through_an_open_connection_broadcasts(watcher_home, tmp_path):
+    """The relay and the Desktop backend are separate processes on one state.db, and the relay
+    keeps its SQLite connection open. A session it writes must still move this process's
+    signature (a Desktop sidebar stayed stale until a profile switch, 2026-09-09; G9)."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    home, events = watcher_home
+    script = tmp_path / "sibling_writer.py"
+    script.write_text(_SIBLING_WRITER, encoding="utf-8")
+    repo = str(Path(__file__).resolve().parents[2])
+    proc = subprocess.Popen([sys.executable, str(script), repo, str(home / "state.db")],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert proc.stdout.readline().strip() == "ready"
+        server._broadcast_watched_changes(now=0.0)
+        time.sleep(0.05)  # past the filesystem's mtime granularity
+        proc.stdin.write("go\n")
+        proc.stdin.flush()
+        assert proc.stdout.readline().strip() == "wrote"
+        server._broadcast_watched_changes(now=10.0)
+    finally:
+        proc.stdin.close()
+        proc.wait(timeout=30)
+    assert ("sessions.changed", {}) in events
