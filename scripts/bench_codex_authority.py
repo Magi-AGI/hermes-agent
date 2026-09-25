@@ -7,7 +7,8 @@ single-use, a reused one is rejected, and every presented token is recorded in i
   python scripts/bench_codex_authority.py progress   # 24 processes x 4 threads, real entry points
   python scripts/bench_codex_authority.py kills      # a real process kill at every boundary
   python scripts/bench_codex_authority.py latency --tree <checkout>   # read-path p50/p99
-  python scripts/bench_codex_authority.py startup --baseline <checkout>  # N processes starting at once
+  python scripts/bench_codex_authority.py startup --baseline <checkout>  # A/B, bench-reports/STARTUP-AB-PROTOCOL.md
+  python scripts/bench_codex_authority.py rescue-scan  # per-refresh rescue-location scan vs profile count
 
 Progress drives all three refresh entry points concurrently: (P1) singleton refresh, (P2) the
 quota-probe pre-refresh of an exhausted row whose token expired, (P3) the pool refresh. Kills: every
@@ -631,6 +632,7 @@ def worker_startup(args) -> None:
 
 
 def _startup_wave(tree: Path, sandbox: Path, homes: dict, url: str, n: int) -> dict:
+    """N processes started at once (a fleet restart); every per-process sample is kept."""
     me = str(Path(__file__).resolve())
     names = list(homes)
     procs = []
@@ -639,46 +641,119 @@ def _startup_wave(tree: Path, sandbox: Path, homes: dict, url: str, n: int) -> d
         procs.append((time.perf_counter(), subprocess.Popen(
             [sys.executable, me, "worker-startup", "--tree", str(tree)], env=env, cwd=str(sandbox),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)))
-    rows, walls, errors = [], [], []
+    samples, errors = [], []
     for started, proc in procs:
         out, err = proc.communicate(timeout=600)
-        walls.append((time.perf_counter() - started) * 1000)
+        wall = (time.perf_counter() - started) * 1000
         try:
             data = json.loads(out.strip().splitlines()[-1])
-            rows.append(data)
+            data["process_wall_ms"] = wall
+            samples.append(data)
             if data.get("error"):
                 errors.append(data["error"])
         except Exception:
             errors.append((err or out)[-300:])
+    return {"samples": samples, "errors": errors}
 
-    def stats(values):
-        return {"p50": round(_pct(values, .5), 1), "p99": round(_pct(values, .99), 1),
-                "max": round(max(values), 1)} if values else None
 
-    return {"auth_ms": stats([r["auth_ms"] for r in rows]), "dispatch_ms": stats([r["dispatch_ms"] for r in rows]),
-            "resume_ms": stats([r["resume_ms"] for r in rows]), "process_wall_ms": stats(walls),
-            "dispatch_outcomes": sorted({str(r.get("dispatch")) for r in rows}), "errors": errors[:5]}
+def _startup_sandbox():
+    ledger = Ledger()
+    sandbox = Path(tempfile.mkdtemp(prefix="bench-start-"))
+    root = sandbox / "hroot"
+    s = ledger.issue("root")
+    write_store(root, singleton=s, pool=[{"id": "devcod", "label": "d", "auth_type": "oauth", "priority": 0,
+                                          "source": "device_code", "access_token": s[0], "refresh_token": s[1]}])
+    homes = {"root": root}
+    for name in ("work1", "work2"):
+        homes[name] = make_profile(root, name)
+        write_store(homes[name], singleton=ledger.issue(name))
+    return sandbox, homes
+
+
+def _stats(values):
+    if not values:
+        return None
+    return {"n": len(values), "p50": round(_pct(values, .5), 1), "p95": round(_pct(values, .95), 1),
+            "p99": round(_pct(values, .99), 1), "max": round(max(values), 1)}
 
 
 def run_startup(args) -> int:
-    """Cold (no registry: the first process bootstraps while the rest start) and warm (registry
-    present) concurrent startups, branch vs baseline, identical sandboxes and credentials."""
-    out = {"processes": args.processes}
-    for label, tree in (("branch", REPO), ("baseline", Path(args.baseline).resolve())):
+    """The A/B protocol of bench-reports/STARTUP-AB-PROTOCOL.md: one discarded warm-up round per
+    tree, then ``--runs`` measured runs, alternating which tree goes first; each run is a fresh
+    sandbox per tree with a COLD wave (no registry: one process bootstraps while the rest start)
+    then a WARM wave (registry present). Every per-process sample is kept; the gate is on the
+    POOLED p99 of ``auth_ms`` (dispatch + resume), branch <= baseline + ``--gate-ms``, cold and warm."""
+    trees = {"branch": REPO, "baseline": Path(args.baseline).resolve()}
+    url = "http://127.0.0.1:9"
+    runs = []
+    for index in range(-1, args.runs):  # -1: the discarded warm-up round
+        order = ["branch", "baseline"] if index % 2 == 0 else ["baseline", "branch"]
+        run = {"index": index, "order": order, "warmup": index < 0}
+        for label in order:
+            sandbox, homes = _startup_sandbox()
+            run[label] = {"cold": _startup_wave(trees[label], sandbox, homes, url, args.processes),
+                          "warm": _startup_wave(trees[label], sandbox, homes, url, args.processes)}
+            shutil.rmtree(sandbox, ignore_errors=True)
+        runs.append(run)
+    measured = [r for r in runs if not r["warmup"]]
+    summary, failures = {}, []
+    for label in trees:
+        summary[label] = {}
+        for wave in ("cold", "warm"):
+            pooled = [x for r in measured for x in r[label][wave]["samples"]]
+            summary[label][wave] = {
+                metric: _stats([x[metric] for x in pooled])
+                for metric in ("auth_ms", "dispatch_ms", "resume_ms", "process_wall_ms")}
+            summary[label][wave]["per_run_p99_auth_ms"] = [
+                round(_pct([x["auth_ms"] for x in r[label][wave]["samples"]], .99), 1) for r in measured]
+            summary[label][wave]["errors"] = [e for r in measured for e in r[label][wave]["errors"]][:5]
+    for wave in ("cold", "warm"):
+        branch, baseline = summary["branch"][wave]["auth_ms"]["p99"], summary["baseline"][wave]["auth_ms"]["p99"]
+        summary[f"gate_{wave}"] = {"branch_p99": branch, "baseline_p99": baseline, "limit": baseline + args.gate_ms,
+                                   "pass": branch <= baseline + args.gate_ms}
+        if not summary[f"gate_{wave}"]["pass"]:
+            failures.append(f"{wave}: pooled p99 {branch} > baseline {baseline} + {args.gate_ms}")
+        if summary["branch"][wave]["errors"]:
+            failures.append(f"{wave}: branch worker errors")
+    out = {"protocol": "bench-reports/STARTUP-AB-PROTOCOL.md", "processes": args.processes, "runs": args.runs,
+           "gate_ms": args.gate_ms, "summary": summary, "failures": failures, "raw_runs": runs}
+    print(json.dumps(out, indent=1))
+    return 1 if failures else 0
+
+
+def worker_rescue_scan(args) -> None:
+    """The per-refresh rescue-location scan (``unrecorded_legacy_rescues``) with N named profiles."""
+    import statistics as st
+    from hermes_cli.auth_codex_authority import authority_dispatch
+    from hermes_cli.auth_codex_registry import read_registry, unrecorded_legacy_rescues
+    authority_dispatch()
+    view = read_registry()
+    lat = []
+    for _ in range(args.iterations):
+        t0 = time.perf_counter()
+        unrecorded_legacy_rescues(view)
+        lat.append((time.perf_counter() - t0) * 1000)
+    print(json.dumps({"profiles": args.profiles, "median_ms": round(st.median(lat), 3),
+                      "p99_ms": round(_pct(lat, .99), 3)}))
+
+
+def run_rescue_scan(args) -> int:
+    me = str(Path(__file__).resolve())
+    results = []
+    for n in (0, 10, 50, 200):
         ledger = Ledger()
-        sandbox = Path(tempfile.mkdtemp(prefix="bench-start-"))
+        sandbox = Path(tempfile.mkdtemp(prefix="bench-rescue-"))
         root = sandbox / "hroot"
-        s = ledger.issue("root")
-        write_store(root, singleton=s, pool=[{"id": "devcod", "label": "d", "auth_type": "oauth", "priority": 0,
-                                              "source": "device_code", "access_token": s[0], "refresh_token": s[1]}])
-        homes = {"root": root}
-        for name in ("work1", "work2"):
-            homes[name] = make_profile(root, name)
-            write_store(homes[name], singleton=ledger.issue(name))
-        out[label] = {"cold": _startup_wave(tree, sandbox, homes, "http://127.0.0.1:9", args.processes),
-                      "warm": _startup_wave(tree, sandbox, homes, "http://127.0.0.1:9", args.processes)}
+        write_store(root, singleton=ledger.issue("root"))
+        for i in range(n):
+            make_profile(root, f"p{i:03d}")
+        env = sandbox_env(sandbox, root, "http://127.0.0.1:9")
+        proc = subprocess.run([sys.executable, me, "worker-rescue-scan", "--profiles", str(n),
+                               "--iterations", str(args.iterations)], env=env, cwd=str(sandbox),
+                              capture_output=True, text=True, timeout=600)
+        results.append(json.loads(proc.stdout.strip().splitlines()[-1]))
         shutil.rmtree(sandbox, ignore_errors=True)
-    print(json.dumps(out, indent=2))
+    print(json.dumps({"rescue_scan": results}, indent=1))
     return 0
 
 
@@ -697,6 +772,13 @@ def main() -> int:
     st = sub.add_parser("startup")
     st.add_argument("--baseline", required=True)
     st.add_argument("--processes", type=int, default=24)
+    st.add_argument("--runs", type=int, default=10)
+    st.add_argument("--gate-ms", type=float, default=20.0)
+    rs = sub.add_parser("rescue-scan")
+    rs.add_argument("--iterations", type=int, default=200)
+    wr = sub.add_parser("worker-rescue-scan")
+    wr.add_argument("--profiles", type=int)
+    wr.add_argument("--iterations", type=int)
     ws = sub.add_parser("worker-startup")
     ws.add_argument("--tree")
     lt = sub.add_parser("latency")
@@ -721,7 +803,8 @@ def main() -> int:
     wl.add_argument("--tree")
     wl.add_argument("--iterations", type=int)
     args = ap.parse_args()
-    handlers = {"progress": run_progress, "kills": run_kills, "latency": run_latency, "startup": run_startup,
+    handlers = {"progress": run_progress, "kills": run_kills, "latency": run_latency, "startup": run_startup, "rescue-scan": run_rescue_scan,
+                "worker-rescue-scan": worker_rescue_scan,
                 "worker-progress": worker_progress, "worker-kill": worker_kill, "worker-check": worker_check,
                 "worker-latency": worker_latency, "worker-startup": worker_startup}
     return handlers[args.cmd](args) or 0
