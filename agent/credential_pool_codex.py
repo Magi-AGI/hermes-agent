@@ -63,17 +63,8 @@ class CodexAuthorityPoolMixin:
         except CodexAuthorityBusy as exc:
             logger.info("Codex pool entry %s: %s", entry.label or entry.id, exc)
             return entry
-        except auth_mod.AuthError as exc:
-            if exc.relogin_required:
-                logger.warning("Codex pool entry %s cannot refresh: %s", entry.label or entry.id, exc)
-                self._mark_dead_refresh_grant(entry, exc)
-            else:
-                self._mark_exhausted(entry, None)
-            return None
         except Exception as exc:
-            logger.debug("Codex pool entry %s refresh failed: %s", entry.id, exc)
-            self._mark_exhausted(entry, None)
-            return None
+            return self._publish_codex_refresh_failure(entry, snapshot, exc)
         with self._lock:
             current = self._find(lambda e: e.id == entry.id)
             if current is None:
@@ -93,6 +84,31 @@ class CodexAuthorityPoolMixin:
         except Exception:
             logger.warning("Codex pool entry %s: status could not be saved", updated.id, exc_info=True)
         return updated
+
+    def _publish_codex_refresh_failure(self, entry: "PooledCredential", snapshot, exc: Exception
+                                       ) -> Optional["PooledCredential"]:
+        """A refresh verdict is published like its success (RULE-T5): only while, under the pool
+        mutex, the entry still holds the pair AND chain the refresh started from. If another thread
+        adopted a re-authorized login for the same row id meanwhile, the old refresh's failure is
+        about a credential that is no longer there: the newer entry is kept and returned."""
+        import hermes_cli.auth as auth_mod
+        with self._lock:
+            current = self._find(lambda e: e.id == entry.id)
+            if current is None:
+                return None
+            if ((current.access_token or "", current.refresh_token or "") != snapshot
+                    or current.extra.get("chain_id") != entry.extra.get("chain_id")):
+                logger.info("Codex pool entry %s: a failed refresh of a replaced login is ignored",
+                            entry.label or entry.id)
+                return current
+            if isinstance(exc, auth_mod.AuthError) and exc.relogin_required:
+                logger.warning("Codex pool entry %s cannot refresh: %s", entry.label or entry.id, exc)
+                self._mark_dead_refresh_grant(current, exc)
+            else:
+                if not isinstance(exc, auth_mod.AuthError):
+                    logger.debug("Codex pool entry %s refresh failed: %s", entry.id, exc)
+                self._mark_exhausted(current, None)
+        return None
 
     def _refresh_codex_selected(self, entry: Optional["PooledCredential"]) -> Optional["PooledCredential"]:
         if entry is None:

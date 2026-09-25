@@ -142,3 +142,34 @@ def test_fence_inside_a_callers_store_lock_is_deferred_not_lost(codex_home):
     assert len(endpoint.calls) == posts, "the verdict held although the fence was deferred"
     (chain,) = registry(root)["chains"].values()
     assert chain["state"] == "fenced", "the next transaction recorded the deferred fence"
+
+
+@pytest.mark.parametrize("verdict", ["reject", "status429"])
+def test_a_late_refresh_failure_never_marks_the_replacement_login(codex_home, monkeypatch, verdict):
+    """The failure of a refresh that started from the OLD pair is published only while the entry
+    still holds that pair and chain — as success already was. If another thread adopted a fresh
+    login for the same row id meanwhile, the old refresh's verdict must not mark it DEAD / exhausted."""
+    from dataclasses import replace
+
+    from agent.credential_pool import load_pool
+
+    root, endpoint = codex_home
+    write_store(root, pool=[pool_row("acct01", endpoint.issue(), source="manual:device_code")])
+    _bootstrap()
+    pool = load_pool("openai-codex")
+    replacement = endpoint.issue()
+    endpoint.mode = verdict
+    real_endpoint = endpoint.__call__
+
+    def endpoint_racing_an_adoption(*a, **k):
+        current = next(e for e in pool.entries() if e.id == "acct01")
+        # Another thread adopts a re-authorized login for the same row id while this POST runs.
+        pool._replace_entry(current, replace(current, access_token=replacement[0], refresh_token=replacement[1],
+                                             extra={**current.extra, "chain_id": "replacement-chain"}))
+        return real_endpoint(*a, **k)
+
+    monkeypatch.setattr(auth, "refresh_codex_oauth_pure", endpoint_racing_an_adoption)
+    pool.try_refresh_matching(credential_id="acct01")
+    entry = next(e for e in pool.entries() if e.id == "acct01")
+    assert entry.refresh_token == replacement[1]
+    assert entry.last_status in (None, "ok"), f"the replacement login was marked {entry.last_status}"
