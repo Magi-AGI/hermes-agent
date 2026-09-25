@@ -46,12 +46,40 @@ def test_isolated_home_hides_ambient_borrowed_credentials(isolated_home):
     assert aux._pool_cache_hint("anthropic").startswith("anthropic::")
 
 
+def _codex_rotator(home, monkeypatch):
+    """Codex rows are created only by ownership ops and rotated only by the refresh transaction
+    (credential recovery protocol, RULE-K1): the first call registers ``entry-1`` on disk
+    (bootstrap), each later call rotates it through the real pool refresh (fake endpoint)."""
+    import json
+
+    import hermes_cli.auth as auth_mod
+    from agent.credential_pool import load_pool
+    from hermes_cli.auth_codex_authority import authority_dispatch
+
+    def rotate(token: str) -> None:
+        if not (home / "auth.json").exists():
+            home.mkdir(parents=True, exist_ok=True)
+            row = {"id": "entry-1", "label": "pooled", "auth_type": "oauth", "priority": 1,
+                   "source": "manual:device_code", "access_token": token, "refresh_token": f"rt-{token}"}
+            (home / "auth.json").write_text(json.dumps(
+                {"version": 1, "providers": {}, "credential_pool": {"openai-codex": [row]}}), encoding="utf-8")
+            assert authority_dispatch() == "bootstrapped"
+            return
+        monkeypatch.setattr(auth_mod, "refresh_codex_oauth_pure", lambda access, refresh, **kw: {
+            "access_token": token, "refresh_token": f"rt-{token}", "last_refresh": "2026-09-24T00:00:00Z"})
+        assert load_pool("openai-codex").try_refresh_matching(credential_id="entry-1") is not None
+
+    return rotate
+
+
 @pytest.mark.parametrize("provider", ["anthropic", "openai-codex"])
-def test_pool_token_rotation_changes_cache_key_and_hides_the_secret(isolated_home, provider):
+def test_pool_token_rotation_changes_cache_key_and_hides_the_secret(isolated_home, monkeypatch, provider):
     """Same entry id, new token -> different key; the token itself never enters the key."""
-    _seed(provider, "tok-old")
+    seed = _codex_rotator(isolated_home, monkeypatch) if provider == "openai-codex" else (
+        lambda token: _seed(provider, token))
+    seed("tok-old")
     before = aux._client_cache_key(provider, async_mode=False, model=MODEL)
-    _seed(provider, "tok-new")
+    seed("tok-new")
     after = aux._client_cache_key(provider, async_mode=False, model=MODEL)
 
     assert before != after
