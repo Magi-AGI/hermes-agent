@@ -125,24 +125,29 @@ def _kill_leftover(pidfile: Path) -> None:
             pass
 
 
-def test_failed_server_leaves_no_helper_behind_while_the_backend_lives(tmp_path):
-    """A server that never answers ``initialize`` is torn down at its connect timeout. Anything it
-    spawned goes with it, even a helper that escaped the SDK's job object: before the fix every
-    failed attempt stranded one (the leaked ``mcp-remote`` bridges)."""
+def test_failed_servers_leave_no_helper_behind_while_the_backend_lives(tmp_path):
+    """Servers that never answer ``initialize`` are torn down at their connect timeout. Anything they
+    spawned goes with them, even a helper that escaped the SDK's job object (the SDK assigns the job
+    only after the process started, so a launcher that spawns at once races it; concurrent spawns
+    during discovery make it lose): before the fix each such attempt stranded one helper for the
+    life of the backend (the leaked ``mcp-remote`` bridges)."""
     home = tmp_path / "home"
-    pidfile = tmp_path / "helper.pid"
     hang = _script(tmp_path, "hang_server.py", _HANG_SERVER)
-    _write_home(home, {"hang": {"command": sys.executable, "args": [str(hang)], "connect_timeout": 3,
-                                "env": {"HANG_PIDFILE": str(pidfile)}}})
+    fast = _script(tmp_path, "fast_server.py", _FAST_SERVER)
+    pidfiles = [tmp_path / f"helper{i}.pid" for i in range(3)]
+    servers = {f"hang{i}": {"command": sys.executable, "args": [str(hang)], "connect_timeout": 4,
+                            "env": {"HANG_PIDFILE": str(pf)}} for i, pf in enumerate(pidfiles)}
+    servers["fast"] = {"command": sys.executable, "args": [str(fast)]}
+    _write_home(home, servers)
     try:
-        result = _discover(tmp_path, home, extra_env={"HANG_PIDFILE": str(pidfile),
-                                                      "POST_DISCOVERY_SLEEP": "3"})
+        result = _discover(tmp_path, home, extra_env={"POST_DISCOVERY_SLEEP": "3"})
+        alive = [pf.name for pf in pidfiles if pf.exists() and psutil.pid_exists(int(pf.read_text()))]
     finally:
-        alive_after_run = pidfile.exists() and psutil.pid_exists(int(pidfile.read_text()))
-        _kill_leftover(pidfile)
-    assert result["status"]["hang"]["status"] == "failed"
-    assert result["helper_alive"] is False
-    assert not alive_after_run
+        for pidfile in pidfiles:
+            _kill_leftover(pidfile)
+    assert all(result["status"][f"hang{i}"]["status"] == "failed" for i in range(3))
+    assert all(pf.exists() for pf in pidfiles)  # every helper really was spawned
+    assert alive == []
 
 
 def test_expired_token_and_dead_server_fail_fast_while_a_healthy_server_registers(tmp_path):
