@@ -140,6 +140,20 @@ def _has_codex_material(load: Callable[[], bytes]) -> bool:
     return any(any(rows_mod.row_tokens(store, row)) for row in rows_mod.codex_rows(store))
 
 
+def _existing_codex_material(dest: Path) -> bool:
+    if not dest.exists():
+        return False
+    return _has_codex_material(lambda: dest.read_bytes())
+
+
+def _inside_protected_root(dest: Path) -> bool:
+    """*dest* (resolved) lies inside the Hermes root whose authority this restore holds."""
+    from hermes_cli.auth_codex_registry import root_home
+    root = _norm(str(canonical_path(root_home())))
+    here = _norm(str(dest))
+    return here == root or here.startswith(root.rstrip(os.sep) + os.sep)
+
+
 def check_restore(targets: Iterable[Tuple[Path, Callable[[], bytes]]], action: str) -> None:
     """Raise :class:`CodexAuthorityRefused` if restoring these ``(target path, bytes loader)`` pairs
     would overwrite Codex credential state unsafely (module docstring)."""
@@ -150,6 +164,13 @@ def check_restore(targets: Iterable[Tuple[Path, Callable[[], bytes]]], action: s
         if kind is None:
             continue
         target = _destination(Path(target))
+        if not _inside_protected_root(target) and (
+                kind == "protocol" or _has_codex_material(load) or _existing_codex_material(target)):
+            # The state check, lock, barrier and fence below protect THIS root only: Codex state
+            # bound for (or already in) another Hermes root would land there unprotected.
+            raise CodexAuthorityRefused(
+                f"The backup would write Hermes credentials outside this installation ({target}); "
+                f"{action} isn't supported for them.")
         if kind == "store":
             refuse_if_registered_store(target, action)
         if has_state is None:
