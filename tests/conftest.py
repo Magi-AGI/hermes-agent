@@ -680,16 +680,67 @@ def _neutralize_git_safe_directory_read(request, monkeypatch):
     monkeypatch.setattr(_subprocess_compat, "_user_safe_directories", lambda base_env: [], raising=False)
 
 
+_REAL_CODEX_AUTH_HOSTS = frozenset({"auth.openai.com"})
+
+
 @pytest.fixture(autouse=True)
 def _block_real_codex_token_endpoint(monkeypatch):
-    """No test may present a refresh token (fake or not) to OpenAI's real token endpoint: point the
-    module constant at a closed local port. Tests with a loopback endpoint set their own URL."""
+    """No test may present a refresh token (fake or not) to OpenAI's real token host, by ANY path.
+
+    ``auth_codex.CODEX_OAUTH_TOKEN_URL`` is pointed at a closed local port (tests with a loopback
+    endpoint set their own URL), and the host of the real URL is refused at the transport — httpx
+    sync/async transports and name resolution — before a connection is opened. Every attempt is
+    recorded and fails the test at teardown even if the caller swallowed the error. Yields the
+    attempt list (a test of the guard itself clears it)."""
+    from urllib.parse import urlsplit
+
+    attempts: list = []
+    hosts = set(_REAL_CODEX_AUTH_HOSTS)
     try:
         from hermes_cli import auth_codex as _auth_codex
+        from hermes_cli.auth_constants import CODEX_OAUTH_TOKEN_URL as _real_url
+        hosts.add((urlsplit(_real_url).hostname or "").lower())
+        monkeypatch.setattr(_auth_codex, "CODEX_OAUTH_TOKEN_URL",
+                            "http://127.0.0.1:9/codex-token-endpoint-blocked-in-tests", raising=False)
     except Exception:
-        return
-    monkeypatch.setattr(_auth_codex, "CODEX_OAUTH_TOKEN_URL",
-                        "http://127.0.0.1:9/codex-token-endpoint-blocked-in-tests", raising=False)
+        pass
+    hosts.discard("")
+
+    def _refuse(host) -> None:
+        name = host.decode("ascii", "replace") if isinstance(host, bytes) else str(host or "")
+        if name.lower().rstrip(".") in hosts:
+            attempts.append(name)
+            raise ConnectionRefusedError(f"test session: the real Codex auth host {name} is blocked")
+
+    try:
+        import httpx
+
+        _sync, _async = httpx.HTTPTransport.handle_request, httpx.AsyncHTTPTransport.handle_async_request
+
+        def _handle_request(self, request):
+            _refuse(request.url.host)
+            return _sync(self, request)
+
+        async def _handle_async_request(self, request):
+            _refuse(request.url.host)
+            return await _async(self, request)
+
+        monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _handle_request)
+        monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", _handle_async_request)
+    except Exception:
+        pass
+    import socket
+
+    _getaddrinfo = socket.getaddrinfo
+
+    def _guarded_getaddrinfo(host, *args, **kwargs):  # urllib / requests / raw sockets
+        _refuse(host)
+        return _getaddrinfo(host, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", _guarded_getaddrinfo)
+    yield attempts
+    if attempts:
+        pytest.fail(f"a test tried to reach the real Codex auth host: {attempts}")
 
 
 @pytest.fixture(autouse=True)
