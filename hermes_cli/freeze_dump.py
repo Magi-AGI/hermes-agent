@@ -31,8 +31,9 @@ _MINIDUMP_FLAGS = (
 _PROCESS_QUERY_INFORMATION = 0x0400
 _PROCESS_VM_READ = 0x0010
 _PROCESS_DUP_HANDLE = 0x0040
-#: Dumps kept per directory; each freeze writes one per process of the tree.
-KEEP_DUMPS = 12
+#: Freeze incidents kept per directory. An incident is every dump of one capture (one file per
+#: process of the tree); pruning never splits one, and never touches the incident just written.
+KEEP_INCIDENTS = 3
 
 
 def write_minidump(pid: int, path: Path) -> Path:
@@ -70,7 +71,7 @@ def write_minidump(pid: int, path: Path) -> Path:
 
 
 def dump_process_tree(pid: int, out_dir: Path, *, label: str = "backend") -> list[Path]:
-    """Dump *pid* and every live descendant into *out_dir*; prune to :data:`KEEP_DUMPS` files.
+    """Dump *pid* and every live descendant into *out_dir*; keep :data:`KEEP_INCIDENTS` incidents.
 
     A process that cannot be dumped (exited meanwhile, access denied) is skipped and reported on
     stderr; the others are still written."""
@@ -82,21 +83,28 @@ def dump_process_tree(pid: int, out_dir: Path, *, label: str = "backend") -> lis
         tree = [root, *root.children(recursive=True)]
     except psutil.Error as exc:
         raise OSError(f"process {pid} is not inspectable: {exc}") from exc
+    incident = f"{label}-{stamp}-{pid}"
     written: list[Path] = []
     for proc in tree:
-        target = out_dir / f"{label}-{stamp}-{pid}-{proc.pid}.dmp"
+        target = out_dir / f"{incident}-{proc.pid}.dmp"
         try:
             written.append(write_minidump(proc.pid, target))
         except OSError as exc:
             print(f"freeze_dump: skipped pid {proc.pid}: {exc}", file=sys.stderr)
-    _prune(out_dir)
+    _prune(out_dir, keep=incident)
     return written
 
 
-def _prune(out_dir: Path) -> None:
-    dumps = sorted(out_dir.glob("*.dmp"), key=lambda p: p.stat().st_mtime, reverse=True)
-    for stale in dumps[KEEP_DUMPS:]:
-        stale.unlink(missing_ok=True)
+def _prune(out_dir: Path, *, keep: str) -> None:
+    """Delete whole incidents beyond the newest :data:`KEEP_INCIDENTS`, *keep* always included."""
+    incidents: dict[str, list[Path]] = {}
+    for dump in out_dir.glob("*.dmp"):
+        incidents.setdefault(dump.stem.rsplit("-", 1)[0], []).append(dump)
+    newest_first = sorted((name for name in incidents if name != keep),
+                          key=lambda name: max(p.stat().st_mtime for p in incidents[name]), reverse=True)
+    for stale in newest_first[KEEP_INCIDENTS - 1:]:
+        for dump in incidents[stale]:
+            dump.unlink(missing_ok=True)
 
 
 def main(argv: list[str] | None = None) -> int:

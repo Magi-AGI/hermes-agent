@@ -108,3 +108,65 @@ test('a backend whose loop froze is dumped, then killed; a healthy one is left a
   assert.deepEqual(supervisor.watchedKeys(), ['healthy'])
   supervisor.unwatch('healthy')
 })
+
+// A backend that never answers, driven through a scripted probe so each capture can be steered.
+function silentSupervisor(onCapture: (ctl: ReturnType<typeof createBackendLivenessSupervisor>) => Promise<void>) {
+  const kills: number[] = []
+  let answer = false
+
+  const supervisor = createBackendLivenessSupervisor({
+    intervalMs: 20,
+    isAlive: () => true,
+    log: () => undefined,
+    probe: async () => answer,
+    probeTimeoutMs: 10,
+    unresponsiveMs: 100
+  })
+
+  supervisor.watch('primary', {
+    baseUrl: 'http://127.0.0.1:1',
+    captureDumps: () => onCapture(supervisor),
+    kill: () => void kills.push(4242),
+    pid: 4242
+  })
+
+  return { kills, setAnswer: (value: boolean) => (answer = value), supervisor }
+}
+
+const settle = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+
+test('a teardown that begins while dumps are being written cancels the kill', async () => {
+  let captured!: () => void
+  const capturing = new Promise<void>(resolve => (captured = resolve))
+
+  const { kills, supervisor } = silentSupervisor(async ctl => {
+    // Quit / profile switch / repair starts its intentional stop mid-capture.
+    ctl.unwatch('primary')
+    captured()
+  })
+
+  await capturing
+  await settle(100)
+
+  assert.deepEqual(kills, [])
+  assert.deepEqual(supervisor.watchedKeys(), [])
+})
+
+test('a backend that answers again by the end of the dump is not killed and stays watched', async () => {
+  let captured!: () => void
+  const capturing = new Promise<void>(resolve => (captured = resolve))
+  let recover = () => undefined as unknown
+
+  const run = silentSupervisor(async () => {
+    recover()
+    captured()
+  })
+
+  recover = () => run.setAnswer(true)
+  await capturing
+  await settle(100)
+
+  assert.deepEqual(run.kills, [])
+  assert.deepEqual(run.supervisor.watchedKeys(), ['primary'])
+  run.supervisor.unwatchAll()
+})

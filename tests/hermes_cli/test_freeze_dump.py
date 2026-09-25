@@ -60,3 +60,34 @@ def test_a_suspended_process_tree_is_dumped_with_its_children(tmp_path):
     finally:
         subprocess.run(["taskkill", "/PID", str(parent.pid), "/T", "/F"], capture_output=True)
         parent.wait(timeout=10)
+
+
+@pytest.mark.windows_only
+def test_retention_keeps_whole_incidents_including_the_one_just_written(tmp_path):
+    """The root is dumped FIRST, so per-file retention deleted it whenever one incident had more
+    files than the cap. Retention now counts incidents and never splits or drops the current one."""
+    import os
+
+    from hermes_cli.freeze_dump import KEEP_INCIDENTS, dump_process_tree
+
+    out = tmp_path / "freeze-dumps"
+    out.mkdir()
+    for n in range(KEEP_INCIDENTS + 2):  # earlier incidents, each several files, all "older"
+        for pid in range(20):
+            old = out / f"backend-2026090{n}-000000-{1000 + n}-{pid}.dmp"
+            old.write_bytes(b"MDMP")
+            os.utime(old, (n + 1, n + 1))
+
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        written = dump_process_tree(child.pid, out)
+    finally:
+        subprocess.run(["taskkill", "/PID", str(child.pid), "/T", "/F"], capture_output=True)
+        child.wait(timeout=10)
+
+    remaining = {p.stem.rsplit("-", 1)[0] for p in out.glob("*.dmp")}
+    current = written[0].stem.rsplit("-", 1)[0]
+    assert all(p.exists() for p in written), "the incident just written lost a dump"
+    assert current in remaining and len(remaining) == KEEP_INCIDENTS
+    for incident in remaining - {current}:
+        assert len(list(out.glob(f"{incident}-*.dmp"))) == 20, "an older incident was split"

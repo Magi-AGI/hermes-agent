@@ -11440,7 +11440,15 @@ function resetBootProgressForReconnect() {
   )
 }
 
+// Every ready local backend this app owns is supervised for liveness (D7, backend-liveness.ts): a
+// backend that answers nothing for 120 s while alive gets native dumps written, then its exact
+// process tree killed; the owner's exit handler and recovery respawn it.
+const backendLiveness = createBackendLivenessSupervisor({ isAlive: pidIsAlive, log: rememberLog })
+
 function stopBackendChild(child) {
+  // An intentional stop disarms liveness supervision first: a backend that is shutting down must
+  // never be dumped and killed as frozen (D7).
+  backendLiveness.unwatchPid(child?.pid)
   void localBackendLifecycle.stop(child).catch(error => rememberLog(`Backend teardown failed: ${error.message}`))
 }
 
@@ -13071,6 +13079,7 @@ async function stopAllPoolBackends() {
 }
 
 const backendShutdown = createBackendShutdownCoordinator(async () => {
+  backendLiveness.unwatchAll()
   const localShutdown = localBackendLifecycle.shutdown()
   const primary = backendConnectionState.invalidate()
 
@@ -13307,11 +13316,6 @@ function startHermes() {
 
   return start
 }
-
-// Every ready local backend this app owns is supervised for liveness (D7, backend-liveness.ts): a
-// backend that answers nothing for 120 s while alive gets native dumps written, then its exact
-// process tree killed; the owner's exit handler and recovery respawn it.
-const backendLiveness = createBackendLivenessSupervisor({ isAlive: pidIsAlive, log: rememberLog })
 
 function pidIsAlive(pid: number): boolean {
   try {

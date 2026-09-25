@@ -17,6 +17,8 @@ import http from 'node:http'
 export const LIVENESS_INTERVAL_MS = 15_000
 export const LIVENESS_PROBE_TIMEOUT_MS = 5_000
 export const LIVENESS_UNRESPONSIVE_MS = 120_000
+/** The dump helper's own timeout is 90 s; beyond this the check was interrupted, not completed. */
+export const LIVENESS_CAPTURE_BUDGET_MS = 150_000
 
 export interface LivenessTarget {
   pid: number
@@ -81,12 +83,15 @@ export interface BackendLivenessOptions {
   isAlive: (pid: number) => boolean
   probe?: (baseUrl: string, timeoutMs: number) => Promise<boolean>
   intervalMs?: number
+  /** Longest a dump capture may take before the check counts as interrupted (asleep, stalled). */
+  captureBudgetMs?: number
   probeTimeoutMs?: number
   unresponsiveMs?: number
   now?: () => number
 }
 
 export function createBackendLivenessSupervisor({
+  captureBudgetMs = LIVENESS_CAPTURE_BUDGET_MS,
   intervalMs = LIVENESS_INTERVAL_MS,
   isAlive,
   log,
@@ -133,12 +138,36 @@ export function createBackendLivenessSupervisor({
 
     const silentForS = Math.round((now() - (verdict.window.firstFailureAt ?? now())) / 1000)
     log(`[liveness] ${key} backend pid ${target.pid} has not answered for ${silentForS}s while alive; capturing native dumps, then restarting it`)
-    watched.delete(key)
+    // The entry stays registered through the capture: unwatch() (an intentional teardown, quit,
+    // or the process exiting) cancels the kill.
+    const captureStartedAt = now()
     await target.captureDumps()
 
-    if (isAlive(target.pid)) {
-      target.kill()
+    if (watched.get(key)?.target !== target || !isAlive(target.pid)) {
+      log(`[liveness] ${key} backend pid ${target.pid} was torn down or exited during the dump; not killing it`)
+
+      return
     }
+
+    // Revalidate before the kill: a backend that answers again recovered on its own, and a capture
+    // that outlasted its budget means this process (or the machine) stalled, so start over.
+    const recovered = await probe(target.baseUrl, probeTimeoutMs)
+    const stalled = now() - captureStartedAt > captureBudgetMs
+
+    if (watched.get(key)?.target !== target || !isAlive(target.pid)) {
+      return
+    }
+
+    if (recovered || stalled) {
+      log(`[liveness] ${key} backend pid ${target.pid} ${recovered ? 'answered again' : 'check was interrupted by a stall'}; not restarting it`)
+      entry.window = freshLivenessWindow()
+      schedule(key, target)
+
+      return
+    }
+
+    watched.delete(key)
+    target.kill()
   }
 
   /** Stop watching *key*; with *pid*, only when that exact backend is still the watched one. */
@@ -161,6 +190,19 @@ export function createBackendLivenessSupervisor({
       schedule(key, target)
     },
     unwatch,
+    /** Disarm whichever key watches *pid*: every deliberate stop of a backend calls this first. */
+    unwatchPid(pid: number | undefined) {
+      for (const [key, entry] of watched) {
+        if (entry.target.pid === pid) {
+          unwatch(key)
+        }
+      }
+    },
+    unwatchAll() {
+      for (const key of [...watched.keys()]) {
+        unwatch(key)
+      }
+    },
     watchedKeys: () => [...watched.keys()]
   }
 }
