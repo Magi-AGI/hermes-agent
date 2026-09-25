@@ -7,11 +7,12 @@ registry, a live chain record, or an unfinished op's payload.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import List
 
 from hermes_cli.auth_codex_registry import (
-    REGISTRY_NAME, all_store_paths, ops_dir, read_registry, registry_path)
+    RECORDS_DIR_NAME, REGISTRY_NAME, all_store_paths, migration_lock, ops_dir, read_registry, registry_path)
 from hermes_cli.auth_codex_records import records_dir
 
 
@@ -39,12 +40,35 @@ def list_recovery() -> List[str]:
     return lines
 
 
+def _index_archived_record(path: Path) -> bool:
+    """Fold an archived chain record into the retired-token index before its file goes; False
+    when the file cannot be read (it is then KEPT: its evidence would otherwise be lost)."""
+    from hermes_cli.auth_codex_evidence import material_of, read_index, retain
+    from hermes_cli.auth_codex_records import RecordView
+    from hermes_cli.auth_credential_io import read_bytes_retrying
+    try:
+        data = json.loads(read_bytes_retrying(path).decode("utf-8"))
+        cid = data["chain_id"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    status, index = read_index()
+    if status != "ok" or cid not in index["chains"]:
+        retain({cid: material_of(RecordView("ok", data), reason="archived")})
+    return True
+
+
 def clear_archives() -> int:
+    """Delete archived files. Archived chain records are indexed first (the retired-token index
+    itself is never an archive and is never removed)."""
     removed = 0
-    for path in _archive_files():
-        try:
-            path.unlink()
-            removed += 1
-        except OSError:
-            pass
+    with migration_lock():
+        for path in _archive_files():
+            if path.parent.name == "archive" and path.parent.parent.name == RECORDS_DIR_NAME:
+                if not _index_archived_record(path):
+                    continue
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                pass
     return removed

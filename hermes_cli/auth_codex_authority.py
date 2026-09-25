@@ -23,9 +23,10 @@ from hermes_cli import auth_codex_rows as rows_mod
 from hermes_cli.auth_codex_ops import recover_ops, record_legacy_rescues, run_op
 from hermes_cli.auth_codex_plans import (
     load_snapshots, plan_override, plan_registration, plan_removal, plan_sign_in, rescue_candidates)
-from hermes_cli.auth_codex_records import known_token_shas, read_record
+from hermes_cli.auth_codex_evidence import known_material
+from hermes_cli.auth_codex_records import read_record
 from hermes_cli.auth_codex_registry import (
-    PROVIDER, SINGLETON, STATE_ACTIVE, CodexAuthorityRefused, CodexRegistryUnreadable, RegistryView,
+    PROVIDER, SINGLETON, STATE_ACTIVE, STATE_RETIRED, CodexAuthorityRefused, CodexRegistryUnreadable, RegistryView,
     active_store_path, all_store_paths, migration_lock, ops_dir, pair_fp, preserve_unreadable_registry,
     read_registry, store_locks, store_path_of, thread_holds_store_lock, token_sha,
     try_migration_lock, unrecorded_legacy_rescues)
@@ -197,18 +198,18 @@ def sign_in(access: str, refresh: str, *, kind: str = "singleton", last_refresh:
     return _run_with_all_stores(build)
 
 
-def _chain_known_shas(view: RegistryView) -> Dict[str, Tuple[set, set, Dict[str, Any]]]:
+def _live_chain_records(view: RegistryView) -> Dict[str, Tuple[set, set, Dict[str, Any]]]:
+    """Live (non-retired) chains whose record reads ok, with every token hash it lists. A chain
+    whose record does not read is NOT listed here; ``known_material`` reports it as a gap."""
+    from hermes_cli.auth_codex_evidence import record_material
     out = {}
     for cid, entry in view.chains.items():
+        if entry.get("state") == STATE_RETIRED:
+            continue
         rec = read_record(store_path_of(entry["owner"]), cid)
         if rec.status == "ok":
-            a, r = known_token_shas(rec.data)
-            attempt = rec.data.get("attempt") or {}
-            if attempt.get("predecessor_access_sha"):
-                a.add(attempt["predecessor_access_sha"])
-            if attempt.get("predecessor_refresh_sha"):
-                r.add(attempt["predecessor_refresh_sha"])
-            out[cid] = (a, r, rec.data)
+            material = record_material(rec.data)
+            out[cid] = (material["access"], material["refresh"], rec.data)
     return out
 
 
@@ -233,7 +234,7 @@ def import_pair(access: str, refresh: str, *, reason: str, last_refresh: Optiona
             if current_access != expected_singleton_access:
                 logger.info("Codex import skipped (%s): the credential was re-authenticated meanwhile.", reason)
                 return None
-        for cid, (a_set, r_set, record) in _chain_known_shas(view).items():
+        for cid, (a_set, r_set, record) in _live_chain_records(view).items():
             entry = view.chain(cid)
             attempt = record.get("attempt") or {}
             succ = attempt.get("successor") or {}
@@ -254,6 +255,15 @@ def import_pair(access: str, refresh: str, *, reason: str, last_refresh: Optiona
                 return None
             logger.info("Codex import (%s) matched a known login; using its current tokens", reason)
             return current
+        evidence = known_material(view)
+        if evidence.retired(access, refresh):
+            logger.warning("Codex import refused (%s): that token belongs to a Codex login Hermes already "
+                           "replaced or removed; sign in again instead", reason)
+            return None
+        if not evidence.complete:
+            logger.warning("Codex import refused (%s): Hermes can't check the token against its login history "
+                           "(%s); sign in again instead", reason, "; ".join(evidence.gaps[:3]))
+            return None
         if any_chain_fenced(view):
             logger.warning("Codex import refused (%s): a Codex login is paused; sign in again instead", reason)
             return None

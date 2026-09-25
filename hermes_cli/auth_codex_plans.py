@@ -16,7 +16,8 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from hermes_cli import auth_codex_rows as rows_mod
 from hermes_cli.auth_codex_ops import Payload, retire_entry
-from hermes_cli.auth_codex_records import known_token_shas, read_record
+from hermes_cli.auth_codex_evidence import Evidence, known_material, row_material
+from hermes_cli.auth_codex_records import read_record
 from hermes_cli.auth_codex_registry import (
     PROVIDER, SINGLETON, STATE_ACTIVE, STATE_FENCED, RegistryView, is_root_store, new_id,
     pair_fp, root_store_path, token_sha, unrecorded_legacy_rescues, utc_now)
@@ -110,6 +111,13 @@ def _alias_defaults(store: Dict[str, Any], access: str) -> Dict[str, Any]:
             "request_count": 0}
 
 
+def _index_only_evidence() -> Evidence:
+    """Bootstrap / reconstruction (no readable registry): the retired-token index alone."""
+    from hermes_cli.auth_codex_registry import RegistryView as _View
+    evidence = known_material(_View("ok", {"version": 1, "ops": {}, "chains": {}}))
+    return evidence
+
+
 def _add(payload: Payload, key: str, edit: Dict[str, Any]) -> None:
     payload.edits.setdefault(key, []).append(edit)
 
@@ -149,14 +157,9 @@ def plan_registration(view: RegistryView, snaps: Dict[str, Snapshot], *, only_un
         if info[2]:
             fps_by_access[info[2]].add(fp)
         fps_by_refresh[info[3]].add(fp)
-    known_access, known_refresh = set(), set()
-    if only_unregistered:  # material an existing chain ever held is never a new authorization
-        for cid, entry in view.chains.items():
-            rec = read_record(Path(snaps[entry["owner"]].path) if entry["owner"] in snaps else Path(entry["owner"]), cid)
-            if rec.status == "ok":
-                a, r = known_token_shas(rec.data)
-                known_access |= a
-                known_refresh |= r
+    # Material any chain ever held (live records + the retired-token index) is never a new
+    # authorization; when that evidence is incomplete, nothing is registered active (fail closed).
+    evidence = known_material(view) if view.ok else _index_only_evidence()
 
     payload = Payload(kind=kind, scope_chains="*" if not only_unregistered else [],
                       scope_stores=sorted(snaps), scope_profiles=sorted({s.profile for s in snaps.values()}))
@@ -169,8 +172,8 @@ def plan_registration(view: RegistryView, snaps: Dict[str, Snapshot], *, only_un
         root_rows = [m for m in members if is_root_store(m[0])]
         ambiguous = (
             len(fps_by_refresh[refresh]) > 1 or (access and len(fps_by_access[access]) > 1)
-            or (not root_rows and len(stores) > 1)
-            or token_sha(access) in known_access or token_sha(refresh) in known_refresh)
+            or (not root_rows and len(stores) > 1) or evidence.knows(access, refresh))
+        unverified = not ambiguous and not fence_all and not evidence.complete
         units = [[m] for m in members] if ambiguous else [members]
         for unit in units:
             cid = new_id()
@@ -181,6 +184,9 @@ def plan_registration(view: RegistryView, snaps: Dict[str, Snapshot], *, only_un
                 state, fence = STATE_FENCED, {"reason": "ambiguous-lineage", "epoch": 1}
             elif fence_all:
                 state, fence = STATE_FENCED, {"reason": fence_all, "epoch": 1}
+            elif unverified:
+                state, fence = STATE_FENCED, {"reason": "unverified-history", "epoch": 1,
+                                              "evidence": {"gaps": evidence.gaps[:5]}}
             unit_rows = [(m[0], m[1]) for m in unit]
             if not ambiguous:
                 for store, row in unit_rows:
@@ -242,7 +248,21 @@ def _fence_legacy_rescues(view: RegistryView, snaps: Dict[str, Snapshot], payloa
 
 # ── RULE-A2 fresh sign-in ────────────────────────────────────────────────────────────────────
 
-def _release_rows(view: RegistryView, payload: Payload, target: str, released: List[str]) -> None:
+def _chain_row_material(entry: Dict[str, Any], snaps: Dict[str, Snapshot]) -> List[Dict[str, Any]]:
+    """Token hashes of every row a chain holds now (kept in the retired-token index with its
+    record's history, RULE-A3)."""
+    out = []
+    for r in entry.get("rows", ()):
+        snap = snaps.get(r["store"])
+        if snap is not None:
+            access, refresh = rows_mod.row_tokens(snap.store, r["row"])
+            if access or refresh:
+                out.append(row_material(access, refresh))
+    return out
+
+
+def _release_rows(view: RegistryView, payload: Payload, target: str, released: List[str],
+                  snaps: Dict[str, Snapshot]) -> None:
     """Take *released* rows out of their old chains; an old chain owned by the target store (or
     left without rows) is retired and its record archived (RULE-A3)."""
     released_set = {(target, r) for r in released}
@@ -256,7 +276,7 @@ def _release_rows(view: RegistryView, payload: Payload, target: str, released: L
         if entry["owner"] == target or not remaining:
             payload.chains[cid] = retire_entry(entry, remaining)
             payload.records.append({"action": "archive", "owner": entry["owner"], "chain_id": cid,
-                                    "reason": "retired"})
+                                    "reason": "retired", "rows": _chain_row_material(entry, snaps)})
         else:
             payload.chains[cid] = {**entry, "rows": remaining, "epoch": entry["epoch"] + 1}
             payload.records.append({"action": "set_epoch", "owner": entry["owner"], "chain_id": cid,
@@ -328,7 +348,7 @@ def plan_sign_in(view: RegistryView, snaps: Dict[str, Snapshot], target: str, ac
             _add(payload, target, {"op": "unsuppress", "sources": list(listed)})
         if activate_if_unset:
             _add(payload, target, {"op": "set_active_provider", "value": PROVIDER, "only_if_unset": True})
-    _release_rows(view, payload, target, [r for r in rows if view.chain_for_row(target, r)])
+    _release_rows(view, payload, target, [r for r in rows if view.chain_for_row(target, r)], snaps)
     payload.chains[cid] = _chain_entry(target, [(target, r) for r in rows], access)
     payload.records.append(_create_record(target, cid, 1, access, refresh, outcome))
     payload.result = {"chain_id": cid, "rows": rows}
@@ -346,14 +366,14 @@ def plan_removal(view: RegistryView, snaps: Dict[str, Snapshot], target: str, ro
             continue
         _add(payload, target, {"op": "remove_row", "row": row, "chain_id": rows_mod.row_chain(snap.store, row),
                                "fp": rows_mod.row_fp(snap.store, row)})
-    _release_rows(view, payload, target, [r for r in rows if view.chain_for_row(target, r)])
+    _release_rows(view, payload, target, [r for r in rows if view.chain_for_row(target, r)], snaps)
     for cid, entry in list(payload.chains.items()):
         owner_rows = [r for r in entry["rows"] if r["store"] == entry["owner"]]
         if entry.get("state") != "retired" and not owner_rows:
             payload.chains[cid] = retire_entry(view.chain(cid), entry["rows"])
             payload.records = [a for a in payload.records if a.get("chain_id") != cid]
             payload.records.append({"action": "archive", "owner": entry["owner"], "chain_id": cid,
-                                    "reason": "removed"})
+                                    "reason": "removed", "rows": _chain_row_material(view.chain(cid), snaps)})
     if suppress:
         _add(payload, target, {"op": "suppress", "sources": list(suppress)})
     if deactivate:

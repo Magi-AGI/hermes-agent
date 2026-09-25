@@ -65,6 +65,7 @@ _FENCE_REASON_TEXT = {
     "rejected": "OpenAI rejected the saved refresh token",
     "retired": "this login was replaced by a newer sign-in",
     "unregistered": "this credential is not registered yet",
+    "unverified-history": "Hermes could not check this credential against its login history",
 }
 
 

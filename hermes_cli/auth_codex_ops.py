@@ -207,6 +207,10 @@ def _apply_record_action(action: Dict[str, Any]) -> None:
     owner = store_path_of(action["owner"])
     cid, kind = action["chain_id"], action["action"]
     if kind == "archive":
+        # The record is about to leave the live set: its token material goes to the durable
+        # retired-token index FIRST, so recognition never depends on the archive (RULE-A1/A3).
+        from hermes_cli.auth_codex_evidence import retain_chain
+        retain_chain(owner, cid, action.get("rows") or (), action.get("reason", "retired"))
         archive_record(owner, cid, action.get("reason", "retired"))
         return
     view = read_record(owner, cid)
