@@ -411,16 +411,16 @@ def record_legacy_rescues(found: List[Any], candidates: Dict[str, Set[str]]) -> 
     view = read_registry()
     data = json.loads(json.dumps(view.data))
     fenced = []
-    for store, sha in found:
-        chains = sorted(candidates.get(store, set()))
+    for store, sha, rescue in found:
+        chains = sorted(candidates.get(rescue, set()))
         for cid in chains:
             entry = data["chains"].get(cid)
             if entry and entry.get("state") == STATE_ACTIVE:
                 entry["state"] = STATE_FENCED
                 entry["fence"] = {"reason": "legacy-rescue", "epoch": entry["epoch"],
-                                  "evidence": {"rescue_store": store, "rescue_sha": sha}}
+                                  "evidence": {"rescue_store": store, "rescue_file": rescue, "rescue_sha": sha}}
                 fenced.append(cid)
-        data["legacy_rescues"][store] = {"sha": sha, "chains": chains, "at": utc_now()}
+        data["legacy_rescues"][rescue] = {"sha": sha, "store": store, "chains": chains, "at": utc_now()}
     write_registry(data)
     return fenced
 

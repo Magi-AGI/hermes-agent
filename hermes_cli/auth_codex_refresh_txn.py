@@ -134,8 +134,7 @@ def _transaction(row_store: Path, row: str, started: Tuple[str, str], *, force: 
     if touching and all(op.get("status") == OP_UNRECOVERABLE for _op_id, op in touching):
         # Kept until its payload reads again (the dispatcher retries it) or it is resolved.
         raise CodexRecoveryFenced("op-unrecoverable", _unrecoverable_message(touching[0][0]))
-    if touching or entry.get("lifecycle") or unrecorded_legacy_rescues(
-            view, {row_store, store_path_of(entry["owner"])}):
+    if touching or entry.get("lifecycle") or unrecorded_legacy_rescues(view):  # every alias path (§7)
         _dispatch_once(round_)
     if entry.get("state") in (STATE_FENCED, STATE_RETIRED):
         raise _fenced_error(cid, entry)

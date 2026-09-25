@@ -468,21 +468,46 @@ def legacy_rescue_path(store: Path) -> Path:
     return Path(store).parent / LEGACY_RESCUE_NAME
 
 
-def unrecorded_legacy_rescues(view: RegistryView, stores: Iterable[Path]) -> List[Tuple[str, str]]:
-    """``(store key, sha)`` of rescue files (written by the withdrawn rev-0 code) not yet fenced."""
+def rescue_locations() -> List[Tuple[Path, Path]]:
+    """``(rescue file, store path)`` at EVERY path a store is reached by, enumerated BEFORE store
+    aliases are collapsed (§7): root, the active store, and every live named profile directory —
+    with or without its own auth.json (a borrowing profile's rescue belongs to root's grant) —
+    beside the path as given AND beside its canonical file. A rescue written beside a profile whose
+    auth.json links to root's is found here although that profile is the same store as root."""
+    from hermes_cli.auth_credential_io import canonical_path
+    stores = [root_store_path(), active_store_path()]
+    try:
+        from hermes_cli.profiles import _iter_named_profile_dirs
+        stores.extend(d / "auth.json" for d in _iter_named_profile_dirs())
+    except Exception:
+        logger.debug("codex authority: profile enumeration failed", exc_info=True)
+    seen, out = set(), []
+    for store in stores:
+        for rescue in (legacy_rescue_path(store), legacy_rescue_path(canonical_path(store))):
+            key = store_key(rescue)
+            if key not in seen:
+                seen.add(key)
+                out.append((rescue, Path(store)))
+    return out
+
+
+def unrecorded_legacy_rescues(view: RegistryView,
+                              locations: Optional[Iterable[Tuple[Path, Path]]] = None) -> List[Tuple[str, str, str]]:
+    """``(store key, sha, rescue key)`` of rescue files (written by the withdrawn rev-0 code) not
+    yet fenced. The store key maps each rescue to the CANONICAL store it belongs to; the rescue key
+    (the file's own canonical identity) is what the registry records."""
     known = view.data.get("legacy_rescues", {}) if view.ok else {}
     found = []
-    for store in stores:
-        rescue = legacy_rescue_path(store)
+    for rescue, store in (rescue_locations() if locations is None else locations):
         try:
             _raw, sha = read_witnessed_bytes(rescue)
         except OSError:
             sha = "unreadable"
         if sha is None:
             continue
-        key = store_key(store)
-        if (known.get(key) or {}).get("sha") != sha:
-            found.append((key, sha))
+        rescue_key = store_key(rescue)
+        if (known.get(rescue_key) or {}).get("sha") != sha:
+            found.append((store_key(store), sha, rescue_key))
     return found
 
 

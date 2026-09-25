@@ -235,15 +235,15 @@ def rescue_candidates(view_chains: Dict[str, Dict[str, Any]], snaps: Dict[str, S
 
 
 def _fence_legacy_rescues(view: RegistryView, snaps: Dict[str, Snapshot], payload: Payload) -> None:
-    for store, sha in unrecorded_legacy_rescues(view, [s.path for s in snaps.values()]):
+    for store, sha, rescue in unrecorded_legacy_rescues(view):
         chains = sorted(rescue_candidates({**view.chains, **payload.chains}, snaps, store))
         for cid in chains:
             entry = payload.chains.get(cid) or view.chain(cid)
             if entry and entry.get("state") == STATE_ACTIVE:
                 payload.chains[cid] = {**entry, "state": STATE_FENCED, "fence": {
                     "reason": "legacy-rescue", "epoch": entry["epoch"],
-                    "evidence": {"rescue_store": store, "rescue_sha": sha}}}
-        payload.legacy_rescues[store] = {"sha": sha, "chains": chains, "at": utc_now()}
+                    "evidence": {"rescue_store": store, "rescue_file": rescue, "rescue_sha": sha}}}
+        payload.legacy_rescues[rescue] = {"sha": sha, "store": store, "chains": chains, "at": utc_now()}
 
 
 # ── RULE-A2 fresh sign-in ────────────────────────────────────────────────────────────────────

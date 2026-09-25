@@ -53,12 +53,12 @@ def _bootstrap(fence_all: Optional[str] = None) -> Dict[str, Any]:
 def _fence_new_legacy_rescues() -> List[str]:
     view = read_registry()
     paths = all_store_paths()
-    found = unrecorded_legacy_rescues(view, paths)
+    found = unrecorded_legacy_rescues(view)
     if not found:
         return []
     with store_locks(paths):
         snaps = load_snapshots(paths)
-        candidates = {store: rescue_candidates(view.chains, snaps, store) for store, _sha in found}
+        candidates = {rescue: rescue_candidates(view.chains, snaps, store) for store, _sha, rescue in found}
         return record_legacy_rescues(found, candidates)
 
 
@@ -66,10 +66,10 @@ def _codex_material_present(paths: Iterable[Path]) -> bool:
     """Any Codex row or legacy rescue file anywhere (an ABSENT registry with neither is trivially
     consistent: nothing to govern, so nothing is written until the first Codex sign-in)."""
     from hermes_cli.auth import _load_auth_store
-    from hermes_cli.auth_codex_registry import legacy_rescue_path
+    from hermes_cli.auth_codex_registry import rescue_locations
+    if any(rescue.exists() for rescue, _store in rescue_locations()):
+        return True
     for path in paths:
-        if legacy_rescue_path(path).exists():
-            return True
         try:
             if path.exists() and rows_mod.codex_rows(_load_auth_store(path)):
                 return True
@@ -148,7 +148,7 @@ def startup_dispatch() -> str:
             from hermes_cli.auth_codex_restore import restore_barrier_pending
             if not _codex_material_present(paths) and not ops_dir().is_dir() and not restore_barrier_pending():
                 return "idle"
-        elif not dispatch_needed() and not unrecorded_legacy_rescues(view, paths):
+        elif not dispatch_needed() and not unrecorded_legacy_rescues(view):
             return "idle"
     except Exception:
         return "idle"
