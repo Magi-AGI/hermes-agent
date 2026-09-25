@@ -45,9 +45,7 @@ def test_retry_policy_distinguishes_self_lock_deferral(tmp_path: Path) -> None:
         check=False,
         capture_output=True,
         text=True,
-        # A hang guard, not a latency bound: a cold PowerShell 5.1 start (module analysis,
-        # AMSI) can run past 30 s on a loaded machine; the check itself has no timing in it.
-        timeout=180,
+        timeout=30,
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
