@@ -121,20 +121,23 @@ def test_no_reemit_when_discovery_added_nothing(monkeypatch):
         server._sessions.pop(sid, None)
 
 
-def test_no_refresh_when_join_times_out(monkeypatch):
+def test_no_refresh_while_a_slow_server_has_not_registered(monkeypatch):
     base = [_tool("read_file")]
-    full = base + [_tool("mcp__slow__c")]
     agent = _make_fake_agent(base)
     sid = "sess-late-5"
     server._sessions[sid] = {"agent": agent}
     try:
-        # Server never connected within the bound → join returns False, no rebuild.
-        emitted = _install(monkeypatch, in_flight=True, join_result=False, new_defs=full)
+        # Discovery runs on (join keeps timing out) and the slow server never registers → no
+        # rebuild worth announcing, and the waiter ends with discovery rather than spinning on.
+        emitted = _install(monkeypatch, in_flight=True, join_result=True, new_defs=list(base))
+        joins = iter([False, False, False])
+        monkeypatch.setattr(entry, "join_mcp_discovery", lambda timeout=None: next(joins, True))
         server._schedule_mcp_late_refresh(sid, agent)
         _drain_refresh_threads()
 
         assert len(agent.tools) == 1
         assert emitted == []
+        assert not any(t.name == f"tui-mcp-late-refresh-{sid}" for t in threading.enumerate())
     finally:
         server._sessions.pop(sid, None)
 

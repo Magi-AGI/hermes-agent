@@ -71,6 +71,8 @@ def _watch():
 threading.Thread(target=_watch, daemon=True).start()
 discover_mcp_tools()
 elapsed = time.monotonic() - started
+if not fast_at and any(e.name.startswith("mcp__fast__") for e in registry.get_all_entries()):
+    fast_at.append(elapsed)  # registered synchronously (lazy): the watcher may not have polled yet
 time.sleep(float(os.environ.get("POST_DISCOVERY_SLEEP", "0")))
 import psutil
 spawned = [p.pid for p in psutil.Process().children(recursive=True)]
