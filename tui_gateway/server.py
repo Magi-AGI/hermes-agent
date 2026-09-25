@@ -2203,9 +2203,10 @@ def broadcast_session_info() -> None:
 
 def _schedule_mcp_late_refresh(sid: str, agent) -> None:
     """Refresh a session's tool snapshot when MCP discovery lands late (``_make_agent`` waits only a bounded
-    ``mcp_discovery_timeout``, so a slow server's tools would be missing all session): a daemon joins discovery,
-    rebuilds like ``/reload-mcp`` and re-emits ``session.info``. Only pre-first-turn (nothing cached to
-    invalidate); afterwards late tools need an explicit, consent-gated ``/reload-mcp``."""
+    ``mcp_discovery_timeout``, so a slow server's tools would be missing all session): a daemon follows
+    discovery, rebuilds like ``/reload-mcp`` whenever tools register and re-emits ``session.info``. Only
+    pre-first-turn (nothing cached to invalidate); afterwards late tools need an explicit, consent-gated
+    ``/reload-mcp``."""
     try:
         from tui_gateway.entry import mcp_discovery_in_flight, join_mcp_discovery
     except Exception:
@@ -2213,25 +2214,42 @@ def _schedule_mcp_late_refresh(sid: str, agent) -> None:
     if not mcp_discovery_in_flight():
         return
 
-    def _wait_then_refresh() -> None:
-        if not join_mcp_discovery(timeout=30.0):  # a server still not connected after this is genuinely slow/dead
-            return
+    from tools.registry import registry
+
+    def _refresh() -> bool:
+        """Rebuild once; False when this session no longer takes late tools (closed, reset, or
+        its conversation started)."""
         with _sessions_lock:
             session = _sessions.get(sid)
             if session is None or session.get("agent") is not agent:
-                return  # closed/reset while we waited
+                return False  # closed/reset while we waited
             if int(getattr(agent, "_user_turn_count", 0) or 0) > 0 or int(getattr(agent, "_api_call_count", 0) or 0) > 0:
-                return  # conversation started: a rebuild would invalidate the cached prompt prefix
+                return False  # conversation started: a rebuild would invalidate the cached prompt prefix
             try:
                 from tools.mcp_tool_agent import refresh_agent_mcp_tools
                 added = refresh_agent_mcp_tools(agent, quiet_mode=True)
             except Exception as exc:
                 logger.warning("Late MCP refresh: tool snapshot rebuild failed for %s: %s", sid, exc)
-                return
+                return False
             if not added:
-                return  # discovery added nothing → don't churn the client
+                return True  # nothing new yet → don't churn the client
             info = _session_info(agent, session)
         _emit("session.info", sid, info)  # outside the lock — write_json must not block under _sessions_lock
+        return True
+
+    def _wait_then_refresh() -> None:
+        # Each server's tools as they land, not only once the whole pass settles: a pass can run for
+        # minutes behind one dead server, and waiting for all of it (or giving up after 30 s) left the
+        # healthy servers' tools out of every session opened meanwhile.
+        seen = None  # tools registered between the build and this thread count too
+        while True:
+            done = join_mcp_discovery(timeout=1.0)
+            generation = registry._generation
+            if (generation != seen or done) and not _refresh():
+                return
+            seen = generation
+            if done:
+                return
     threading.Thread(target=_wait_then_refresh, name=f"tui-mcp-late-refresh-{sid}", daemon=True).start()
 
 

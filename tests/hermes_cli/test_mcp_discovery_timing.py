@@ -31,9 +31,11 @@ from hermes_constants import hermes_home_key
 def _reset_mcp_startup_state():
     saved_started = mcp_startup._mcp_discovery_started
     saved_thread = mcp_startup._mcp_discovery_thread
+    saved_started_at = getattr(mcp_startup, "_mcp_discovery_started_at", None)
     try:
         mcp_startup._mcp_discovery_started = set()
         mcp_startup._mcp_discovery_thread = {}
+        mcp_startup._mcp_discovery_started_at = {}
         yield
     finally:
         thread = mcp_startup._current_home_thread()
@@ -41,6 +43,8 @@ def _reset_mcp_startup_state():
             thread.join(timeout=1.0)
         mcp_startup._mcp_discovery_started = saved_started
         mcp_startup._mcp_discovery_thread = saved_thread
+        if saved_started_at is not None:
+            mcp_startup._mcp_discovery_started_at = saved_started_at
 
 
 # ── _resolve_discovery_timeout: single_query bound ──────────────────────────
@@ -311,3 +315,27 @@ def test_wait_returns_instantly_when_discovery_done():
     t0 = time.time()
     mcp_startup.wait_for_mcp_discovery(single_query=True)
     assert time.time() - t0 < 0.2
+
+
+def test_agent_build_grace_is_one_window_from_discovery_start(monkeypatch):
+    """Discovery can run for minutes behind a dead server; every agent build during it (a
+    27-window reopen is 27 builds on the RPC pool) used to pay the full bound again. The bound
+    is one window from discovery's start: a build after it waits for nothing (gate item G8)."""
+    _stub_mcp_modules(monkeypatch)
+    release = threading.Event()
+    monkeypatch.setitem(sys.modules, "tools.mcp_tool_discovery", types.SimpleNamespace(
+        discover_mcp_tools=lambda: release.wait(10), get_mcp_status=lambda: [{"connected": True}]))
+    logger = types.SimpleNamespace(debug=lambda *_a, **_k: None, warning=lambda *_a, **_k: None)
+    try:
+        mcp_startup.start_background_mcp_discovery(logger=logger, thread_name="grace-window-test")
+        first_started = time.monotonic()
+        mcp_startup.wait_for_mcp_discovery(timeout=0.5)
+        first = time.monotonic() - first_started
+        second_started = time.monotonic()
+        mcp_startup.wait_for_mcp_discovery(timeout=0.5)
+        second = time.monotonic() - second_started
+        assert mcp_startup.mcp_discovery_in_flight()
+    finally:
+        release.set()
+    assert 0.3 < first < 2.0
+    assert second < 0.2

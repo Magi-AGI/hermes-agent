@@ -317,6 +317,7 @@ class MCPServerTransportMixin:
         # thread: the reaper blocks up to 2s (SIGTERM → wait → SIGKILL) when orphans exist, which would
         # otherwise stall the shared MCP event loop.
         new_pids: set = set()
+        descendants: list = []
         # Subprocess stderr goes to ~/.hermes/logs/mcp-stderr.log so banners can't corrupt the TUI.
         _config._write_stderr_log_header(self.name)
         try:
@@ -328,14 +329,18 @@ class MCPServerTransportMixin:
                 if new_pids:
                     self._track_spawned_children(new_pids)
                 self._stdio_child_pids = set(new_pids)  # so in-flight calls fail fast when the child dies
-                async with _core.ClientSession(read_stream, write_stream, **self._session_kwargs()) as session:
-                    # Bound the handshake here (``connect_timeout`` only bounds the caller's ``.result()``):
-                    # a server that never answers ``initialize`` would leak child + pipes per retry until EMFILE.
-                    connect_timeout = float(config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT))
-                    return await self._serve_session(session, connect_timeout, mark_lifecycle=True)
+                try:
+                    async with _core.ClientSession(read_stream, write_stream, **self._session_kwargs()) as session:
+                        # Bound the handshake here (``connect_timeout`` only bounds the caller's ``.result()``):
+                        # a server that never answers ``initialize`` would leak child + pipes per retry until EMFILE.
+                        connect_timeout = float(config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT))
+                        return await self._serve_session(session, connect_timeout, mark_lifecycle=True)
+                finally:  # before the SDK tears the tree down: afterwards escaped descendants are unreachable
+                    descendants = _lifecycle._snapshot_descendants(new_pids)
         finally:  # clean exit, exceptions AND cancellation
             if new_pids:
                 self._release_spawned_children(new_pids)
+            _lifecycle._reap_escaped_descendants(descendants, self.name)
 
     # ------------------------------------------------------------------- HTTP
 

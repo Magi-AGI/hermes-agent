@@ -54,6 +54,67 @@ def _snapshot_child_pids() -> set:
         return set()
 
 
+def _snapshot_descendants(pids) -> list:
+    """``(pid, create_time)`` of every live descendant of the stdio children *pids*, taken while
+    their tree is still intact (a descendant is only reachable through its parent while that
+    parent lives)."""
+    try:
+        import psutil
+    except ImportError:
+        return []
+    found = []
+    for pid in pids:
+        try:
+            children = psutil.Process(pid).children(recursive=True)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            continue
+        for child in children:
+            try:
+                found.append((child.pid, child.create_time()))
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                continue
+    return found
+
+
+# The SDK's own teardown kills its job members asynchronously; survivors past this grace escaped it.
+_ESCAPED_DESCENDANT_GRACE_S = 1.0
+
+
+def _reap_escaped_descendants(snapshot, server_name: str) -> None:
+    """Kill, off the MCP loop and after a short grace, the snapshotted descendants still alive once
+    the SDK tore the transport down.
+
+    On Windows the SDK puts the server in a kill-on-close Job Object only AFTER the process has
+    started, so anything it spawns in that window (a venv launcher's interpreter, ``npx``'s
+    ``node``) is outside the job and survives the teardown: one stranded bridge per failed
+    attempt for the life of the backend. Identity is (pid, create_time), so a reused pid is
+    never touched."""
+    if snapshot:
+        import threading
+        threading.Thread(target=_kill_snapshot_survivors, args=(list(snapshot), server_name),
+                         name=f"mcp-reap-{server_name}", daemon=True).start()
+
+
+def _kill_snapshot_survivors(snapshot, server_name: str) -> list:
+    import psutil
+    time.sleep(_ESCAPED_DESCENDANT_GRACE_S)
+    killed = []
+    for pid, created in snapshot:
+        try:
+            proc = psutil.Process(pid)
+            if proc.create_time() != created:
+                continue
+            name = proc.name()
+            proc.kill()
+            killed.append(f"{pid} ({name})")
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            continue
+    if killed:
+        logger.warning("MCP server '%s': killed %d descendant process(es) that outlived its transport "
+                       "teardown: %s", server_name, len(killed), ", ".join(killed))
+    return killed
+
+
 # argv markers of non-MCP gateway children that can race into the snapshot delta during an
 # MCP spawn (defense-in-depth; LSP/slash_worker already use start_new_session). Matched against
 # argv[1:] because Python/Java children start with the interpreter path.

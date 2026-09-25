@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from contextlib import nullcontext
 from contextvars import copy_context
 from typing import Dict, Optional, Set
@@ -16,6 +17,9 @@ _mcp_discovery_lock = threading.Lock()
 # A single-profile process has exactly one key, so behaviour is the old single-slot form.
 _mcp_discovery_started: Set[str] = set()
 _mcp_discovery_thread: Dict[str, threading.Thread] = {}
+# When each home's discovery thread started: the agent-build wait is one grace window from here,
+# not a fresh bound per build (see ``wait_for_mcp_discovery``).
+_mcp_discovery_started_at: Dict[str, float] = {}
 _mcp_discovery_deferred: Optional[threading.Timer] = None
 # Process-wide MCP server-name allowlist derived from ``-t/--toolsets``.
 # ``None`` = no filter (spawn every configured server). Set once at CLI
@@ -132,6 +136,7 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
 
         thread = threading.Thread(target=copy_context().run, args=(_discover,), name=thread_name, daemon=True)
         _mcp_discovery_thread[home_key] = thread
+        _mcp_discovery_started_at[home_key] = time.monotonic()
         thread.start()
 
 
@@ -226,12 +231,21 @@ def wait_for_mcp_discovery(timeout: "float | None" = None, *, single_query: bool
     ``join`` returns the instant discovery completes, so this only blocks for a still-pending
     server's real connect time. ``single_query`` uses ``mcp_single_query_discovery_timeout``
     (15s vs 1.5s) because one-shot sessions have no second turn to recover.
+
+    The bound is ONE grace window measured from discovery's start, not a fresh wait per call:
+    discovery can run for minutes behind a dead or slow server, and every agent build during it
+    (a 27-window reopen is 27 builds on the RPC pool) used to pay the full bound again. Builds
+    after the window take what is registered; the late refresh adds the rest.
     """
     start_deferred_mcp_discovery_now()
     thread = _current_home_thread()
     if thread is None or not thread.is_alive():
         return
-    thread.join(timeout=_resolve_discovery_timeout(timeout, single_query=single_query))
+    bound = _resolve_discovery_timeout(timeout, single_query=single_query)
+    started = _mcp_discovery_started_at.get(hermes_home_key())
+    remaining = bound if started is None else started + bound - time.monotonic()
+    if remaining > 0:
+        thread.join(timeout=remaining)
 
 
 def _current_home_thread() -> Optional[threading.Thread]:
