@@ -173,7 +173,7 @@ export function BootFailureOverlay() {
 
   const retry = async () => {
     setBusy('retry')
-    await window.hermesDesktop?.resetBootstrap().catch(() => undefined)
+    await window.hermesDesktop?.resetBootstrap({ retry: true }).catch(() => undefined)
     window.location.reload()
   }
 

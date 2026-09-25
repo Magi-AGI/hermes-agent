@@ -89,6 +89,7 @@ import {
   resolveLinuxPasswordStore
 } from './bootstrap-platform'
 import { decideBootstrapRepair } from './bootstrap-repair-guard'
+import { createBootstrapResetGate } from './bootstrap-reset-gate'
 import { runBootstrap } from './bootstrap-runner'
 import {
   BROWSER_WINDOW_HEIGHT,
@@ -14225,6 +14226,7 @@ app.on('web-contents-created', (_event, contents) => {
 // and gets its main-minted token (echoed on every readiness report; Codex A4
 // round 6 #1).
 ipcMain.on('hermes:window:register-document', event => {
+  noteDocumentResetEpoch(event.sender)
   event.returnValue = windowReadiness.registerDocument(event.sender.id)
 })
 
@@ -16217,10 +16219,10 @@ ipcMain.handle('hermes:backend:recycle', async (_event, profile) => {
 
   return { ok: true }
 })
-ipcMain.handle('hermes:bootstrap:reset', async () => {
-  // Renderer's "Reload and retry" path. Clear the latched failure and
-  // reset connection state so the next startHermes() call restarts the
-  // full backend flow (including a fresh runBootstrap pass).
+// Renderer "Reload and retry": one teardown per failure however many windows click Retry
+// (the 08-27 reset storm). Clear the latched failure and reset connection state so the next
+// startHermes() call restarts the full backend flow (including a fresh runBootstrap pass).
+const bootstrapResetGate = createBootstrapResetGate(async () => {
   rememberLog('[bootstrap] reset requested by renderer; clearing latched failure')
   await teardownPrimaryBackendAndWait()
   bootstrapFailure = null
@@ -16228,8 +16230,33 @@ ipcMain.handle('hermes:bootstrap:reset', async () => {
   remoteReauthFailure = null
   getFirstRunSetupGate().resetForRetry()
   resetBootstrapSnapshot()
+})
+// Reset epoch each window's CURRENT document started under. A Retry from a document that loaded
+// before the latest reset is superseded by it: that reset already rebooted the backend this
+// document's reload will attach to. (A document that lived through another window's reset and then
+// fails genuinely needs one reload before its Retry resets again: safe, never a second teardown.)
+const documentResetEpochs = new Map<number, number>()
 
-  return { ok: true }
+function noteDocumentResetEpoch(contents: Electron.WebContents) {
+  if (!documentResetEpochs.has(contents.id)) {
+    const { id } = contents
+    contents.once('destroyed', () => documentResetEpochs.delete(id))
+  }
+
+  documentResetEpochs.set(contents.id, bootstrapResetGate.epoch())
+}
+
+ipcMain.handle('hermes:bootstrap:reset', async (event, request) => {
+  // Only the boot-failure overlay's Retry is supersedable. Install retry and a confirmed cloud
+  // sign-in must reset (their latches would otherwise survive); they still join one in flight.
+  const documentEpoch = request?.retry === true ? documentResetEpochs.get(event.sender.id) : undefined
+  const outcome = await bootstrapResetGate.request(documentEpoch)
+
+  if (!outcome.performed) {
+    rememberLog('[bootstrap] reset joined an in-flight or newer reset; backend left running')
+  }
+
+  return outcome
 })
 ipcMain.handle('hermes:bootstrap:repair', async () => {
   // Forceful repair: force the next startHermes() through the full installer

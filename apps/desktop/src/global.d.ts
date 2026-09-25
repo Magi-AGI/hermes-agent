@@ -596,7 +596,8 @@ declare global {
       getBootstrapState: () => Promise<DesktopBootstrapState>
       continueBootstrapLocal: () => Promise<{ ok: boolean }>
       recycleBackend?: (profile?: null | string) => Promise<{ ok: boolean }>
-      resetBootstrap: () => Promise<{ ok: boolean }>
+      /** `retry`: the boot-failure overlay's Retry, superseded by a reset newer than this document. */
+      resetBootstrap: (request?: { retry?: boolean }) => Promise<{ ok: boolean; performed?: boolean }>
       repairBootstrap: () => Promise<{ ok: boolean }>
       cancelBootstrap: () => Promise<{ ok: boolean; cancelled: boolean }>
       onBootstrapEvent: (callback: (payload: DesktopBootstrapEvent) => void) => () => void

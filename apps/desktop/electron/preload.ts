@@ -603,7 +603,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   getBootstrapState: () => ipcRenderer.invoke('hermes:bootstrap:get'),
   continueBootstrapLocal: () => ipcRenderer.invoke('hermes:bootstrap:continue-local'),
   recycleBackend: profile => ipcRenderer.invoke('hermes:backend:recycle', profile),
-  resetBootstrap: () => ipcRenderer.invoke('hermes:bootstrap:reset'),
+  resetBootstrap: (request?: { retry?: boolean }) => ipcRenderer.invoke('hermes:bootstrap:reset', request),
   repairBootstrap: () => ipcRenderer.invoke('hermes:bootstrap:repair'),
   cancelBootstrap: () => ipcRenderer.invoke('hermes:bootstrap:cancel'),
   onBootstrapEvent: callback => {
