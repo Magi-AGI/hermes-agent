@@ -287,7 +287,7 @@ def test_lazy_server_registers_from_the_schema_cache_without_spawning(tmp_path):
 _NOISY_SERVER = """
 import sys
 for _ in range(200000):
-    sys.stderr.write("connect ENOENT \\\\.\\pipe\\unity-mcp" + chr(10))
+    sys.stderr.write("connect ENOENT pipe unity-mcp-ledgetcg" + chr(10))
 sys.stderr.flush()
 sys.stdin.read()
 """
