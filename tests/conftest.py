@@ -37,6 +37,32 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
+# ── The real Codex auth host is refused for the WHOLE session, child Pythons included ──────────
+# Installed here, at conftest import — before collection imports test modules and before any
+# session/module fixture runs — not in a function-scoped fixture. ``tests/netguard`` is prepended
+# to the children's PYTHONPATH: its sitecustomize installs the same guard in every Python a test
+# spawns with the inherited environment. See tests/netguard/hermes_net_guard.py.
+def _install_codex_net_guard():
+    import importlib.util
+
+    guard_dir = Path(__file__).parent / "netguard"
+    module = sys.modules.get("hermes_net_guard")
+    if module is None:
+        spec = importlib.util.spec_from_file_location("hermes_net_guard", guard_dir / "hermes_net_guard.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["hermes_net_guard"] = module
+        spec.loader.exec_module(module)
+    os.environ.setdefault(module.ENV_HOSTS, ",".join(module.DEFAULT_HOSTS))
+    module.install()
+    entries = [e for e in os.environ.get("PYTHONPATH", "").split(os.pathsep) if e]
+    if str(guard_dir) not in entries:
+        os.environ["PYTHONPATH"] = os.pathsep.join([str(guard_dir), *entries])
+    return module
+
+
+_codex_net_guard = _install_codex_net_guard()
+
+
 # ── Sandbox HERMES_HOME before ANY test module is imported ──────────────────
 # `hermes_cli/main.py` calls `setup_logging()` at MODULE level, which resolves
 # `get_hermes_home()` and attaches rotating file handlers to the ROOT logger.
@@ -680,67 +706,41 @@ def _neutralize_git_safe_directory_read(request, monkeypatch):
     monkeypatch.setattr(_subprocess_compat, "_user_safe_directories", lambda base_env: [], raising=False)
 
 
-_REAL_CODEX_AUTH_HOSTS = frozenset({"auth.openai.com"})
-
-
 @pytest.fixture(autouse=True)
 def _block_real_codex_token_endpoint(monkeypatch):
     """No test may present a refresh token (fake or not) to OpenAI's real token host, by ANY path.
 
-    ``auth_codex.CODEX_OAUTH_TOKEN_URL`` is pointed at a closed local port (tests with a loopback
-    endpoint set their own URL), and the host of the real URL is refused at the transport — httpx
-    sync/async transports and name resolution — before a connection is opened. Every attempt is
-    recorded and fails the test at teardown even if the caller swallowed the error. Yields the
-    attempt list (a test of the guard itself clears it)."""
+    The transport / name-resolution guard is installed for the whole session at conftest import
+    (``_install_codex_net_guard``). Here ``auth_codex.CODEX_OAUTH_TOKEN_URL`` is also pointed at a
+    closed local port (tests with a loopback endpoint set their own URL), the constant's host is
+    added to the refused set, and any attempt recorded since the last check — by this test, or by a
+    collection-time import / module or session fixture that ran before it — fails the test at
+    teardown even if the caller swallowed the error. Yields the attempt list (a test of the guard
+    itself clears it)."""
     from urllib.parse import urlsplit
 
-    attempts: list = []
-    hosts = set(_REAL_CODEX_AUTH_HOSTS)
     try:
         from hermes_cli import auth_codex as _auth_codex
         from hermes_cli.auth_constants import CODEX_OAUTH_TOKEN_URL as _real_url
-        hosts.add((urlsplit(_real_url).hostname or "").lower())
+        _codex_net_guard.install([urlsplit(_real_url).hostname or ""])
         monkeypatch.setattr(_auth_codex, "CODEX_OAUTH_TOKEN_URL",
                             "http://127.0.0.1:9/codex-token-endpoint-blocked-in-tests", raising=False)
     except Exception:
         pass
-    hosts.discard("")
-
-    def _refuse(host) -> None:
-        name = host.decode("ascii", "replace") if isinstance(host, bytes) else str(host or "")
-        if name.lower().rstrip(".") in hosts:
-            attempts.append(name)
-            raise ConnectionRefusedError(f"test session: the real Codex auth host {name} is blocked")
-
-    try:
-        import httpx
-
-        _sync, _async = httpx.HTTPTransport.handle_request, httpx.AsyncHTTPTransport.handle_async_request
-
-        def _handle_request(self, request):
-            _refuse(request.url.host)
-            return _sync(self, request)
-
-        async def _handle_async_request(self, request):
-            _refuse(request.url.host)
-            return await _async(self, request)
-
-        monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _handle_request)
-        monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", _handle_async_request)
-    except Exception:
-        pass
-    import socket
-
-    _getaddrinfo = socket.getaddrinfo
-
-    def _guarded_getaddrinfo(host, *args, **kwargs):  # urllib / requests / raw sockets
-        _refuse(host)
-        return _getaddrinfo(host, *args, **kwargs)
-
-    monkeypatch.setattr(socket, "getaddrinfo", _guarded_getaddrinfo)
+    attempts = _codex_net_guard.ATTEMPTS
     yield attempts
     if attempts:
-        pytest.fail(f"a test tried to reach the real Codex auth host: {attempts}")
+        seen = list(attempts)
+        attempts.clear()
+        pytest.fail(f"a test tried to reach the real Codex auth host: {seen}")
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """An attempt no test's teardown reported (e.g. at collection of a module whose tests were all
+    deselected) still fails the run."""
+    if _codex_net_guard.ATTEMPTS:
+        print(f"\nERROR: the real Codex auth host was contacted: {_codex_net_guard.ATTEMPTS}", file=sys.stderr)
+        session.exitstatus = 1
 
 
 @pytest.fixture(autouse=True)
