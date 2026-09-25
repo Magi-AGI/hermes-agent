@@ -7,8 +7,12 @@ files. Restoring an older copy of any of them can roll the protocol back — an 
 for a chain that was retired, a refresh token that was already spent — so until stage 2 implements
 restoration as an ownership operation that preserves fences, a restore (backup import, quick
 snapshot, profile import) that would write such a file is REFUSED whenever this install already
-has Codex authority state. Restoring onto an install that never had any (a fresh machine) is the
-upstream behaviour and stays allowed.
+has Codex authority state (newer protocol evidence is never overwritten or merged). Restoring onto
+an install that never had any (a fresh machine) is allowed, but nothing in a backup proves its
+refresh tokens are unspent: every Codex chain it brings in lands FENCED ``restored-from-backup``
+behind a restore barrier (:func:`restore_guard`, :func:`fence_restored`); the exit is a fresh
+sign-in. Other providers' credentials restore unchanged. Members are classified by their resolved
+destination (``backup._member_destination`` for archives).
 
 Callers run :func:`check_restore` and the file writes inside :func:`restore_guard`, which holds the
 migration lock: no sign-in, import or bootstrap can register anything between the check and the
