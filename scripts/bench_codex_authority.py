@@ -7,6 +7,12 @@ single-use, a reused one is rejected, and every presented token is recorded in i
   python scripts/bench_codex_authority.py progress   # 24 processes x 4 threads, real entry points
   python scripts/bench_codex_authority.py kills      # a real process kill at every boundary
   python scripts/bench_codex_authority.py latency --tree <checkout>   # read-path p50/p99
+  python scripts/bench_codex_authority.py startup --baseline <checkout>  # N processes starting at once
+
+Progress drives all three refresh entry points concurrently: (P1) singleton refresh, (P2) the
+quota-probe pre-refresh of an exhausted row whose token expired, (P3) the pool refresh. Kills: every
+refresh boundary through each of P1/P2/P3, every step of an ownership op, and a kill DURING the
+recovery (the dispatcher's roll-forward) of a decided op.
 
 Invariants checked (progress): no token presented twice (no automatic replay), every chain's
 ledger is ONE linear sequence (no store forked a chain), no chain fenced, every owner row holds its
@@ -48,7 +54,8 @@ def fake_jwt(chain: str, exp_in: int = 3600) -> str:
 
 
 class Ledger:
-    def __init__(self) -> None:
+    def __init__(self, expired=()) -> None:
+        self.expired = set(expired)  # chains whose access tokens are issued already expired (P2)
         self.lock = threading.Lock()
         self.valid: dict = {}        # refresh token -> chain (unconsumed)
         self.chain_of: dict = {}     # every refresh token ever issued -> chain
@@ -57,7 +64,8 @@ class Ledger:
         self.drop_response_for: set = set()
 
     def issue(self, chain: str):
-        access, refresh = fake_jwt(chain), f"rt-{chain}-{uuid.uuid4().hex[:12]}"
+        access = fake_jwt(chain, -120 if chain in self.expired else 3600)
+        refresh = f"rt-{chain}-{uuid.uuid4().hex[:12]}"
         self.valid[refresh] = chain
         self.chain_of[refresh] = chain
         self.last_issued[chain] = (access, refresh)
@@ -148,11 +156,59 @@ def _worker_setup():
     auth_codex.CODEX_OAUTH_TOKEN_URL = os.environ["BENCH_TOKEN_URL"] + "/token"
 
 
+class _ProbeFailures:
+    """``_refresh_expired_codex_probe_token`` (P2) logs and swallows its failure; this handler keeps
+    the last one per thread so the worker can classify the outcome like the other entry points."""
+
+    def __init__(self) -> None:
+        import logging
+        self.last: dict = {}
+
+        class Handler(logging.Handler):
+            def emit(inner, record):  # noqa: N805
+                if record.exc_info and record.getMessage().startswith("Codex pre-probe token refresh failed"):
+                    self.last[record.thread] = record.exc_info[1]
+
+        handler = Handler(level=logging.DEBUG)
+        log = logging.getLogger("hermes_cli.auth")
+        log.addHandler(handler)
+        log.setLevel(logging.DEBUG)
+
+    def take(self):
+        return self.last.pop(threading.get_ident(), None)
+
+
+def run_entry(kind: str, target: str, probe_failures=None):
+    """One refresh through a REAL entry point: ``singleton`` (P1), ``pool`` (P3), ``probe`` (P2).
+    Returns ``(outcome, error)``: ok / refused / fenced / <error name>."""
+    import hermes_cli.auth as auth
+    if kind == "singleton":
+        auth.resolve_codex_runtime_credentials(force_refresh=True)
+        return "ok", None
+    if kind == "pool":
+        from agent.credential_pool import load_pool
+        if load_pool("openai-codex").try_refresh_matching(credential_id=target) is None:
+            return "fenced", None
+        return "ok", None
+    from hermes_cli import auth_codex
+    from hermes_cli.auth_codex_rows import get_row
+    row = get_row(auth._load_auth_store(), f"pool:{target}") or {}
+    fresh = auth_codex._refresh_expired_codex_probe_token(
+        row.get("access_token"), row.get("refresh_token"), row_store=auth._auth_file_path(),
+        row=f"pool:{target}", min_interval_seconds=0)
+    if fresh is not None:
+        return "ok", None
+    exc = probe_failures.take() if probe_failures else None
+    if exc is None:
+        return "ok", None  # nothing to do: a peer already refreshed the expired token
+    raise exc
+
+
 def worker_progress(args) -> None:
     _worker_setup()
     import hermes_cli.auth as auth
-    from agent.credential_pool import load_pool
 
+    probe_failures = _ProbeFailures()
     targets = json.loads(args.targets)
     stats = {"attempts": 0, "ok": 0, "refused": 0, "fenced": 0, "errors": {}, "lat": []}
     lock = threading.Lock()
@@ -173,11 +229,7 @@ def worker_progress(args) -> None:
             t0 = time.perf_counter()
             outcome = "ok"
             try:
-                if kind == "singleton":
-                    auth.resolve_codex_runtime_credentials(force_refresh=True)
-                else:
-                    if load_pool("openai-codex").try_refresh_matching(credential_id=target) is None:
-                        outcome = "fenced"
+                outcome, _ = run_entry(kind, target, probe_failures)
             except auth.AuthError as exc:
                 outcome = "refused" if getattr(exc, "reason", None) == "in-progress" else (
                     "fenced" if exc.code in ("codex_recovery_fenced", "codex_refresh_indeterminate") else exc.code)
@@ -227,14 +279,17 @@ def _install_kill(boundary: str) -> None:
 
     txn._write_attempt = write_attempt
     if boundary == "after-response":
-        real = auth_mod.refresh_codex_oauth_pure
+        from hermes_cli import auth_codex
+        for module in (auth_mod, auth_codex):  # P1/P3 call auth's seam, P2 auth_codex's own
+            real = module.refresh_codex_oauth_pure
 
-        def refresh(*a, **k):
-            real(*a, **k)
-            die()
-        auth_mod.refresh_codex_oauth_pure = refresh
+            def refresh(*a, _real=real, **k):
+                _real(*a, **k)
+                die()
+            module.refresh_codex_oauth_pure = refresh
     op_hooks = {"op-payload": "write_registry", "op-decision": "apply_payload",
-                "op-apply": "_apply_record_action", "op-commit": "commit_op"}
+                "op-apply": "_apply_record_action", "op-commit": "commit_op",
+                "recovery-apply": "_apply_record_action", "recovery-commit": "commit_op"}
     if boundary in op_hooks:
         setattr(ops, op_hooks[boundary], lambda *a, **k: die())
 
@@ -243,11 +298,14 @@ def worker_kill(args) -> None:
     _worker_setup()
     import hermes_cli.auth as auth
     _install_kill(args.boundary)
-    if args.boundary.startswith("op-"):
+    if args.boundary.startswith("recovery-"):
+        from hermes_cli.auth_codex_authority import startup_dispatch
+        startup_dispatch()  # the dispatcher rolls the decided op forward and dies midway
+    elif args.boundary.startswith("op-"):
         pair = json.loads(args.pair)
         auth._save_codex_tokens({"access_token": pair[0], "refresh_token": pair[1]})
     else:
-        auth.resolve_codex_runtime_credentials(force_refresh=True)
+        run_entry(args.path, "poolaa")
     print("SURVIVED")  # the kill point was never reached
 
 
@@ -259,7 +317,10 @@ def worker_check(args) -> None:
     if args.job:
         out["dispatch"] = startup_dispatch()
     try:
-        out["key"] = auth.resolve_codex_runtime_credentials(force_refresh=args.force)["api_key"]
+        if args.path == "singleton" and not args.force:
+            out["key"] = auth.resolve_codex_runtime_credentials()["api_key"]
+        else:
+            out["outcome"] = run_entry(args.path, "poolaa", _ProbeFailures())[0]
     except auth.AuthError as exc:
         out["error"] = exc.code
     print(json.dumps(out))
@@ -307,13 +368,18 @@ def run_progress(args) -> int:
     server, url = start_endpoint(ledger)
     sandbox = Path(tempfile.mkdtemp(prefix="bench-codex-"))
     root = sandbox / "hroot"
-    chains = ["root", "poolA", "poolB", "work1", "work2"]
+    chains = ["root", "poolA", "poolB", "probeC", "work1", "work2"]
+    ledger.expired.add("probeC")
     s_root, s_a, s_b = ledger.issue("root"), ledger.issue("poolA"), ledger.issue("poolB")
+    s_c = ledger.issue("probeC")
     write_store(root, singleton=s_root, pool=[
         {"id": "poolaa", "label": "A", "auth_type": "oauth", "priority": 1, "source": "manual:device_code",
          "access_token": s_a[0], "refresh_token": s_a[1]},
         {"id": "poolbb", "label": "B", "auth_type": "oauth", "priority": 2, "source": "manual:device_code",
-         "access_token": s_b[0], "refresh_token": s_b[1]}])
+         "access_token": s_b[0], "refresh_token": s_b[1]},
+        {"id": "probecc", "label": "C", "auth_type": "oauth", "priority": 3, "source": "manual:device_code",
+         "access_token": s_c[0], "refresh_token": s_c[1], "last_status": "exhausted",
+         "last_error_code": 429, "last_error_reason": "usage_limit_reached"}])
     homes = {"root": root}
     for name in ("work1", "work2"):
         homes[name] = make_profile(root, name)
@@ -322,15 +388,16 @@ def run_progress(args) -> int:
     write_store(homes["borrower"])
     plans = {  # (HERMES_HOME, targets)
         "root": [["singleton", "root"]], "pools": [["pool", "poolaa"], ["pool", "poolbb"]],
+        "probe": [["probe", "probecc"], ["pool", "probecc"]],
         "work1": [["singleton", "work1"]], "work2": [["singleton", "work2"]],
         "borrower": [["singleton", "root"]],
     }
-    order = ["root", "pools", "work1", "work2", "borrower", "pools"]
+    order = ["root", "pools", "work1", "probe", "work2", "borrower", "pools", "probe"]
     procs = []
     t0 = time.monotonic()
     for i in range(args.processes):
         plan = order[i % len(order)]
-        home = homes["root"] if plan in ("pools", "root") else homes[plan]
+        home = homes["root"] if plan in ("pools", "root", "probe") else homes[plan]
         env = sandbox_env(sandbox, home, url)
         procs.append(subprocess.Popen(
             [sys.executable, str(Path(__file__).resolve()), "worker-progress", "--targets", json.dumps(plans[plan]),
@@ -414,62 +481,99 @@ def run_progress(args) -> int:
 
 
 KILL_EXPECT = {
-    # boundary: (expected error of the next forced refresh or None, posts expected in the check)
-    "after-intent": ("codex_refresh_indeterminate", 0),
-    "after-response": ("codex_refresh_indeterminate", 0),
+    # boundary: (fence reason expected after the next refresh through the same path, posts in it)
+    "after-intent": ("indeterminate", 0),
+    "after-response": ("indeterminate", 0),
     "after-pending": (None, 0),
     "before-completion": (None, 1),
 }
+OP_BOUNDARIES = ["op-payload", "op-decision", "op-apply", "op-commit"]
+RECOVERY_BOUNDARIES = ["recovery-apply", "recovery-commit"]
+
+
+def _kill_sandbox(path: str):
+    ledger = Ledger(expired={"c"} if path == "probe" else ())
+    server, url = start_endpoint(ledger)
+    sandbox = Path(tempfile.mkdtemp(prefix="bench-kill-"))
+    root = sandbox / "hroot"
+    first = ledger.issue("c")
+    if path == "singleton":
+        write_store(root, singleton=first)
+    else:
+        write_store(root, pool=[{"id": "poolaa", "label": "A", "auth_type": "oauth", "priority": 0,
+                                 "source": "manual:device_code", "access_token": first[0],
+                                 "refresh_token": first[1], "last_status": "exhausted",
+                                 "last_error_code": 429, "last_error_reason": "usage_limit_reached"}])
+    return ledger, server, url, sandbox, root
+
+
+def _chain_c(root: Path):
+    reg = _load(root / "auth.chains.json")
+    for chain in reg["chains"].values():
+        if chain["state"] != "retired":
+            return reg, chain
+    return reg, None
 
 
 def run_kills(args) -> int:
     failures, report = [], {}
-    for boundary in list(KILL_EXPECT) + ["op-payload", "op-decision", "op-apply", "op-commit"]:
-        ledger = Ledger()
-        server, url = start_endpoint(ledger)
-        sandbox = Path(tempfile.mkdtemp(prefix="bench-kill-"))
-        root = sandbox / "hroot"
-        first = ledger.issue("c")
-        write_store(root, singleton=first)
+    me = str(Path(__file__).resolve())
+    cases = [(p, b) for p in ("singleton", "pool", "probe") for b in KILL_EXPECT]
+    cases += [("singleton", b) for b in OP_BOUNDARIES + RECOVERY_BOUNDARIES]
+    for path, boundary in cases:
+        name = f"{path}:{boundary}"
+        ledger, server, url, sandbox, root = _kill_sandbox(path)
         env = sandbox_env(sandbox, root, url)
-        me = str(Path(__file__).resolve())
-        subprocess.run([sys.executable, me, "worker-check", "--job"], env=env, cwd=str(sandbox),
-                       capture_output=True, text=True, timeout=120)  # bootstrap
+
+        def run(*argv, timeout=120):
+            return subprocess.run([sys.executable, me, *argv], env=env, cwd=str(sandbox),
+                                  capture_output=True, text=True, timeout=timeout)
+
+        run("worker-check", "--job")  # bootstrap (cold-start dispatch)
         new = ledger.issue("n")
-        kill = subprocess.run([sys.executable, me, "worker-kill", "--boundary", boundary, "--pair", json.dumps(new)],
-                              env=env, cwd=str(sandbox), capture_output=True, text=True, timeout=120)
+        first_kill = "op-decision" if boundary in RECOVERY_BOUNDARIES else boundary
+        kill = run("worker-kill", "--boundary", first_kill, "--path", path, "--pair", json.dumps(new))
+        kills = [kill.returncode]
+        if boundary in RECOVERY_BOUNDARIES:  # the recovery of that decided op dies midway too
+            kills.append(run("worker-kill", "--boundary", boundary, "--path", path).returncode)
         posts_before = len(ledger.presented)
-        job = boundary.startswith("op-")
-        check = subprocess.run([sys.executable, me, "worker-check", "--force"] + (["--job"] if job else []),
-                               env=env, cwd=str(sandbox), capture_output=True, text=True, timeout=120)
+        job = boundary.startswith(("op-", "recovery-"))
+        check = run("worker-check", "--path", path, "--force", *(["--job"] if job else []))
         server.shutdown()
         try:
             outcome = json.loads(check.stdout.strip().splitlines()[-1])
         except Exception:
             outcome = {"crash": check.stderr[-1500:]}
         posts = ledger.presented[posts_before:]
-        entry = {"kill_exit": kill.returncode, "check": outcome, "posts_after": [p[3] for p in posts],
+        entry = {"kill_exits": kills, "check": outcome, "posts_after": [p[3] for p in posts],
                  "replays": sum(1 for p in ledger.presented if p[3] == "reused")}
-        if kill.returncode != 137:
-            failures.append(f"{boundary}: the kill point was not reached ({kill.stdout[-200:]} {kill.stderr[-500:]})")
+        if any(code != 137 for code in kills):
+            failures.append(f"{name}: a kill point was not reached ({kill.stdout[-200:]} {kill.stderr[-500:]})")
         if entry["replays"]:
-            failures.append(f"{boundary}: a refresh token was replayed")
+            failures.append(f"{name}: a refresh token was replayed")
+        reg, chain = _chain_c(root)
+        rows = _rows_of(_load(root / "auth.json"))
         if boundary in KILL_EXPECT:
-            want_error, want_posts = KILL_EXPECT[boundary]
-            if outcome.get("error") != want_error or len(posts) != want_posts:
-                failures.append(f"{boundary}: expected error={want_error} posts={want_posts}, got {entry}")
+            want_fence, want_posts = KILL_EXPECT[boundary]
+            fence = (chain or {}).get("fence") or {}
+            got_fence = fence.get("reason") if chain and chain["state"] == "fenced" else None
+            held = {rows[r["row"]] for r in (chain or {}).get("rows", ()) if r["row"] in rows}
+            entry.update(fence=got_fence, rows_hold_last_issued=held == {ledger.last_issued["c"]})
+            if got_fence != want_fence or len(posts) != want_posts:
+                failures.append(f"{name}: expected fence={want_fence} posts={want_posts}, got {entry}")
+            if want_fence is None and held != {ledger.last_issued["c"]}:
+                failures.append(f"{name}: rows do not hold the chain's last issued pair (moved backward?)")
         else:
-            reg = _load(root / "auth.chains.json")
-            store = _load(root / "auth.json")
             decided = boundary != "op-payload"
-            tokens = store["providers"]["openai-codex"]["tokens"]
+            tokens = _load(root / "auth.json")["providers"]["openai-codex"]["tokens"]
             lineage = ledger.chain_of.get(tokens["refresh_token"])
             if reg["ops"] or (decided and lineage != "n") or (not decided and lineage != "c"):
-                failures.append(f"{boundary}: end state wrong (ops={list(reg['ops'])}, lineage={lineage})")
+                failures.append(f"{name}: end state wrong (ops={list(reg['ops'])}, lineage={lineage})")
             entry["lineage_after"] = lineage
-        report[boundary] = entry
+        report[name] = entry
         if not args.keep:
             shutil.rmtree(sandbox, ignore_errors=True)
+    report["cases"] = len(cases)
     report["failures"] = failures
     print(json.dumps(report, indent=2))
     return 1 if failures else 0
@@ -498,6 +602,86 @@ def run_latency(args) -> int:
     return 0
 
 
+def worker_startup(args) -> None:
+    """One process starting up the way a runtime CLI / gateway does: the authority dispatch (when
+    the tree has it), then credential resolution (resume) and a pool selection. Times in ms."""
+    t0 = time.perf_counter()
+    sys.path.insert(0, args.tree)
+    import hermes_cli.auth as auth
+    from agent.credential_pool import load_pool
+    t_import = time.perf_counter()
+    dispatch = None
+    try:
+        from hermes_cli.auth_codex_authority import startup_dispatch
+    except ImportError:
+        startup_dispatch = None
+    if startup_dispatch is not None:
+        dispatch = startup_dispatch()
+    t_dispatch = time.perf_counter()
+    error = None
+    try:
+        auth.resolve_codex_runtime_credentials()
+        load_pool("openai-codex").select()
+    except Exception as exc:  # reported, never hidden
+        error = f"{type(exc).__name__}: {exc}"[:300]
+    t_done = time.perf_counter()
+    print(json.dumps({"import_ms": (t_import - t0) * 1000, "dispatch_ms": (t_dispatch - t_import) * 1000,
+                      "resume_ms": (t_done - t_dispatch) * 1000, "auth_ms": (t_done - t_import) * 1000,
+                      "dispatch": dispatch, "error": error}))
+
+
+def _startup_wave(tree: Path, sandbox: Path, homes: dict, url: str, n: int) -> dict:
+    me = str(Path(__file__).resolve())
+    names = list(homes)
+    procs = []
+    for i in range(n):  # all started before any is waited for: they contend like a fleet restart
+        env = sandbox_env(sandbox, homes[names[i % len(names)]], url, tree)
+        procs.append((time.perf_counter(), subprocess.Popen(
+            [sys.executable, me, "worker-startup", "--tree", str(tree)], env=env, cwd=str(sandbox),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)))
+    rows, walls, errors = [], [], []
+    for started, proc in procs:
+        out, err = proc.communicate(timeout=600)
+        walls.append((time.perf_counter() - started) * 1000)
+        try:
+            data = json.loads(out.strip().splitlines()[-1])
+            rows.append(data)
+            if data.get("error"):
+                errors.append(data["error"])
+        except Exception:
+            errors.append((err or out)[-300:])
+
+    def stats(values):
+        return {"p50": round(_pct(values, .5), 1), "p99": round(_pct(values, .99), 1),
+                "max": round(max(values), 1)} if values else None
+
+    return {"auth_ms": stats([r["auth_ms"] for r in rows]), "dispatch_ms": stats([r["dispatch_ms"] for r in rows]),
+            "resume_ms": stats([r["resume_ms"] for r in rows]), "process_wall_ms": stats(walls),
+            "dispatch_outcomes": sorted({str(r.get("dispatch")) for r in rows}), "errors": errors[:5]}
+
+
+def run_startup(args) -> int:
+    """Cold (no registry: the first process bootstraps while the rest start) and warm (registry
+    present) concurrent startups, branch vs baseline, identical sandboxes and credentials."""
+    out = {"processes": args.processes}
+    for label, tree in (("branch", REPO), ("baseline", Path(args.baseline).resolve())):
+        ledger = Ledger()
+        sandbox = Path(tempfile.mkdtemp(prefix="bench-start-"))
+        root = sandbox / "hroot"
+        s = ledger.issue("root")
+        write_store(root, singleton=s, pool=[{"id": "devcod", "label": "d", "auth_type": "oauth", "priority": 0,
+                                              "source": "device_code", "access_token": s[0], "refresh_token": s[1]}])
+        homes = {"root": root}
+        for name in ("work1", "work2"):
+            homes[name] = make_profile(root, name)
+            write_store(homes[name], singleton=ledger.issue(name))
+        out[label] = {"cold": _startup_wave(tree, sandbox, homes, "http://127.0.0.1:9", args.processes),
+                      "warm": _startup_wave(tree, sandbox, homes, "http://127.0.0.1:9", args.processes)}
+        shutil.rmtree(sandbox, ignore_errors=True)
+    print(json.dumps(out, indent=2))
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -510,6 +694,11 @@ def main() -> int:
     p.add_argument("--keep", action="store_true")
     k = sub.add_parser("kills")
     k.add_argument("--keep", action="store_true")
+    st = sub.add_parser("startup")
+    st.add_argument("--baseline", required=True)
+    st.add_argument("--processes", type=int, default=24)
+    ws = sub.add_parser("worker-startup")
+    ws.add_argument("--tree")
     lt = sub.add_parser("latency")
     lt.add_argument("--tree", default=str(REPO))
     lt.add_argument("--iterations", type=int, default=500)
@@ -523,16 +712,18 @@ def main() -> int:
     wk = sub.add_parser("worker-kill")
     wk.add_argument("--boundary")
     wk.add_argument("--pair")
+    wk.add_argument("--path", default="singleton")
     wc = sub.add_parser("worker-check")
     wc.add_argument("--force", action="store_true")
     wc.add_argument("--job", action="store_true")
+    wc.add_argument("--path", default="singleton")
     wl = sub.add_parser("worker-latency")
     wl.add_argument("--tree")
     wl.add_argument("--iterations", type=int)
     args = ap.parse_args()
-    handlers = {"progress": run_progress, "kills": run_kills, "latency": run_latency,
+    handlers = {"progress": run_progress, "kills": run_kills, "latency": run_latency, "startup": run_startup,
                 "worker-progress": worker_progress, "worker-kill": worker_kill, "worker-check": worker_check,
-                "worker-latency": worker_latency}
+                "worker-latency": worker_latency, "worker-startup": worker_startup}
     return handlers[args.cmd](args) or 0
 
 
