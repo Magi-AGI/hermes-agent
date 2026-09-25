@@ -158,8 +158,9 @@ def _worker_setup():
 
 
 class _ProbeFailures:
-    """``_refresh_expired_codex_probe_token`` (P2) logs and swallows its failure; this handler keeps
-    the last one per thread so the worker can classify the outcome like the other entry points."""
+    """The P2 probe pre-refresh and the P3 pool refresh log and swallow their failures (the pool
+    returns None); this handler keeps the last swallowed exception per thread so the worker can
+    classify the outcome precisely (fenced vs a lock timeout vs anything else)."""
 
     def __init__(self) -> None:
         import logging
@@ -167,13 +168,18 @@ class _ProbeFailures:
 
         class Handler(logging.Handler):
             def emit(inner, record):  # noqa: N805
-                if record.exc_info and record.getMessage().startswith("Codex pre-probe token refresh failed"):
+                message = str(record.msg)
+                if record.exc_info and message.startswith("Codex pre-probe token refresh failed"):
                     self.last[record.thread] = record.exc_info[1]
+                elif message.startswith(("Codex pool entry %s refresh failed", "Codex pool entry %s cannot refresh")) \
+                        and record.args and isinstance(record.args[-1], BaseException):
+                    self.last[record.thread] = record.args[-1]
 
         handler = Handler(level=logging.DEBUG)
-        log = logging.getLogger("hermes_cli.auth")
-        log.addHandler(handler)
-        log.setLevel(logging.DEBUG)
+        for name in ("hermes_cli.auth", "agent.credential_pool"):
+            log = logging.getLogger(name)
+            log.addHandler(handler)
+            log.setLevel(logging.DEBUG)
 
     def take(self):
         return self.last.pop(threading.get_ident(), None)
@@ -189,6 +195,9 @@ def run_entry(kind: str, target: str, probe_failures=None):
     if kind == "pool":
         from agent.credential_pool import load_pool
         if load_pool("openai-codex").try_refresh_matching(credential_id=target) is None:
+            exc = probe_failures.take() if probe_failures else None
+            if exc is not None:
+                raise exc  # classified by the caller like a direct failure
             return "fenced", None
         return "ok", None
     from hermes_cli import auth_codex
@@ -211,7 +220,7 @@ def worker_progress(args) -> None:
 
     probe_failures = _ProbeFailures()
     targets = json.loads(args.targets)
-    stats = {"attempts": 0, "ok": 0, "refused": 0, "fenced": 0, "errors": {}, "lat": []}
+    stats = {"attempts": 0, "ok": 0, "refused": 0, "fenced": 0, "lock_timeout": 0, "errors": {}, "lat": []}
     lock = threading.Lock()
     deadline = time.monotonic() + args.seconds
 
@@ -235,7 +244,7 @@ def worker_progress(args) -> None:
                 outcome = "refused" if getattr(exc, "reason", None) == "in-progress" else (
                     "fenced" if exc.code in ("codex_recovery_fenced", "codex_refresh_indeterminate") else exc.code)
             except TimeoutError:
-                outcome = "refused"
+                outcome = "lock_timeout"  # the store lock stayed contended past its budget
             except Exception as exc:  # pragma: no cover - reported
                 outcome = type(exc).__name__
                 import traceback
@@ -244,7 +253,7 @@ def worker_progress(args) -> None:
             with lock:
                 stats["attempts"] += 1
                 stats["lat"].append(time.perf_counter() - t0)
-                if outcome in ("ok", "refused", "fenced"):
+                if outcome in ("ok", "refused", "fenced", "lock_timeout"):
                     stats[outcome] += 1
                 else:
                     stats["errors"][outcome] = stats["errors"].get(outcome, 0) + 1
@@ -428,6 +437,7 @@ def run_progress(args) -> int:
     report["attempts"], report["refused"] = attempts, refused
     report["refusal_rate"] = round(refused / attempts, 4) if attempts else None
     report["fenced_outcomes"] = sum(r.get("fenced", 0) for r in results)
+    report["lock_timeouts"] = sum(r.get("lock_timeout", 0) for r in results)
     report["worker_errors"] = [r.get("errors") for r in results if r.get("errors")]
     report["worker_crashes"] = [r["crash"] for r in results if "crash" in r]
     report["error_tracebacks"] = [t for r in results for t in r.get("tracebacks", [])][:5]
