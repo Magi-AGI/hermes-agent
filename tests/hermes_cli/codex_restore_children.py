@@ -148,3 +148,40 @@ def spawn_in(code: str, args, userhome: Path, hermes_home: Path) -> subprocess.P
     env["HERMES_HOME"] = str(hermes_home)
     return subprocess.Popen([sys.executable, "-c", code, *map(str, args)], cwd=str(REPO), env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+
+# A NORMAL runtime startup: the CLI startup dispatch, then a forced refresh whose token-endpoint
+# seam only records what it would have presented.
+STARTUP_RUNTIME = r'''
+import json, sys
+from pathlib import Path
+presented = Path(sys.argv[1])
+import hermes_cli.auth as auth
+from hermes_cli import auth_codex
+def record(access, refresh, **kw):
+    with open(presented, "a", encoding="utf-8") as f:
+        f.write(refresh + "\n")
+    raise auth.AuthError("recorded only", provider="openai-codex", code="invalid_grant", relogin_required=True)
+auth.refresh_codex_oauth_pure = record
+auth_codex.refresh_codex_oauth_pure = record
+from hermes_cli.auth_codex_authority import startup_dispatch
+out = {"dispatch": startup_dispatch()}
+try:
+    auth.resolve_codex_runtime_credentials(force_refresh=True)
+    out["refresh"] = "ok"
+except auth.AuthError as exc:
+    out["refresh"] = exc.code
+print(json.dumps(out))
+'''
+
+
+def runtime_startup(tmp: Path, userhome: Path, hermes_home: Path) -> dict:
+    presented = tmp / "presented-runtime.log"
+    proc = spawn_in(STARTUP_RUNTIME, [presented], userhome, hermes_home)
+    out, err = proc.communicate(timeout=180)
+    try:
+        result = json.loads(out.strip().splitlines()[-1])
+    except Exception as exc:  # pragma: no cover - diagnostic
+        raise AssertionError(f"runtime startup failed: {err[-2000:]}") from exc
+    result["presented"] = presented.read_text(encoding="utf-8").split() if presented.exists() else []
+    return result

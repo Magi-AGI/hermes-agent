@@ -178,19 +178,20 @@ _authority: "contextvars.ContextVar[Optional[Tuple[Path, Path]]]" = contextvars.
 
 
 def authority_root_for(home: Path) -> Path:
-    """The Hermes root that owns *home*: ``<root>/profiles/<name>`` -> ``<root>``, else *home*."""
-    from hermes_constants import named_profile_home
-    home = Path(home)
-    named = named_profile_home(home)
-    return home.parent.parent if named is not None and Path(named) == home else home
+    """The Hermes root that owns *home* — the SAME resolver the runtime applies to HERMES_HOME
+    (``hermes_constants.hermes_root_for_home``), so a restore into *home* and a later startup
+    with ``HERMES_HOME=home`` always agree on the authority."""
+    from hermes_constants import _expand_hermes_home, hermes_root_for_home
+    return hermes_root_for_home(_expand_hermes_home(str(home)))
 
 
 @contextmanager
 def authority_scope(home: Path) -> Iterator[Path]:
     """Run protocol code (registry, locks, barrier, fence, store enumeration) for the authority that
     owns *home* instead of the process's own root. Yields that root."""
+    from hermes_constants import _expand_hermes_home
     root = authority_root_for(home)
-    token = _authority.set((root, Path(home) / "auth.json"))
+    token = _authority.set((root, _expand_hermes_home(str(home)) / "auth.json"))
     try:
         yield root
     finally:

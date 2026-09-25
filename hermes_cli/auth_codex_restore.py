@@ -156,14 +156,29 @@ def _is_independent_root(directory: Path) -> bool:
     return False
 
 
+def _relative_parts(dest: Path, base: Path) -> Optional[list]:
+    base_parts = [_norm(p) for p in base.parts]
+    parts = [_norm(p) for p in dest.parts]
+    return parts[len(base_parts):] if parts[:len(base_parts)] == base_parts else None
+
+
 def _managed_kind(dest: Path) -> Optional[str]:
     """``store`` / ``protocol`` when *dest* (resolved) is one of the PROTECTED authority's own managed
     credential locations, else None. The authority's locations are its root's auth.json and protocol
     files, and each profile store ``profiles/<id>/auth.json`` with its records and rescue file — a
     profile directory that carries its own authority markers is an independent root, not a store of
     this one. Membership is decided by this structure, never by directory containment."""
-    from hermes_cli.auth_codex_registry import root_home
+    from hermes_cli.auth_codex_registry import active_store_path, root_home
     from hermes_constants import PROFILE_ID_RE
+    # The authority's ACTIVE store is one of its stores even when it is not ``<root>/auth.json``
+    # or ``profiles/<id>/auth.json`` (HERMES_HOME = a directory beneath the root).
+    active = canonical_path(active_store_path())
+    if _norm(str(dest)) == _norm(str(active)):
+        return "store"
+    active_rel = _relative_parts(dest, active.parent)
+    if active_rel and (active_rel == [_norm(LEGACY_RESCUE_NAME)]
+                       or (len(active_rel) >= 2 and active_rel[0] == _norm(RECORDS_DIR_NAME))):
+        return "protocol"
     root = canonical_path(root_home())
     root_parts = [_norm(p) for p in root.parts]
     parts = [_norm(p) for p in dest.parts]

@@ -174,6 +174,21 @@ LOCAL_RUNTIME_ROOT_DIRS: frozenset[str] = frozenset({"models", "runtimes", "node
 _default_hermes_root_memo: "tuple[str, str, Path] | None" = None
 
 
+def hermes_root_for_home(home: Path, native_home: Path | None = None) -> Path:
+    """The Hermes root that owns *home* — the ONE rule for "which installation is this home part
+    of" (``get_default_hermes_root`` applies it to ``HERMES_HOME``; an operation on an explicit
+    home, e.g. a quick-snapshot restore into another home, applies it to that home):
+    anything under the platform-native root belongs to it (normal or profile mode); elsewhere
+    (Docker / custom root) ``<root>/profiles/<name>`` -> ``<root>``, else the home itself."""
+    native_home = native_home or _get_platform_default_hermes_home()
+    home = Path(home)
+    try:
+        home.resolve().relative_to(native_home.resolve())
+        return native_home
+    except ValueError:
+        return home.parent.parent if home.parent.name == "profiles" else home
+
+
 def get_default_hermes_root() -> Path:
     """Root Hermes dir for profile-level ops: ``<root>`` when ``HERMES_HOME=<root>/profiles/<name>``."""
     global _default_hermes_root_memo
@@ -184,12 +199,7 @@ def get_default_hermes_root() -> Path:
     memo = _default_hermes_root_memo
     if memo is not None and memo[:2] == memo_key:
         return memo[2]
-    result = native_home
-    if env_path is not None:
-        try:
-            env_path.resolve().relative_to(native_home.resolve())  # under ~/.hermes (normal or profile mode)
-        except ValueError:  # Docker/custom root: <root>/profiles/<name> -> <root>, else HERMES_HOME itself
-            result = env_path.parent.parent if env_path.parent.name == "profiles" else env_path
+    result = native_home if env_path is None else hermes_root_for_home(env_path, native_home)
     _default_hermes_root_memo = (*memo_key, result)
     return result
 
