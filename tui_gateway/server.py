@@ -881,9 +881,10 @@ def _wait_agent(session: dict, rid: str, timeout: float = 30.0) -> dict | None:
     return _err(rid, 5032, err) if (err := session.get("agent_error")) else None
 
 
-# The deferred prompt path waits in short slices so a cancel is honored promptly and a slow
-# build is reported to the client exactly once.
-_AGENT_BUILD_WAIT_SLICE = 5.0
+# The deferred prompt path waits in short slices so a cancel is honored promptly (a Stop during a
+# slow build ends the turn within a slice, not up to 5 s later) and a slow build is reported to the
+# client exactly once.
+_AGENT_BUILD_WAIT_SLICE = 0.25
 _AGENT_BUILD_SLOW_NOTICE_AFTER = 30.0
 _AGENT_BUILD_SLOW_NOTICE_KEY = "agent-build-slow"
 

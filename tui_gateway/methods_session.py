@@ -2090,9 +2090,9 @@ def _(rid, params: dict) -> dict:
         except Exception as exc:
             return _err(rid, 5019, f"compute-host interrupt failed: {exc}")
         return _ok(rid, {"status": "interrupted", "turn_isolation": True})
-    session, err = _sess(params, rid)
-    if err:
-        return err
+    # Never wait for the agent build here: a Stop pressed while the turn's agent is still building
+    # used to block until the build finished (8 s under a 12-turn burst). The cancel flag set below is
+    # what the building turn's wait loop and its start both honor.
     _interrupt_session_turn(sid, session)
     # Retire the crash-recovery marker NOW: until the run thread's finally, a backend exit looks like a crash
     # and session.resume auto-continues the turn the user just stopped (the extra key covers compression

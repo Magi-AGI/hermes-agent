@@ -10,6 +10,7 @@ ran to its end (3 of 3 stops, ~34 s each).
 from __future__ import annotations
 
 import threading
+import time
 
 import pytest
 
@@ -64,3 +65,35 @@ def test_a_stop_landing_after_the_pre_start_check_ends_the_submitted_turn(monkey
     assert session["running"] is False
     assert ("error", {"message": "Turn cancelled before it started"}) in emitted
     assert agent.cleared == 0, "the pending stop was cleared instead of honored"
+
+
+def test_a_stop_during_the_agent_build_answers_at_once_and_ends_the_turn(monkeypatch):
+    """A Stop pressed while the turn's agent is still building used to wait for the build (8 s under a
+    12-turn burst) before acting, and the building turn noticed the cancel only every 5 s."""
+    sid = "stop-during-build"
+    building = threading.Event()  # agent_ready: never set, the build is slow
+    session = {"history_lock": threading.RLock(), "running": True, "_turn_cancel_requested": False,
+               "session_key": "stored-key", "agent": None, "agent_ready": building, "attached_images": [],
+               "inflight_turn": {"user": "hello"}, "history": [], "transport": None}
+    emitted = []
+    monkeypatch.setattr(server, "_sessions", {sid: session})
+    monkeypatch.setattr(server, "_emit", lambda event, s, payload=None: emitted.append((event, payload)))
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *a, **kw: False)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *a, **kw: None)
+    monkeypatch.setattr(server, "_ensure_session_db_row",
+                        lambda *_a: pytest.fail("the stopped turn went on to start"))
+    turn = threading.Thread(
+        target=server._run_after_agent_ready, args=("r1", sid, session, "hello", None, None, None), daemon=True)
+    turn.start()
+    session["_run_thread"] = turn
+
+    started = time.monotonic()
+    reply = server._methods["session.interrupt"]("r2", {"session_id": sid})
+    answered = time.monotonic() - started
+    turn.join(timeout=5)
+
+    assert reply["result"]["status"] == "interrupted"
+    assert answered < 2.0, f"the Stop waited {answered:.1f}s for the agent build"
+    assert not turn.is_alive(), "the building turn did not notice the Stop"
+    assert session["running"] is False
+    assert any(e == "error" and "cancelled" in (p or {}).get("message", "") for e, p in emitted)
