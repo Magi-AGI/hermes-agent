@@ -349,7 +349,7 @@ def _(rid, params: dict) -> dict:
             include_unconfigured=bool(params.get("include_unconfigured")), refresh=bool(params.get("refresh")))
     # Windows opening the picker together share one build (rpc_coalesce); the payload is read-only.
     key = rpc_coalesce.model_options_key(get_hermes_home(), ctx, params)
-    return _ok(rid, build() if key is None else rpc_coalesce.MODEL_OPTIONS.run(key, build))
+    return rpc_coalesce.respond(rpc_coalesce.MODEL_OPTIONS, key, rid, build, error_code=5033)
 
 
 @method("model.save_key")

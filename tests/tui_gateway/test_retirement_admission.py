@@ -42,7 +42,7 @@ def test_queued_and_running_rpc_hold_admission_until_the_response(runtime, monke
     monkeypatch.setitem(server._methods, "test.retirement", handler)
     monkeypatch.setattr(server, "_LONG_HANDLERS", {"test.retirement"})
     # One worker in the lane the method maps to, held busy: the dispatched request waits QUEUED.
-    lanes = LaneSet((LaneSpec("maintenance", workers=1, max_queued=4, auto_retry=False, retry_after_ms=1),))
+    lanes = LaneSet((LaneSpec("maintenance", workers=1, max_queued=4, retry_after_ms=1),))
     monkeypatch.setattr(server, "_lanes", lanes)
     blocked = lanes.for_method("test.retirement").try_submit("blocker", lambda: release_pool.wait(10))
     try:

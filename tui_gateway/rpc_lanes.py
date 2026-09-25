@@ -7,8 +7,8 @@ bounded lane: resume never queues behind catalog work, and a lane that is full a
 :data:`BUSY_CODE` at once instead of accepting work that would wait unboundedly.
 
 ``BUSY_CODE`` is distinct from every failure code (5036 is session enumeration/deletion failure).
-Its ``data.retry`` tells the client what it may do: ``"auto"`` only for idempotent reads (bounded,
-jittered retry), ``"none"`` for anything that mutates (the error is surfaced to the user).
+Its ``data.retry`` tells the client what it may do: ``"auto"`` only for the idempotent reads in
+:data:`AUTO_RETRY_METHODS` (bounded, jittered retry), ``"none"`` for anything else (surfaced).
 """
 
 from __future__ import annotations
@@ -32,8 +32,6 @@ class LaneSpec:
     workers: int
     #: Requests allowed to WAIT beyond the running ones; one more is refused with BUSY_CODE.
     max_queued: int
-    #: Every method in the lane is an idempotent read the client may retry automatically.
-    auto_retry: bool
     retry_after_ms: int
 
 
@@ -141,19 +139,18 @@ def _percentiles(values: list[float]) -> dict[str, float]:
 
 # Lane table. Interactive work (resume) and user-typed commands never share a queue with catalog
 # reads or with minutes-long maintenance/relay work. Sizes are totals for the whole backend.
-RESUME = LaneSpec("resume", workers=4, max_queued=60, auto_retry=True, retry_after_ms=500)
-EXEC = LaneSpec("exec", workers=4, max_queued=16, auto_retry=False, retry_after_ms=1000)
+RESUME = LaneSpec("resume", workers=4, max_queued=60, retry_after_ms=500)
+EXEC = LaneSpec("exec", workers=4, max_queued=16, retry_after_ms=1000)
 # Minutes-long model calls (manual /compress, one-shot LLM): never in front of a window's slash command.
-LLM = LaneSpec("llm", workers=4, max_queued=16, auto_retry=False, retry_after_ms=2000)
-CATALOG = LaneSpec("catalog", workers=4, max_queued=32, auto_retry=True, retry_after_ms=750)
-MAINTENANCE = LaneSpec("maintenance", workers=3, max_queued=16, auto_retry=False, retry_after_ms=2000)
-RELAY = LaneSpec("relay", workers=2, max_queued=8, auto_retry=False, retry_after_ms=2000)
+LLM = LaneSpec("llm", workers=4, max_queued=16, retry_after_ms=2000)
+CATALOG = LaneSpec("catalog", workers=4, max_queued=32, retry_after_ms=750)
+MAINTENANCE = LaneSpec("maintenance", workers=3, max_queued=16, retry_after_ms=2000)
+RELAY = LaneSpec("relay", workers=2, max_queued=8, retry_after_ms=2000)
 
 _METHOD_LANES: dict[str, LaneSpec] = {
     **dict.fromkeys(("session.resume", "session.branch"), RESUME),
     **dict.fromkeys(("slash.exec", "command.dispatch", "shell.exec", "cli.exec"), EXEC),
     **dict.fromkeys(("session.compress", "llm.oneshot"), LLM),
-    # Idempotent reads only: a full lane answers BUSY and the client retries on its own.
     **dict.fromkeys((
         "model.options", "session.list", "session.active_list", "setup.status", "setup.runtime_check",
         "profiles.list", "profiles.describe", "profiles.get_asset", "billing.state", "subscription.state",
@@ -164,6 +161,19 @@ _METHOD_LANES: dict[str, LaneSpec] = {
     **dict.fromkeys(("bot_relay.roster.sync", "bot_relay.outbox.drain", "bot_relay.deliver",
                      "bot_relay.reply"), RELAY),
 }
+
+
+# Idempotent reads: a BUSY refusal (which always happens BEFORE the handler runs) may be retried by
+# the client on its own. Per METHOD, not per lane: session.branch shares the resume lane but creates
+# and persists a session, so its refusal is surfaced instead.
+AUTO_RETRY_METHODS = frozenset({
+    "session.resume", "model.options", "session.list", "session.active_list", "setup.status",
+    "setup.runtime_check", "profiles.list", "profiles.describe", "profiles.get_asset", "billing.state",
+    "subscription.state", "subscription.preview", "usage.bars", "session.usage", "pet.cells", "pet.gallery",
+    "pet.info", "pet.thumb", "learning.frames", "process.list", "projects.discover_repos", "projects.for_cwd",
+    "projects.tree", "projects.project_sessions", "session.foreign.list", "session.foreign.preview",
+    "wake.status", "complete.path", "complete.slash",
+})
 
 
 def lane_spec_for(method: str) -> LaneSpec:
@@ -191,7 +201,7 @@ def busy_error(rid: Any, method: str, lane: Lane) -> dict:
     return {"jsonrpc": "2.0", "id": rid, "error": {
         "code": BUSY_CODE,
         "message": f"backend busy: the {spec.name} lane is full; retry shortly",
-        "data": {"lane": spec.name, "method": method, "retry": "auto" if spec.auto_retry else "none",
+        "data": {"lane": spec.name, "method": method, "retry": "auto" if method in AUTO_RETRY_METHODS else "none",
                  "retry_after_ms": spec.retry_after_ms}}}
 
 
@@ -199,7 +209,10 @@ class SingleFlight:
     """Concurrent callers with the same key share ONE in-flight computation. Nothing is cached after
     it finishes: a caller arriving later starts a fresh one, so a joiner receives exactly what it
     would have got by arriving when the shared computation started. The result is shared READ-ONLY
-    (each caller wraps it in its own response frame); callers must not mutate it."""
+    (each caller wraps it in its own response frame); callers must not mutate it.
+
+    :meth:`claim` + :meth:`lead` let a joiner attach to the shared future instead of blocking a
+    thread on it (``tui_gateway.rpc_coalesce.respond``): joiners never hold a lane worker."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -207,19 +220,19 @@ class SingleFlight:
         self.joined = 0
         self.led = 0
 
-    def run(self, key: Hashable, compute: Callable[[], Any]) -> Any:
+    def claim(self, key: Hashable) -> tuple[concurrent.futures.Future, bool]:
+        """The shared future for *key* and whether the caller must compute it (leader)."""
         with self._lock:
             shared = self._inflight.get(key)
-            if shared is None:
-                shared = concurrent.futures.Future()
-                self._inflight[key] = shared
-                self.led += 1
-                leader = True
-            else:
+            if shared is not None:
                 self.joined += 1
-                leader = False
-        if not leader:
-            return shared.result()
+                return shared, False
+            shared = self._inflight[key] = concurrent.futures.Future()
+            self.led += 1
+            return shared, True
+
+    def lead(self, key: Hashable, shared: concurrent.futures.Future, compute: Callable[[], Any]) -> Any:
+        """Run *compute* as the leader of *shared*, publish its outcome, and retire the key."""
         try:
             result = compute()
         except BaseException as exc:
@@ -230,4 +243,10 @@ class SingleFlight:
             return result
         finally:
             with self._lock:
-                self._inflight.pop(key, None)
+                if self._inflight.get(key) is shared:
+                    del self._inflight[key]
+
+    def run(self, key: Hashable, compute: Callable[[], Any]) -> Any:
+        """Blocking form: lead, or wait on the leader in this thread."""
+        shared, leader = self.claim(key)
+        return self.lead(key, shared, compute) if leader else shared.result()

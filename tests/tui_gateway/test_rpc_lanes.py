@@ -32,7 +32,8 @@ def server(monkeypatch):
     methods = dict(mod._methods)
     # Fresh lanes per test: a stuck handler from one test must not occupy the next test's lanes.
     monkeypatch.setattr(mod, "_lanes", LaneSet(), raising=False)
-    for name in ("model.options", "session.resume", "reload.mcp", "session.list", "session.compress", "slash.exec"):
+    for name in ("model.options", "session.resume", "reload.mcp", "session.list", "session.compress", "slash.exec",
+                 "session.branch"):
         monkeypatch.delitem(mod._contracts.METHODS, name, raising=False)
     release = threading.Event()
     yield mod, release
@@ -183,3 +184,19 @@ def test_a_window_slash_command_is_served_while_compactions_run(server):
     frame = transport.wait_for("slash", timeout=5)
     assert frame is not None and frame["result"] == {"output": "ok"}, (
         "a slash command waited behind other windows' compactions")
+
+
+def test_a_busy_refusal_is_auto_retried_only_for_reads_even_within_one_lane(server):
+    """session.branch shares the resume lane with session.resume but creates and persists a session:
+    the lane being full must not tell the client to replay it."""
+    mod, release = server
+    transport = _Capture()
+    mod._methods["session.resume"] = _stuck(release)
+    capacity = mod._lanes.for_method("session.resume").capacity
+
+    _fill(mod, transport, "session.resume", capacity)
+    resume = mod.dispatch({"id": "resume-over", "method": "session.resume", "params": {}}, transport)
+    branch = mod.dispatch({"id": "branch-over", "method": "session.branch", "params": {}}, transport)
+
+    assert resume["error"]["data"]["retry"] == "auto"
+    assert branch["error"]["data"]["retry"] == "none"

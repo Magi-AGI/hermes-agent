@@ -463,7 +463,8 @@ def _(rid, params: dict, db) -> dict:
             return [_session_row_summary(s) for s in rows]
         from tui_gateway import rpc_coalesce
         key = rpc_coalesce.session_list_key(db, limit=limit, include_hidden=include_hidden)
-        return _ok(rid, {"sessions": summaries() if key is None else rpc_coalesce.SESSION_LIST.run(key, summaries)})
+        return rpc_coalesce.respond(rpc_coalesce.SESSION_LIST, key, rid, lambda: {"sessions": summaries()},
+                                    error_code=5006)
     except Exception as e:
         return _err(rid, 5006, str(e))
 
