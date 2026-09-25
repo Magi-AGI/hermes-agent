@@ -1984,7 +1984,17 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
         if archive_root != canon:
             final_source = staging_root / canon
             extracted.rename(final_source)
-        shutil.move(str(final_source), str(profile_dir))
+        # Codex credential state in the archive (auth.json with Codex tokens, the authority's
+        # files) is not restored while this install has Codex authority state (stage 1).
+        from hermes_cli.auth_codex_registry import CodexAuthorityRefused
+        from hermes_cli.auth_codex_restore import restore_guard
+        staged = [(profile_dir / f.relative_to(final_source), f.read_bytes)
+                  for f in final_source.rglob("*") if f.is_file()]
+        try:
+            with restore_guard(lambda: staged, "importing it with the profile"):
+                shutil.move(str(final_source), str(profile_dir))
+        except CodexAuthorityRefused as exc:
+            raise ValueError(str(exc)) from exc
     return profile_dir
 
 

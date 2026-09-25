@@ -990,20 +990,27 @@ def _import_members(
     return restored, restored_external, errors, skipped_runtime, db_shrunk
 
 
-def _refuse_registered_codex_stores(members: List[str], prefix: str, hermes_root: Path) -> None:
-    """Credential-bearing restore (RULE-P1, stage 1): importing an auth.json over a store that owns
-    or holds a registered Codex login would roll its refresh chain back."""
-    from hermes_cli.auth_codex_authority import refuse_if_registered_store
-    from hermes_cli.auth_codex_registry import CodexAuthorityRefused
+def _codex_restore_targets(zf: zipfile.ZipFile, members: List[str], prefix: str, hermes_root: Path):
+    """``(target, bytes loader)`` for every non-external member (credential recovery protocol:
+    ``auth_codex_restore`` decides which of them are Codex credential state)."""
     for name in members:
-        rel = name[len(prefix):] if prefix and name.startswith(prefix) else name
-        if rel.replace("\\", "/").split("/")[-1] != "auth.json":
+        if name.startswith(_EXTERNAL_PREFIX):
             continue
-        try:
-            refuse_if_registered_store(hermes_root / rel, "restoring its auth.json from a backup")
-        except CodexAuthorityRefused as exc:
-            print(f"Error: {exc}")
-            sys.exit(1)
+        rel = name[len(prefix):] if prefix and name.startswith(prefix) else name
+        if rel:
+            yield hermes_root / rel, (lambda n=name: zf.read(n))
+
+
+def _refuse_codex_credential_state(zf: zipfile.ZipFile, members: List[str], prefix: str,
+                                   hermes_root: Path) -> None:
+    """Early refusal (before the overwrite prompt); ``run_import`` re-checks under the lock."""
+    from hermes_cli.auth_codex_registry import CodexAuthorityRefused
+    from hermes_cli.auth_codex_restore import check_restore
+    try:
+        check_restore(_codex_restore_targets(zf, members, prefix, hermes_root), "restoring it from a backup")
+    except CodexAuthorityRefused as exc:
+        print(f"Error: {exc}")
+        sys.exit(1)
 
 
 def run_import(args) -> None:
@@ -1025,7 +1032,7 @@ def run_import(args) -> None:
             sys.exit(1)
         prefix = _detect_prefix(zf)
         members = [n for n in zf.namelist() if not n.endswith("/")]
-        _refuse_registered_codex_stores(members, prefix, hermes_root)
+        _refuse_codex_credential_state(zf, members, prefix, hermes_root)
         file_count = len(members)
         print(f"Backup contains {file_count} files\nTarget: {display_hermes_home()}")
         if prefix:
@@ -1035,8 +1042,18 @@ def run_import(args) -> None:
         print(f"\nImporting {file_count} files ...")
         hermes_root.mkdir(parents=True, exist_ok=True)
         t0 = time.monotonic()
-        restored, restored_external, errors, skipped_runtime, db_shrunk = _import_members(
-            zf, members, prefix, hermes_root, file_count)
+        from hermes_cli.auth_codex_registry import CodexAuthorityRefused
+        from hermes_cli.auth_codex_restore import restore_guard
+        try:
+            # Re-checked under the migration lock, held until every member is written: nothing can
+            # register a Codex login between the check and the overwrite.
+            with restore_guard(lambda: _codex_restore_targets(zf, members, prefix, hermes_root),
+                               "restoring it from a backup"):
+                restored, restored_external, errors, skipped_runtime, db_shrunk = _import_members(
+                    zf, members, prefix, hermes_root, file_count)
+        except CodexAuthorityRefused as exc:
+            print(f"Error: {exc}")
+            sys.exit(1)
         elapsed = time.monotonic() - t0
         print(f"\nImport complete: {restored} files restored in {elapsed:.1f}s\n  Target: {display_hermes_home()}")
         if restored_external:
@@ -1358,16 +1375,23 @@ def restore_quick_snapshot(snapshot_id: str, hermes_home: Optional[Path] = None)
     with open(manifest_path, encoding="utf-8") as f:
         meta = json.load(f)
     snap_res, home_res = snap_dir.resolve(), home.resolve()
-    if "auth.json" in meta.get("files", {}):
-        # Credential-bearing restore (RULE-P1, stage 1): rolling a registered Codex store back
-        # would replay spent refresh tokens.
-        from hermes_cli.auth_codex_authority import refuse_if_registered_store
-        from hermes_cli.auth_codex_registry import CodexAuthorityRefused
-        try:
-            refuse_if_registered_store(home / "auth.json", "restoring its auth.json from a snapshot")
-        except CodexAuthorityRefused as exc:
-            logger.error("%s", exc)
-            return False
+    # Codex credential state (auth.json and the authority's files) is never rolled back (credential
+    # recovery protocol, stage 1): checked and written under the migration lock.
+    from hermes_cli.auth_codex_registry import CodexAuthorityRefused
+    from hermes_cli.auth_codex_restore import restore_guard
+    targets = [(home / rel, (lambda r=rel: (snap_dir / r).read_bytes())) for rel in meta.get("files", {})]
+    try:
+        with restore_guard(lambda: targets, "restoring it from a snapshot"):
+            restored = _restore_quick_snapshot_files(meta, snap_dir, home, snap_res, home_res)
+    except CodexAuthorityRefused as exc:
+        logger.error("%s", exc)
+        return False
+    logger.info("Restored %d files from snapshot %s", restored, snapshot_id)
+    return restored > 0
+
+
+def _restore_quick_snapshot_files(meta: Dict[str, Any], snap_dir: Path, home: Path, snap_res: Path,
+                                  home_res: Path) -> int:
     restored = 0
     for rel in meta.get("files", {}):
         src = snap_dir / rel
@@ -1391,8 +1415,7 @@ def restore_quick_snapshot(snapshot_id: str, hermes_home: Optional[Path] = None)
             restored += 1
         except (OSError, PermissionError) as exc:
             logger.error("Failed to restore %s: %s", rel, exc)
-    logger.info("Restored %d files from snapshot %s", restored, snapshot_id)
-    return restored > 0
+    return restored
 
 
 # Kept in sync with ``_QUICK_STATE_FILES`` and ``cron/jobs.py``'s ``JOBS_FILE``.
