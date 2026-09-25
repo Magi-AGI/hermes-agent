@@ -175,9 +175,12 @@ _LONG_HANDLERS = frozenset({
     "command.dispatch",  # /goal draft invokes the auxiliary model; never block the RPC reader
 })
 
-_rpc_pool_workers = max(2, env_int("HERMES_TUI_RPC_POOL_WORKERS", 8))
-_pool = concurrent.futures.ThreadPoolExecutor(max_workers=_rpc_pool_workers, thread_name_prefix="tui-rpc")
-atexit.register(lambda: _pool.shutdown(wait=False, cancel_futures=True))
+# Long handlers run in bounded per-class lanes (tui_gateway.rpc_lanes): resume never queues behind
+# catalog reads, and a full lane answers BUSY instead of accepting unbounded waiting work.
+from tui_gateway.rpc_lanes import LaneSet as _LaneSet  # noqa: E402
+
+_lanes = _LaneSet()
+atexit.register(_lanes.shutdown)
 
 # Exact in-memory session record executing on the current turn thread — unlike a public session id,
 # this object identity cannot be supplied by RPC.

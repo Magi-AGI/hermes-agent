@@ -10,7 +10,7 @@ to time out (120s) and the WebSocket to disconnect — the false "needs setup"
 failure mode (#50005).
 
 The fix routes all frontend-polled RPCs through ``_LONG_HANDLERS`` so
-``dispatch()`` returns immediately (``_pool.submit`` + ``return None``) and
+``dispatch()`` returns immediately (lane submit + ``return None``) and
 the WS read loop is never blocked.
 """
 
@@ -127,15 +127,3 @@ def test_dispatch_inline_rpc_does_not_block_under_gil_pressure(server):
     )
 
     released.set()
-
-
-def test_rpc_pool_workers_supports_concurrent_long_handlers(server):
-    """The RPC thread pool must have enough workers to handle concurrent
-    long handlers without queueing. With 6+ frontend-polled RPCs added to
-    _LONG_HANDLERS, the default 4 workers can be exhausted when multiple
-    agent turns are running. The pool must be at least 8."""
-    assert server._rpc_pool_workers >= 8, (
-        f"_rpc_pool_workers is {server._rpc_pool_workers}, expected >= 8. "
-        f"Frontend-polled RPCs added to _LONG_HANDLERS need more workers to "
-        f"avoid queueing under multi-agent load (#50005)."
-    )
