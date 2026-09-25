@@ -22,6 +22,7 @@ the witnessed-save table).
 
 from __future__ import annotations
 
+import contextvars
 import enum
 import hashlib
 import json
@@ -30,7 +31,7 @@ import os
 import random
 import tempfile
 import time
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Tuple, Union
@@ -74,10 +75,40 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+_path_memo: "contextvars.ContextVar[Optional[dict]]" = contextvars.ContextVar("credential_path_memo", default=None)
+
+
+@contextmanager
+def path_memo():
+    """Memoize path canonicalization for one bounded protocol pass (a dispatch, an ownership op, a
+    refresh transaction): each realpath costs a filesystem round trip, and a pass resolves the same
+    few store paths dozens of times. Nested scopes share the outer memo."""
+    if _path_memo.get() is not None:
+        yield _path_memo.get()
+        return
+    token = _path_memo.set({})
+    try:
+        yield _path_memo.get()
+    finally:
+        _path_memo.reset(token)
+
+
+def memo() -> Optional[dict]:
+    """The active pass memo, or None (callers may cache other per-pass values in it)."""
+    return _path_memo.get()
+
+
 def canonical_path(path: Union[str, Path]) -> Path:
     """The real file a write lands in: every symlink resolved, so a symlinked store is written
     THROUGH (upstream ``atomic_replace`` semantics), never replaced by a regular file."""
-    return Path(os.path.realpath(os.fspath(path)))
+    cache = _path_memo.get()
+    raw = os.fspath(path)
+    if cache is None:
+        return Path(os.path.realpath(raw))
+    hit = cache.get(raw)
+    if hit is None:
+        hit = cache[raw] = Path(os.path.realpath(raw))
+    return hit
 
 
 def store_key(path: Union[str, Path]) -> str:

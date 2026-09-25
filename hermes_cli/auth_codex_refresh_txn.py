@@ -279,11 +279,13 @@ def refresh_row(row_store: Path, row: str, started: Tuple[str, str], *, force: b
             from hermes_cli import auth as auth_mod
             return auth_mod.refresh_codex_oauth_pure(*args, **kwargs)
     budget = max(float(AUTH_LOCK_TIMEOUT_SECONDS), float(timeout_seconds) + 5.0)
+    from hermes_cli.auth_credential_io import path_memo
     for round_ in range(2):
         try:
-            return _transaction(Path(row_store), row, started, force=force, needs_refresh=needs_refresh,
-                                timeout=budget, refresh_timeout=float(timeout_seconds) if pass_timeout else None,
-                                refresh_fn=refresh_fn, round_=round_)
+            with path_memo():  # one memo per round: a restart re-resolves everything
+                return _transaction(Path(row_store), row, started, force=force, needs_refresh=needs_refresh,
+                                    timeout=budget, refresh_timeout=float(timeout_seconds) if pass_timeout else None,
+                                    refresh_fn=refresh_fn, round_=round_)
         except _Restart:
             continue
         except NeedsAuthorityRepair as need:

@@ -122,11 +122,13 @@ def authority_dispatch(*, read_only: bool = False, budget_seconds: float = 0.0) 
     holds a store lock), ``unreadable``, ``idle``, ``bootstrapped``, ``done`` or ``failed``."""
     if read_only:
         return "skipped"
+    from hermes_cli.auth_credential_io import path_memo
     with try_migration_lock(budget_seconds) as acquired:
         if not acquired:
             return "busy"
         try:
-            return dispatch_locked()
+            with path_memo():
+                return dispatch_locked()
         except Exception:
             logger.warning("Codex authority dispatch failed", exc_info=True)
             return "failed"
@@ -176,7 +178,8 @@ def _run_with_all_stores(build) -> Any:
     """Migration lock, registry ready, ALL store locks (ownership ops are rare), then build + run."""
     if thread_holds_store_lock():
         raise RuntimeError("Codex ownership operations must not run inside an auth-store lock")
-    with migration_lock():
+    from hermes_cli.auth_credential_io import path_memo
+    with migration_lock(), path_memo():
         # An interrupted restore's fence is finished FIRST, before any branch below (an unreadable
         # registry skips _ready_view) and before the store locks: otherwise this op's new chain
         # would be fenced as restored by the next dispatch.

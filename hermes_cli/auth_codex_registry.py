@@ -212,7 +212,11 @@ def store_path_of(key: str) -> Path:
 
 def all_store_paths() -> List[Path]:
     """Root, the active store, and every live named profile's auth.json that exists (read-only
-    enumeration)."""
+    enumeration; computed once per protocol pass when a ``path_memo`` scope is active)."""
+    from hermes_cli.auth_credential_io import memo
+    cache = memo()
+    if cache is not None and "__all_store_paths__" in cache:
+        return list(cache["__all_store_paths__"])
     paths = [root_store_path(), active_store_path()]
     try:
         from hermes_cli.profiles import _iter_named_profile_dirs
@@ -225,6 +229,8 @@ def all_store_paths() -> List[Path]:
         if k not in seen:
             seen.add(k)
             unique.append(p)
+    if cache is not None:
+        cache["__all_store_paths__"] = list(unique)
     return unique
 
 
@@ -470,20 +476,33 @@ def legacy_rescue_path(store: Path) -> Path:
 
 def rescue_locations() -> List[Tuple[Path, Path]]:
     """``(rescue file, store path)`` at EVERY path a store is reached by, enumerated BEFORE store
-    aliases are collapsed (§7): root, the active store, and every live named profile directory —
+    aliases are collapsed (§7): root, the active store, and every directory under profiles/ —
     with or without its own auth.json (a borrowing profile's rescue belongs to root's grant) —
     beside the path as given AND beside its canonical file. A rescue written beside a profile whose
-    auth.json links to root's is found here although that profile is the same store as root."""
+    auth.json links to root's is found here although that profile is the same store as root.
+    Only EXISTING rescue files are returned, and only they are canonicalized: the scan runs on every
+    refresh admission, so a location costs one ``lstat`` (plus one for a symlinked auth.json).
+    Every directory under ``profiles/`` counts (identity markers are not required: a rescue beside a
+    marker-less directory is still evidence)."""
     from hermes_cli.auth_credential_io import canonical_path
     stores = [root_store_path(), active_store_path()]
     try:
-        from hermes_cli.profiles import _iter_named_profile_dirs
-        stores.extend(d / "auth.json" for d in _iter_named_profile_dirs())
+        from hermes_cli.profiles import _get_profiles_root
+        with os.scandir(_get_profiles_root()) as entries:
+            stores.extend(Path(e.path) / "auth.json" for e in entries
+                          if not e.name.startswith(".") and e.is_dir())
+    except OSError:
+        pass
     except Exception:
         logger.debug("codex authority: profile enumeration failed", exc_info=True)
     seen, out = set(), []
     for store in stores:
-        for rescue in (legacy_rescue_path(store), legacy_rescue_path(canonical_path(store))):
+        candidates = [legacy_rescue_path(store)]
+        if os.path.islink(store):  # a file-level alias: its rescue may sit beside the target
+            candidates.append(legacy_rescue_path(canonical_path(store)))
+        for rescue in candidates:
+            if not os.path.lexists(rescue):
+                continue
             key = store_key(rescue)
             if key not in seen:
                 seen.add(key)
