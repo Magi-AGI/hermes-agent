@@ -108,7 +108,7 @@ def _plan_goal_compression_recovery(
 def _admit_prompt_turn(
     sid: str, session: dict, text: Any, image_paths: list[str] | None,
     queued_prompt_generation: int | None, display_kind: str | None,
-    display_metadata: dict | None) -> tuple[list[str], Any] | None:
+    display_metadata: dict | None, *, honor_pending_stop: bool = False) -> tuple[list[str], Any] | None:
     """Ownership + liveness gate every turn source must cross; ``(images, agent)`` or None.
     Synthesized turns (auto-continue, wake-ups) call ``_run_prompt_submit`` directly — the
     bypass that once let a second backend run a duplicate turn."""
@@ -140,6 +140,17 @@ def _admit_prompt_turn(
             _start_inflight_turn(
                 session, text, display_kind=display_kind, display_metadata=display_metadata)
         agent = session["agent"]
+        # A Stop that landed after the submit's own pre-start check (session.interrupt waits for the
+        # same agent build the turn thread waits for, so both wake together) is still pending here:
+        # clearing the interrupt below used to wipe it and the turn then ran to its end although the
+        # user was told "interrupted". Only a submit's turn honors it: its claim resets the flag, so
+        # a set flag was aimed at THIS turn (other sources claim without resetting it).
+        if honor_pending_stop and session.get("_turn_cancel_requested"):
+            session["running"] = False
+            session.pop("_submit_user_row", None)
+            _clear_inflight_turn(session)
+            _emit("error", sid, {"message": "Turn cancelled before it started"})
+            return None
         if agent is None:
             session["running"] = False
         else:
@@ -917,7 +928,7 @@ def _run_prompt_submit(
     display_metadata: dict | None = None, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
-    turn_author: dict | None = None) -> bool:
+    turn_author: dict | None = None, honor_pending_stop: bool = False) -> bool:
     # Every dispatch binds the session's own row (session_key, real source) before the turn writes:
     # the synthesized turns that enter here directly (crash auto-continue, queued-prompt drain,
     # wake-ups) bypass prompt.submit's persist, and a row-less turn is otherwise materialized by
@@ -927,7 +938,8 @@ def _run_prompt_submit(
             "prompt dispatch: session store unavailable for %s — this turn may not persist",
             session.get("session_key") or sid)
     admitted = _admit_prompt_turn(
-        sid, session, text, image_paths, queued_prompt_generation, display_kind, display_metadata)
+        sid, session, text, image_paths, queued_prompt_generation, display_kind, display_metadata,
+        honor_pending_stop=honor_pending_stop)
     if admitted is None:
         return False
     images, agent = admitted
