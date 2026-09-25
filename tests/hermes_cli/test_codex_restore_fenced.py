@@ -30,10 +30,6 @@ from hermes_cli.auth_codex_registry import CodexAuthorityRefused
 from tests.hermes_cli.codex_authority_env import codex_home, pool_row, read_json, registry, write_store  # noqa: F401
 
 
-class Killed(SystemExit):
-    pass
-
-
 def _backup_then_reinstall(root, endpoint, tmp_path):
     """Back up an install holding R0 (bootstrapped), spend R0 (-> R1), wipe the install."""
     from hermes_cli.auth_codex_authority import authority_dispatch
@@ -61,45 +57,23 @@ def quiet_backup(monkeypatch):
     return backup
 
 
-@pytest.mark.parametrize("crash", [None, "mid-extraction", "before-fence", "mid-fence", "before-barrier-clear"])
-def test_a_restored_codex_login_is_fenced_at_every_step(codex_home, tmp_path, monkeypatch, quiet_backup, crash):
-    from hermes_cli import auth_codex_ops as ops
+@pytest.mark.parametrize("crash", [None, "after-auth-json", "before-fence", "mid-fence", "before-barrier-clear"])
+def test_a_restored_codex_login_is_fenced_at_every_step(codex_home, tmp_path, crash):
+    """The restore runs in a REAL child process that dies with ``os._exit`` at *crash* (no finally,
+    no handler); recovery then runs in a separate process whose token-endpoint seam only records."""
     from hermes_cli.auth_codex_authority import grant_retry_override
+    from tests.hermes_cli.codex_restore_children import recover, restore
 
     root, endpoint = codex_home
     archive, _r0 = _backup_then_reinstall(root, endpoint, tmp_path)
-    posts = len(endpoint.calls)
-    with monkeypatch.context() as inject:
-        if crash == "mid-extraction":  # auth.json lands, then the process dies (registry maybe not yet)
-            real = quiet_backup._extract_member_atomically
-
-            def extract(zf, member, target, *a, **k):
-                real(zf, member, target, *a, **k)
-                if member == "auth.json":
-                    raise Killed("x")
-            inject.setattr(quiet_backup, "_extract_member_atomically", extract)
-        elif crash == "before-fence":
-            from hermes_cli import auth_codex_restore as restore
-            inject.setattr(restore, "fence_restored", lambda: (_ for _ in ()).throw(Killed("x")))
-        elif crash == "mid-fence":  # the fencing registry write itself dies
-            from hermes_cli import auth_codex_registry as reg
-            for module in (reg, ops):
-                inject.setattr(module, "write_registry", lambda data: (_ for _ in ()).throw(Killed("x")))
-        elif crash == "before-barrier-clear":  # fenced, but the barrier is still there
-            from hermes_cli.auth_credential_io import unlink_retrying
-            inject.setattr("hermes_cli.auth_credential_io.unlink_retrying",
-                           lambda path: (_ for _ in ()).throw(Killed("x"))
-                           if str(path).endswith("auth.restore-barrier.json") else unlink_retrying(path))
-        run = lambda: quiet_backup.run_import(SimpleNamespace(zipfile=str(archive), force=True))  # noqa: E731
-        if crash:
-            with pytest.raises(Killed):
-                run()
-        else:
-            run()
-    # The next process: an ordinary forced refresh never presents a restored token.
-    with pytest.raises(AuthError):
-        auth.resolve_codex_runtime_credentials(force_refresh=True)
-    assert len(endpoint.calls) == posts, "a restored refresh token was presented to the endpoint"
+    proc, _log, _gate = restore(archive, tmp_path, tmp_path / "userhome", point=crash or "none", mode="die")
+    out, err = proc.communicate(timeout=180)
+    assert proc.returncode == (137 if crash else 0), err[-2000:]
+    if crash:
+        assert (root / "auth.restore-barrier.json").exists(), "the barrier must outlive a death mid-restore"
+    recovered = recover(tmp_path, tmp_path / "userhome")
+    assert recovered["presented"] == [], "a restored refresh token was presented to the endpoint"
+    assert recovered["refresh"] == "codex_recovery_fenced", recovered
     live = [c for c in registry(root)["chains"].values() if c["state"] != "retired"]
     assert live and all(c["state"] == "fenced" and c["fence"]["reason"] == "restored-from-backup" for c in live)
     assert not (root / "auth.restore-barrier.json").exists()
