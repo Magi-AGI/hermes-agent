@@ -42,6 +42,9 @@ MIGRATION_LOCK_NAME = "auth.migration.lock"
 OPS_DIR_NAME = "auth.ops"
 RECORDS_DIR_NAME = "auth.recovery"
 LEGACY_RESCUE_NAME = "auth.codex-rotation-rescue.json"
+# Written BEFORE a restore brings Codex credential material in; honoured by every dispatcher and
+# refresh admission until the restored chains are durably fenced (auth_codex_restore).
+RESTORE_BARRIER_NAME = "auth.restore-barrier.json"
 SINGLETON = "singleton"
 
 STATE_ACTIVE, STATE_FENCED, STATE_RETIRED = "active", "fenced", "retired"
@@ -180,6 +183,10 @@ def active_store_path() -> Path:
 
 def registry_path() -> Path:
     return root_home() / REGISTRY_NAME
+
+
+def restore_barrier_path() -> Path:
+    return root_home() / RESTORE_BARRIER_NAME
 
 
 def ops_dir() -> Path:

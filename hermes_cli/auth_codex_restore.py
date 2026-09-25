@@ -18,33 +18,70 @@ write (the check is re-run under the lock).
 from __future__ import annotations
 
 import json
+import os
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Optional, Tuple
 
 from hermes_cli.auth_codex_registry import (
-    LEGACY_RESCUE_NAME, MIGRATION_LOCK_NAME, OPS_DIR_NAME, RECORDS_DIR_NAME, REGISTRY_NAME,
-    CodexAuthorityRefused, all_store_paths, migration_lock, ops_dir, registry_path)
+    LEGACY_RESCUE_NAME, MIGRATION_LOCK_NAME, OPS_DIR_NAME, RECORDS_DIR_NAME, REGISTRY_NAME, RESTORE_BARRIER_NAME,
+    CodexAuthorityRefused, all_store_paths, migration_lock, ops_dir, registry_path, restore_barrier_path)
+from hermes_cli.auth_credential_io import canonical_path
 
 AUTH_STORE_NAME = "auth.json"
 
 
 def _names() -> Tuple[str, ...]:
     from hermes_cli.auth_codex_evidence import RETIRED_INDEX_NAME
-    return (REGISTRY_NAME, RETIRED_INDEX_NAME, MIGRATION_LOCK_NAME, LEGACY_RESCUE_NAME)
+    return (REGISTRY_NAME, RETIRED_INDEX_NAME, MIGRATION_LOCK_NAME, LEGACY_RESCUE_NAME, RESTORE_BARRIER_NAME)
+
+
+def _norm(text: str) -> str:
+    return os.path.normcase(text)
+
+
+def _destination(path: Path) -> Path:
+    """The file a write to *path* really lands in: symlinks and junctions resolved (a missing tail
+    stays as given); comparisons below are case-normalized where the platform is."""
+    return canonical_path(path)
+
+
+def _known_credential_files() -> Iterable[Path]:
+    """Root-level credential files a hard link elsewhere could alias (names catch the rest)."""
+    from hermes_cli.auth_codex_evidence import retired_index_path
+    from hermes_cli.auth_codex_registry import root_store_path
+    return (root_store_path(), registry_path(), retired_index_path(), restore_barrier_path())
+
+
+def _classify(path: Path) -> Optional[str]:
+    """``store`` (an auth.json), ``protocol`` (a Codex authority file) or None, by the resolved
+    destination — by name, directory, or identity with a known credential file (hard links)."""
+    dest = _destination(path)
+    parts = [_norm(p) for p in dest.parts]
+    name = parts[-1] if parts else ""
+    if name == _norm(AUTH_STORE_NAME):
+        return "store"
+    if any(name == _norm(n) or name.startswith(_norm(f"{n}.")) for n in _names()):
+        return "protocol"
+    if any(p in (_norm(OPS_DIR_NAME), _norm(RECORDS_DIR_NAME)) for p in parts[:-1]):
+        return "protocol"
+    if dest.exists():
+        for known in _known_credential_files():
+            try:
+                if known.exists() and os.path.samefile(dest, known):
+                    return "store" if _norm(known.name) == _norm(AUTH_STORE_NAME) else "protocol"
+            except OSError:
+                continue
+    return None
 
 
 def is_protocol_file(path: Path) -> bool:
-    """A Codex authority protocol file (not ``auth.json`` itself), by name or directory."""
-    parts = Path(path).parts
-    name = parts[-1] if parts else ""
-    if any(name == n or name.startswith(f"{n}.") for n in _names()):
-        return True
-    return any(p in (OPS_DIR_NAME, RECORDS_DIR_NAME) for p in parts[:-1])
+    """A Codex authority protocol file (not ``auth.json`` itself), by its resolved destination."""
+    return _classify(path) == "protocol"
 
 
 def is_credential_state(path: Path) -> bool:
-    return Path(path).name == AUTH_STORE_NAME or is_protocol_file(path)
+    return _classify(path) is not None
 
 
 def authority_has_state() -> bool:
@@ -74,16 +111,17 @@ def check_restore(targets: Iterable[Tuple[Path, Callable[[], bytes]]], action: s
     from hermes_cli.auth_codex_authority import refuse_if_registered_store
     has_state: Optional[bool] = None
     for target, load in targets:
-        target = Path(target)
-        if not is_credential_state(target):
+        kind = _classify(Path(target))
+        if kind is None:
             continue
-        if target.name == AUTH_STORE_NAME:
+        target = _destination(Path(target))
+        if kind == "store":
             refuse_if_registered_store(target, action)
         if has_state is None:
             has_state = authority_has_state()
         if not has_state:
             continue
-        if is_protocol_file(target):
+        if kind == "protocol":
             raise CodexAuthorityRefused(
                 f"The backup contains Hermes's Codex login records ({target.name}); {action} would roll "
                 "your Codex login state back, which isn't supported yet. Restore without them, or sign "

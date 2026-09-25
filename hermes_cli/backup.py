@@ -14,7 +14,7 @@ import zipfile
 from contextlib import closing, contextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 from hermes_constants import (
     LOCAL_RUNTIME_ROOT_DIRS, _get_platform_default_hermes_home, get_default_hermes_root, get_hermes_home,
@@ -917,6 +917,32 @@ def _confirm_import_overwrite(hermes_root: Path) -> bool:
     return False
 
 
+class _MemberDestination(NamedTuple):
+    external: bool
+    rel: str
+    target: Path
+    root: Path              # containment root the target must stay within
+    skipped_runtime: bool   # runtime state kept from this machine (never restored)
+
+
+def _member_destination(member: str, prefix: str, hermes_root: Path, home_dir: Path) -> _MemberDestination:
+    """Where one archive member is written. The ONE resolver both the restore guard (Codex
+    credential state, ``auth_codex_restore``) and the extraction use, so they can never disagree
+    about a destination."""
+    # ``_external/`` members restore to their home-relative location (~/.honcho/config.json),
+    # NOT under HERMES_HOME; provider configs commonly hold credentials, so tighten to 0600.
+    if member.startswith(_EXTERNAL_PREFIX):
+        rel = member[len(_EXTERNAL_PREFIX):]
+        return _MemberDestination(True, rel, home_dir / rel, home_dir, False)
+    rel = member[len(prefix):] if prefix and member.startswith(prefix) else member
+    # A ``.db`` member is page-restored into the live file; an archived WAL/SHM/journal describes a
+    # different database image and installed beside it (over a live sidecar) would replay a foreign
+    # WAL on next open. Current backups never ship these (_EXCLUDED_SUFFIXES); older or hand-built
+    # archives might. ``_IMPORT_SKIP_NAMES``: see there.
+    skipped = bool(rel) and (Path(rel).name in _IMPORT_SKIP_NAMES or rel.endswith(_SQLITE_SIDECAR_SUFFIXES))
+    return _MemberDestination(False, rel, hermes_root / rel, hermes_root.resolve(), skipped)
+
+
 def _import_members(
     zf: zipfile.ZipFile, members: List[str], prefix: str, hermes_root: Path, file_count: int
 ) -> tuple[int, int, list[str], list[str], list[tuple[str, tuple[int, int], tuple[int, int]]]]:
@@ -932,29 +958,13 @@ def _import_members(
     home_dir = Path.home().resolve()
     new_file_mode = default_new_file_mode()  # once: every member is published via mkstemp (0600)
     for member in members:
-        # ``_external/`` members restore to their home-relative location (~/.honcho/config.json),
-        # NOT under HERMES_HOME; provider configs commonly hold credentials, so tighten to 0600.
-        external = member.startswith(_EXTERNAL_PREFIX)
-        if external:
-            rel = member[len(_EXTERNAL_PREFIX):]
-            target = home_dir / rel
-            root = home_dir
-            tighten = target.suffix in {".json", ".env", ".conf"} or target.name in _SECRET_FILE_NAMES
-        else:
-            rel = member[len(prefix):] if prefix and member.startswith(prefix) else member
-            if rel and Path(rel).name in _IMPORT_SKIP_NAMES:  # see ``_IMPORT_SKIP_NAMES``
-                skipped_runtime.append(rel)
-                continue
-            # A ``.db`` member is page-restored into the live file; an archived WAL/SHM/journal
-            # describes a different database image and installed beside it (over a live sidecar)
-            # would replay a foreign WAL on next open. Current backups never ship these
-            # (_EXCLUDED_SUFFIXES); older or hand-built archives might.
-            if rel.endswith(_SQLITE_SIDECAR_SUFFIXES):
-                skipped_runtime.append(rel)
-                continue
-            target = hermes_root / rel
-            root = hermes_root.resolve()
-            tighten = target.name in _SECRET_FILE_NAMES
+        dest = _member_destination(member, prefix, hermes_root, home_dir)
+        if dest.skipped_runtime:
+            skipped_runtime.append(dest.rel)
+            continue
+        external, rel, target, root = dest.external, dest.rel, dest.target, dest.root
+        tighten = (target.suffix in {".json", ".env", ".conf"} or target.name in _SECRET_FILE_NAMES) if external \
+            else target.name in _SECRET_FILE_NAMES
         if not rel:
             continue
 
@@ -991,14 +1001,13 @@ def _import_members(
 
 
 def _codex_restore_targets(zf: zipfile.ZipFile, members: List[str], prefix: str, hermes_root: Path):
-    """``(target, bytes loader)`` for every non-external member (credential recovery protocol:
-    ``auth_codex_restore`` decides which of them are Codex credential state)."""
+    """``(destination, bytes loader)`` for every member that will be written, external ones included
+    (credential recovery protocol: ``auth_codex_restore`` decides which are Codex credential state)."""
+    home_dir = Path.home().resolve()
     for name in members:
-        if name.startswith(_EXTERNAL_PREFIX):
-            continue
-        rel = name[len(prefix):] if prefix and name.startswith(prefix) else name
-        if rel:
-            yield hermes_root / rel, (lambda n=name: zf.read(n))
+        dest = _member_destination(name, prefix, hermes_root, home_dir)
+        if dest.rel and not dest.skipped_runtime:
+            yield dest.target, (lambda n=name: zf.read(n))
 
 
 def _refuse_codex_credential_state(zf: zipfile.ZipFile, members: List[str], prefix: str,
