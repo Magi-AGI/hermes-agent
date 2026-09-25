@@ -522,15 +522,65 @@ class RecallGuardMiddleware(InboundMiddleware):
     def _resolve_sid(cls, store, adapter, group_code: str, from_account: str) -> str:
         return store.get_or_create_session(cls._build_source(adapter, group_code, from_account)).session_id
 
+    # A turn or compression holding the conversation defers the redaction; this bounds the wait.
+    _REDACT_RETRY_WINDOW_S = 600.0
+    _REDACT_RETRY_INTERVAL_S = 1.0
+
     @classmethod
-    def _redact(cls, adapter, store, sid: str, transcript: list, entry: dict, ok_msg: str, fail_msg: str, *ok_args) -> None:
-        """Blank *entry* in place and persist *transcript* (warns, never raises)."""
-        entry["content"] = cls._REDACTED
-        try:
-            store.rewrite_transcript(sid, transcript, active_only=True)
-            logger.info(ok_msg, adapter.name, *ok_args)
-        except Exception as exc:
-            logger.warning(fail_msg, adapter.name, exc)
+    def _schedule_redact(cls, adapter, session_key: str, group_code: str, from_account: str, *,
+                         recalled_id: str, content: Optional[str], wait_for_row_s: float = 0.0,
+                         note_if_missing: bool = False) -> None:
+        """Overwrite the recalled message in place (targeted and fenced: see
+        ``SessionStore.redact_user_message``) on a tracked task. While a turn or compression holds the
+        conversation the store refuses, so this retries until it ends: the interrupted turn's own late
+        write of the recalled message then lands first and is caught. ``wait_for_row_s`` keeps looking
+        that long for a row the interrupted turn has not written yet; ``note_if_missing`` appends the
+        do-not-reference note when nothing was stored (branch B)."""
+        from hermes_state import SessionCompressionInProgressError
+        from hermes_state_errors import SessionTurnLeaseLostError
+
+        async def _run() -> None:
+            store = _session_store(adapter)
+            if not store:
+                return
+            try:
+                sid = cls._resolve_sid(store, adapter, group_code, from_account)
+            except Exception as exc:
+                logger.warning("[%s] Recall: failed to resolve session: %s", adapter.name, exc)
+                return
+            started = time.monotonic()
+            while True:
+                try:
+                    changed = await asyncio.to_thread(
+                        store.redact_user_message, sid, platform_message_id=recalled_id or None,
+                        content=content or None, replacement=cls._REDACTED)
+                except (SessionTurnLeaseLostError, SessionCompressionInProgressError):
+                    changed = None  # a live turn or compression owns the conversation: after it
+                except Exception as exc:
+                    logger.warning("[%s] Recall redact failed for msg_id=%s: %s", adapter.name, recalled_id, exc)
+                    return
+                elapsed = time.monotonic() - started
+                if changed:
+                    logger.info("[%s] Recall: redacted msg_id=%s (%d row(s)), session %s",
+                                adapter.name, recalled_id, changed, session_key[:30])
+                    return
+                if changed == 0 and elapsed >= wait_for_row_s:
+                    break
+                if elapsed >= cls._REDACT_RETRY_WINDOW_S:
+                    logger.warning("[%s] Recall redact gave up on msg_id=%s: the conversation stayed busy "
+                                   "for %.0fs", adapter.name, recalled_id, elapsed)
+                    return
+                await asyncio.sleep(cls._REDACT_RETRY_INTERVAL_S)
+            if note_if_missing:
+                await asyncio.to_thread(store.append_to_transcript, sid, {
+                    "role": "system", "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                    "content": f'[recall] message_id="{recalled_id}" has been recalled; do not quote or reference it.',
+                })
+                logger.info("[%s] Recall: system note for msg_id=%s (branch B)", adapter.name, recalled_id)
+            else:
+                logger.debug("[%s] Recall redact: msg_id=%s was never stored, session %s",
+                             adapter.name, recalled_id, session_key[:30])
+        adapter._track_task(asyncio.create_task(_run()))
 
     def _handle_recall(self, ctx: InboundContext, cmd: str) -> None:
         adapter = ctx.adapter
@@ -581,89 +631,21 @@ class RecallGuardMiddleware(InboundMiddleware):
         if active_event is not None:
             active_event.set()
         logger.info("[%s] Recall interrupt: msg_id=%s session=%s", adapter.name, recalled_id, session_key[:30])
-        # The interrupted turn persists the recalled content *after* our interrupt — redact later.
-        recalled_text = adapter._processing_msg_texts.get(session_key, "")
-        if recalled_text:
-            cls._schedule_content_redact(adapter, session_key, recalled_text, group_code, from_account)
-
-    @classmethod
-    def _schedule_content_redact(cls, adapter, session_key: str, recalled_text: str, group_code: str, from_account: str) -> None:
-        async def _redact() -> None:
-            store = _session_store(adapter)
-            if not store:
-                return
-            try:
-                sid = cls._resolve_sid(store, adapter, group_code, from_account)
-            except Exception:
-                return
-            # Poll until the recalled content appears — the interrupted turn hasn't finished writing yet.
-            for _ in range(30):
-                await asyncio.sleep(0.5)
-                try:
-                    transcript = store.load_transcript(sid)
-                except TranscriptReadError as exc:
-                    # No readable rows means nothing to redact; polling on
-                    # would just re-log the same failure (#100788).
-                    logger.warning(
-                        "[%s] Recall redact: transcript unreadable for "
-                        "session %s: %s", adapter.name, sid, exc,
-                    )
-                    return
-                except Exception:
-                    continue
-                for entry in transcript:
-                    if entry.get("role") == "user" and entry.get("content") == recalled_text:
-                        cls._redact(adapter, store, sid, transcript, entry, "[%s] Recall redact: session %s",
-                                    "[%s] Recall redact failed: %s", session_key[:30])
-                        return
-            logger.debug("[%s] Recall redact: content not found after polling, session %s", adapter.name, session_key[:30])
-        adapter._track_task(asyncio.create_task(_redact()))
+        # The interrupted turn may persist the recalled content after our interrupt: the fenced redaction
+        # waits for that turn to release the conversation, then looks a little longer for the row.
+        cls._schedule_redact(adapter, session_key, group_code, from_account, recalled_id=recalled_id,
+                             content=adapter._processing_msg_texts.get(session_key, ""), wait_for_row_s=15.0)
 
     # -- Branch A/B: patch transcript (session idle) --------------------
 
     @classmethod
     def _patch_transcript(cls, adapter, recalled_id: str, group_code: str,
                           from_account: str, recalled_content: Optional[str] = None) -> None:
-        store = _session_store(adapter)
-        if not store:
-            return
-        try:
-            sid = cls._resolve_sid(store, adapter, group_code, from_account)
-        except Exception as exc:
-            logger.warning("[%s] Recall: failed to resolve session: %s", adapter.name, exc)
-            return
-        try:
-            # Load transcript from canonical store (state.db). Since PR #29278 added a
-            # ``platform_message_id`` column to the messages table and ``append_to_transcript`` wires the
-            # incoming dict's ``message_id`` into it, ``load_transcript`` returns rows with ``message_id``
-            # set for any message that was observed with one — Branch A1 (exact id match) is the canonical
-            # path again.
-            transcript = store.load_transcript(sid)
-        except TranscriptReadError as exc:
-            # Not an empty transcript — the rows are unreadable, so recall has
-            # nothing to match against (#100788).
-            logger.warning("[%s] Recall: transcript unreadable: %s", adapter.name, exc)
-            return
-        except Exception as exc:
-            logger.warning("[%s] Recall: failed to load transcript: %s", adapter.name, exc)
-            return
-        # A1: exact platform message_id match; A2: content-match fallback for rows without a
-        # platform id (agent-processed @bot messages — run.py doesn't carry msg_id — or pre-column rows).
-        target = next((e for e in transcript if e.get("message_id") == recalled_id), None)
-        branch_label = "branch A1: id match"
-        if target is None and recalled_content:
-            target = next((e for e in transcript if e.get("role") == "user" and e.get("content") == recalled_content), None)
-            branch_label = "branch A2: content match"
-        if target is not None:
-            cls._redact(adapter, store, sid, transcript, target, "[%s] Recall: redacted msg_id=%s (%s)",
-                        "[%s] Recall: rewrite_transcript failed: %s", recalled_id, branch_label)
-            return
-        # Branch B: not found in transcript → append system note
-        store.append_to_transcript(sid, {
-            "role": "system", "timestamp": datetime.now(tz=timezone.utc).isoformat(),
-            "content": f'[recall] message_id="{recalled_id}" has been recalled; do not quote or reference it.',
-        })
-        logger.info("[%s] Recall: system note for msg_id=%s (branch B)", adapter.name, recalled_id)
+        # A1: platform message_id (``platform_message_id`` since PR #29278); A2: exact content for rows
+        # without one (agent-processed @bot messages, pre-column rows); B: nothing stored → a note.
+        cls._schedule_redact(adapter, f"direct:{from_account}" if not group_code else f"group:{group_code}",
+                             group_code, from_account, recalled_id=recalled_id, content=recalled_content,
+                             note_if_missing=True)
 
 
 class SkipSelfMiddleware(InboundMiddleware):

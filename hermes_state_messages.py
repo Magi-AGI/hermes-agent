@@ -8,7 +8,7 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from agent.context_compressor import (
     _DB_PERSISTED_MARKER as _DB_PERSISTED_MARKER_KEY, _is_checkpoint_item, _newest_checkpoint_carrier,
@@ -807,6 +807,41 @@ class SessionMessagesMixin:
         return self._write_rowcount(
             "UPDATE messages SET content = ? WHERE id = ? AND session_id = ? AND role = 'user' AND active = 1",
             (self._encode_content(content), row_id, session_id))
+
+    def redact_user_message(self, session_ids: Sequence[str], *, platform_message_id: Optional[str] = None,
+                            content: Any = None, replacement: str) -> int:
+        """Overwrite ONE withdrawn user message in place, in every row that holds it: live and
+        compaction-archived copies across *session_ids* (a compression lineage, tip first). Matches the
+        platform message id, else the exact content. The sidecar ``api_content`` goes too; FTS follows
+        through its update triggers. Every other row is left alone, so concurrent messages survive.
+
+        Fenced like a user rewrite, in the same transaction: refused (``SessionTurnLeaseLostError`` /
+        ``SessionCompressionInProgressError``) while a live turn or a compression holds the tip, so the
+        caller retries after it; a stale lease is reclaimed here, which fences that holder's late flush.
+        Returns the number of rows overwritten."""
+        ids = [sid for sid in dict.fromkeys(session_ids) if sid]
+        if not ids or not (platform_message_id or content):
+            return 0
+        marks = ",".join("?" * len(ids))
+        redacted = self._encode_content(replacement)
+
+        def _do(conn):
+            self._check_transcript_write_guards(
+                conn, ids[0], None, reject_active_turn_lease=True, reject_active_compression_lock=True)
+            changed = 0
+            if platform_message_id:
+                changed = conn.execute(
+                    f"UPDATE messages SET content = ?, api_content = NULL WHERE session_id IN ({marks}) "
+                    "AND role = 'user' AND platform_message_id = ?", (redacted, *ids, platform_message_id)).rowcount
+            if not changed and content:
+                # Stored bytes may carry whitespace the loaded view strips: match either form.
+                variants = {self._encode_content(content), self._encode_content(self._loaded_view_content("user", content))}
+                changed = conn.execute(
+                    f"UPDATE messages SET content = ?, api_content = NULL WHERE session_id IN ({marks}) "
+                    f"AND role = 'user' AND content IN ({','.join('?' * len(variants))})",
+                    (redacted, *ids, *variants)).rowcount
+            return changed
+        return self._execute_write(_do)
 
     def _display_dedupe_key(self, row) -> Tuple[Any, ...]:
         """Historical display identity, including normalized live content from user handoff carriers."""

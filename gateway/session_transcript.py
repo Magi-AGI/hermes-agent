@@ -513,6 +513,38 @@ class SessionTranscriptMixin:
             self._clear_dirty_transcript(session_id)
             return True
 
+    def redact_user_message(self, session_id: str, *, platform_message_id: Optional[str] = None,
+                            content: Any = None, replacement: str) -> int:
+        """Overwrite one withdrawn user message wherever it is stored for this conversation: the
+        durable rows of its compression lineage (see ``SessionDB.redact_user_message``) and any copy
+        still queued here for a retried write, which would otherwise re-insert it later. Nothing else
+        in the transcript is rewritten. Raises the SessionDB fence errors while a live turn or a
+        compression holds the conversation; the caller retries once it ends. Returns rows changed."""
+        db = self._db_for_session_id(session_id)
+        if not db:
+            return 0
+        with self._get_transcript_drain_lock():
+            tip = self._follow_reroutes(session_id)
+            with contextlib.suppress(Exception):
+                tip = db.get_compression_tip(tip) or tip
+            try:
+                lineage = list(reversed(db.get_compression_lineage(tip))) or [tip]
+            except Exception:
+                lineage = [tip]
+            changed = db.redact_user_message(
+                lineage, platform_message_id=platform_message_id, content=content, replacement=replacement)
+            with self._transcript_retry_lock:
+                for sid in {session_id, *lineage}:
+                    for queued in self._dirty_transcripts.get(sid, []):
+                        if queued.get("role") == "user" and (
+                                (platform_message_id and platform_message_id in (
+                                    queued.get("platform_message_id"), queued.get("message_id")))
+                                or (content and queued.get("content") == content)):
+                            queued["content"] = replacement
+                            queued.pop("api_content", None)
+                            changed += 1
+            return changed
+
     def has_input_owner(self, session_id: str, owner: str) -> bool:
         """Find this accepted input on the canonical live continuation and its ancestors.
 
