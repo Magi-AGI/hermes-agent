@@ -34,8 +34,45 @@ def run_git(cwd: str, *args: str) -> str:
     return bounded_git_probe(["git", "-C", cwd, *args], timeout=_GIT_TIMEOUT)
 
 
-def branch(cwd: str) -> str:
+# The current branch is read for every session.info (every resume): 27 windows reconnecting over one
+# checkout spawned `git` 27-54 times at once, the largest cost of a reconnect burst on Windows. A
+# short TTL keeps a branch switch visible within seconds; concurrent identical probes share one spawn.
+_BRANCH_TTL = 2.0
+_branch_lock = threading.Lock()
+_branch_cache: dict[str, tuple[float, str]] = {}
+_branch_inflight: dict[str, threading.Event] = {}
+
+
+def _probe_branch(cwd: str) -> str:
     return run_git(cwd, "branch", "--show-current") or run_git(cwd, "rev-parse", "--short", "HEAD")
+
+
+def branch(cwd: str) -> str:
+    while True:
+        with _branch_lock:
+            hit = _branch_cache.get(cwd)
+            if hit is not None and hit[0] > time.monotonic():
+                return hit[1]
+            gate = _branch_inflight.get(cwd)
+            leader = gate is None
+            if leader:
+                gate = _branch_inflight[cwd] = threading.Event()
+        if not leader:
+            gate.wait(timeout=2 * _GIT_TIMEOUT + 0.5)
+            continue
+        value = ""
+        try:
+            value = _probe_branch(cwd)
+        finally:
+            with _branch_lock:
+                now = time.monotonic()
+                _branch_cache[cwd] = (now + _BRANCH_TTL, value)
+                if len(_branch_cache) > 512:
+                    for stale in [k for k, (expiry, _v) in _branch_cache.items() if expiry <= now]:
+                        del _branch_cache[stale]
+                _branch_inflight.pop(cwd, None)
+            gate.set()
+        return value
 
 
 class _RootCache:
