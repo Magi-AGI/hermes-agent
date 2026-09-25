@@ -665,7 +665,21 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     stored_prompt = None
     stored_state = "missing"
     session_row = None
-    if conversation_history and agent._session_db:
+    from agent.conversation_compression import caller_history_authoritative
+    if conversation_history and agent._session_db and caller_history_authoritative(agent):
+        # A caller-authoritative turn never takes its system prompt from a session row: under a shared
+        # derived API id the row (or a compression child it rotated to) was written by ANOTHER chat.
+        # Build this turn's prompt; a continuing session is not a new session, so no start hooks and
+        # no write-back over the shared row (review: Codex, A10 round 2).
+        try:
+            continuing = agent._session_db.get_session(agent.session_id) is not None
+        except Exception:
+            continuing = True
+        if continuing:
+            agent._cached_system_prompt = agent._build_system_prompt(system_message)
+            stage_surface_switch_note(agent, agent._cached_system_prompt, conversation_history)
+            return
+    elif conversation_history and agent._session_db:
         try:
             session_row = agent._session_db.get_session(agent.session_id)
             if session_row is not None:

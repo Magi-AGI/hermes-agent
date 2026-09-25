@@ -76,6 +76,10 @@ class TurnFacadeMixin:
             else ""
         )
         relay_lease = relay_turn = lease = None
+        # History provenance for EVERY model-context path of this turn (turn-start compression
+        # recovery, system-prompt restore, in-loop compression adoption), not only lease admission.
+        # Set before admission and reset in the finally, so a cached agent never carries it over.
+        self._caller_history_authoritative = bool(caller_history_authoritative)
         # Scope tokens start None: early returns leave the try before the set_*() calls and
         # the finally resets each one unconditionally.
         token = affinity_token = acct_token = None
@@ -203,6 +207,7 @@ class TurnFacadeMixin:
                         self._reset_activity_labels_after_turn()
                     if getattr(self, "_relay_pending_turn_id", None) == relay_turn_id:
                         self._relay_pending_turn_id = None
+                    self._caller_history_authoritative = False
                     if acct_token is not None:
                         reset_accounting_context(acct_token)
                     if token is not None:

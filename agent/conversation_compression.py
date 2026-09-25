@@ -1724,6 +1724,55 @@ def _adopt_live_compression_child(
     return recovered
 
 
+def caller_history_authoritative(agent: Any) -> bool:
+    """True while the running turn's history is the CALLER's record (see
+    ``TurnFacadeMixin.run_conversation``). Every durable adoption path then follows the live
+    compression tip for PERSISTENCE only and never imports its messages or system prompt into the
+    model context: one derived API session id can hold several independent chats (review: Codex,
+    A10 round 2)."""
+    return getattr(agent, "_caller_history_authoritative", False) is True
+
+
+def _follow_live_compression_tip(agent: Any, session_db: Any, parent_session_id: str) -> bool:
+    """Persistence-only twin of ``_adopt_live_compression_child``: move ``agent.session_id`` (and the
+    flush cursor) onto the live continuation tip so this turn's writes land there, WITHOUT loading the
+    tip's transcript or system prompt. The context engine is rebound for durable bookkeeping only
+    (``bind_session_state``), never ``on_session_start``, which may load the tip's state into context."""
+    resolver = getattr(type(session_db), "get_compression_tip", None)
+    row_getter = getattr(type(session_db), "get_session", None)
+    if not callable(resolver) or not callable(row_getter):
+        return False
+    tip = resolver(session_db, parent_session_id)
+    if not tip or str(tip) == str(parent_session_id):
+        return False
+    child_session_id = str(tip)
+    child = row_getter(session_db, child_session_id)
+    if not isinstance(child, dict) or child.get("ended_at") is not None:
+        return False
+    agent.session_id = child_session_id
+    _rebind_session_context(child_session_id)
+    agent._session_db_created = True
+    # Same cursor reset as the flush's own tip adoption: the caller's history is not durable in the
+    # tip, but each flush skips the turn's conversation_history by identity.
+    agent._last_flushed_db_idx = 0
+    agent._flushed_db_message_session_id = child_session_id
+    agent._flushed_db_message_ids = set()
+    bind_state = getattr(getattr(agent, "context_compressor", None), "bind_session_state", None)
+    if callable(bind_state):
+        with contextlib.suppress(Exception):
+            bind_state(session_db=session_db, session_id=child_session_id)
+    with _swallow('memory manager compression-tip follow failed: %s'):
+        if agent._memory_manager:
+            agent._memory_manager.on_session_switch(
+                child_session_id, parent_session_id=parent_session_id, reset=False, reason="compression"
+            )
+    logger.info(
+        "compression recovery: caller-authoritative turn follows live tip=%s of session=%s for persistence "
+        "only (model context stays the caller's history)", child_session_id, parent_session_id,
+    )
+    return True
+
+
 def _reopen_orphaned_parent(session_db: Any, session_id: str) -> None:
     """Reopen a compression-ended parent that has no continuation and no lease holder."""
     orphan_reopener = getattr(type(session_db), "reopen_orphaned_compression_session", None)
@@ -1737,11 +1786,15 @@ def _reopen_orphaned_parent(session_db: Any, session_id: str) -> None:
 
 
 def recover_rotated_compression_session(agent: Any) -> Optional[List[Dict[str, Any]]]:
-    """Recover a stale live agent before a new turn writes to its old parent."""
+    """Recover a stale live agent before a new turn writes to its old parent.
+
+    A caller-authoritative turn only follows the tip for persistence and always returns None: its
+    model context stays the caller's history."""
     session_db = getattr(agent, "_session_db", None)
     session_id = getattr(agent, "session_id", None) or ""
     if session_db is None or not session_id:
         return None
+    authoritative = caller_history_authoritative(agent)
     try:
         if not _session_was_rotated_by_compression(session_db, session_id):
             return None
@@ -1749,7 +1802,12 @@ def recover_rotated_compression_session(agent: Any) -> Optional[List[Dict[str, A
         # briefly rather than observe the parent-ended/child-empty intermediate state.
         holder_getter = getattr(session_db, "get_compression_lock_holder", None)
         for attempt in range(21):
-            recovered = _adopt_live_compression_child(agent, session_db, session_id)
+            if authoritative:
+                if _follow_live_compression_tip(agent, session_db, session_id):
+                    return None
+                recovered = None
+            else:
+                recovered = _adopt_live_compression_child(agent, session_db, session_id)
             if recovered is not None:
                 return recovered
             holder = holder_getter(session_id) if callable(holder_getter) else None
@@ -2937,6 +2995,16 @@ def _adopt_if_parent_rotated(
         return messages, _existing_system_prompt(agent, system_message)
     if not _parent_already_rotated:
         return None
+    if caller_history_authoritative(agent):
+        # Persistence follows the tip; the model keeps the caller's own messages and prompt. Sit this
+        # cycle out: the next compression (on the tip) compacts the caller's history, not the tip's.
+        _follow_live_compression_tip(agent, lease.db, lease.sid)
+        lease.release()
+        logger.warning(
+            "compression skipped: session=%s was already rotated; caller-authoritative turn keeps its own "
+            "history (persistence now follows session=%s)", lease.sid, agent.session_id,
+        )
+        return messages, _existing_system_prompt(agent, system_message)
     recovered_messages = _adopt_live_compression_child(agent, lease.db, lease.sid)
     lease.release()
     _existing_sp = _existing_system_prompt(agent, system_message)
@@ -2956,6 +3024,9 @@ def _adopt_grown_durable_parent(agent: Any, lease: _CompressionLease, messages: 
     committed a turn — ADOPT it (aborting wedged busy sessions forever). Length check only: in-memory edits of
     past turns are legal."""
     if lease.db is None or not lease.sid:
+        return None
+    if caller_history_authoritative(agent):
+        # The durable parent can hold OTHER chats' turns under a shared derived id: never import it.
         return None
     durable_loader = getattr(type(lease.db), "get_messages_as_conversation", None)
     if not callable(durable_loader):
