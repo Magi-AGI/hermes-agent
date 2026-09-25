@@ -14,7 +14,6 @@ between ``HERMES_BACKEND_READY`` and the first prompt. Three fixes:
 """
 
 import asyncio
-import inspect
 import sys
 from unittest.mock import patch, MagicMock
 
@@ -122,7 +121,6 @@ def test_handle_ws_ready_payload_wires_skin_through_to_thread():
     import threading
 
     import tui_gateway.server as server_mod
-    import tui_gateway.ws as ws_mod
 
     idents = {}
     frames = []
@@ -152,11 +150,6 @@ def test_handle_ws_ready_payload_wires_skin_through_to_thread():
     assert frames[0]["params"]["payload"]["skin"] == {"palette": "wired"}
     assert frames[0]["params"]["payload"]["change_events"] is True
     assert idents["skin_thread"] != idents["loop_thread"]
-    # Belt and braces: the production site must still route through
-    # to_thread — assert against the live source so a revert to inline
-    # resolve_skin() cannot slip past the behavioral stub above.
-    source = inspect.getsource(ws_mod.handle_ws)
-    assert "to_thread(server.resolve_skin)" in source
 
 
 # ─── Fix 3: _warm_gateway_module pre-imports heavy chains ──────────────

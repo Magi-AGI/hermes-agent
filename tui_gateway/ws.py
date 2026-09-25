@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextvars
+import functools
 import json
 import logging
 import socket
@@ -15,6 +17,7 @@ import time
 from typing import Any
 
 from tui_gateway import server
+from tui_gateway.server_requests import is_response_frame
 from agent.message_sanitization import _sanitize_surrogates
 from tui_gateway.event_replay import replay_epoch
 from tui_gateway.transport import serialize_frame
@@ -75,6 +78,24 @@ _WS_LOG_PAYLOAD_PREVIEW = 240
 # ordering is preserved. _TOKEN_COALESCE_S: max buffer wait (~30 fps; imperceptible).
 _STREAMING_EVENT_TYPES = frozenset({"message.delta", "reasoning.delta", "thinking.delta"})
 _TOKEN_COALESCE_S = 0.033
+
+# RPC ingress never runs on asyncio's DEFAULT executor: everything else in the backend (dashboard
+# SQLite reads, skin resolve, disconnect teardown) shares that one, and saturating it used to hold
+# every window's requests before they could reach a free lane. Each connection dispatches one frame
+# at a time, so the ingress pool only has to cover the connection count. Interrupts, stops and the
+# answers to the agent's own questions (approval, clarify, ...) get a reserved pool of their own.
+_INGRESS_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=48, thread_name_prefix="tui-ws-ingress")
+_CONTROL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="tui-ws-control")
+_CONTROL_METHODS = frozenset({
+    "session.interrupt", "approval.respond", "connection.respond", "subagent.interrupt", "subagent.steer",
+    "pet.cancel", "wake.stop",
+})
+
+
+def _ingress_executor(req: Any) -> concurrent.futures.Executor:
+    method = req.get("method") if isinstance(req, dict) else None
+    return _CONTROL_EXECUTOR if method in _CONTROL_METHODS or is_response_frame(req) else _INGRESS_EXECUTOR
+
 
 # starlette stays optional at import time; fall back to a generic sentinel.
 try:
@@ -291,8 +312,9 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
         _disable_nagle(ws)
         _log.info("ws accepted peer=%s", peer)
         transport = WSTransport(ws, asyncio.get_running_loop(), peer=peer, auth_identity=auth_identity)
-        # resolve_skin() is sync I/O + CPU; pooled so the read loop can drain the frontend's initial RPC burst.
-        skin_payload = await asyncio.to_thread(server.resolve_skin)
+        # resolve_skin() is sync I/O + CPU; off the loop so the read loop can drain the frontend's initial RPC
+        # burst, and on the ingress pool so a saturated default executor cannot hold the handshake.
+        skin_payload = await asyncio.get_running_loop().run_in_executor(_INGRESS_EXECUTOR, server.resolve_skin)
         # change_events: this backend broadcasts pet/cron/sessions.changed, so clients can demote legacy
         # polls to backstops. replay_epoch lets reconnecting clients detect a backend restart and reset
         # their per-session seq watermarks (event_replay).
@@ -353,11 +375,13 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
                 await _reply({"jsonrpc": "2.0", "result": {"ok": True}, "id": req_id}, "send_failed_after_heartbeat",
                              "ws heartbeat reply send failed peer=%s id=%s", peer, req_id)
                 continue
-            # dispatch() may schedule long handlers on the pool; it returns None then and the worker
+            # dispatch() may schedule long handlers on a lane; it returns None then and the worker
             # writes the response itself via transport.write (a separate thread, so that is the safe
             # path). Inline handlers return the response dict, written here from the loop.
             try:
-                resp = await asyncio.to_thread(server.dispatch, req, transport)
+                ctx = contextvars.copy_context()  # as asyncio.to_thread would
+                resp = await asyncio.get_running_loop().run_in_executor(
+                    _ingress_executor(req), functools.partial(ctx.run, server.dispatch, req, transport))
             except Exception:
                 dispatch_crashes += 1
                 _log.exception("ws dispatch crash peer=%s id=%s method=%s", peer, req_id, req_method)
