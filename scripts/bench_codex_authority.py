@@ -171,7 +171,8 @@ class _ProbeFailures:
                 message = str(record.msg)
                 if record.exc_info and message.startswith("Codex pre-probe token refresh failed"):
                     self.last[record.thread] = record.exc_info[1]
-                elif message.startswith(("Codex pool entry %s refresh failed", "Codex pool entry %s cannot refresh")) \
+                elif message.startswith(("Codex pool entry %s refresh failed", "Codex pool entry %s cannot refresh",
+                                         "Codex pool entry %s: %s")) \
                         and record.args and isinstance(record.args[-1], BaseException):
                     self.last[record.thread] = record.args[-1]
 
@@ -194,12 +195,11 @@ def run_entry(kind: str, target: str, probe_failures=None):
         return "ok", None
     if kind == "pool":
         from agent.credential_pool import load_pool
-        if load_pool("openai-codex").try_refresh_matching(credential_id=target) is None:
-            exc = probe_failures.take() if probe_failures else None
-            if exc is not None:
-                raise exc  # classified by the caller like a direct failure
-            return "fenced", None
-        return "ok", None
+        result = load_pool("openai-codex").try_refresh_matching(credential_id=target)
+        exc = probe_failures.take() if probe_failures else None
+        if exc is not None:
+            raise exc  # a failure / busy the pool swallowed: classified like a direct one
+        return ("fenced" if result is None else "ok"), None
     from hermes_cli import auth_codex
     from hermes_cli.auth_codex_rows import get_row
     row = get_row(auth._load_auth_store(), f"pool:{target}") or {}
@@ -241,8 +241,13 @@ def worker_progress(args) -> None:
             try:
                 outcome, _ = run_entry(kind, target, probe_failures)
             except auth.AuthError as exc:
-                outcome = "refused" if getattr(exc, "reason", None) == "in-progress" else (
-                    "fenced" if exc.code in ("codex_recovery_fenced", "codex_refresh_indeterminate") else exc.code)
+                from hermes_cli.auth_codex_registry import CodexStoreLockBusy
+                if isinstance(exc, CodexStoreLockBusy):
+                    outcome = "lock_timeout"  # local store-lock contention: retryable busy
+                else:
+                    outcome = "refused" if getattr(exc, "reason", None) == "in-progress" else (
+                        "fenced" if exc.code in ("codex_recovery_fenced", "codex_refresh_indeterminate")
+                        else exc.code)
             except TimeoutError:
                 outcome = "lock_timeout"  # the store lock stayed contended past its budget
             except Exception as exc:  # pragma: no cover - reported
@@ -438,6 +443,10 @@ def run_progress(args) -> int:
     report["refusal_rate"] = round(refused / attempts, 4) if attempts else None
     report["fenced_outcomes"] = sum(r.get("fenced", 0) for r in results)
     report["lock_timeouts"] = sum(r.get("lock_timeout", 0) for r in results)
+    unsuccessful = refused + report["fenced_outcomes"] + report["lock_timeouts"] + sum(
+        n for r in results for n in (r.get("errors") or {}).values())
+    report["unsuccessful_attempts"] = unsuccessful  # refused + fenced + lock timeouts + errors
+    report["unsuccessful_rate"] = round(unsuccessful / attempts, 4) if attempts else None
     report["worker_errors"] = [r.get("errors") for r in results if r.get("errors")]
     report["worker_crashes"] = [r["crash"] for r in results if "crash" in r]
     report["error_tracebacks"] = [t for r in results for t in r.get("tracebacks", [])][:5]
@@ -480,8 +489,9 @@ def run_progress(args) -> int:
         failures.append(f"{report['replays_presented']} replayed refresh token(s)")
     if report["refresh_total"] < args.n or any(ok_by_chain.get(c, 0) < args.per_chain for c in chains):
         failures.append("progress target not reached")
-    if report["refusal_rate"] is not None and report["refusal_rate"] > 0.01:
-        failures.append(f"refusal rate {report['refusal_rate']} > 1%")
+    if report["unsuccessful_rate"] is not None and report["unsuccessful_rate"] > 0.01:
+        failures.append(f"unsuccessful-attempt rate {report['unsuccessful_rate']} > 1% "
+                        "(refused + fenced + lock timeouts + errors)")
     if report["fenced_outcomes"] or report["worker_errors"] or report["worker_crashes"]:
         failures.append("fences / errors / crashes in workers")
     report["failures"] = failures
