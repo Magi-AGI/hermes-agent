@@ -32,6 +32,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.checkout_scan import is_other_checkout
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Runtimes Hermes provisions into HERMES_HOME and must therefore resolve
@@ -141,6 +143,7 @@ def _source_files() -> list[Path]:
                 d for d in dirnames
                 if d not in _EXEMPT_DIRS and not _is_packaging_copy(d)
             ]
+        dirnames[:] = [d for d in dirnames if not is_other_checkout(Path(dirpath) / d)]
         for fname in filenames:
             if fname.endswith(".py"):
                 files.append(Path(dirpath) / fname)

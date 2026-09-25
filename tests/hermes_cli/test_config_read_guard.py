@@ -28,6 +28,8 @@ import os
 import re
 from pathlib import Path
 
+from tests.checkout_scan import is_other_checkout
+
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 # Files where a yaml.safe_load near a config.yaml reference is legal.
@@ -79,7 +81,10 @@ def _iter_source_files():
     # The prune skips those trees. The onerror callback ignores a directory
     # that disappears anyway.
     for dirpath, dirnames, filenames in os.walk(REPO_ROOT, onerror=lambda _e: None):
-        dirnames[:] = [d for d in dirnames if d not in EXCLUDED_DIR_PARTS]
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in EXCLUDED_DIR_PARTS and not is_other_checkout(Path(dirpath) / d)
+        ]
         for name in filenames:
             if not name.endswith(".py"):
                 continue

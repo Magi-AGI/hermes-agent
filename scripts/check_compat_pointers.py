@@ -33,7 +33,10 @@ ROOT_SKIP_DIRS = DEPENDENCY_DIRS | {
 def _py_files():
     for dirpath, dirnames, filenames in os.walk(ROOT):
         excluded = ROOT_SKIP_DIRS if Path(dirpath) == ROOT else DEPENDENCY_DIRS
-        dirnames[:] = [name for name in dirnames if name not in excluded]
+        # A directory with its own .git is another checkout (a nested worktree or clone) at
+        # another commit, not this tree's code.
+        dirnames[:] = [name for name in dirnames
+                       if name not in excluded and not os.path.lexists(os.path.join(dirpath, name, ".git"))]
         for filename in filenames:
             if not filename.endswith(".py") or filename == "check_compat_pointers.py":
                 continue

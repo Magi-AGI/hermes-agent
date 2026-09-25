@@ -797,15 +797,25 @@ class TestNoProductionCodeMutatesTheAliasCacheInPlace:
     )
 
     @staticmethod
-    def _production_sources():
+    def _production_sources(repo=None):
+        import os
         import pathlib
 
-        repo = pathlib.Path(__file__).resolve().parents[2]
+        from tests.checkout_scan import is_other_checkout
+
+        repo = repo or pathlib.Path(__file__).resolve().parents[2]
         skip = {".git", "node_modules", "tests", "build", "dist", ".venv"}
-        for path in repo.rglob("*.py"):
-            if any(part in skip for part in path.parts):
-                continue
-            yield path, path.relative_to(repo).as_posix()
+        # Pruned by name below the repo only: matching the absolute path skipped every file of a
+        # checkout that lives under a directory named e.g. "build".
+        for dirpath, dirnames, filenames in os.walk(repo, onerror=lambda _e: None):
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in skip and not is_other_checkout(pathlib.Path(dirpath) / d)
+            ]
+            for name in filenames:
+                if name.endswith(".py"):
+                    path = pathlib.Path(dirpath) / name
+                    yield path, path.relative_to(repo).as_posix()
 
     @classmethod
     def _violations(cls, source: str, rel: str):
