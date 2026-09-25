@@ -79,6 +79,36 @@ def _classify(path: Path) -> Optional[str]:
     return None
 
 
+# Runtime lock files of the credential protocol. A restore never extracts one: the restorer holds
+# the migration lock while it extracts, and replacing a held lock file (a new inode on POSIX) lets
+# another process lock the replacement and run recovery underneath the restore.
+_RUNTIME_LOCK_NAMES = ("auth.lock", MIGRATION_LOCK_NAME, "nous_auth.lock", ".backup.lock")
+_LIFECYCLE_LOCK_DIR = ".locks"  # <root>/profiles/.locks/<profile>.lock (stage 2)
+
+
+def is_runtime_lock(path: Path) -> bool:
+    """A protocol lock file, by its resolved destination: the migration lock, any auth store lock
+    (``auth.lock`` / ``auth.*.lock``), the Nous shared-store lock, a profile lifecycle lock — or a
+    file that IS the root's migration / store lock under another name (hard link)."""
+    dest = _destination(path)
+    name = _norm(dest.name)
+    if name in {_norm(n) for n in _RUNTIME_LOCK_NAMES}:
+        return True
+    if name.startswith(_norm("auth.")) and name.endswith(_norm(".lock")):
+        return True
+    if name.endswith(_norm(".lock")) and _norm(_LIFECYCLE_LOCK_DIR) in [_norm(p) for p in dest.parts[:-1]]:
+        return True
+    if dest.exists():
+        from hermes_cli.auth_codex_registry import root_home
+        for known in (root_home() / MIGRATION_LOCK_NAME, root_home() / "auth.lock"):
+            try:
+                if known.exists() and os.path.samefile(dest, known):
+                    return True
+            except OSError:
+                continue
+    return False
+
+
 def is_protocol_file(path: Path) -> bool:
     """A Codex authority protocol file (not ``auth.json`` itself), by its resolved destination."""
     return _classify(path) == "protocol"

@@ -931,15 +931,18 @@ def _member_destination(member: str, prefix: str, hermes_root: Path, home_dir: P
     about a destination."""
     # ``_external/`` members restore to their home-relative location (~/.honcho/config.json),
     # NOT under HERMES_HOME; provider configs commonly hold credentials, so tighten to 0600.
+    from hermes_cli.auth_codex_restore import is_runtime_lock
     if member.startswith(_EXTERNAL_PREFIX):
         rel = member[len(_EXTERNAL_PREFIX):]
-        return _MemberDestination(True, rel, home_dir / rel, home_dir, False)
+        # Credential-protocol lock files are runtime state, never restored (auth_codex_restore).
+        return _MemberDestination(True, rel, home_dir / rel, home_dir, bool(rel) and is_runtime_lock(home_dir / rel))
     rel = member[len(prefix):] if prefix and member.startswith(prefix) else member
     # A ``.db`` member is page-restored into the live file; an archived WAL/SHM/journal describes a
     # different database image and installed beside it (over a live sidecar) would replay a foreign
     # WAL on next open. Current backups never ship these (_EXCLUDED_SUFFIXES); older or hand-built
     # archives might. ``_IMPORT_SKIP_NAMES``: see there.
-    skipped = bool(rel) and (Path(rel).name in _IMPORT_SKIP_NAMES or rel.endswith(_SQLITE_SIDECAR_SUFFIXES))
+    skipped = bool(rel) and (Path(rel).name in _IMPORT_SKIP_NAMES or rel.endswith(_SQLITE_SIDECAR_SUFFIXES)
+                             or is_runtime_lock(hermes_root / rel))
     return _MemberDestination(False, rel, hermes_root / rel, hermes_root.resolve(), skipped)
 
 

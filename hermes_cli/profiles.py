@@ -1993,7 +1993,9 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
         # Codex credential state in the archive (auth.json with Codex tokens, the authority's
         # files) is not restored while this install has Codex authority state (stage 1).
         from hermes_cli.auth_codex_registry import CodexAuthorityRefused
-        from hermes_cli.auth_codex_restore import restore_guard
+        from hermes_cli.auth_codex_restore import is_runtime_lock, restore_guard
+        for lock_file in [f for f in final_source.rglob("*") if f.is_file() and is_runtime_lock(f)]:
+            lock_file.unlink()  # runtime lock files are never restored
         staged = [(profile_dir / f.relative_to(final_source), f.read_bytes)
                   for f in final_source.rglob("*") if f.is_file()]
         try:
