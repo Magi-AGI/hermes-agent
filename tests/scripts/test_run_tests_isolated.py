@@ -178,15 +178,22 @@ def test_the_user_home_is_sandboxed_too(tmp_path, monkeypatch):
 @pytest.mark.windows_only
 def test_powershell_under_the_sandbox_env_writes_nothing_into_its_cwd(tmp_path):
     """T5/A7: .NET resolves LocalApplicationData from USERPROFILE and returns "" for a missing
-    folder, so PowerShell 5.1 wrote Microsoft\Windows\PowerShell\ModuleAnalysisCache relative to
+    folder, so PowerShell 5.1 wrote Microsoft/Windows/PowerShell/ModuleAnalysisCache relative to
     its CWD, i.e. into the checkout."""
     cwd = tmp_path / "checkout"
     cwd.mkdir()
     env = rti._sandbox_env(tmp_path / "box")
+    cache = Path(env["LOCALAPPDATA"]) / "Microsoft" / "Windows" / "PowerShell" / "ModuleAnalysisCache"
     powershell = Path(os.environ["SYSTEMROOT"]) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
-    subprocess.run([str(powershell), "-NoProfile", "-Command", "Get-Command Get-HermesNoSuchCommand -ErrorAction SilentlyContinue"],
+    # The lookup analyses modules and PowerShell saves the cache a few seconds later, so the child
+    # stays alive until the cache exists where LOCALAPPDATA says (90 s is a hang guard).
+    script = ("Get-Command Get-HermesNoSuchCommand -ErrorAction SilentlyContinue | Out-Null; "
+              "$deadline = (Get-Date).AddSeconds(90); "
+              f"while (-not (Test-Path -LiteralPath '{cache}') -and (Get-Date) -lt $deadline) "
+              "{ Start-Sleep -Milliseconds 200 }")
+    subprocess.run([str(powershell), "-NoProfile", "-Command", script],
                    env=env, cwd=str(cwd), capture_output=True, timeout=180, check=False)
-    assert list(cwd.iterdir()) == []
+    assert (sorted(p.name for p in cwd.iterdir()), cache.is_file()) == ([], True)
 
 
 @pytest.mark.windows_only
