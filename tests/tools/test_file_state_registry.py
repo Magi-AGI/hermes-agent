@@ -24,6 +24,7 @@ import time
 import unittest
 from unittest.mock import patch
 
+from tests.driven_clock import DrivenClock
 from tools import file_state
 from tools.file_tools import (
     clear_file_ops_cache,
@@ -67,11 +68,12 @@ class FileStateRegistryUnitTests(unittest.TestCase):
 
     def test_sibling_write_flags_other_agent_as_stale(self):
         p = self._mk()
-        file_state.record_read("A", p)
-        # Simulate sibling writing this file later
-        time.sleep(0.01)  # ensure ts ordering across resolution
-        file_state.note_write("B", p)
-        warn = file_state.check_stale("A", p)
+        clock = DrivenClock("time")
+        with patch.object(file_state, "time", clock):
+            file_state.record_read("A", p)
+            clock.advance(1.0)  # the sibling writes this file later
+            file_state.note_write("B", p)
+            warn = file_state.check_stale("A", p)
         self.assertIsNotNone(warn)
         self.assertIn("B", warn)
         self.assertIn("sibling", warn.lower())

@@ -4,6 +4,7 @@ import time
 
 import pytest
 
+from tests.driven_clock import DrivenClock
 from tools import mcp_schema_cache as sc
 
 
@@ -33,10 +34,12 @@ def test_entry_past_ttl_is_a_miss(monkeypatch):
     assert sc.get_cached_entry("srv", "fp") is None
 
 
-def test_ttl_rewrite_advances_written_at():
+def test_ttl_rewrite_advances_written_at(monkeypatch):
+    clock = DrivenClock("time")
+    monkeypatch.setattr(sc, "time", clock)
     sc.write_cache_entry("srv", "fp", tools=[{"name": "t"}], ttl_ms=60_000)
     first = sc.get_cached_entry("srv", "fp")["written_at"]
-    time.sleep(0.01)
+    clock.advance(1.0)
     # Identical payload would previously short-circuit; TTL'd entries must
     # rewrite so written_at advances on every live reconfirmation.
     sc.write_cache_entry("srv", "fp", tools=[{"name": "t"}], ttl_ms=60_000)

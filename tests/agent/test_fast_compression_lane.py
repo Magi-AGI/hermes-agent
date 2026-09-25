@@ -12,11 +12,11 @@ Tests that only exercise generic latency-hook plumbing (not the certification
 gate) use a non-compression task instead, since that plumbing is task-agnostic.
 """
 
-import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from agent.auxiliary_client import CodexAuxiliaryClient
+from tests.driven_clock import DrivenClock
 
 
 def _codex_oauth_client(create_side_effect=None, create_return=None):
@@ -34,25 +34,6 @@ def _codex_oauth_client(create_side_effect=None, create_return=None):
     else:
         client.chat.completions.create.return_value = create_return
     return client
-
-
-class _AuxClock:
-    """``time`` as agent.auxiliary_client sees it, with a monotonic() the test advances.
-
-    The latency stamps read time.monotonic(), which ticks every 15.6 ms on Windows: a real
-    10 ms sleep measured 0 ms about a third of the time."""
-
-    def __init__(self):
-        self.now = 1000.0
-
-    def monotonic(self):
-        return self.now
-
-    def advance(self, seconds):
-        self.now += seconds
-
-    def __getattr__(self, name):
-        return getattr(time, name)
 
 
 def _resolve(config, *, provider="ollama", model="qwen3:8b", requested_model=None):
@@ -154,7 +135,7 @@ def test_summary_model_override_is_certified_against_the_effective_model():
 def test_compression_latency_records_delayed_first_provider_chunk():
     from agent.auxiliary_client import _notify_aux_progress, call_llm
 
-    clock = _AuxClock()
+    clock = DrivenClock("monotonic")  # latency stamps; a real sleep can read 0 ms on Windows
 
     class _DelayedSemaphore:
         def acquire(self):
@@ -334,7 +315,7 @@ def test_bedrock_converse_ttfp_waits_for_the_nonstreaming_response():
         usage=None,
     )
     timings = {}
-    clock = _AuxClock()
+    clock = DrivenClock("monotonic")  # latency stamps; a real sleep can read 0 ms on Windows
 
     def _delayed_converse(**_kwargs):
         clock.advance(0.02)

@@ -31,10 +31,12 @@ def test_wait_falls_through_to_shared_owner(monkeypatch):
         mcp_startup, "start_background_mcp_discovery", lambda **kw: None
     )
     thread = threading.Thread(target=lambda: time.sleep(0.05), daemon=True)
+    # Clock starts before the thread does: a main thread descheduled after start() used to see
+    # most of the 50 ms already gone and measure under the bound.
+    start = time.monotonic()
     thread.start()
     monkeypatch.setattr(mcp_startup, "_mcp_discovery_thread", {hermes_home_key(): thread})
 
-    start = time.monotonic()
     entry.wait_for_mcp_discovery(timeout=2.0)
     elapsed = time.monotonic() - start
 

@@ -424,7 +424,7 @@ class TestMetrics:
         monkeypatch.delenv("A2A_PEER_TOKENS", raising=False)
 
         def slow_reply(event):
-            time.sleep(0.05)
+            time.sleep(0.2)
             return "done"
 
         adapter, base = _make_live_adapter(monkeypatch, reply_fn=slow_reply)
@@ -434,7 +434,9 @@ class TestMetrics:
             before = len(protocol.metrics._latencies)
             await asyncio.to_thread(_post_json, base + "/", _send_body("time me"))
             new = list(protocol.metrics._latencies)[before:]
-            assert new and new[-1] >= 0.05
+            # Well under the 0.2 s reply: the latency comes from time.time(), which can step in
+            # 15.6 ms ticks on Windows, so a bound at the sleep itself read short.
+            assert new and new[-1] >= 0.1
             await adapter.disconnect()
 
         asyncio.run(run())
