@@ -66,6 +66,55 @@ export class JsonRpcGatewayError extends Error {
   }
 }
 
+/**
+ * Backend overloaded: a bounded RPC lane was full (tui_gateway/rpc_lanes.py). `data.retry` is
+ * `"auto"` only for idempotent reads; anything else is surfaced to the caller as is.
+ */
+export const JSON_RPC_BACKEND_BUSY = 5037
+
+const BUSY_RETRY_DEFAULT_MS = 500
+const BUSY_RETRY_MAX_BACKOFF = 4
+
+/**
+ * Delay before retrying *error*, or null when it is not an auto-retryable BUSY. Jittered
+ * (0.5x-1.5x) so 20+ windows refused together do not come back together; grows with *attempt*.
+ */
+export function busyRetryDelayMs(error: unknown, attempt: number, random: () => number = Math.random): null | number {
+  if (!(error instanceof JsonRpcGatewayError) || error.code !== JSON_RPC_BACKEND_BUSY) {
+    return null
+  }
+
+  const data = (error.data && typeof error.data === 'object' ? error.data : {}) as {
+    retry?: unknown
+    retry_after_ms?: unknown
+  }
+
+  if (data.retry !== 'auto') {
+    return null
+  }
+
+  const base =
+    typeof data.retry_after_ms === 'number' && data.retry_after_ms > 0 ? data.retry_after_ms : BUSY_RETRY_DEFAULT_MS
+
+  return Math.round(base * Math.min(attempt, BUSY_RETRY_MAX_BACKOFF) * (0.5 + random()))
+}
+
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(new DOMException('Aborted', 'AbortError'))
+    }
+
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
 /** JSON-RPC "method not found" (tui_gateway/server.py::dispatch `_err(rid, -32601, …)`). */
 export const JSON_RPC_METHOD_NOT_FOUND = -32601
 
@@ -231,12 +280,44 @@ export class JsonRpcRequestChannel {
     return this.transport === transport
   }
 
-  request<T>(
+  /**
+   * One RPC. A BUSY refusal of an idempotent read is retried within the SAME timeout budget and
+   * only on the transport generation it was sent on: a reconnect or abort ends the retries, and
+   * mutating calls are never retried (the backend marks them `retry: "none"`).
+   */
+  async request<T>(
     method: string,
     params: Record<string, unknown> = {},
     timeoutMs = this.options.requestTimeoutMs,
     signal?: AbortSignal,
     notConnectedError: () => Error = () => new Error('gateway not connected')
+  ): Promise<T> {
+    const transport = this.transport
+    const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : Number.POSITIVE_INFINITY
+
+    for (let attempt = 1; ; attempt += 1) {
+      const remaining = deadline === Number.POSITIVE_INFINITY ? timeoutMs : Math.max(1, deadline - Date.now())
+
+      try {
+        return await this.requestOnce<T>(method, params, remaining, signal, notConnectedError)
+      } catch (error) {
+        const delay = busyRetryDelayMs(error, attempt)
+
+        if (delay === null || this.transport !== transport || Date.now() + delay >= deadline || signal?.aborted) {
+          throw error
+        }
+
+        await abortableDelay(delay, signal)
+      }
+    }
+  }
+
+  private requestOnce<T>(
+    method: string,
+    params: Record<string, unknown>,
+    timeoutMs: number,
+    signal: AbortSignal | undefined,
+    notConnectedError: () => Error
   ): Promise<T> {
     const transport = this.transport
 

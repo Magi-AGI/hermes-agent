@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { JsonRpcGatewayError, JsonRpcRequestChannel, type JsonRpcTransport } from './json-rpc-channel.js'
+import {
+  JSON_RPC_BACKEND_BUSY,
+  JsonRpcGatewayError,
+  JsonRpcRequestChannel,
+  type JsonRpcTransport
+} from './json-rpc-channel.js'
 
 const spyTransport = () => {
   const sent: string[] = []
@@ -285,5 +290,92 @@ describe('JsonRpcRequestChannel', () => {
     const third = sent.at(-1)!
     expect((JSON.parse(third) as { id: string }).id).toBe('srq-3')
     expect((JSON.parse(third) as { result?: { answer?: string } }).result?.answer).toBe('yes')
+  })
+})
+
+describe('JsonRpcRequestChannel backend-busy retry', () => {
+  const busy = (id: string, retry: 'auto' | 'none') =>
+    JSON.stringify({
+      error: { code: JSON_RPC_BACKEND_BUSY, data: { lane: 'catalog', retry, retry_after_ms: 100 }, message: 'busy' },
+      id,
+      jsonrpc: '2.0'
+    })
+
+  it('retries an idempotent read the backend refused as busy, within the same call', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(Math, 'random').mockReturnValue(0.5)
+
+    try {
+      const channel = new JsonRpcRequestChannel()
+      const { sent, transport, last } = spyTransport()
+      channel.attach(transport)
+
+      const options = channel.request<{ providers: unknown[] }>('model.options', {}, 10_000)
+      channel.handleFrame(busy(last().id, 'auto'))
+      await vi.advanceTimersByTimeAsync(150)
+
+      expect(sent).toHaveLength(2)
+      expect(last().method).toBe('model.options')
+      channel.handleFrame(JSON.stringify({ id: last().id, jsonrpc: '2.0', result: { providers: [] } }))
+      await expect(options).resolves.toEqual({ providers: [] })
+    } finally {
+      vi.restoreAllMocks()
+      vi.useRealTimers()
+    }
+  })
+
+  it('never retries a mutating call and surfaces the busy error', async () => {
+    const channel = new JsonRpcRequestChannel()
+    const { sent, transport, last } = spyTransport()
+    channel.attach(transport)
+
+    const reload = channel.request('reload.mcp')
+    channel.handleFrame(busy(last().id, 'none'))
+    const error = (await reload.catch((e: unknown) => e)) as JsonRpcGatewayError
+
+    expect(error.code).toBe(JSON_RPC_BACKEND_BUSY)
+    expect(sent).toHaveLength(1)
+  })
+
+  it('stops retrying when the transport is replaced (a reconnect is a new generation)', async () => {
+    vi.useFakeTimers()
+
+    try {
+      const channel = new JsonRpcRequestChannel()
+      const first = spyTransport()
+      channel.attach(first.transport)
+
+      const options = channel.request('model.options', {}, 10_000)
+      channel.attach(spyTransport().transport)
+      channel.handleFrame(busy(first.last().id, 'auto'))
+      const outcome = options.catch((e: unknown) => e)
+      await vi.advanceTimersByTimeAsync(1_000)
+
+      expect(first.sent).toHaveLength(1)
+      expect(await outcome).toBeInstanceOf(Error)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('gives up once the retry would outlive the caller timeout', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(Math, 'random').mockReturnValue(0.5)
+
+    try {
+      const channel = new JsonRpcRequestChannel()
+      const { sent, transport, last } = spyTransport()
+      channel.attach(transport)
+
+      const options = channel.request('model.options', {}, 50)
+      channel.handleFrame(busy(last().id, 'auto'))
+      const error = (await options.catch((e: unknown) => e)) as JsonRpcGatewayError
+
+      expect(error.code).toBe(JSON_RPC_BACKEND_BUSY)
+      expect(sent).toHaveLength(1)
+    } finally {
+      vi.restoreAllMocks()
+      vi.useRealTimers()
+    }
   })
 })
