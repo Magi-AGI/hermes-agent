@@ -1,4 +1,4 @@
-import { execFileSync, spawn } from 'node:child_process'
+import { execFile, execFileSync, spawn } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import http from 'node:http'
@@ -67,6 +67,7 @@ import { BackendDialClaims } from './backend-dial-claim'
 import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
 import { createBackendExitRecoveryLatch } from './backend-exit-recovery'
 import { isReauthRequiredError, waitForHermesReady } from './backend-health'
+import { createBackendLivenessSupervisor } from './backend-liveness'
 import { backendCommandMatches, createBackendOwnership, createBackendShutdownCoordinator } from './backend-ownership'
 import { canImportHermesCli, PROBE_TIMEOUT_MS, shouldTrustHermesOverride, verifyHermesCli } from './backend-probes'
 import { waitForDashboardPortAnnouncement } from './backend-ready'
@@ -12913,6 +12914,7 @@ async function runPoolBackendStart(
   })
   child.once('exit', (code, signal) => {
     rememberLog(formatBackendExitLine(`Hermes backend for profile "${profile}" exited`, code, signal, outputTail))
+    backendLiveness.unwatch(`pool:${poolKey}`, child.pid)
     releaseBackendChild(child)
 
     if (!ready) {
@@ -12977,6 +12979,8 @@ async function runPoolBackendStart(
       `Hermes backend for profile "${profile}" is HTTP-reachable but the WebSocket (/api/ws) rejected the session token: ${wsProbe.reason}`
     )
   }
+
+  watchBackendLiveness(`pool:${poolKey}`, child, baseUrl, backend, hermesCwd)
 
   return {
     baseUrl,
@@ -13302,6 +13306,81 @@ function startHermes() {
   void start.then(releaseStart, releaseStart)
 
   return start
+}
+
+// Every ready local backend this app owns is supervised for liveness (D7, backend-liveness.ts): a
+// backend that answers nothing for 120 s while alive gets native dumps written, then its exact
+// process tree killed; the owner's exit handler and recovery respawn it.
+const backendLiveness = createBackendLivenessSupervisor({ isAlive: pidIsAlive, log: rememberLog })
+
+function pidIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException)?.code === 'EPERM'
+  }
+}
+
+function watchBackendLiveness(key: string, child, baseUrl: string, backend, cwd: string) {
+  const pid = child?.pid
+
+  if (!Number.isInteger(pid)) {
+    return
+  }
+
+  backendLiveness.watch(key, {
+    baseUrl,
+    captureDumps: () => captureFreezeDumps(pid, backend, cwd, key),
+    kill: () => (IS_WINDOWS ? forceKillProcessTree(pid) : void child.kill('SIGKILL')),
+    pid
+  })
+}
+
+// The interpreter that can run `-m hermes_cli.freeze_dump`: the backend's own Python when it was
+// launched as one, else the active runtime's venv. A PATH-installed `hermes` shim has neither.
+function freezeDumpPython(backend): null | string {
+  const command = String(backend?.command || '')
+
+  if (/^python(\d+(\.\d+)?)?(\.exe)?$/i.test(path.basename(command))) {
+    return command
+  }
+
+  const venvPython = getVenvPython(VENV_ROOT)
+
+  return fileExists(venvPython) ? venvPython : null
+}
+
+function captureFreezeDumps(pid: number, backend, cwd: string, key: string): Promise<void> {
+  const python = IS_WINDOWS ? freezeDumpPython(backend) : null
+
+  if (!python) {
+    rememberLog(
+      `[liveness] native dumps skipped for pid ${pid}: ${IS_WINDOWS ? 'no Python interpreter known for this runtime' : 'Windows only'}`
+    )
+
+    return Promise.resolve()
+  }
+
+  const outDir = path.join(HERMES_HOME, 'logs', 'freeze-dumps')
+  const label = key.replace(/[^A-Za-z0-9_-]+/g, '_')
+
+  return new Promise(resolve => {
+    execFile(
+      python,
+      ['-m', 'hermes_cli.freeze_dump', String(pid), outDir, '--label', label],
+      hiddenWindowsChildOptions({ cwd, timeout: 90_000 }),
+      (error, stdout, stderr) => {
+        rememberLog(
+          error
+            ? `[liveness] native dump of pid ${pid} failed: ${error.message} ${String(stderr).trim()}`
+            : `[liveness] native dumps written: ${String(stdout).trim().split(/\r?\n/).join(', ')}`
+        )
+        resolve()
+      }
+    )
+  })
 }
 
 // A ready primary child died. When its exit leaves the primary slot with no
@@ -13683,6 +13762,7 @@ async function runHermesStart() {
       rejectBackendStart?.(error)
     })
     hermesProcess.once('exit', (code, signal) => {
+      backendLiveness.unwatch('primary', hermesProcess.pid)
       releaseBackendChild(hermesProcess)
 
       if (!backendConnectionState.clearForCurrentProcess(processOwner)) {
@@ -13762,6 +13842,8 @@ async function runHermesStart() {
         `Local Hermes backend is HTTP-reachable but the WebSocket (/api/ws) rejected the session token: ${wsProbe.reason}`
       )
     }
+
+    watchBackendLiveness('primary', hermesProcess, baseUrl, backend, hermesCwd)
 
     updateBootProgress({
       phase: 'backend.ready',
@@ -16219,6 +16301,7 @@ ipcMain.handle('hermes:backend:recycle', async (_event, profile) => {
 
   return { ok: true }
 })
+
 // Renderer "Reload and retry": one teardown per failure however many windows click Retry
 // (the 08-27 reset storm). Clear the latched failure and reset connection state so the next
 // startHermes() call restarts the full backend flow (including a fresh runBootstrap pass).
@@ -16231,6 +16314,7 @@ const bootstrapResetGate = createBootstrapResetGate(async () => {
   getFirstRunSetupGate().resetForRetry()
   resetBootstrapSnapshot()
 })
+
 // Reset epoch each window's CURRENT document started under. A Retry from a document that loaded
 // before the latest reset is superseded by it: that reset already rebooted the backend this
 // document's reload will attach to. (A document that lived through another window's reset and then
