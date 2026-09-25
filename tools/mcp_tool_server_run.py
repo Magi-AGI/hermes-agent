@@ -213,8 +213,7 @@ class MCPServerRunMixin:
         self._reconnect_event.clear()
         paused = False
         while True:
-            outcome = await self._wait_for_reconnect_or_shutdown(
-                timeout=_core._PARKED_RETRY_INTERVAL)
+            outcome = await self._wait_for_reconnect_or_shutdown(timeout=self._parked_probe_interval())
             if outcome == "shutdown":
                 return True
             # A disabled or deleted config entry must stop the self-probe here: the probe
@@ -231,6 +230,8 @@ class MCPServerRunMixin:
                     "self-probe until it is re-enabled", self.name)
                 paused = True
                 continue
+            # Only an unattended probe backs off; an explicit request (login, /mcp refresh) starts over.
+            self._park_probes = self._park_probes + 1 if outcome == "self-probe" else 0
             # Nobody asked for this revival: a self-probe must never open a browser OAuth flow. The
             # OAuth provider runs inside THIS task (the SDK's auth flow sits in the transport), so a
             # task-local ContextVar reaches it; it stays set for the task's life — every later
@@ -247,6 +248,11 @@ class MCPServerRunMixin:
                 outcome,
             )
             return False
+
+    def _parked_probe_interval(self) -> float:
+        """Wait before the next unattended self-probe: doubled per probe that failed, capped."""
+        base = _core._PARKED_RETRY_INTERVAL
+        return min(base * (2 ** min(self._park_probes, 16)), max(base, _core._PARKED_RETRY_MAX_INTERVAL))
 
     def _still_configured_enabled(self) -> bool:
         """Whether ``mcp_servers`` on disk still wants this server connected: entry present

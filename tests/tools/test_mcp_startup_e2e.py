@@ -282,3 +282,25 @@ def test_lazy_server_registers_from_the_schema_cache_without_spawning(tmp_path):
     assert legacy["status"]["fast"]["status"] == "connected"
     healed = _discover(tmp_path, home)
     assert healed["status"]["fast"]["status"] == "lazy" and healed["spawned"] == []
+
+
+_NOISY_SERVER = """
+import sys
+for _ in range(200000):
+    sys.stderr.write("connect ENOENT \\\\.\\pipe\\unity-mcp" + chr(10))
+sys.stderr.flush()
+sys.stdin.read()
+"""
+
+
+def test_a_server_flooding_stderr_cannot_grow_the_log_without_bound(tmp_path):
+    """A Unity bridge retrying ``connect ENOENT`` wrote 101 MB into mcp-stderr.log: the child held
+    the file directly, so nothing could cap or rotate it (gate item G9)."""
+    home = tmp_path / "home"
+    noisy = _script(tmp_path, "noisy_server.py", _NOISY_SERVER)
+    _write_home(home, {"unity": {"command": sys.executable, "args": [str(noisy)], "connect_timeout": 4}})
+    result = _discover(tmp_path, home)
+    log = home / "logs" / "mcp-stderr.log"
+    assert result["status"]["unity"]["status"] == "failed"
+    assert log.stat().st_size < 1024 * 1024  # the server wrote ~7 MB
+    assert "bytes of stderr dropped" in log.read_text(encoding="utf-8", errors="replace")

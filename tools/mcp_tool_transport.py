@@ -17,6 +17,7 @@ from tools.mcp_tool_lifecycle import _filter_mcp_children, _orphan_stdio_pid_ser
 from tools.mcp_tool_common import _core
 from tools import mcp_tool_config as _config
 from tools import mcp_tool_lifecycle as _lifecycle
+from tools import mcp_tool_stderr as _stderr
 from tools import mcp_tool_registration as _registration
 
 logger = logging.getLogger("tools.mcp_tool")
@@ -318,11 +319,11 @@ class MCPServerTransportMixin:
         # otherwise stall the shared MCP event loop.
         new_pids: set = set()
         descendants: list = []
-        # Subprocess stderr goes to ~/.hermes/logs/mcp-stderr.log so banners can't corrupt the TUI.
-        _config._write_stderr_log_header(self.name)
+        # Subprocess stderr goes to logs/mcp-stderr.log (rate-capped, rotated) so banners can't corrupt the TUI.
+        stderr_sink = _stderr.open_stderr_sink(self.name)
         try:
-            errlog = _config._get_mcp_stderr_log()
-            async with _core.stdio_client(server_params, errlog=errlog) as (read_stream, write_stream):
+            async with _core.stdio_client(server_params, errlog=stderr_sink.writer) as (read_stream, write_stream):
+                stderr_sink.release_writer()  # spawned: the child holds its own copy now
                 # New PIDs for force-kill cleanup, minus non-MCP children (slash_worker, LSP) racing
                 # into the window: they share the TUI's pgid — leaking them would killpg() the TUI.
                 new_pids = _filter_mcp_children(_lifecycle._snapshot_child_pids() - pids_before)
@@ -338,6 +339,7 @@ class MCPServerTransportMixin:
                 finally:  # before the SDK tears the tree down: afterwards escaped descendants are unreachable
                     descendants = _lifecycle._snapshot_descendants(new_pids)
         finally:  # clean exit, exceptions AND cancellation
+            stderr_sink.release_writer()
             if new_pids:
                 self._release_spawned_children(new_pids)
             _lifecycle._reap_escaped_descendants(descendants, self.name)

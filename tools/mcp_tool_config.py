@@ -9,7 +9,6 @@ import re
 import shutil
 import sys
 import threading
-from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 from tools.mcp_tool_common import _env_ref_name, _prepend_path
 
@@ -20,7 +19,8 @@ _mcp_stderr_log_lock = threading.Lock()
 
 
 def _get_mcp_stderr_log() -> Any:
-    """Shared append-mode handle for MCP subprocess stderr, cached until shutdown PER PROFILE HOME (a
+    """Shared append-mode handle for the parent-death supervisor's stderr (stdio servers go through
+    ``tools.mcp_tool_stderr``), cached until shutdown PER PROFILE HOME (a
     multiplexed gateway's secondary profile must log under ITS ``logs/``, not the launch profile's). Must
     expose a real fd (asyncio wires the child's stderr to it); falls back to ``/dev/null``, then real stderr."""
     from hermes_constants import get_hermes_home, hermes_home_key, mkdir_under_hermes_home
@@ -57,17 +57,6 @@ def _close_mcp_stderr_logs(*, scope: Optional[str] = None) -> None:
                 fh.close()
             except OSError:
                 logger.warning("Could not close MCP stderr log for %s", key, exc_info=True)
-
-
-def _write_stderr_log_header(server_name: str) -> None:
-    """Session marker so operators can find each server's output in the shared log
-    (per-line prefixes would need a pipe + reader thread)."""
-    fh = _get_mcp_stderr_log()
-    try:
-        fh.write(f"\n===== [{datetime.now():%Y-%m-%d %H:%M:%S}] starting MCP server '{server_name}' =====\n")
-        fh.flush()
-    except Exception:
-        pass
 
 
 # Env vars safe to pass to stdio subprocesses (no secrets).

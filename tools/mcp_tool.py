@@ -236,7 +236,11 @@ _MAX_INITIAL_CONNECT_RETRIES = 3 # retries for the very first connection attempt
 _MAX_BACKOFF_SECONDS = 60
 _RECYCLED_RECONNECT_TIMEOUT = 15.0
 # Parked servers (tools deregistered) self-probe on this cadence: nothing else can revive them.
+# Each unattended probe that fails doubles the next wait, up to the cap: a server that is simply
+# not there (a Unity bridge with no editor running) otherwise respawns its launcher, spends its
+# whole connect timeout and floods mcp-stderr.log every interval for the life of the process.
 _PARKED_RETRY_INTERVAL = 300
+_PARKED_RETRY_MAX_INTERVAL = 3600
 # Bounded wait for a respawned stdio child when a call finds it dead (gateway restarts kill
 # every MCP child); bounded so a broken server still parks via run()'s rapid-drop budget.
 _STDIO_RESPAWN_WAIT_SEC = 15.0
@@ -322,7 +326,7 @@ class MCPServerTask(MCPServerRunMixin, MCPServerTransportMixin, MCPServerHealthM
         "_recycled_reason", "initialize_result", "_ping_unsupported", "_list_cache_meta",
         "_reconnect_retries", "_session_proven", "_was_parked", "_inflight_tasks", "_reconnecting",
         "_suspect_reason", "_teardown_race", "_permanent_grace_used", "_stdio_child_pids",
-        "_ever_connected", "_sse_fallback", "_park_reason", "_last_park_line")
+        "_ever_connected", "_sse_fallback", "_park_reason", "_last_park_line", "_park_probes")
 
     def __init__(self, name: str):
         self.name = name
@@ -363,6 +367,8 @@ class MCPServerTask(MCPServerRunMixin, MCPServerTransportMixin, MCPServerHealthM
         # (revoked credentials, dead endpoint) that must not run the job tool-less forever.
         self._park_reason: Optional[str] = None
         self._last_park_line: Optional[str] = None  # last park WARNING text; identical re-parks log at DEBUG
+        # Unattended self-probes since the server was last healthy or explicitly asked to reconnect.
+        self._park_probes: int = 0
         # In-flight RPC tasks so a deliberate teardown fails them fast; _reconnecting is True
         # during that teardown so _track_inflight_rpc turns the cancel into a retryable error.
         # In-flight RPC bookkeeping (#48069 salvage): user-visible requests registered while running so a

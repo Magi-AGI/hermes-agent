@@ -621,7 +621,6 @@ def _stdio_connection(child_pid, fake_supervisor):
             "tools.mcp_tool_lifecycle._snapshot_child_pids",
             side_effect=[set(), {child_pid}],
         ),
-        patch("tools.mcp_tool_config._write_stderr_log_header"),
         patch("tools.mcp_tool._get_mcp_stderr_log", return_value=None),
         patch(
             "tools.mcp_tool._spawn_death_supervisor",
