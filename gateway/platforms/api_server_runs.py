@@ -448,6 +448,10 @@ class _RunLaunch:
     # caller-supplied conversation_history is authoritative for the turn; neither consumes a
     # SessionDB delivery row, so both stay default-denied.
     session_history_delivery: bool
+    # History provenance for the model context (review: Codex, A10): True when the caller supplied the
+    # history or a previous_response_id snapshot supplies it — the lease then only serializes, and turn
+    # setup / compression never import a shared session row's messages or system prompt.
+    caller_history_authoritative: bool
     agent_kwargs: dict  # ``_create_agent`` keyword arguments (prompt, model overrides, route, room policy)
     request_profile: Any
     browser_control_principal: Any
@@ -657,6 +661,11 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     # overwrite ``conversation_history``: a caller-supplied history is authoritative for this
     # turn, never consumes the SessionDB delivery row, and is denied on the same contract.
     session_history_delivery = not previous_response_id and not conversation_history
+    # Declared from the same two inputs, BEFORE the SessionDB load below overwrites the history.
+    caller_history_authoritative = bool(previous_response_id) or bool(conversation_history)
+    # Invariant today: authority is exactly the history the wake capability is denied for. Asserted, not
+    # derived — a future provenance that breaks the relation must choose both explicitly.
+    assert caller_history_authoritative is (not session_history_delivery)
     if not conversation_history and selected_session_id and not previous_response_id:
         conversation_history = await self._conversation_history_for_session(str(selected_session_id))
     q = self._run_streams[run_id] = asyncio.Queue()
@@ -678,6 +687,7 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     launch = _RunLaunch(
         self, run_id, q, session_id, gateway_session_key, _declared_selected, user_message,
         conversation_history, session_history_delivery,
+        caller_history_authoritative=caller_history_authoritative,
         agent_kwargs=dict(
             ephemeral_system_prompt=instructions, session_id=session_id, gateway_session_key=gateway_session_key,
             route=route, room_dispatch=room_dispatch, room_execution_policy=room_execution_policy,
@@ -774,10 +784,10 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
             _api_server._publish_turn_process_ownership(agent, effective_task_id)
             # Passed only when set: a human turn keeps today's call shape.
             author_kwargs = {"turn_author": run.turn_author} if run.turn_author is not None else {}
-            # A caller-supplied history or previous_response_id snapshot is authoritative for the turn
-            # (the same provenance that denies it the wake capability above): the lease serializes it but
-            # never swaps it for the durable transcript. Passed only when set (fakes keep the call shape).
-            if not run.session_history_delivery:
+            # A caller-supplied history or previous_response_id snapshot is authoritative for the turn:
+            # the lease serializes it but never swaps it for the durable transcript. Passed only when set
+            # (fakes keep the call shape).
+            if run.caller_history_authoritative:
                 author_kwargs["caller_history_authoritative"] = True
             r = agent.run_conversation(
                 user_message=run.user_message, conversation_history=run.conversation_history,

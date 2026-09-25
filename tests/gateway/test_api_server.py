@@ -462,7 +462,7 @@ class TestAgentExecution:
         model_options = {"reasoning": {"enabled": False}, "fast": False}
         with patch.object(adapter, "_create_agent", return_value=mock_agent) as mock_create_agent:
             result, usage = await adapter._run_agent(
-                user_message="hello",
+                caller_history_authoritative=False, user_message="hello",
                 conversation_history=[],
                 session_id="session-123",
                 requested_model="MiniMax-M3",
@@ -503,6 +503,14 @@ class TestAgentExecution:
             caller_history_authoritative=True)
 
     @pytest.mark.asyncio
+    async def test_run_agent_requires_history_provenance(self, adapter):
+        """Provenance is a REQUIRED keyword at the API bridge: a new route cannot silently inherit
+        the durable-continuation default (review: Codex, A10 round 2)."""
+        with patch.object(adapter, "_create_agent", side_effect=AssertionError("agent built")):
+            with pytest.raises(TypeError, match="caller_history_authoritative"):
+                await adapter._run_agent(user_message="hello", conversation_history=[], session_id="s")
+
+    @pytest.mark.asyncio
     async def test_run_agent_sets_and_clears_process_ownership_markers(self, adapter):
         """#76188 review: this surface runs its own agent lifecycle outside
         TurnRunner, so it needs its own baseline snapshot/clear — verify the
@@ -523,7 +531,7 @@ class TestAgentExecution:
 
         with patch.object(adapter, "_create_agent", return_value=mock_agent):
             await adapter._run_agent(
-                user_message="hello",
+                caller_history_authoritative=False, user_message="hello",
                 conversation_history=[],
                 session_id="session-456",
                 requested_model="MiniMax-M3",

@@ -361,7 +361,7 @@ class TestRunAgentRegistersForShutdownInterrupt:
 
         with patch.object(adapter, "_create_agent", return_value=agent):
             await adapter._run_agent(
-                user_message="hello",
+                caller_history_authoritative=False, user_message="hello",
                 conversation_history=[],
                 session_id="s1",
             )
@@ -386,7 +386,7 @@ class TestRunAgentRegistersForShutdownInterrupt:
 
         with patch.object(adapter, "_create_agent", return_value=agent):
             task = asyncio.ensure_future(
-                adapter._run_agent(user_message="hello", conversation_history=[], session_id="s1"))
+                adapter._run_agent(caller_history_authoritative=False, user_message="hello", conversation_history=[], session_id="s1"))
             await asyncio.wait_for(started.wait(), _TURN_UNBLOCK_TIMEOUT)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -412,7 +412,7 @@ class TestRunAgentRegistersForShutdownInterrupt:
         with patch.object(adapter, "_create_agent", return_value=agent):
             with pytest.raises(RuntimeError):
                 await adapter._run_agent(
-                    user_message="hello",
+                    caller_history_authoritative=False, user_message="hello",
                     conversation_history=[],
                     session_id="s1",
                 )

@@ -3922,7 +3922,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         confirmed_runtime_lock: bool = False, bind_declared_conversation: bool = False,
         session_history_delivery: str = "", turn_author: Optional[Dict[str, Any]] = None,
         relay_metadata: Optional[Dict[str, Any]] = None, notification_category: str = "result",
-        resume_unanswered_turn: bool = False, caller_history_authoritative: bool = False) -> tuple:
+        resume_unanswered_turn: bool = False, *, caller_history_authoritative: bool) -> tuple:
         """Create an agent and run one turn in a thread executor -> ``(result, usage)``.
         ``agent_ref[0]`` receives the agent so SSE writers can interrupt it; ``active_run_id``
         registers it in ``_active_run_agents``. Under a confirmed model lock the actual
@@ -3935,12 +3935,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         already persisted: the transcript's unanswered tail row is adopted from ``conversation_history``
         as THIS turn's user message instead of being appended a second time
         (``agent.session_persistence.adopt_unanswered_turn``; #115325).
-        ``caller_history_authoritative``: every route declares where ``conversation_history`` came
-        from. True = the client supplied it (header-less chat completions, /v1/responses input or a
-        ``previous_response_id`` snapshot): admission never swaps it for the durable transcript of a
-        session id another chat may share. False = the route LOADED it from SessionDB, so a turn that
-        waited on the session lease reloads the latest durable transcript (the default, and the call
-        shape run_conversation keeps)."""
+        ``caller_history_authoritative`` (REQUIRED keyword, no default): every route declares where
+        ``conversation_history`` came from. True = the client supplied it (header-less chat completions,
+        /v1/responses input or a ``previous_response_id`` snapshot): neither lease admission nor turn
+        setup nor compression ever swaps it (or the system prompt) for a session row another chat may
+        share. False = the route LOADED it from SessionDB, so a turn that waited on the session lease
+        reloads the latest durable transcript (run_conversation's call shape is kept)."""
         loop = asyncio.get_running_loop()
         # ContextVars do not follow run_in_executor threads: capture here, re-enter in _run().
         request_profile = _api_request_profile.get()

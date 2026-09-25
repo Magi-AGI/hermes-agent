@@ -43,7 +43,7 @@ async def test_notification_projection_preserves_source_outcome(tmp_path, monkey
         return finish(agent, result, *args, **kwargs)
 
     with patch.object(adapter, "_create_agent", return_value=agent), patch.object(adapter, "_finish_turn_result", side_effect=record_finish):
-        result, usage = await adapter._run_agent("internal event", [], session_id="session", notification_category=category)
+        result, usage = await adapter._run_agent("internal event", [], session_id="session", caller_history_authoritative=False, notification_category=category)
     muted = setting is True and category == "diagnostic"
     assert finished == [expected]
     assert source["final_response"] == expected["final_response"]
@@ -66,7 +66,7 @@ async def test_pre_agent_auth_diagnostic_obeys_policy_without_losing_logs(tmp_pa
         f"display: {{suppress_warning_notifications: {str(setting).lower()}}}\n")
     adapter = APIServerAdapter(PlatformConfig(enabled=True))
     with patch.object(adapter, "_create_agent", side_effect=_ProviderAuthResolutionError("fixture unavailable")):
-        result, usage = await adapter._run_agent("internal event", [], session_id="session", notification_category="diagnostic")
+        result, usage = await adapter._run_agent("internal event", [], session_id="session", caller_history_authoritative=False, notification_category="diagnostic")
     assert "fixture unavailable" in result["final_response"]
     assert bool(result.get("_notification_presentation_suppressed")) is (setting is True)
     assert "fixture unavailable" in caplog.text

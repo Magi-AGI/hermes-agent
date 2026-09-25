@@ -229,7 +229,7 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
     monkeypatch.setattr(adapter, "_create_agent", fake_create_agent)
 
     result, usage = await adapter._run_agent(
-        user_message="hello",
+        caller_history_authoritative=False, user_message="hello",
         conversation_history=[],
         session_id="request-session",
         gateway_session_key="request-key",
@@ -276,7 +276,7 @@ async def test_run_agent_registers_active_run_id_for_steering(adapter, monkeypat
     monkeypatch.setattr(adapter, "_create_agent", fake_create_agent)
 
     result, usage = await adapter._run_agent(
-        user_message="hello",
+        caller_history_authoritative=False, user_message="hello",
         conversation_history=[],
         session_id="request-session",
         active_run_id="run_steer_test",
@@ -809,7 +809,7 @@ async def test_run_agent_reports_actual_agent_runtime_not_requested_metadata(ada
     monkeypatch.setattr(adapter, "_create_agent", lambda **kwargs: FakeAgent())
 
     result, usage = await adapter._run_agent(
-        user_message="hello",
+        caller_history_authoritative=False, user_message="hello",
         conversation_history=[],
         session_id="runtime-session",
         route={"provider": "requested-provider", "model": "requested-model"},
@@ -847,7 +847,7 @@ async def test_confirmed_runtime_lock_rejects_actual_runtime_mismatch(adapter, m
 
     with pytest.raises(RuntimeError, match="confirmed model lock runtime mismatch"):
         await adapter._run_agent(
-            user_message="hello",
+            caller_history_authoritative=False, user_message="hello",
             conversation_history=[],
             session_id="mismatch-session",
             route={"provider": "nous", "model": "x-ai/grok-4.5"},
@@ -1059,8 +1059,8 @@ async def test_run_agent_forwards_author_to_run_conversation_only_when_set(adapt
     monkeypatch.setattr(adapter, "_create_agent", lambda **kwargs: FakeAgent())
     author = {"id": "bot:dixie", "name": "dixie", "is_bot": True}
     await adapter._run_agent(
-        user_message="hello", conversation_history=[], session_id="author-run", turn_author=author)
-    await adapter._run_agent(user_message="hello", conversation_history=[], session_id="author-run")
+        caller_history_authoritative=False, user_message="hello", conversation_history=[], session_id="author-run", turn_author=author)
+    await adapter._run_agent(caller_history_authoritative=False, user_message="hello", conversation_history=[], session_id="author-run")
 
     assert calls == [{"turn_author": author}, {}]
 

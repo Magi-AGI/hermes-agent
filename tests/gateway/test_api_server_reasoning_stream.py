@@ -89,7 +89,8 @@ async def test_chat_completions_stream_forwards_agent_reasoning_callback(adapter
     request, written, fake_response = _fake_writer_env()
     stream_q = ThreadSafeAsyncQueue()
     agent_task, agent_ref = adapter._spawn_stream_agent(
-        stream_q, user_message="q", conversation_history=[], session_id="api-session")
+        stream_q, user_message="q", conversation_history=[], session_id="api-session",
+        caller_history_authoritative=True)
     with patch.object(api_mod.web, "StreamResponse", return_value=fake_response):
         await adapter._write_sse_chat_completion(
             request, "chatcmpl-x", "hermes-agent", int(time.time()), stream_q, agent_task, agent_ref)
