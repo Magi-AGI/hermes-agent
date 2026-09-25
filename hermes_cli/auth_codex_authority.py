@@ -174,6 +174,10 @@ def _run_with_all_stores(build) -> Any:
     if thread_holds_store_lock():
         raise RuntimeError("Codex ownership operations must not run inside an auth-store lock")
     with migration_lock():
+        # An interrupted restore's fence is finished FIRST, before any branch below (an unreadable
+        # registry skips _ready_view) and before the store locks: otherwise this op's new chain
+        # would be fenced as restored by the next dispatch.
+        _resolve_restore_barrier()
         view = read_registry()
         if view.status == "unreadable":
             view = None

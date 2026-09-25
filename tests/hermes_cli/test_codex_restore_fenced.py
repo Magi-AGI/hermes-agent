@@ -137,3 +137,26 @@ def test_other_providers_restore_and_work_normally(codex_home, tmp_path, quiet_b
         entry = load_pool(provider).select()
         assert entry is not None and entry.access_token == row["access_token"], provider
         assert entry.last_status in (None, "ok"), provider
+
+
+def test_a_sign_in_right_after_an_interrupted_restore_is_not_fenced_as_restored(codex_home):
+    """An interrupted restore left the barrier AND a damaged registry. A fresh sign-in must finish
+    the restore's fence FIRST; it used to rebuild the registry without consuming the barrier, and
+    the next dispatch then fenced the NEW login as restored-from-backup."""
+    from hermes_cli.auth_codex_authority import authority_dispatch
+    from hermes_cli.auth_codex_registry import migration_lock
+    from hermes_cli.auth_codex_restore import write_restore_barrier
+
+    root, endpoint = codex_home
+    write_store(root, singleton=endpoint.issue())
+    assert authority_dispatch() == "bootstrapped"
+    with migration_lock():
+        write_restore_barrier("restoring it from a backup")
+    (root / "auth.chains.json").write_text("{ damaged by the interrupted restore", encoding="utf-8")
+    fresh = endpoint.issue()
+    auth._save_codex_tokens({"access_token": fresh[0], "refresh_token": fresh[1]})
+    authority_dispatch()
+    assert auth.resolve_codex_runtime_credentials()["api_key"] == fresh[0]
+    active = [c for c in registry(root)["chains"].values() if c["state"] == "active"]
+    assert len(active) == 1, "the fresh sign-in was fenced as restored"
+    assert not (root / "auth.restore-barrier.json").exists()
