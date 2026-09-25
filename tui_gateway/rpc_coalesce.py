@@ -44,7 +44,7 @@ def _stat_fingerprint(paths) -> tuple:
 
 def model_options_key(home: Any, ctx: Any, params: dict) -> Hashable | None:
     """Coalescing identity for a ``model.options`` build, or None when it must run alone."""
-    if params.get("refresh"):
+    if params.get("refresh") or not dataclasses.is_dataclass(ctx):
         return None
     home_path = Path(home)
     context = json.dumps(dataclasses.asdict(ctx), sort_keys=True, default=str)

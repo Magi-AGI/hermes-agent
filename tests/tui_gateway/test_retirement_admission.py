@@ -1,10 +1,11 @@
 """Every admission source participates in the same process retirement fence."""
 
-from concurrent.futures import ThreadPoolExecutor
 import queue
 import threading
 
 import pytest
+
+from tui_gateway.rpc_lanes import LaneSet, LaneSpec
 
 
 @pytest.fixture
@@ -40,22 +41,24 @@ def test_queued_and_running_rpc_hold_admission_until_the_response(runtime, monke
 
     monkeypatch.setitem(server._methods, "test.retirement", handler)
     monkeypatch.setattr(server, "_LONG_HANDLERS", {"test.retirement"})
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        monkeypatch.setattr(server, "_pool", pool)
-        blocked = pool.submit(release_pool.wait, 10)
-        try:
-            assert server.dispatch({"id": "test", "method": "test.retirement"}, transport) is None
-            assert fence.prepare() == {"ok": False, "idle": False}
-            assert idle_proof()["idle"] is False
-            release_pool.set()
-            blocked.result(10)
-            assert entered.wait(10)
-            assert fence.prepare() == {"ok": False, "idle": False}
-            release_handler.set()
-            assert transport.frames.get(timeout=10)["result"] == {"done": True}
-        finally:
-            release_pool.set()
-            release_handler.set()
+    # One worker in the lane the method maps to, held busy: the dispatched request waits QUEUED.
+    lanes = LaneSet((LaneSpec("maintenance", workers=1, max_queued=4, auto_retry=False, retry_after_ms=1),))
+    monkeypatch.setattr(server, "_lanes", lanes)
+    blocked = lanes.for_method("test.retirement").try_submit("blocker", lambda: release_pool.wait(10))
+    try:
+        assert server.dispatch({"id": "test", "method": "test.retirement"}, transport) is None
+        assert fence.prepare() == {"ok": False, "idle": False}
+        assert idle_proof()["idle"] is False
+        release_pool.set()
+        blocked.result(10)
+        assert entered.wait(10)
+        assert fence.prepare() == {"ok": False, "idle": False}
+        release_handler.set()
+        assert transport.frames.get(timeout=10)["result"] == {"done": True}
+    finally:
+        release_pool.set()
+        release_handler.set()
+        lanes.shutdown()
     assert idle_proof()["idle"] is True
     token = fence.prepare()["token"]
     assert server.dispatch({"id": "late", "method": "test.retirement"}, transport)["error"]["code"] == 5035
