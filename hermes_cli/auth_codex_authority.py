@@ -115,9 +115,11 @@ def authority_dispatch(*, read_only: bool = False, budget_seconds: float = 0.0) 
 
 
 def dispatch_needed() -> bool:
-    """Unfinished ops to roll forward, or payloads left by an op that never reached its decision."""
+    """Unfinished ops to roll forward (incl. an ``unrecoverable`` one whose payload may read again),
+    or payloads left by an op that never reached its decision."""
     view = read_registry()
-    return (view.status == "absent" or any(op.get("status") == "running" for op in view.ops.values())
+    return (view.status == "absent"
+            or any(op.get("status") in ("running", "unrecoverable") for op in view.ops.values())
             or (ops_dir().is_dir() and any(ops_dir().glob("*.json"))))
 
 

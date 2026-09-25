@@ -35,9 +35,9 @@ from hermes_cli.auth_codex_records import (
     ATTEMPT_INDETERMINATE, ATTEMPT_PENDING, ATTEMPT_REJECTED, completed, history_entry, new_attempt,
     read_record, reconcile, write_record)
 from hermes_cli.auth_codex_registry import (
-    STATE_FENCED, STATE_RETIRED, CodexAuthorityBusy, CodexRecoveryFenced, CodexRefreshIndeterminate,
-    CodexRegistryUnreadable, CodexRotationPersistFailed, NeedsAuthorityRepair, RepairRequest, new_id,
-    pair_fp, read_registry, store_locks, store_path_of, thread_holds_store_lock,
+    OP_UNRECOVERABLE, STATE_FENCED, STATE_RETIRED, CodexAuthorityBusy, CodexRecoveryFenced,
+    CodexRefreshIndeterminate, CodexRegistryUnreadable, CodexRotationPersistFailed, NeedsAuthorityRepair,
+    RepairRequest, new_id, pair_fp, read_registry, store_locks, store_path_of, thread_holds_store_lock,
     unrecorded_legacy_rescues)
 from hermes_cli.auth_constants import AUTH_LOCK_TIMEOUT_SECONDS, AuthError, httpx
 from hermes_cli.auth_credential_io import CredentialWriteUncertain, WriteOutcome, store_key
@@ -88,6 +88,12 @@ def _fenced_error(entry: dict) -> AuthError:
     return CodexRecoveryFenced(reason)
 
 
+def _unrecoverable_message(op_id: str) -> str:
+    return ("Hermes paused Codex token refresh to protect your login (an interrupted login update "
+            f"could not be completed). Run `hermes auth recovery resolve {op_id[:8]}`, then sign in "
+            "again with `hermes auth codex`.")
+
+
 def _dispatch_once(round_: int) -> None:
     from hermes_cli.auth_codex_authority import REQUEST_DISPATCH_BUDGET_SECONDS, authority_dispatch
     if round_ == 0 and authority_dispatch(budget_seconds=REQUEST_DISPATCH_BUDGET_SECONDS) not in ("busy", "failed"):
@@ -121,7 +127,11 @@ def _transaction(row_store: Path, row: str, started: Tuple[str, str], *, force: 
             "unregistered", "This Codex credential is not registered with Hermes's login registry yet; "
             "run `hermes auth migrate`, or sign in again.")
     cid, entry = found
-    if view.ops_touching(cid) or entry.get("lifecycle") or unrecorded_legacy_rescues(
+    touching = view.ops_touching(cid)
+    if touching and all(op.get("status") == OP_UNRECOVERABLE for _op_id, op in touching):
+        # Kept until its payload reads again (the dispatcher retries it) or it is resolved.
+        raise CodexRecoveryFenced("op-unrecoverable", _unrecoverable_message(touching[0][0]))
+    if touching or entry.get("lifecycle") or unrecorded_legacy_rescues(
             view, {row_store, store_path_of(entry["owner"])}):
         _dispatch_once(round_)
     if entry.get("state") in (STATE_FENCED, STATE_RETIRED):

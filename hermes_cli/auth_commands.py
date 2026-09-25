@@ -668,9 +668,20 @@ def auth_recovery_command(args) -> None:
     """`hermes auth recovery list|clear`: inspect the Codex authority, or delete ARCHIVED recovery
     files (never live state; archives are never pruned automatically)."""
     from hermes_cli.auth_codex_recovery import clear_archives, list_recovery
-    if getattr(args, "recovery_action", "list") == "clear":
+    action = getattr(args, "recovery_action", "list")
+    if action == "clear":
         removed = clear_archives()
         print(f"Removed {removed} archived Codex recovery file(s).")
+        return
+    if action == "resolve":
+        from hermes_cli.auth_codex_ops import resolve_unrecoverable
+        try:
+            outcome = resolve_unrecoverable(getattr(args, "op_id", None) or "")
+        except auth_mod.AuthError as exc:
+            raise SystemExit(auth_mod.format_auth_error(exc)) from exc
+        print("The interrupted Codex login update was completed." if outcome == "rolled-forward" else
+              "The interrupted Codex login update was released; its logins stay paused. Sign in again "
+              "with `hermes auth codex`.")
         return
     for line in list_recovery():
         print(line)

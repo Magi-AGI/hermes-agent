@@ -95,5 +95,7 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
         "migrate", help="Create the Codex login registry / finish interrupted Codex login updates")
     auth_recovery = auth_subparsers.add_parser(
         "recovery", help="Inspect the Codex login registry, or clear ARCHIVED recovery files")
-    auth_recovery.add_argument("recovery_action", nargs="?", choices=["list", "clear"], default="list")
+    auth_recovery.add_argument("recovery_action", nargs="?", choices=["list", "clear", "resolve"], default="list")
+    auth_recovery.add_argument(
+        "op_id", nargs="?", help="resolve: the unrecoverable login update (id or prefix from `list`)")
     auth_parser.set_defaults(func=cmd_auth)

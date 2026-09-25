@@ -35,7 +35,9 @@ def list_recovery() -> List[str]:
         rows = ", ".join(r["row"] for r in entry.get("rows", ()))
         lines.append(f"  {cid[:8]}  {entry.get('state')}{detail}  owner={entry.get('owner')}  rows=[{rows}]")
     for op_id, op in view.ops.items():
-        lines.append(f"  unfinished op {op_id[:8]}: {op.get('kind')} ({op.get('status')})")
+        hint = (f" — `hermes auth recovery resolve {op_id[:8]}` releases it"
+                if op.get("status") == "unrecoverable" else "")
+        lines.append(f"  unfinished op {op_id[:8]}: {op.get('kind')} ({op.get('status')}){hint}")
     lines.append(f"Archived recovery files: {len(_archive_files())} (`hermes auth recovery clear` removes them)")
     return lines
 

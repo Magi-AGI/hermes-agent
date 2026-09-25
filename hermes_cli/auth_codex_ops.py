@@ -11,7 +11,9 @@ Every ownership change runs under the migration lock + the store locks of its sc
 
 RULE-M1 recovery (any later migration-lock holder): a payload with no ``ops`` entry never decided ->
 archived as ``abandoned``; an ``ops`` entry with its payload -> rolled FORWARD; an ``ops`` entry whose
-payload is missing/corrupt -> every chain it touches is fenced ``op-unrecoverable`` (never guessed).
+payload is missing/corrupt -> every chain it touches is fenced ``op-unrecoverable`` (never guessed) and
+the entry is KEPT (status ``unrecoverable``, reservation intact) until its payload reads again or
+``hermes auth recovery resolve`` releases it.
 
 Fences requested by refresh transactions (RULE-R1) and legacy-rescue fences are single registry
 writes (no store or record change), applied only while the request still matches.
@@ -117,9 +119,12 @@ def run_op(payload: Payload, view: RegistryView, *, continuing: Optional[str] = 
     blocking = conflicting_op(view, payload.scope_chains, payload.scope_stores, payload.scope_profiles,
                               continuing)
     if blocking is not None:
+        op = view.ops[blocking]
+        action = (f"`hermes auth recovery resolve {blocking[:8]}` releases it (its logins stay paused)"
+                  if op.get("status") == OP_UNRECOVERABLE else "run `hermes auth migrate` to complete it")
         raise CodexAuthorityRefused(
-            f"Another Codex login update ({view.ops[blocking].get('kind')}, op {blocking}) is unfinished; "
-            f"run `hermes auth migrate` to complete it, then try again.")
+            f"Another Codex login update ({op.get('kind')}, op {blocking[:8]}) is unfinished; {action}, "
+            "then try again.")
     body = payload.to_json()
     decided = _decided_registry(view.data if view.ok else {}, payload, "")
     validate_registry(decided)  # RULE-G2 checked BEFORE anything is written
@@ -258,8 +263,21 @@ def apply_payload(body: Dict[str, Any]) -> None:
 
 # ── RULE-M1 recovery ──────────────────────────────────────────────────────────────────────────
 
+def _read_payload(op_id: str, op: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The op's payload when it reads AND matches the decided sha; None otherwise."""
+    try:
+        raw, sha = read_witnessed_bytes(_payload_path(op_id))
+        return json.loads(raw.decode("utf-8")) if raw is not None and sha == op.get("payload_sha") else None
+    except Exception:
+        return None
+
+
 def recover_ops() -> Dict[str, List[str]]:
-    """Roll unfinished ops forward; archive undecided payloads. Caller holds the migration lock."""
+    """Roll unfinished ops forward; archive undecided payloads. Caller holds the migration lock.
+
+    An op whose payload cannot be read is marked ``unrecoverable`` (its chains fenced) but KEEPS
+    its entry — and so its reservation (RULE-G4) — and is retried here on every pass: a payload
+    that reads again is rolled forward; only ``resolve_unrecoverable`` releases one that never does."""
     report: Dict[str, List[str]] = {"abandoned": [], "rolled_forward": [], "unrecoverable": []}
     view = read_registry()
     if view.status == "unreadable":
@@ -273,18 +291,16 @@ def recover_ops() -> Dict[str, List[str]]:
     if not view.ok:
         return report
     for op_id, op in list(view.ops.items()):
-        if op.get("status") != OP_RUNNING:
+        if op.get("status") not in (OP_RUNNING, OP_UNRECOVERABLE):
             continue
-        path = _payload_path(op_id)
-        try:
-            raw, sha = read_witnessed_bytes(path)
-            body = json.loads(raw.decode("utf-8")) if raw is not None and sha == op.get("payload_sha") else None
-        except Exception:
-            body = None
+        body = _read_payload(op_id, op)
         if body is None:
-            _fence_unrecoverable(op_id, op)
+            if op.get("status") != OP_UNRECOVERABLE:
+                _fence_unrecoverable(op_id, op)
             report["unrecoverable"].append(op_id)
             continue
+        if op.get("status") == OP_UNRECOVERABLE:
+            _reinstate_decision(op_id, body)
         apply_payload(body)
         commit_op(op_id)
         report["rolled_forward"].append(op_id)
@@ -292,8 +308,9 @@ def recover_ops() -> Dict[str, List[str]]:
 
 
 def _fence_unrecoverable(op_id: str, op: Dict[str, Any]) -> None:
-    """Payload missing/corrupt: fence every chain the op touches; the op itself cannot finish, so
-    its entry is closed (its chains stay fenced; a fresh sign-in is the exit)."""
+    """Payload missing/corrupt: fence every chain the op touches and mark the op ``unrecoverable``.
+    The entry and the payload file (if any) are KEPT: the reservation holds and a payload that is
+    only temporarily unreadable is rolled forward later (RULE-M1, RULE-G4)."""
     view = read_registry()
     data = json.loads(json.dumps(view.data))
     scope = op.get("chains")
@@ -303,12 +320,62 @@ def _fence_unrecoverable(op_id: str, op: Dict[str, Any]) -> None:
         if entry.get("state") == STATE_ACTIVE:
             entry["state"] = STATE_FENCED
             entry["fence"] = {"reason": "op-unrecoverable", "epoch": entry["epoch"], "evidence": {"op_id": op_id}}
-    data["ops"] = {k: v for k, v in data["ops"].items() if k != op_id}
+    data["ops"][op_id] = {**data["ops"][op_id], "status": OP_UNRECOVERABLE, "unrecoverable_at": utc_now()}
     write_registry(data)
-    path = _payload_path(op_id)
-    if path.exists():
-        _archive_payload(path, OP_UNRECOVERABLE)
-    logger.warning("Codex ownership op %s could not be recovered; its chains are fenced", op_id)
+    logger.warning("Codex ownership op %s could not be read; its chains are paused until it can be "
+                   "completed or `hermes auth recovery resolve %s` releases it", op_id, op_id[:8])
+
+
+def _reinstate_decision(op_id: str, body: Dict[str, Any]) -> None:
+    """The payload of an ``unrecoverable`` op reads again: restore its DECIDED chain entries (the
+    op-unrecoverable fences were about the missing payload, not the credentials) and make it
+    runnable, so the ordinary roll-forward completes it. Its reservation kept every other
+    ownership change off these chains meanwhile."""
+    view = read_registry()
+    data = json.loads(json.dumps(view.data))
+    for cid, decided in (body.get("chains") or {}).items():
+        entry = data["chains"].get(cid)
+        fence = (entry or {}).get("fence") or {}
+        if entry is not None and fence.get("reason") == "op-unrecoverable" and (
+                fence.get("evidence") or {}).get("op_id") == op_id:
+            data["chains"][cid] = decided
+    data["ops"][op_id] = {**data["ops"][op_id], "status": OP_RUNNING}
+    data["ops"][op_id].pop("unrecoverable_at", None)
+    write_registry(data)
+    logger.info("Codex ownership op %s is readable again; completing it", op_id)
+
+
+def resolve_unrecoverable(op_id: str) -> str:
+    """``hermes auth recovery resolve <op>``: the durable resolution of an ``unrecoverable`` op.
+    A payload that reads now is rolled forward (``rolled-forward``); otherwise the op is COMMITTED
+    as given up (``released``): its entry and reservation are removed, its chains STAY fenced
+    (nothing it decided is guessed), and whatever is left of the payload is archived."""
+    with migration_lock():
+        view = read_registry()
+        matches = [k for k in view.ops if k.startswith(op_id)] if op_id else []
+        if len(matches) != 1:
+            raise CodexAuthorityRefused(f"No single unfinished Codex login update matches {op_id!r}.")
+        op_id = matches[0]
+        op = view.ops[op_id]
+        if op.get("status") != OP_UNRECOVERABLE:
+            raise CodexAuthorityRefused(
+                f"Codex login update {op_id[:8]} is not unrecoverable; `hermes auth migrate` completes it.")
+        body = _read_payload(op_id, op)
+        if body is not None:
+            _reinstate_decision(op_id, body)
+            apply_payload(body)
+            commit_op(op_id)
+            return "rolled-forward"
+        data = json.loads(json.dumps(view.data))
+        data["ops"] = {k: v for k, v in data["ops"].items() if k != op_id}
+        write_registry(data)
+        path = _payload_path(op_id)
+        try:
+            _archive_payload(path, OP_UNRECOVERABLE)
+        except OSError:
+            logger.warning("Codex ownership payload %s could not be archived; left in place", path)
+        logger.warning("Codex ownership op %s released by the operator; its logins stay paused", op_id)
+        return "released"
 
 
 # ── Fence decisions (single registry writes) ─────────────────────────────────────────────────
