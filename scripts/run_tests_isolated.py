@@ -25,6 +25,10 @@ What this runner guarantees, and what it does not:
    identity, identity re-verified at open) are scanned for test markers. A hit fails the run (exit 3);
    any enumeration/stat/read failure, or a file truncated in place, makes the result INCONCLUSIVE
    (exit 4). A clean scan is not proof that nothing was written.
+5. CHECKOUT WRITES: untracked, non-ignored paths that appear in this checkout during the run are
+   listed and fail an otherwise green run (exit 5). Tests run with the checkout as CWD, so a
+   relative or mangled path (a Windows path handed to bash, an unexpanded ``%VAR%``, an empty
+   known-folder lookup) lands here. Editing the tree during a run trips it too.
 
 Usage: python scripts/run_tests_isolated.py [--timeout SECONDS] [--] [run_tests_parallel.py args]
 """
@@ -75,12 +79,17 @@ LIVE_ROOT = LIVE_ROOTS[0]
 
 def _sandbox_env(box: Path) -> dict:
     env = {k: v for k, v in os.environ.items() if k in _FORWARD or k.startswith(_FORWARD_PREFIX)}
-    for name in ("home", "userhome", "localappdata", "appdata", "tmp"):
-        (box / name).mkdir(parents=True, exist_ok=True)
     userhome = box / "userhome"
+    # LOCALAPPDATA/APPDATA are the sandbox profile's own AppData folders, and those folders exist:
+    # .NET's GetFolderPath resolves them from USERPROFILE (not the env vars) and returns "" for a
+    # missing folder, so PowerShell 5.1 wrote its ModuleAnalysisCache relative to the CWD (the
+    # checkout) as Microsoft\Windows\PowerShell\ModuleAnalysisCache.
+    localappdata, appdata = userhome / "AppData" / "Local", userhome / "AppData" / "Roaming"
+    for d in (box / "home", localappdata, appdata, box / "tmp"):
+        d.mkdir(parents=True, exist_ok=True)
     env.update(_DETERMINISTIC)
-    env.update(HERMES_HOME=str(box / "home"), LOCALAPPDATA=str(box / "localappdata"),
-               APPDATA=str(box / "appdata"), TEMP=str(box / "tmp"), TMP=str(box / "tmp"),
+    env.update(HERMES_HOME=str(box / "home"), LOCALAPPDATA=str(localappdata),
+               APPDATA=str(appdata), TEMP=str(box / "tmp"), TMP=str(box / "tmp"),
                HERMES_TEST_LIVE_ROOTS=os.pathsep.join(str(r) for r in LIVE_ROOTS),
                PYTHONUTF8="1", PYTHONDONTWRITEBYTECODE="1",
                USERPROFILE=str(userhome), HOME=str(userhome),
@@ -137,6 +146,16 @@ def _scan_appended(before: dict) -> tuple[list[str], list[str]]:
             continue
         hits += [f"{p}: {line[:160]}" for line in text.splitlines() if LEAK_MARKERS.search(line)]
     return hits, problems
+
+
+def _untracked(problems: list[str]) -> set[str] | None:
+    try:
+        out = subprocess.run(["git", "-C", str(REPO), "ls-files", "--others", "--exclude-standard", "-z"],
+                             capture_output=True, check=True, timeout=120).stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        problems.append(f"cannot list untracked files: {exc}")
+        return None
+    return {p for p in out.decode("utf-8", "replace").split("\0") if p}
 
 
 class _Job:
@@ -259,6 +278,7 @@ def main() -> int:
     box = Path(tempfile.mkdtemp(prefix="isolated-run-"))
     problems_before: list[str] = []
     before = _log_snapshot(problems_before)
+    tree_before = _untracked(problems_before)
     job = _Job()
     rc = 1
     try:
@@ -275,17 +295,26 @@ def main() -> int:
         shutil.rmtree(box, ignore_errors=True)
 
     hits, problems = _scan_appended(before)
+    tree_after = _untracked(problems)
     problems = problems_before + problems
     if hits:
         print(f"[isolated-run] LIVE-LOG LEAK: {len(hits)} test-marked line(s) in the live logs:", file=sys.stderr)
         for line in hits[:20]:
             print("  " + line, file=sys.stderr)
         return rc or 3
+    written = sorted(tree_after - tree_before) if tree_before is not None and tree_after is not None else []
+    if written:
+        print(f"[isolated-run] CHECKOUT WRITE: {len(written)} new untracked path(s) in {REPO} "
+              "(a test wrote into the working tree, or the tree was edited during the run):", file=sys.stderr)
+        for path in written[:20]:
+            print("  " + path, file=sys.stderr)
+        return rc or 5
     if problems:
-        print("[isolated-run] INCONCLUSIVE log diagnostic: " + "; ".join(problems[:5]), file=sys.stderr)
+        print("[isolated-run] INCONCLUSIVE diagnostic: " + "; ".join(problems[:5]), file=sys.stderr)
         return rc or 4
     print("[isolated-run] diagnostic: no test-marked lines appended to the live logs "
-          "(not proof of no writes); job closed, all child processes terminated", file=sys.stderr)
+          "(not proof of no writes); no new untracked paths in the checkout; job closed, all child "
+          "processes terminated", file=sys.stderr)
     return rc
 
 
