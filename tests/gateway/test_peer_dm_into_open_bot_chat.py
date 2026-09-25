@@ -26,6 +26,15 @@ from hermes_state import SessionDB
 from tools import bot_live_delivery as mailbox
 
 AUTHOR = {"id": "bot:cto", "name": "cto", "is_bot": True}
+# Hang guards, not expectations. Every wait below ends on an event (the owner's receipt, a terminal
+# run status); a fixed attempt count or a 1 s budget raced the owner thread on a loaded runner.
+DEADLINE_SECONDS = 30.0
+# The local DM budget in a case where no owner ever answers: the budget running out IS the outcome.
+UNANSWERED_WAIT_SECONDS = 1.0
+
+
+def _live_wait(owner_answers: bool) -> float:
+    return DEADLINE_SECONDS if owner_answers else UNANSWERED_WAIT_SECONDS
 
 
 def _app(adapter):
@@ -38,7 +47,8 @@ def _owner_answers(home, reply):
     """What the Desktop's live session does: claim the delivery, run it as its next turn, settle it."""
     def _run():
         owner = mailbox.find_canonical_live_owner(home)
-        for _ in range(200):
+        deadline = time.monotonic() + DEADLINE_SECONDS
+        while time.monotonic() < deadline:
             claimed = mailbox.claim_pending_delivery(home, owner)
             if claimed is not None:
                 mailbox.complete_delivery(home, claimed["delivery_id"], status="settled", reply=reply)
@@ -69,7 +79,7 @@ async def test_a_peer_turn_into_an_open_bot_chat_is_answered_by_its_live_owner(
     queued in that chat, never as a failure the sender would resend."""
     home = tmp_path.resolve()
     monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setattr("tools.bot_mode_dm._LIVE_WAIT_SECONDS", 1.0)
+    monkeypatch.setattr("tools.bot_mode_dm._LIVE_WAIT_SECONDS", _live_wait(owner_replies))
     db = SessionDB(home / "state.db")
     db.create_session("bot-chat", "desktop")
     db.set_session_title("bot-chat", "Bot Chat")
@@ -90,7 +100,7 @@ async def test_a_peer_turn_into_an_open_bot_chat_is_answered_by_its_live_owner(
                 resp = await cli.post(f"/api/sessions/{target}/chat", json={"message": "ping", "author": AUTHOR})
                 body = await resp.json()
         if owner is not None:
-            owner.join(5)
+            owner.join(DEADLINE_SECONDS)
         assert resp.status == status, body
         assert run.called is turn_ran_here
         admitted = sorted((home / "runtime" / "bot_live_delivery").glob("*.json"))
@@ -130,7 +140,7 @@ async def test_a_streamed_peer_turn_into_an_open_bot_chat_is_answered_by_its_liv
     single assistant.completed event (or run.queued at the budget) and no turn runs here."""
     home = tmp_path.resolve()
     monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setattr("tools.bot_mode_dm._LIVE_WAIT_SECONDS", 1.0)
+    monkeypatch.setattr("tools.bot_mode_dm._LIVE_WAIT_SECONDS", _live_wait(owner_replies))
     db = SessionDB(home / "state.db")
     db.create_session("bot-chat", "desktop")
     db.set_session_title("bot-chat", "Bot Chat")
@@ -151,7 +161,7 @@ async def test_a_streamed_peer_turn_into_an_open_bot_chat_is_answered_by_its_liv
                 assert resp.status == 200 and resp.content_type == "text/event-stream"
                 events = _sse_events(await resp.text())
         if owner is not None:
-            owner.join(5)
+            owner.join(DEADLINE_SECONDS)
         assert not run.called
         [record] = [json.loads(p.read_text()) for p in (home / "runtime" / "bot_live_delivery").glob("*.json")]
         assert (record["message"], record["author"]) == ("ping", AUTHOR)
@@ -180,7 +190,8 @@ def _owner_settles(home, *, status, reply="", error="", reason="", after=0.05):
     """The Desktop's live session: claim the delivery, run it, write the receipt."""
     def _run():
         owner = mailbox.find_canonical_live_owner(home)
-        for _ in range(200):
+        deadline = time.monotonic() + DEADLINE_SECONDS
+        while time.monotonic() < deadline:
             claimed = mailbox.claim_pending_delivery(home, owner)
             if claimed is not None:
                 time.sleep(after)
@@ -194,9 +205,10 @@ def _owner_settles(home, *, status, reply="", error="", reason="", after=0.05):
     return thread
 
 
-async def _poll_terminal(cli, run_id, *, until=("completed", "failed", "cancelled"), tries=100):
+async def _poll_terminal(cli, run_id, *, until=("completed", "failed", "cancelled")):
     status = {}
-    for _ in range(tries):
+    deadline = time.monotonic() + DEADLINE_SECONDS
+    while time.monotonic() < deadline:
         status = await (await cli.get(f"/v1/runs/{run_id}")).json()
         if status.get("status") in until:
             break
@@ -256,7 +268,7 @@ async def test_a_peer_run_into_an_open_bot_chat_is_driven_by_its_owners_receipt(
                     assert (await cli.post(f"/v1/runs/{run_id}/stop")).status == 200
                 status = await _poll_terminal(cli, run_id)
         if owner is not None:
-            owner.join(5)
+            owner.join(DEADLINE_SECONDS)
         assert status["status"] == expected[0], status
         assert bool(ran_here) is turn_ran_here
         admitted = sorted((home / "runtime" / "bot_live_delivery").glob("*.json"))

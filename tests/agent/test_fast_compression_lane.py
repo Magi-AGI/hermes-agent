@@ -36,6 +36,25 @@ def _codex_oauth_client(create_side_effect=None, create_return=None):
     return client
 
 
+class _AuxClock:
+    """``time`` as agent.auxiliary_client sees it, with a monotonic() the test advances.
+
+    The latency stamps read time.monotonic(), which ticks every 15.6 ms on Windows: a real
+    10 ms sleep measured 0 ms about a third of the time."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def monotonic(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
 def _resolve(config, *, provider="ollama", model="qwen3:8b", requested_model=None):
     from agent.auxiliary_client import resolve_compression_fast_lane
 
@@ -135,9 +154,11 @@ def test_summary_model_override_is_certified_against_the_effective_model():
 def test_compression_latency_records_delayed_first_provider_chunk():
     from agent.auxiliary_client import _notify_aux_progress, call_llm
 
+    clock = _AuxClock()
+
     class _DelayedSemaphore:
         def acquire(self):
-            time.sleep(0.01)
+            clock.advance(0.01)
 
         def release(self):
             pass
@@ -148,7 +169,7 @@ def test_compression_latency_records_delayed_first_provider_chunk():
     client.base_url = "http://127.0.0.1:11434/v1"
 
     def _chunks():
-        time.sleep(0.02)
+        clock.advance(0.02)
         yield SimpleNamespace(
             id="chunk-1",
             model="qwen3:8b",
@@ -172,6 +193,7 @@ def test_compression_latency_records_delayed_first_provider_chunk():
     # (only the Codex / Claude OAuth routes may summarise). Allow the route here to keep pinning
     # upstream's contract; the refusal itself is covered in test_compression_route_guard.py.
     with (
+        patch("agent.auxiliary_client.time", clock),
         patch("agent.auxiliary_client._compression_client_allowed", return_value=True),
         patch("agent.auxiliary_client._acquire_sync_aux_semaphore", return_value=_DelayedSemaphore()),
         patch("agent.auxiliary_client._get_cached_client", side_effect=_resolve_client),
@@ -312,12 +334,14 @@ def test_bedrock_converse_ttfp_waits_for_the_nonstreaming_response():
         usage=None,
     )
     timings = {}
+    clock = _AuxClock()
 
     def _delayed_converse(**_kwargs):
-        time.sleep(0.02)
+        clock.advance(0.02)
         return response
 
     with (
+        patch("agent.auxiliary_client.time", clock),
         patch("agent.auxiliary_client._get_auxiliary_task_config", return_value=config),
         patch(
             "agent.auxiliary_client._get_cached_client",

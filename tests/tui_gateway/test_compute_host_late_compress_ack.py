@@ -9,7 +9,6 @@ never reached the gateway session and the desktop never refreshed.
 import queue
 import sys
 import threading
-import time
 import types
 
 import pytest
@@ -93,16 +92,21 @@ def test_late_control_error_and_bare_error_frames_fire_handler():
 def test_late_ack_handlers_are_bounded_by_ttl_and_cap(monkeypatch):
     from tui_gateway import host_supervisor as hs
 
-    monkeypatch.setattr(hs, "_LATE_CONTROL_MAX", 3)
+    # The supervisor's clock is driven by the test: a real sleep shorter than Windows'
+    # 15.6 ms monotonic tick often measured zero elapsed, so nothing had expired.
     sup, _sent = _supervisor()
+    clock = types.SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(hs, "time", types.SimpleNamespace(monotonic=lambda: clock.now))
+    monkeypatch.setattr(hs, "_LATE_CONTROL_MAX", 3)
+    monkeypatch.setattr(hs, "_LATE_CONTROL_TTL_SECS", 60.0)
     for i in range(5):
         sup._register_late_control_handler(f"r{i}", lambda _f: None)
+        clock.now += 1.0
     assert len(sup._late_control_handlers) == 3
     assert set(sup._late_control_handlers) == {"r2", "r3", "r4"}
 
     # TTL: an old registration is dropped on the next registration.
-    monkeypatch.setattr(hs, "_LATE_CONTROL_TTL_SECS", 0.0)
-    time.sleep(0.01)
+    clock.now += 60.0
     sup._register_late_control_handler("fresh", lambda _f: None)
     assert set(sup._late_control_handlers) == {"fresh"}
 
