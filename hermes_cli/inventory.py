@@ -71,7 +71,16 @@ def _without_slug(rows: list[dict], slug: str) -> list[dict]:
 # ─── Public: payload builder ────────────────────────────────────────────
 
 
-def build_models_payload(
+def build_models_payload(*args, **kwargs) -> dict:
+    """See :func:`_build_models_payload`. Every per-model capability/override lookup in one build
+    reads ONE config snapshot instead of re-loading config per model (2026-09-13 RPC-pool convoy)."""
+    from agent.models_dev import config_snapshot
+
+    with config_snapshot():
+        return _build_models_payload(*args, **kwargs)
+
+
+def _build_models_payload(
     ctx: ConfigContext, *, explicit_only: bool = False, include_unconfigured: bool = False,
     picker_hints: bool = False, canonical_order: bool = False, pricing: bool = False,
     pricing_cache_only: bool = False,

@@ -8,6 +8,7 @@ pass ``allow_network=False`` and never do I/O. A corrupt/empty disk cache is
 quarantined, never served as ``{}``. ``models_dev.url`` in config.yaml = mirror."""
 
 import contextlib
+import contextvars
 import json
 import logging
 import re
@@ -186,11 +187,40 @@ def _models_dev_id(provider: str) -> Optional[str]:
 _UNKNOWN_CATALOG_PROVIDER_WARNED: set = set()  # (provider, alias) warned once per process
 
 
+# One config snapshot for a whole payload build. Capability resolution reads config up to three
+# times PER MODEL (_override_for, catalog aliases, the models.dev URL); a picker payload covers
+# thousands of models and every window builds one, so those reads convoyed the RPC pool
+# (2026-09-13: all 8 workers in load_config_readonly). The snapshot lives exactly as long as the
+# ``with`` block on one thread, unlike an id(cfg)-keyed memo, so it cannot outlive a config reload.
+_CONFIG_SNAPSHOT: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.ContextVar(
+    "models_dev_config_snapshot", default=None)
+
+
+@contextlib.contextmanager
+def config_snapshot():
+    """Serve this block's config reads from ONE ``load_config_readonly()``; nested blocks join the
+    outer snapshot."""
+    if _CONFIG_SNAPSHOT.get() is not None:
+        yield
+        return
+    try:
+        from hermes_cli.config import load_config_readonly
+        snapshot = load_config_readonly()
+    except Exception:
+        snapshot = {}
+    token = _CONFIG_SNAPSHOT.set(snapshot if isinstance(snapshot, dict) else {})
+    try:
+        yield
+    finally:
+        _CONFIG_SNAPSHOT.reset(token)
+
+
 def _cfg_get(*keys: str, default: Any) -> Any:
-    """``cfg_get`` over the read-only config; *default* on any failure."""
+    """``cfg_get`` over the read-only config (the bound snapshot, if any); *default* on any failure."""
     try:
         from hermes_cli.config import cfg_get, load_config_readonly
-        return cfg_get(load_config_readonly(), *keys, default=default)
+        snapshot = _CONFIG_SNAPSHOT.get()
+        return cfg_get(snapshot if snapshot is not None else load_config_readonly(), *keys, default=default)
     except Exception:
         return default
 
@@ -639,9 +669,9 @@ _BUILTIN_MODEL_METADATA: Dict[Tuple[str, str], Dict[str, Any]] = {
 
 
 def _load_model_overrides() -> Dict[str, Any]:
-    """The ``model_overrides`` config section ({} on any failure). Deliberately not memoized:
-    ``load_config_readonly()`` is already (mtime, size)-cached upstream, and an ``id(cfg)``-keyed
-    layer can serve stale overrides after a reload when CPython reuses the dict address."""
+    """The ``model_overrides`` config section ({} on any failure). Not memoized here: an
+    ``id(cfg)``-keyed layer can serve stale overrides after a reload when CPython reuses the dict
+    address. Per-model loops bind :func:`config_snapshot` instead."""
     return _dict_or_empty(_cfg_get("model_overrides", default={}))
 
 
