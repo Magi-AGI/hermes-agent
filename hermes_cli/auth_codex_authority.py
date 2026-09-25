@@ -40,11 +40,14 @@ logger = logging.getLogger("hermes_cli.auth")
 
 def _bootstrap(fence_all: Optional[str] = None) -> Dict[str, Any]:
     paths = all_store_paths()
-    with store_locks(paths):
+    with store_locks(paths):  # a consistent snapshot of every store to plan from
         view = read_registry()
         payload = plan_registration(view, load_snapshots(paths), only_unregistered=False,
                                     fence_all=fence_all, kind="rebuild" if fence_all else "bootstrap")
-        run_op(payload, view)
+    # PAYLOAD / DECISION / COMMIT need only the migration lock; APPLY takes each store's lock in
+    # turn and its edits are conditional (RULE-M7). No Codex token can move meanwhile: refresh is
+    # never admitted without a registry or while an op touches the chain.
+    run_op(payload, view)
     logger.info("Codex authority registry %s: %d chain(s)", "rebuilt" if fence_all else "created",
                 len(payload.chains))
     return {"chains": len(payload.chains)}

@@ -252,13 +252,20 @@ def _apply_record_action(action: Dict[str, Any]) -> None:
 
 
 def apply_payload(body: Dict[str, Any]) -> None:
-    stores = sorted(set(body["edits"]) | {a["owner"] for a in body["records"]})
-    with store_locks([store_path_of(k) for k in stores]):
-        for key, edits in body["edits"].items():
+    """APPLY, one store at a time (RULE-L1 order: profile stores sorted, root last): each store's
+    row edits and the chain records it owns are written under THAT store's lock only, so lock-
+    taking readers of the other stores are not held for the whole op. Every step is conditional
+    and idempotent (RULE-M7), so the per-store order is recovery-safe."""
+    from hermes_cli.auth_codex_registry import is_root_store
+    keys = set(body["edits"]) | {a["owner"] for a in body["records"]}
+    for key in sorted(keys, key=lambda k: (is_root_store(k), k)):
+        with store_locks([store_path_of(key)]):
+            edits = body["edits"].get(key) or []
             if edits:
                 _apply_store_edits(store_path_of(key), edits)
-        for action in body["records"]:
-            _apply_record_action(action)
+            for action in body["records"]:
+                if action["owner"] == key:
+                    _apply_record_action(action)
 
 
 # ── RULE-M1 recovery ──────────────────────────────────────────────────────────────────────────
