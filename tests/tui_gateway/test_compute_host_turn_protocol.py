@@ -267,3 +267,35 @@ def test_host_builds_the_session_agent_with_the_frame_login(monkeypatch):
     assert captured["auth_user_id"] == "basic:alice"
     assert session["auth_user_id"] == "basic:alice"
     assert server._session_auth_user_id(session) == "basic:alice"
+
+
+def test_a_stop_landing_while_an_isolated_turn_starts_ends_it(turn_env, monkeypatch):
+    """Sibling of the in-process stop race (test_stop_during_turn_start): the host claims the turn
+    (resetting the cancel flag), then admits it; a Stop landing between the two was cleared at
+    admission and the turn ran to its end (found by Codex, T1 round 2)."""
+    out = io.StringIO()
+    host = ComputeHost(stdout=out, heartbeat_secs=0)
+    sid = "s1"
+    ran = []
+    agent = _agent(["should ", "not ", "run"])
+    real_run = agent.run_conversation
+    agent.run_conversation = lambda *a, **kw: ran.append(True) or real_run(*a, **kw)
+    session = _session(agent)
+    server._sessions[sid] = session
+
+    def stop_lands_now(_session):
+        with session["history_lock"]:
+            session["_turn_cancel_requested"] = True
+        return True
+
+    monkeypatch.setattr(server, "_ensure_session_db_row", stop_lands_now)
+    try:
+        host.handle_frame({"type": "turn.start", "sid": sid, "request_id": "stopped", "prompt": "hello"})
+        end = _wait(out, lambda f: f["type"] in ("turn.end", "turn.error"))
+    finally:
+        server._sessions.pop(sid, None)
+        host.close()
+
+    assert not ran, "the stopped isolated turn ran the model"
+    assert end["type"] == "turn.end" and end["interrupted"] is True
+    assert session["running"] is False

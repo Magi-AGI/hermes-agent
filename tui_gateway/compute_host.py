@@ -263,10 +263,13 @@ class ComputeHost:
                 hermes_undo.on_user_message_appended(session["session_key"])
             with contextlib.suppress(Exception):
                 server._persist_branch_seed(session)
+            # The claim above reset _turn_cancel_requested, so a set flag at admission is a Stop aimed
+            # at THIS turn: honor it (the in-process submit path does the same).
             server._run_prompt_submit(
                 request_id, sid, session, text, display_kind=frame.get("display_kind") or None,
                 display_metadata=(frame.get("display_metadata")
-                                  if isinstance(frame.get("display_metadata"), dict) else None))
+                                  if isinstance(frame.get("display_metadata"), dict) else None),
+                honor_pending_stop=True)
             run_thread = session.get("_run_thread")
             if run_thread is not None and hasattr(run_thread, "join"):
                 while run_thread.is_alive():
