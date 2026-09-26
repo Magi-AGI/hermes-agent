@@ -52,20 +52,36 @@ class _Silent:
         self.closed.set()
 
 
-def _gate_codex_watchdog(monkeypatch, gate: threading.Event) -> list[str]:
-    """Let the Codex stream watchdog fire only once ``gate`` is set; return the names of the
-    threads it fired on. Expiry then happens at a point the test chooses, not whenever a short
-    timer happens to run on a loaded runner."""
-    fired: list[str] = []
-    real_fire = aux._CodexStreamGuard._watchdog_fire
+class _CodexWatchdog:
+    """Captures Codex stream guards, records the threads their watchdog fires on, and expires a
+    guard on the test's cue. The requests carry a long timeout so nothing expires by itself (an
+    80 ms one could pass before stream entry, on the owner's own deadline check as well as on the
+    timer); ``expire()`` moves the deadline to now and re-arms the guard's real timer at zero
+    delay, so the real watchdog callback runs on its real timer thread."""
 
-    def gated_fire(self) -> None:
-        if gate.wait(timeout=_HANG_GUARD):
-            fired.append(threading.current_thread().name)
-            real_fire(self)
+    def __init__(self, monkeypatch) -> None:
+        self.guards: list[Any] = []
+        self.fired: list[str] = []
+        real_start, real_fire = aux._CodexStreamGuard.start, aux._CodexStreamGuard._watchdog_fire
 
-    monkeypatch.setattr(aux._CodexStreamGuard, "_watchdog_fire", gated_fire)
-    return fired
+        def start(guard) -> None:
+            self.guards.append(guard)
+            real_start(guard)
+
+        def fire(guard) -> None:
+            self.fired.append(threading.current_thread().name)
+            real_fire(guard)
+
+        monkeypatch.setattr(aux._CodexStreamGuard, "start", start)
+        monkeypatch.setattr(aux._CodexStreamGuard, "_watchdog_fire", fire)
+
+    def expire(self, index: int = 0) -> None:
+        guard = self.guards[index]
+        with guard._deadline_lock:
+            guard._progress_deadline = guard.hard_deadline = time.monotonic()
+        if guard._timer is not None:
+            guard._timer.cancel()
+        guard._arm_timer(0.0)
 
 
 class _BlockingStream(_Silent):
@@ -247,10 +263,9 @@ def test_codex_silent_stream_is_isolated_without_closing_shared_client() -> None
 def test_cancelled_codex_orphan_timeout_preserves_cached_shared_client(monkeypatch) -> None:
     """A cancelled Codex worker's delayed timer owns only its event stream."""
     owner_started = threading.Event()
-    # The orphan's watchdog may fire only after the concurrent call below: "still armed" and
+    # The orphan's watchdog expires only after the concurrent call below: "still armed" and
     # "then it fires and closes only its stream" are ordered by the test, not by a timer.
-    timer_may_fire = threading.Event()
-    fired = _gate_codex_watchdog(monkeypatch, timer_may_fire)
+    watchdog = _CodexWatchdog(monkeypatch)
 
     class _SilentOwnerStream(_Silent):
         def __iter__(self):
@@ -314,7 +329,7 @@ def test_cancelled_codex_orphan_timeout_preserves_cached_shared_client(monkeypat
             with aux.aux_interrupt_protection(cancel_event=cancel_event):
                 aux._relay_sync_completion(
                     wrapper,
-                    {"model": "owner", "messages": [], "timeout": 0.12},
+                    {"model": "owner", "messages": [], "timeout": _HANG_GUARD},
                 )
         except BaseException as exc:
             owner_outcome["exc"] = exc
@@ -345,9 +360,9 @@ def test_cancelled_codex_orphan_timeout_preserves_cached_shared_client(monkeypat
 
         # Let the orphan's real adapter timer fire. It may close the attempt's
         # event stream to wake that worker, but never the process-shared client.
-        timer_may_fire.set()
+        watchdog.expire()
         assert owner_stream.closed.wait(timeout=_HANG_GUARD)
-        assert fired and owner_stream.closed_by in fired, (fired, owner_stream.closed_by)
+        assert watchdog.fired and owner_stream.closed_by in watchdog.fired, (watchdog.fired, owner_stream.closed_by)
         time.sleep(0.03)
         assert not real_client.closed.is_set()
         with aux._client_cache_lock:
@@ -377,7 +392,7 @@ def test_codex_timeout_and_explicit_cancel_have_one_linearized_outcome(
     # under test; an earlier expiry held the decision lock the provider needs to get there) or
     # once the cancel is in (cancel case: the timer then finds the cancel and closes only the
     # attempt stream).
-    fired = _gate_codex_watchdog(monkeypatch, stream_started if winner == "timeout" else request_cancelled)
+    watchdog = _CodexWatchdog(monkeypatch)
 
     class _RacingCancelSource:
         def is_set(self) -> bool:
@@ -420,7 +435,7 @@ def test_codex_timeout_and_explicit_cancel_have_one_linearized_outcome(
             with aux.aux_interrupt_protection(cancel_event=_RacingCancelSource()):
                 aux._relay_sync_completion(
                     wrapper,
-                    {"model": "owner", "messages": [], "timeout": 0.08},
+                    {"model": "owner", "messages": [], "timeout": _HANG_GUARD},
                 )
         except BaseException as exc:
             owner_outcome["exc"] = exc
@@ -429,23 +444,25 @@ def test_codex_timeout_and_explicit_cancel_have_one_linearized_outcome(
     owner.start()
     assert stream_started.wait(timeout=_HANG_GUARD)
     if winner == "timeout":
+        watchdog.expire()
         assert timer_read_started.wait(timeout=_HANG_GUARD)
         request_cancelled.set()
         allow_timer_read_return.set()
     else:
         request_cancelled.set()
+        watchdog.expire()
     owner.join(timeout=_HANG_GUARD)
 
     assert not owner.is_alive()
     if winner == "timeout":
         assert real_client.closed.is_set()
-        assert fired, "the watchdog never fired"
+        assert watchdog.fired, "the watchdog never fired"
         assert isinstance(owner_outcome["exc"], TimeoutError)
         assert not isinstance(owner_outcome["exc"], aux.AuxiliaryExplicitCancellation)
     else:
         assert isinstance(owner_outcome["exc"], aux.AuxiliaryExplicitCancellation)
         assert stream.closed.wait(timeout=_HANG_GUARD), "cancelled timer did not wake its stream"
-        assert fired and stream.closed_by in fired, (fired, stream.closed_by)
+        assert watchdog.fired and stream.closed_by in watchdog.fired, (watchdog.fired, stream.closed_by)
         assert not real_client.closed.is_set()
 
 
