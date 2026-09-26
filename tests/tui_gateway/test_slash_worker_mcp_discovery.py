@@ -26,6 +26,9 @@ if not hasattr(_mcp_server_mod, "MCPServer"):
     )
 
 
+_HANG_GUARD = 60.0  # seconds; every wait below ends on an event
+
+
 def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
     profile_home = tmp_path / "profile-home"
     profile_home.mkdir()
@@ -51,6 +54,9 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
     (profile_home / "config.yaml").write_text(
         yaml.safe_dump(
             {
+                # Which profile's servers the worker sees is under test, not the startup bound:
+                # the 1.5 s default let a cold MCP server on a loaded runner miss the snapshot.
+                "mcp_discovery_timeout": _HANG_GUARD,
                 "mcp_servers": {
                     "profileprobe": {
                         "enabled": True,
@@ -99,9 +105,10 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
         proc.stdin.write(json.dumps({"id": 1, "command": "/tools"}) + "\n")
         proc.stdin.flush()
         try:
-            line = output.get(timeout=10)
+            # Past the worker's discovery bound, so a slow start reports as a hang, not a miss.
+            line = output.get(timeout=2 * _HANG_GUARD)
         except queue.Empty:
-            pytest.fail("slash worker produced no /tools response within 10 seconds")
+            pytest.fail(f"slash worker produced no /tools response within {2 * _HANG_GUARD:.0f} seconds")
         response = json.loads(line)
         assert response["ok"] is True
         assert "mcp__profileprobe__hermes_61922_profile_probe" in response["output"]
