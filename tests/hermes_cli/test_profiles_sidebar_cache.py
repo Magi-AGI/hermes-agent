@@ -17,15 +17,16 @@ _REAL_LOCK = threading.Lock
 
 class _LockWatch:
     """Stands in for ``threading`` while the single-flight decorator builds its locks, and records
-    which threads have queued on a lock another thread holds. ``scan_started()`` (called from the
-    fake scan) counts scans and notes the locks the scanning thread holds at that moment."""
+    which threads are between asking for one of them and getting it. ``scan_started()`` (called
+    from the fake scan) counts scans and notes the locks the scanning thread holds at that moment;
+    a thread still pending on one of those is blocked behind the in-flight scan."""
 
     def __init__(self):
         self.cond = threading.Condition(_REAL_LOCK())
         self.scans = 0
         self._scan_locks = ()
         self._locks = []
-        self._queued = {}
+        self._pending = {}
 
     def Lock(self):  # noqa: N802 - the threading.Lock factory the decorator calls
         lock = _WatchedLock(self)
@@ -43,14 +44,15 @@ class _LockWatch:
                 self._scan_locks = tuple(lock for lock in self._locks if lock.owner == me)
             self.cond.notify_all()
 
-    def queued(self, lock, thread_id):
+    def pending(self, lock, thread_id, is_pending):
         with self.cond:
-            self._queued.setdefault(lock, set()).add(thread_id)
+            waiters = self._pending.setdefault(lock, set())
+            (waiters.add if is_pending else waiters.discard)(thread_id)
             self.cond.notify_all()
 
     def wait_for_burst(self, followers, timeout):
         def ready():
-            waiting = set().union(*(self._queued.get(lock, set()) for lock in self._scan_locks))
+            waiting = set().union(*(self._pending.get(lock, set()) for lock in self._scan_locks))
             return self.scans > 1 or len(waiting) >= followers
 
         with self.cond:
@@ -62,13 +64,17 @@ class _WatchedLock:
         self._lock, self._watch, self.owner = _REAL_LOCK(), watch, None
 
     def acquire(self, blocking=True, timeout=-1):
+        # Pending from before the real acquire until after ownership is published, with no check of
+        # who holds the lock first: that check raced the holder publishing itself (Codex r2).
         me = threading.get_ident()
-        if self.owner not in (None, me):
-            self._watch.queued(self, me)
-        acquired = self._lock.acquire(blocking, timeout)
-        if acquired:
-            self.owner = me
-        return acquired
+        self._watch.pending(self, me, True)
+        try:
+            acquired = self._lock.acquire(blocking, timeout)
+            if acquired:
+                self.owner = me
+            return acquired
+        finally:
+            self._watch.pending(self, me, False)
 
     def release(self):
         self.owner = None
