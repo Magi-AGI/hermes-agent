@@ -18,6 +18,8 @@ import subprocess
 import tarfile
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 INSTALL_SH = REPO_ROOT / "scripts" / "install.sh"
@@ -165,6 +167,7 @@ BROKEN_NODE = (
 HEALTHY_NODE = "#!/bin/sh\necho v26.7.0\n"
 
 
+@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 def test_broken_node_degrades_with_clear_error(tmp_path: Path) -> None:
     code, stdout, stderr, _ = _run_install_node(tmp_path, BROKEN_NODE)
 
@@ -193,6 +196,7 @@ def test_broken_node_degrades_with_clear_error(tmp_path: Path) -> None:
     assert not (link_dir / "npm").exists(), "broken npm symlink left behind"
 
 
+@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 def test_healthy_node_reports_success(tmp_path: Path) -> None:
     code, stdout, stderr, _ = _run_install_node(tmp_path, HEALTHY_NODE)
 
@@ -201,6 +205,7 @@ def test_healthy_node_reports_success(tmp_path: Path) -> None:
     assert "HAS_NODE=true" in stdout
 
 
+@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 def test_libatomic1_is_preinstalled_on_ubuntu(tmp_path: Path) -> None:
     _, _, _, apt_calls = _run_install_node(tmp_path, HEALTHY_NODE)
 

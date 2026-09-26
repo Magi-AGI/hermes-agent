@@ -95,6 +95,7 @@ def _run_pin_block(repo_dir: Path, commit: str, *, force: bool = False) -> str:
     ).stdout
 
 
+@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 def test_stale_pin_does_not_rewind_a_newer_checkout(repo):
     """The reported failure: an old baked-in pin downgrading a current tree."""
     repo_dir, shas = repo
@@ -108,6 +109,7 @@ def test_stale_pin_does_not_rewind_a_newer_checkout(repo):
     assert "already newer" in out
 
 
+@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 def test_force_commit_still_rolls_back(repo):
     """Reproducible/CI installs that genuinely want an older SHA keep working."""
     repo_dir, shas = repo
@@ -117,6 +119,7 @@ def test_force_commit_still_rolls_back(repo):
     assert _git(repo_dir, "rev-parse", "HEAD") == shas[0]
 
 
+@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 def test_pin_to_current_head_is_applied(repo):
     """Pinning to HEAD itself is a no-op checkout, not a skipped one."""
     repo_dir, shas = repo
@@ -127,6 +130,7 @@ def test_pin_to_current_head_is_applied(repo):
     assert "already newer" not in out
 
 
+@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 def test_pin_to_a_newer_commit_is_applied(repo):
     """Rolling FORWARD to a newer pin is the legitimate case — never blocked."""
     repo_dir, shas = repo

@@ -84,6 +84,7 @@ def _make_unmerged_repo(repo: Path) -> None:
     _git(repo, "merge", "feature", check=False)
 
 
+@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 @pytest.mark.live_system_guard_bypass  # runs against a dedicated throwaway repo
 def test_install_sh_clears_unmerged_index_then_stashes(tmp_path: Path) -> None:
     repo = tmp_path / "hermes-agent"

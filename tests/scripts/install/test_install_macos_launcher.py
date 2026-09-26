@@ -9,6 +9,8 @@ import stat
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 INSTALL_SH = REPO_ROOT / "scripts" / "install.sh"
@@ -29,6 +31,7 @@ def _setup_path_function() -> str:
     return match.group(0)
 
 
+@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 def test_venv_launcher_bypasses_uv_console_script_that_requires_realpath(tmp_path: Path) -> None:
     """Stock macOS must start Hermes even when its uv console script needs realpath."""
     install_dir = tmp_path / "install"

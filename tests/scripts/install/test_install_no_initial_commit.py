@@ -64,6 +64,7 @@ def _run_guard(install_dir: Path) -> None:
     assert res.returncode == 0, res.stderr
 
 
+@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 def test_install_sh_guard_moves_commitless_checkout_aside(tmp_path: Path) -> None:
     install_dir = tmp_path / "hermes-agent"
     install_dir.mkdir()

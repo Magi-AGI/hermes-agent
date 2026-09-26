@@ -78,6 +78,7 @@ def _assert_conflict_was_recovered(repo: Path, output: str) -> None:
     assert "<<<<<<<" not in content and ">>>>>>>" not in content
 
 
+@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 @pytest.mark.live_system_guard_bypass
 @pytest.mark.skipif(
     shutil.which("git") is None or shutil.which("bash") is None,
@@ -136,6 +137,7 @@ def test_install_ps1_repository_stage_recovers_from_autostash_conflict(
     _assert_conflict_was_recovered(managed, result.stdout)
 
 
+@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 @pytest.mark.live_system_guard_bypass
 @pytest.mark.skipif(
     shutil.which("git") is None or shutil.which("bash") is None,

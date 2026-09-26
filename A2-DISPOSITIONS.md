@@ -1,0 +1,70 @@
+# A2 dispositions — checklist A17 (track gateway-3)
+
+Host: Windows 11 (the deploy host), Python 3.11 venv of this checkout, tests run only through
+`scripts/run_tests_isolated.py -j 4`. Each item below failed identically on the base commit
+(`c055201423`, sync branch). **None is a Hermes product defect**: all three are test-harness
+assumptions about the host. Two are fixed in the tests themselves (they now pass on every host); one
+is marked for the host it is about.
+
+## 1. `tests/tools/test_file_ops_cwd_tracking.py::…::test_patch_returns_success_only_when_file_actually_written`
+
+**Fixed in the test (two harness bugs); production behaved correctly.**
+
+- **Cause 1: bare `bash` is WSL on this host.** The test's fake terminal envs ran `subprocess.run(["bash", "-c", …])`.
+  On Windows `CreateProcess` searches `System32` before `PATH`, so `bash` is `C:\Windows\System32\bash.exe`, the
+  WSL launcher (`shutil.which` still reports Git Bash, which hides it). WSL has no `/c/...` mount (it uses
+  `/mnt/c`), so every Git-Bash-form path Hermes builds was "not found". Production never spawns a bare `bash`:
+  the local backend uses `tools.environments.local._find_bash()` (Git Bash on Windows).
+- **Cause 2: text-mode stdin.** The fake also piped the payload with `text=True`, which on Windows turns `\n`
+  into `\r\n`. The file landed as `new content\r\n`; production's post-write verification
+  (`on-disk content hash differs from the intended write`) correctly reported the write as failed. Production
+  pipes stdin as UTF-8 bytes (`base_output._pipe_stdin`) precisely to avoid this.
+- **Fix:** the fakes now run through `_run_bash()` in the test module, shaped like the local backend
+  (`_find_bash()`, bytes stdin). 10/10 pass.
+
+The same bare-`bash` harness bug made 14 more tests fail on this host (not in A17's list; same root cause, same
+one-line fix, all now pass): `test_remote_media_fetch` (1), `test_agent_env_advertisement` (1),
+`test_a2a_reason_roundtrip` (2), `test_search_giant_line_containment` (6), `test_file_write_surrogate_roundtrip` (3),
+`test_terminal_compound_background` (1); `test_snapshot_session_id_leak` uses the same call and was switched too.
+Production was checked for the same pattern: the bare-`bash` spawns there are POSIX-only branches
+(`gateway/slash_commands.py`, `gateway/run_shutdown.py` return early on Windows), PowerShell on Windows
+(`hermes_cli/dep_ensure.py`), or an argv run inside a remote sandbox (`tools/environments/remote_common.py`).
+
+## 2. The 42 `tests/scripts/install/` failures (39 test functions; one is parametrized 4 ways)
+
+**Disposition: host-specific by design → `@pytest.mark.linux_only`.**
+
+- Every one executes `scripts/install.sh` (or `setup-hermes.sh`, or a block extracted from them) under
+  `bash`. Those are the Linux/macOS/Termux installers; `install.sh` refuses Windows outright
+  (`CYGWIN*|MINGW*|MSYS*) … "Windows detected. Please use the PowerShell installer"`), and Windows is
+  installed by `install.ps1`, whose tests in the same directory pass here.
+- On this host they ran under WSL's bash (see item 1) with Windows paths, so `E:\GitHub\…\install.sh` arrived
+  as `E:GitHubMagi-AGI…install.sh`; others need symlink privilege (WinError 1314), `apt`/Termux probes or
+  POSIX permissions. Running them under Git Bash instead would still test a script the product never runs on
+  Windows.
+- `linux_only` keeps CI coverage exactly as it was: unmarked tests already ran only on the Linux lane (the
+  macOS/Windows lanes import only files carrying their own marker; `scripts/ci/list_os_marked_tests.py
+  linux_only` now lists the 19 files). Only the failing functions are marked; the `install.ps1` tests in the
+  mixed files still run on Windows.
+
+## 3. `tests/scripts/test_contributor_map.py::test_add_contributor_refuses_a_case_collision`
+
+**Fixed in the test; production behaved correctly.** `add_contributor` returned 1 (refused the case
+collision) as intended. The test then asserted `not (d / "agent@example-host.local").exists()`, which on a
+case-insensitive filesystem is always true, because the existing `agent@Example-Host.local` entry matches the
+lowercase name. It now asserts the directory's real entries and content (still only
+`agent@Example-Host.local` → `someone`), which holds on every filesystem and still catches both a second file
+(case-sensitive hosts) and an overwrite (case-insensitive hosts).
+
+## Found alongside, NOT in A17 (different causes; left for the coordinator)
+
+In the same bare-`bash` test files, 5 more failures have other host-specific causes. All are test assumptions,
+none looked like a product defect:
+
+| Test | Cause on Windows | Suggested disposition |
+|---|---|---|
+| `tests/tools/test_docker_environment.py::test_persistent_bind_mounts_survive_a_session_key_task_id` | asserts no `:` in the bind source, but a Windows host path always carries its drive colon (`C:\…`), which Docker Desktop accepts | test: check the source after `os.path.splitdrive` |
+| `tests/tools/test_docker_environment.py::test_wrapped_exec_scopes_explicit_forward_env_across_profiles` | its fake `docker exec` runs the in-container command with a bare `bash` (WSL here); exit 126 | test: simulate the container with `_find_bash()`, or mark `linux_only` |
+| `tests/test_live_system_guard_self_test.py::test_pty_spawn_systemctl_blocked` | `pty` needs `termios` (POSIX-only module) | mark `linux_only` (pty is POSIX) |
+| `tests/test_live_system_guard_self_test.py::test_os_kill_blocks_foreign_pid` | `FOREIGN_PID = 1` is init on POSIX but does not exist on Windows; the guard rightly treats a missing PID as stale and lets the call through, and `os.kill(1, …)` then raises WinError 87. **Not a guard hole**: a live foreign PID is still blocked | test: pick the foreign PID per host (never a real target), or mark POSIX |
+| `tests/test_live_system_guard.py::test_gateway_start_inside_a_container_exec_is_not_blocked` | the "docker" stub is a `#!/bin/sh` script (not executable on Windows) and the guard sees a Windows path argv | mark POSIX, or a `.cmd` stub on Windows |

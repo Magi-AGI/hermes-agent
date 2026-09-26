@@ -57,6 +57,7 @@ def _extract_install_sh_autostash_block() -> str:
     return match.group(0)
 
 
+@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 @pytest.mark.live_system_guard_bypass
 def test_install_sh_discards_runtime_lockfile_churn_before_stash(
     tmp_path: Path,
@@ -91,6 +92,7 @@ def test_install_sh_discards_runtime_lockfile_churn_before_stash(
     assert (repo / "package-lock.json").read_text() == '{"lock":"old"}\n'
 
 
+@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 @pytest.mark.live_system_guard_bypass
 def test_install_sh_keeps_root_lockfile_for_dirty_workspace_manifest(
     tmp_path: Path,
