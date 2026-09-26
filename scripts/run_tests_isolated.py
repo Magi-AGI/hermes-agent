@@ -156,7 +156,7 @@ def _scan_appended(before: dict) -> tuple[list[str], list[str]]:
 
 def _ls_others(problems: list[str], *flags: str) -> set[str] | None:
     try:
-        out = subprocess.run(["git", "-C", str(REPO), "ls-files", "--others", "--exclude-standard", *flags, "-z"],
+        out = subprocess.run(["git", "-C", str(REPO), "ls-files", "-z", "--others", "--exclude-standard", *flags],
                              capture_output=True, check=True, timeout=120).stdout
     except (OSError, subprocess.SubprocessError) as exc:
         problems.append(f"cannot list untracked files: {exc}")
