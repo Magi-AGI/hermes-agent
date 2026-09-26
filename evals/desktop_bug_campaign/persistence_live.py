@@ -1,7 +1,6 @@
 """Real serve/WS profile-rebuild probe; deterministic loopback model, no vendor inference."""
 import argparse
 import json
-import os
 from pathlib import Path
 import socket
 import sqlite3
@@ -12,7 +11,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from sealed_home import seal_user_dirs
+from sealed_home import sealed_env
 
 
 def main():
@@ -68,8 +67,7 @@ def main():
         (p / 'SOUL.md').write_text('You are a deterministic test assistant.\n')
         (p / '.no-bundled-skills').touch()
     (profile / 'profile.yaml').write_text('name: worker\nui_meta:\n  hermes-bots:\n    title: Worker\n')
-    env = {k: v for k, v in os.environ.items() if not (k.startswith('HERMES_') or 'API_KEY' in k or 'TOKEN' in k or k in ('PYTHONPATH', 'PYTEST_PLUGINS'))}
-    seal_user_dirs(env, home / 'os-home')
+    env = sealed_env(home / 'os-home')
     env.update(HERMES_HOME=str(home), HERMES_DASHBOARD_SESSION_TOKEN='persistence-fixture-token', HERMES_IGNORE_RULES='1', PYTHONPATH=str(args.repo), OPENAI_API_KEY='local-fixture')
     log = (args.out / 'serve.log').open('w')
     cmd = [sys.executable, '-m', 'hermes_cli.main', 'serve', '--isolated', '--port', str(args.port)]
