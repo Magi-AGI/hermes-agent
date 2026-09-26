@@ -288,7 +288,14 @@ def _title_match_result(db, query: str, current_lineage_root: Optional[str]) -> 
                           "get_session failed for title match %s", session_id) or {}
     if session_meta.get("source") in _HIDDEN_SESSION_SOURCES:
         return None
-    messages = _quiet(lambda: db.get_messages(session_id), [], "get_messages failed for title match %s", session_id)
+    # Only the first five and last three rows (plus a count) feed the fallbacks below: never load the
+    # whole transcript (the 09-12 desktop OOM was one 102 MB session read in full).
+    messages = _quiet(lambda: db.get_messages(session_id, limit=5), [],
+                      "get_messages failed for title match %s", session_id)
+    tail = _quiet(lambda: db.get_messages(session_id, latest=True, limit=3), [],
+                  "get_messages failed for title match %s", session_id)
+    total = _quiet(lambda: db.active_message_count(session_id), len(messages),
+                   "active_message_count failed for title match %s", session_id)
     anchor_id = messages[0].get("id") if messages else None
     view = {} if anchor_id is None else _quiet(
         lambda: db.get_anchored_view(session_id, anchor_id, window=5, bookend=3), {},
@@ -305,8 +312,8 @@ def _title_match_result(db, query: str, current_lineage_root: Optional[str]) -> 
         snippet=f"Session title matched: {title}",
         bookend_start=shape("bookend_start", messages[:3]),
         messages=shape("window", messages[:5], anchor_id, max_content_len=4000),
-        bookend_end=shape("bookend_end", messages[-3:]), messages_before=view.get("messages_before", 0),
-        messages_after=view.get("messages_after", max(len(messages) - 5, 0)), detail="full"),
+        bookend_end=shape("bookend_end", tail), messages_before=view.get("messages_before", 0),
+        messages_after=view.get("messages_after", max(total - 5, 0)), detail="full"),
         "_lineage_root": lineage_root}
 
 
@@ -448,15 +455,23 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_prof
     meta = _get_session_meta(db, session_id)
     if not meta:
         return tool_error(f"session_id not found: {session_id}", success=False)
-    rows, err = _loud(lambda: db.get_messages(session_id), "get_messages failed for %s: %s", "failed to load session",
-                      session_id)
+    def load():
+        # Count, then read only what is shown: never the whole transcript (the 09-12 desktop OOM was
+        # one 102 MB session read in full).
+        total = db.active_message_count(session_id)
+        if total <= head + tail:
+            return total, db.get_messages(session_id)
+        return total, db.get_messages(session_id, limit=head) + db.get_messages(session_id, latest=True, limit=tail)
+
+    loaded, err = _loud(load, "get_messages failed for %s: %s", "failed to load session", session_id)
     if err:
         return err
+    total, rows = loaded
     shaped = [_shape_message(m, max_content_len=_READ_MAX_CONTENT) for m in rows]
-    total, truncated = len(shaped), len(shaped) > head + tail
+    truncated = total > head + tail
     return _ok(mode="read", session_id=session_id, link=_session_link(session_id, link_profile),
                session_meta=_session_meta_block(meta), message_count=total, truncated=truncated,
-               messages=shaped[:head] + shaped[-tail:] if truncated else shaped,
+               messages=shaped,
                **({"message": (f"Session has {total} messages; showing first {head} + last {tail}. "
                                "Pass around_message_id (any id above) to scroll the middle.")} if truncated else {}))
 

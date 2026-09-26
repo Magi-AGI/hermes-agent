@@ -230,6 +230,34 @@ async def test_topic_restore_quote_unwraps_merged_assistant_carrier(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_topic_restore_quote_never_loads_the_whole_transcript(tmp_path):
+    """The quote needs the newest assistant reply only; reading the whole transcript is what took down
+    the desktop on 09-12 (one 102 MB session). Peak Python allocation stays a small fraction of it."""
+    import tracemalloc
+
+    rows, payload = 1200, 20_000  # ~24 MB of message content
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.enable_telegram_topic_mode(chat_id="208214988", user_id="208214988")
+    db.create_session(session_id="restorable", source="telegram", user_id="208214988")
+    db.append_messages_batch("restorable", [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"{i:05d}" + "x" * payload}
+        for i in range(rows)])
+    db.append_message("restorable", "assistant", "real completed answer")
+    runner = _make_runner(session_db=db)
+
+    tracemalloc.start()
+    try:
+        result = await runner._restore_telegram_topic_session(
+            _make_event("/topic restorable", thread_id="17585"), "restorable")
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+        db.close()
+    assert "Last Hermes message:\nreal completed answer" in result
+    assert peak < rows * payload / 10, f"peak {peak / 1e6:.1f} MB for a {rows * payload / 1e6:.0f} MB transcript"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("thread_id", [None, "1"])
 async def test_internal_root_telegram_dm_event_bypasses_topic_lobby(
     monkeypatch, thread_id

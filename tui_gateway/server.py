@@ -2819,13 +2819,21 @@ def _live_visible_history(session: dict, db, in_memory_fallback: list[dict]) -> 
     resume/REST so the payloads agree) reconciled with the in-memory tail; in-memory when the DB is unavailable."""
     key = session.get("session_key")
     if db is not None and key:
+        from hermes_state import SessionResumeTooLargeError
         try:
+            # Cold resume's bound (sessions.max_resume_messages): past it a switch keeps the in-memory
+            # history instead of materializing the lineage (the 09-12 OOM re-read one 102 MB session);
+            # the full transcript is REST-paged.
+            if callable(guard := getattr(db, "assert_resume_safe", None)):
+                guard(key)
             # include_compacted: a compacted session's archived turns are still the user's
             # conversation; without them a warm switch repainted the chat as summary + tail only.
             display = db.get_messages_as_conversation(
                 key, include_ancestors=True, include_row_ids=True, include_compacted=True)
             # See #92080.
             return _reconcile_display_with_live(display, in_memory_fallback)
+        except SessionResumeTooLargeError as exc:
+            logger.info("live display projection for %s kept in memory: %s", key, exc)
         except Exception:
             logger.debug("live display projection read failed", exc_info=True)
     return in_memory_fallback

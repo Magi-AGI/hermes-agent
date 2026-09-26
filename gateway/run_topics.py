@@ -31,6 +31,7 @@ _TOPIC_RESTORE_STEPS = (
     "1. Create or open a topic. To create a new one, open All Messages and send any message there.",
     "2. Send /topic <session-id> inside that topic.",
 )
+_RESTORE_QUOTE_PAGE = 50  # rows per page while looking back for the last assistant reply
 
 
 def _collapse_title(title: str) -> str:
@@ -641,12 +642,20 @@ class GatewayTopicThreadsMixin:
         title = await db.get_session_title(session_id) or session_id
         last_assistant = None
         with suppress(Exception):
-            for message in reversed(await db.get_messages(session_id)):
-                if message.get("role") != "assistant":
-                    continue
-                projected = project_compaction_message_for_display(message)
-                if projected is not None and projected.get("content"):
-                    last_assistant = str(projected.get("content"))
+            # Newest page first, never the whole transcript (the 09-12 desktop OOM was one 102 MB
+            # session read in full).
+            offset = 0
+            while last_assistant is None:
+                page = await db.get_messages(session_id, latest=True, limit=_RESTORE_QUOTE_PAGE, offset=offset)
+                for message in reversed(page):
+                    if message.get("role") != "assistant":
+                        continue
+                    projected = project_compaction_message_for_display(message)
+                    if projected is not None and projected.get("content"):
+                        last_assistant = str(projected.get("content"))
+                        break
+                if len(page) < _RESTORE_QUOTE_PAGE:
                     break
+                offset += _RESTORE_QUOTE_PAGE
         response = f"Session restored: {title}"
         return response + (f"\n\nLast Hermes message:\n{last_assistant}" if last_assistant else "")
