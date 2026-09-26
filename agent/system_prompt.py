@@ -822,20 +822,26 @@ def __getattr__(name):  # PEP 562 — lazy so no import cycles
 # that row's prompt missing is a genuinely lost write; a prompt never persisted here (first turn in
 # a pre-created row, a row another process owns) is not.
 _PERSISTED_PROMPT_SESSIONS_MAX = 4096
-_persisted_prompt_sessions: "dict[str, None]" = {}
+_persisted_prompt_sessions: "dict[tuple, None]" = {}
 _persisted_prompt_lock = threading.Lock()
 
 
-def note_system_prompt_persisted(session_id) -> None:
+def _persisted_key(session_db, session_id) -> tuple:
+    # Keyed by store as well: two profile stores may hold the same session id.
+    return (str(getattr(session_db, "db_path", "") or ""), session_id)
+
+
+def note_system_prompt_persisted(session_db, session_id) -> None:
     if not session_id:
         return
+    key = _persisted_key(session_db, session_id)
     with _persisted_prompt_lock:
-        _persisted_prompt_sessions.pop(session_id, None)
-        _persisted_prompt_sessions[session_id] = None
+        _persisted_prompt_sessions.pop(key, None)
+        _persisted_prompt_sessions[key] = None
         while len(_persisted_prompt_sessions) > _PERSISTED_PROMPT_SESSIONS_MAX:
             del _persisted_prompt_sessions[next(iter(_persisted_prompt_sessions))]
 
 
-def system_prompt_persisted_here(session_id) -> bool:
+def system_prompt_persisted_here(session_db, session_id) -> bool:
     with _persisted_prompt_lock:
-        return session_id in _persisted_prompt_sessions
+        return _persisted_key(session_db, session_id) in _persisted_prompt_sessions

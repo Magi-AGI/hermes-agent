@@ -667,5 +667,22 @@ class TestPromptNullSignal:
         assert any("although this process persisted it" in m for m in self._warnings(caplog))
 
 
+    def test_the_same_session_id_in_another_store_is_not_a_lost_write(self, tmp_path, caplog):
+        """Round 1 (Codex): the tracker keyed by session id alone, and two profile stores may hold
+        the same id, so a first turn in store B read as a write lost from store A."""
+        from hermes_state import SessionDB
+
+        (tmp_path / "a").mkdir()
+        (tmp_path / "b").mkdir()
+        with (SessionDB(db_path=tmp_path / "a" / "state.db") as db_a,
+              SessionDB(db_path=tmp_path / "b" / "state.db") as db_b):
+            db_a.create_session("shared-id", source="cli")
+            db_b.create_session("shared-id", source="cli")
+            self._restore(db_a, "shared-id", caplog)
+            caplog.clear()
+            self._restore(db_b, "shared-id", caplog)
+        assert self._warnings(caplog) == []
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

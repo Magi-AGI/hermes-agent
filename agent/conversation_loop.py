@@ -650,7 +650,7 @@ def _persist_system_prompt(agent, failure_message: str, *, persist_tools: bool =
     try:
         agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
         from agent.system_prompt import note_system_prompt_persisted
-        note_system_prompt_persisted(agent.session_id)
+        note_system_prompt_persisted(agent._session_db, agent.session_id)
         if persist_tools:
             from tools.mcp_tool_agent import persist_agent_tool_names
             persist_agent_tool_names(agent)
@@ -775,7 +775,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
             "change; rebuilding it this turn (one prefix-cache miss).", agent.session_id)
     elif conversation_history and stored_state in ("null", "empty"):
         from agent.system_prompt import system_prompt_persisted_here
-        if system_prompt_persisted_here(agent.session_id):
+        if system_prompt_persisted_here(agent._session_db, agent.session_id):
             # This process wrote the prompt and it is gone: every turn would now rebuild and
             # miss the prefix cache.
             logger.warning(
