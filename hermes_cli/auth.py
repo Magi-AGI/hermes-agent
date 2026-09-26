@@ -593,13 +593,17 @@ def _kernel_lock(lock_file: Any, acquire: bool) -> None:
 
 def _open_lock_file(lock_path: Path, mode: str, deadline: float):
     """Open the lock file, retrying a Windows sharing violation from a peer creating/writing it
-    (WinError 5/32/33) until *deadline*; after it the last error is raised unchanged."""
+    (WinError 5/32/33) until *deadline*. Contention that outlasts the deadline is a lock that could
+    not be ACQUIRED: ``LockAcquisitionTimeout`` (retryable busy, never a credential verdict). Any
+    other error is raised unchanged at once."""
     while True:
         try:
             return lock_path.open(mode, encoding="utf-8")
         except OSError as exc:
-            if not is_contended_error(exc) or time.monotonic() >= deadline:
+            if not is_contended_error(exc):
                 raise
+            if time.monotonic() >= deadline:
+                raise LockAcquisitionTimeout(f"Timed out opening the lock file {lock_path}: {exc}") from exc
             time.sleep(0.05)
 
 

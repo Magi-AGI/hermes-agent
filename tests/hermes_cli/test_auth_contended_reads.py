@@ -87,9 +87,13 @@ def test_lock_file_open_raises_after_its_deadline(tmp_path, monkeypatch, content
     (tmp_path / "auth.lock").write_text(" ", encoding="utf-8")
     wrapped, _calls = _failing(Path.open, 10 ** 6, _contended)
     monkeypatch.setattr(Path, "open", wrapped)
-    with pytest.raises(PermissionError):
+    from hermes_cli.auth_credential_io import LockAcquisitionTimeout
+    # Contention that outlasts the budget is a lock that could not be acquired (retryable busy),
+    # never granted without its file; the sharing violation stays attached as the cause.
+    with pytest.raises(LockAcquisitionTimeout) as err:
         with auth._file_lock(tmp_path / "auth.lock", threading.local(), 1.0, "timeout"):
             pytest.fail("the lock must not be granted without its file")
+    assert isinstance(err.value.__cause__, PermissionError)
 
 
 @pytest.mark.windows_only
