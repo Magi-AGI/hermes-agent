@@ -31,7 +31,8 @@ What this runner guarantees, and what it does not:
    lookup) lands here. Ignored paths count too (collapsed per directory, so a write inside an
    already-present ignored directory is not seen), except the runner's own caches and durations
    file; ``.claude/`` is agent tooling state that other sessions write, so it is not counted.
-   Editing the tree during a run trips it too.
+   Anyone else adding a file to the tree during the run trips it too. Not seen: changes to
+   tracked files, and writes inside an ignored directory that existed before the run.
 
 Usage: python scripts/run_tests_isolated.py [--timeout SECONDS] [--] [run_tests_parallel.py args]
 """
