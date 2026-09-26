@@ -592,12 +592,32 @@ _background_probes_lock = _threading.Lock()
 
 def _probe_identity(api_key: Any, api_url: str, native_catalog_provider: str, has_explicit_models: bool,
                     headers: dict | None, api_mode: str | None) -> tuple:
-    """A matching URL is not identity: the credential and headers are part of it."""
+    """Who is asking, not only where: a matching URL is not identity. The owning profile home and the
+    inputs a credential resolves from implicitly (that profile's config, .env, auth.json) are part of
+    it, or one profile's in-flight probe would hand its private catalog to another (Codex, T1 r3). A
+    command credential is keyed by its stable ``cache_identity`` (each picker build mints a fresh
+    CommandTokenSource, so an object id never matched and every build started its own probe)."""
     import hashlib
     import json as _json
-    key_part = f"callable:{id(api_key)}" if callable(api_key) else hashlib.sha256(str(api_key or "").encode()).hexdigest()
-    return (api_url, native_catalog_provider, has_explicit_models, api_mode, key_part,
-            _json.dumps(headers or {}, sort_keys=True, default=str))
+    from pathlib import Path
+
+    from agent.command_token_source import CommandTokenSource
+    from hermes_cli.config import _load_config_cache_sig, get_config_path
+    from hermes_constants import get_hermes_home
+    from utils import file_signature
+
+    home = Path(get_hermes_home())
+    credential = api_key.cache_identity if isinstance(api_key, CommandTokenSource) else (
+        f"callable:{id(api_key)}" if callable(api_key) else str(api_key or ""))
+    inputs = []
+    for path in (home / ".env", home / "auth.json"):
+        try:
+            inputs.append(file_signature(path.stat()))
+        except OSError:
+            inputs.append(None)
+    return (str(home), _load_config_cache_sig(get_config_path())[1], tuple(inputs),
+            api_url, native_catalog_provider, has_explicit_models, api_mode,
+            hashlib.sha256(credential.encode()).hexdigest(), _json.dumps(headers or {}, sort_keys=True, default=str))
 
 
 def _bounded_live_probe(identity: tuple, fetch, budget_s: float):
