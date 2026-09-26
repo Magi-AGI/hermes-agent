@@ -124,10 +124,12 @@ def _missing(exc: OSError) -> bool:
 
 
 def _refuse_incomplete(what: str, exc: object) -> CodexAuthorityRefused:
+    from hermes_cli.auth_codex_registry import _signin_command
     return CodexAuthorityRefused(
         f"This restore can't tell which files hold this installation's credentials ({what}: {exc}); "
-        "nothing was restored. Fix the access problem (or run `hermes auth migrate --rebuild` for an "
-        "unreadable registry) and restore again.")
+        "nothing was restored. Fix the access problem and restore again; if the Codex login registry "
+        f"itself is damaged, sign in again with `{_signin_command()}` first (it rebuilds the registry "
+        "with every older Codex login paused).")
 
 
 def _authority_stores() -> List[Path]:
