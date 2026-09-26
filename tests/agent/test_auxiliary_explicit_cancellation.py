@@ -33,15 +33,21 @@ def _settle_threads_started_by_the_test():
     watchdog blocked on unreleased gates after teardown."""
     before = set(threading.enumerate())
     yield
-    while _SILENT_FAKES:
-        _SILENT_FAKES.pop().release()
-    started = [t for t in threading.enumerate() if t not in before]
-    for thread in started:
-        if isinstance(thread, threading.Timer):
-            thread.cancel()  # a pending one never runs; a running one finishes once released
-    for thread in started:
-        thread.join(timeout=_HANG_GUARD)
-    survivors = [t.name for t in started if t.is_alive()]
+    # Re-scan until quiet: a thread being joined can itself start one (an owner launching its
+    # provider), which a single snapshot never sees (Codex r4).
+    deadline = time.monotonic() + _HANG_GUARD
+    while True:
+        while _SILENT_FAKES:
+            _SILENT_FAKES.pop().release()
+        live = [t for t in threading.enumerate() if t not in before and t.is_alive()]
+        if not live or time.monotonic() >= deadline:
+            break
+        for thread in live:
+            if isinstance(thread, threading.Timer):
+                thread.cancel()  # a pending one never runs; a running one finishes once released
+        for thread in live:
+            thread.join(timeout=max(deadline - time.monotonic(), 0.0))
+    survivors = [t.name for t in threading.enumerate() if t not in before and t.is_alive()]
     assert not survivors, f"threads outlived teardown: {survivors}"
 
 
