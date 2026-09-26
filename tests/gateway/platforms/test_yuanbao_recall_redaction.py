@@ -3,8 +3,9 @@
 It used to load the transcript, blank the entry in memory and rewrite the WHOLE live transcript: a
 message landing between the load and the rewrite was deleted, compaction-archived copies of the
 recalled text survived, and nothing stopped a turn still holding the conversation from writing the
-recalled message back afterwards. Now one transaction overwrites exactly the recalled row wherever it
-is stored (live, archived, queued for a retried write) and waits for a live turn to let go first.
+recalled message back afterwards. Now a recall is a durable request settled in one fenced
+transaction over every stored and retry copy; it waits for a live turn to let go first, and whichever
+path gets there (the recall itself, a spool drain, boot recovery, the housekeeping tick) finishes it.
 """
 
 import asyncio
@@ -67,10 +68,10 @@ def test_only_the_recalled_message_is_overwritten_everywhere_it_is_stored(store)
 
     asyncio.run(recall())
     rows = _rows(db, sid)
-    assert not [r for r in rows if SECRET in (r[1] or "")]
     assert ("assistant", "noted", 1) in rows and ("user", "unrelated, keep me", 1) in rows
     assert len(rows) == 4  # nothing deleted, nothing appended (no branch-B note)
-    assert SECRET not in str(store._dirty_transcripts.get(sid))
+    store.append_to_transcript(sid, {"role": "assistant", "content": "later"})  # flushes the queued copy
+    assert not [r for r in _rows(db, sid) if SECRET in (r[1] or "")]
 
 
 def test_a_live_turn_holding_the_conversation_defers_the_redaction(store, monkeypatch):
@@ -136,7 +137,7 @@ def test_a_compression_rotation_mid_recall_is_followed_to_the_new_tip(store, tmp
     db = store._db
     db.append_message(session_id=sid, role="user", content=SECRET, platform_message_id="p1")
     sibling = SessionDB(db_path=tmp_path / "state.db")
-    original = db.redact_user_message
+    original = db.resolve_recall
     rotated = []
 
     def rotate_first(ids, **kw):
@@ -150,7 +151,7 @@ def test_a_compression_rotation_mid_recall_is_followed_to_the_new_tip(store, tmp
             sibling.release_compression_lock(sid, "compressor")
         return original(ids, **kw)
 
-    db.redact_user_message = rotate_first
+    db.resolve_recall = rotate_first
     try:
         _recall(adapter, tasks, "p1", SECRET)
     finally:
@@ -191,19 +192,24 @@ def test_identity_is_resolved_across_the_retry_queue_and_spool_before_anything_c
             {"role": "user", "content": "repeat", "timestamp": 1_700_000_100.0}]
     assert spool_dropped_transcript_message(sid, {"role": "user", "content": "repeat", "timestamp": 1_700_000_200.0})
     _recall(adapter, tasks, "missing", "repeat")
-    everywhere = ([r[1] for r in _rows(db, sid) if r[0] == "user"]  # the note's append flushes the queue
+    everywhere = ([r[1] for r in _rows(db, sid) if r[0] == "user"]
                   + [m["content"] for m in store._dirty_transcripts.get(sid, [])]
                   + [m["content"] for _p, _pl, m in spooled_transcript_messages({sid})])
     assert everywhere.count("repeat") == 3 and RecallGuardMiddleware._REDACTED not in everywhere
     assert any(r[0] == "system" and "missing" in r[1] for r in _rows(db, sid))
+    store._spooled_drop_sessions = {sid}
+    store.append_to_transcript(sid, {"role": "assistant", "content": "next"})  # the hold is released
+    assert not spooled_transcript_messages({sid}) and not store._dirty_transcripts.get(sid)
+    assert [r[1] for r in _rows(db, sid) if r[0] == "user"].count("repeat") == 3
 
     tasks.clear()
     db.append_message(session_id=sid, role="user", content="same words")  # an unrelated, older message
     with store._transcript_retry_lock:
         store._dirty_transcripts[sid] = [{"role": "user", "content": "same words", "message_id": "p9"}]
     _recall(adapter, tasks, "p9", "same words")
-    assert store._dirty_transcripts[sid][0]["content"] == RecallGuardMiddleware._REDACTED
-    assert ("user", "same words", 1) in _rows(db, sid)
+    store.append_to_transcript(sid, {"role": "assistant", "content": "after"})  # flushes the queued copy
+    user_rows = [r[1] for r in _rows(db, sid) if r[0] == "user"]
+    assert user_rows.count("same words") == 1 and RecallGuardMiddleware._REDACTED in user_rows
 
 
 @pytest.mark.windows_only
@@ -283,8 +289,8 @@ def test_identity_is_decided_inside_the_fenced_transaction(store, tmp_path, monk
 
     monkeypatch.setattr(shutdown_flush, "spooled_transcript_messages", turn_finishes_in_the_gap)
     try:
-        store.redact_user_message(sid, platform_message_id="target", content="repeat",
-                                  replacement=RecallGuardMiddleware._REDACTED)
+        store.recall_message(sid, request_id="target", platform_message_id="target", content="repeat",
+                             replacement=RecallGuardMiddleware._REDACTED)
     finally:
         sibling.close()
     rows = _rows(db, sid)
@@ -303,36 +309,37 @@ def test_the_fence_applies_when_nothing_is_stored_yet_or_only_an_undated_retry_c
     db = store._db
     assert db.acquire_session_turn_lease(sid, "live-turn", wait_seconds=0)
     with pytest.raises(SessionTurnLeaseLostError):
-        store.redact_user_message(sid, platform_message_id="target", content=SECRET, replacement="x")
+        store.recall_message(sid, request_id="r1", platform_message_id="target", content=SECRET, replacement="x")
     with store._transcript_retry_lock:
         store._dirty_transcripts[sid] = [{"role": "user", "content": SECRET}]
     with pytest.raises(SessionTurnLeaseLostError):
-        store.redact_user_message(sid, content=SECRET, replacement="x")
+        store.recall_message(sid, request_id="r2", content=SECRET, replacement="x")
     assert store._dirty_transcripts[sid][0]["content"] == SECRET  # untouched while fenced
 
 
 @pytest.mark.windows_only
-def test_a_failed_spool_rewrite_is_retried_and_replay_still_writes_the_redaction(store):
-    """Round 3 (Codex): the spool was readable but its replacement failed; the recall task ended and
-    the next replay restored an id-less original beside its redacted copy."""
-    import time as _time
-
-    from gateway.shutdown_flush import TranscriptSpoolIncompleteError, spool_dropped_transcript_message
+def test_an_undated_spooled_copy_that_cannot_be_stamped_yet_is_retried_and_replays_as_the_redaction(store):
+    """Round 3 (Codex): the spool was readable but its update failed; the recall task ended and the
+    next replay restored an id-less original beside its redacted copy. An undated copy (spooled by an
+    earlier build) must first get a durable timestamp, or replay cannot be matched to the withdrawal."""
+    from gateway.shutdown_flush import (
+        TRANSCRIPT_CAP_DROP_REASON, TranscriptSpoolIncompleteError, _get_flush_dir, _write_payload)
 
     tasks: list = []
     adapter = _adapter(store, tasks)
     sid = _session(store, adapter)
     db = store._db
-    stamp = _time.time() - 5
-    path = spool_dropped_transcript_message(sid, {"role": "user", "content": SECRET, "timestamp": stamp})
+    path = _write_payload(_get_flush_dir(), {"session_key": sid, "reason": TRANSCRIPT_CAP_DROP_REASON, "ts": 1,
+                                             "data": {"session_id": sid, "message": {"role": "user", "content": SECRET}}})
     store._spooled_drop_sessions = {sid}
     release = _hold_windows_file(path, 0x1)  # FILE_SHARE_READ only: readable, not replaceable
     try:
         with pytest.raises(TranscriptSpoolIncompleteError):
-            store.redact_user_message(sid, content=SECRET, replacement=RecallGuardMiddleware._REDACTED)
+            store.recall_message(sid, request_id="r1", content=SECRET, replacement=RecallGuardMiddleware._REDACTED)
     finally:
         release()
-    store.append_to_transcript(sid, {"role": "assistant", "content": "next"})  # replays the spool
+    for n in range(2):  # the first drain settles and stamps the held copy, the next replays it
+        store.append_to_transcript(sid, {"role": "assistant", "content": f"next {n}"})
     assert not [r for r in _rows(db, sid) if SECRET in (r[1] or "")]
     assert ("user", RecallGuardMiddleware._REDACTED, 1) in _rows(db, sid)
 
@@ -341,12 +348,7 @@ def test_a_failed_spool_rewrite_is_retried_and_replay_still_writes_the_redaction
 def test_a_pending_recall_survives_a_restart_and_boot_recovery_honours_it(store, tmp_path):
     """Round 3 (Codex): the pending recall lived only in memory; a new process's boot recovery replayed
     the unread spool file and inserted the original text."""
-    import subprocess
-    import sys
-    from pathlib import Path
-
     from gateway.shutdown_flush import TranscriptSpoolIncompleteError, spool_dropped_transcript_message
-    from hermes_constants import get_hermes_home
 
     tasks: list = []
     adapter = _adapter(store, tasks)
@@ -355,12 +357,23 @@ def test_a_pending_recall_survives_a_restart_and_boot_recovery_honours_it(store,
     release = _hold_windows_file(path, 0)  # no sharing: unreadable
     try:
         with pytest.raises(TranscriptSpoolIncompleteError):
-            store.redact_user_message(sid, platform_message_id="p1", content=SECRET,
-                                      replacement=RecallGuardMiddleware._REDACTED)
+            store.recall_message(sid, request_id="p1", platform_message_id="p1", content=SECRET,
+                                 replacement=RecallGuardMiddleware._REDACTED)
     finally:
         release()
     store._db.close()
-    repo = str(Path(__file__).resolve().parents[3])
+    assert "recovered 1" in _boot(tmp_path)
+    assert not [r for r in _stored_rows(tmp_path, sid) if SECRET in (r[1] or "")]
+
+
+def _boot(tmp_path) -> str:
+    """Boot recovery in a fresh process (nothing in memory survives): its output."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    from hermes_constants import get_hermes_home
     boot = (
         "import sys; sys.path.insert(0, sys.argv[1])\n"
         "from pathlib import Path\n"
@@ -369,16 +382,28 @@ def test_a_pending_recall_survives_a_restart_and_boot_recovery_honours_it(store,
         "db = SessionDB(db_path=Path(sys.argv[2]))\n"
         "print('recovered', recover_pending_to_db(db))\n"
         "db.close()\n")
-    proc = subprocess.run([sys.executable, "-c", boot, repo, str(tmp_path / "state.db")],
-                          capture_output=True, text=True, timeout=120,
-                          env={**__import__("os").environ, "HERMES_HOME": str(get_hermes_home())})
-    assert "recovered 1" in proc.stdout, proc.stderr[-2000:]
+    proc = subprocess.run([sys.executable, "-c", boot, str(Path(__file__).resolve().parents[3]),
+                           str(tmp_path / "state.db")], capture_output=True, text=True, timeout=120,
+                          env={**os.environ, "HERMES_HOME": str(get_hermes_home())})
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    return proc.stdout
+
+
+def _stored_rows(tmp_path, sid):
     reopened = SessionDB(db_path=tmp_path / "state.db")
     try:
-        rows = _rows(reopened, sid)
+        return _rows(reopened, sid)
     finally:
         reopened.close()
-    assert rows and not [r for r in rows if SECRET in (r[1] or "")]
+
+
+def _db_recall(db, sid, request_id, *, platform_message_id=None, content=None, replacement="[redacted]"):
+    """A recall straight against the database: open the request, then settle it."""
+    from gateway.transcript_recall import settle_recall
+    lineage = db.recall_lineage(sid)
+    db.open_recall_request(lineage, request_id=request_id, platform_message_id=platform_message_id,
+                           content=content, replacement=replacement)
+    return settle_recall(db, db.recall_request(lineage, request_id))
 
 
 def _fts_hits(db, word):
@@ -406,12 +431,11 @@ def test_an_upgraded_store_keeps_its_search_index_consistent_through_a_recall(tm
     old.create_session("s", "cli")
     old.append_message(session_id="s", role="user", content="secretword here", platform_message_id="p1")
     old._execute_write(lambda conn: conn.executescript(  # the store as it was before recalls existed
-        "DROP TABLE recalled_messages; DROP TRIGGER IF EXISTS messages_recall_insert; "
-        "DROP TRIGGER IF EXISTS messages_recall_update;"))
+        "DROP TABLE recalled_messages; DROP TABLE recall_requests;"))
     old.close()
     db = SessionDB(db_path=path)
     try:
-        db.redact_user_message(["s"], platform_message_id="p1", content="secretword here", replacement="[redacted]")
+        _db_recall(db, "s", "p1", platform_message_id="p1", content="secretword here")
         db.append_message(session_id="s", role="user", content="secretword here", platform_message_id="p1")  # a late copy
         row_id = db.append_message(session_id="s", role="user", content="other", platform_message_id="p1")
         db.set_user_message_content("s", row_id, "secretword again")  # a prologue rewrite of a withdrawn row
@@ -429,9 +453,9 @@ def test_a_new_recall_of_equal_text_is_not_mistaken_for_an_earlier_one(tmp_path)
     try:
         db.create_session("s", "cli")
         db.append_message(session_id="s", role="user", content="repeat", timestamp=1_700_000_100.0)
-        assert db.redact_user_message(["s"], content="repeat", request_id="r1", replacement="[x]")[0] == 1
+        assert _db_recall(db, "s", "r1", content="repeat", replacement="[x]") == (1, "resolved")
         db.append_message(session_id="s", role="user", content="repeat", timestamp=1_700_000_200.0)
-        assert db.redact_user_message(["s"], content="repeat", request_id="r2", replacement="[x]")[0] == 1
+        assert _db_recall(db, "s", "r2", content="repeat", replacement="[x]") == (1, "resolved")
         assert [r[1] for r in _rows(db, "s")] == ["[x]", "[x]"]
     finally:
         db.close()
@@ -445,7 +469,7 @@ def test_recorded_recalls_survive_recovery_and_a_profile_move(tmp_path):
     source = SessionDB(db_path=tmp_path / "source.db")
     source.create_session("s", "cli")
     source.append_message(session_id="s", role="user", content=SECRET, platform_message_id="p1")
-    source.redact_user_message(["s"], platform_message_id="p1", replacement="[redacted]")
+    _db_recall(source, "s", "p1", platform_message_id="p1")
     payload = source.export_session_for_move("s")
     source.close()
 
@@ -464,43 +488,190 @@ def test_recorded_recalls_survive_recovery_and_a_profile_move(tmp_path):
 @pytest.mark.windows_only
 def test_an_unresolved_text_recall_survives_a_restart_and_boot_recovery_resolves_it(store, tmp_path):
     """Round 4 (Codex): an id recall whose unreadable spooled copy had NO id recorded only the id; a
-    fresh process's boot recovery then inserted the original text. The unresolved text identity is now
-    a durable pending note: replay holds the copy and boot recovery resolves it first."""
-    import subprocess
-    import sys
-    from pathlib import Path
-
-    from gateway.shutdown_flush import TranscriptSpoolIncompleteError, spool_dropped_transcript_message
-    from hermes_constants import get_hermes_home
-
+    fresh process's boot recovery then inserted the original text. The request is durable: replay holds
+    the copy and boot recovery settles it first."""
     tasks: list = []
     adapter = _adapter(store, tasks)
     sid = _session(store, adapter)
-    path = spool_dropped_transcript_message(sid, {"role": "user", "content": SECRET, "timestamp": 1_700_000_100.0})
-    release = _hold_windows_file(path, 0)
+    path = _spool(sid, SECRET, timestamp=1_700_000_100.0)
+    _interrupted_recall(store, adapter, tasks, "p1", SECRET, [path])
+    assert "recovered 1" in _boot(tmp_path)
+    rows = _stored_rows(tmp_path, sid)
+    assert rows and not [r for r in rows if SECRET in (r[1] or "")]
+
+
+def _spool(sid, content, **fields):
+    from gateway.shutdown_flush import spool_dropped_transcript_message
+    return spool_dropped_transcript_message(sid, {"role": "user", "content": content, **fields})
+
+
+def _interrupted_recall(store, adapter, tasks, recalled_id, content, locked, *, keep_locked=False):
+    """A recall that met unreadable spool files (no-sharing handles) and whose process then stopped;
+    the store is closed as a restart would. Returns the release of the handles when *keep_locked*."""
+    releases = [_hold_windows_file(path, 0) for path in locked]
+
+    async def run():
+        RecallGuardMiddleware._patch_transcript(adapter, recalled_id, "", "u1", content)
+        await asyncio.sleep(0.5)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    def release_all():
+        for release in releases:
+            release()
+
     try:
-        with pytest.raises(TranscriptSpoolIncompleteError):
-            store.redact_user_message(sid, platform_message_id="p1", content=SECRET,
-                                      replacement=RecallGuardMiddleware._REDACTED)
+        asyncio.run(run())
+    finally:
+        store._db.close()
+        if not keep_locked:
+            release_all()
+    return release_all
+
+
+@pytest.mark.windows_only
+def test_boot_recovery_resolves_the_recalled_platform_id_before_equal_text(store, tmp_path):
+    """Round 5 (Codex, id_wins): boot recovery resolved the recall by text alone and overwrote an
+    unrelated id-less message with the same words, although the spool held the exact recalled id."""
+    tasks: list = []
+    adapter = _adapter(store, tasks)
+    sid = _session(store, adapter)
+    store._db.append_message(session_id=sid, role="user", content=SECRET, timestamp=1_700_000_100.0)
+    path = _spool(sid, SECRET, message_id="p1", timestamp=1_700_000_200.0)
+    _interrupted_recall(store, adapter, tasks, "p1", SECRET, [path])
+    _boot(tmp_path)
+    assert [r[1] for r in _stored_rows(tmp_path, sid)] == [SECRET, RecallGuardMiddleware._REDACTED]
+
+
+@pytest.mark.windows_only
+def test_boot_recovery_waits_for_every_copy_and_settles_ambiguity_with_the_note(store, tmp_path):
+    """Round 5 (Codex, unreadable + ambiguous): boot resolved from the readable copies only, so one of
+    two equal-text messages was taken for the target; and when it did see both, it dropped the recall
+    without telling the model. Now an unreadable copy keeps the request open and every candidate held;
+    once all are readable the text names two messages: both replay unchanged and the note is written."""
+    tasks: list = []
+    adapter = _adapter(store, tasks)
+    sid = _session(store, adapter)
+    _spool(sid, SECRET, timestamp=1_700_000_100.0)
+    second = _spool(sid, SECRET, timestamp=1_700_000_200.0)
+    release = _interrupted_recall(store, adapter, tasks, "p1", SECRET, [second], keep_locked=True)
+    try:
+        _boot(tmp_path)
+        assert _stored_rows(tmp_path, sid) == []  # nothing decided, nothing replayed
     finally:
         release()
-    store._db.close()
-    repo = str(Path(__file__).resolve().parents[3])
-    boot = (
-        "import sys; sys.path.insert(0, sys.argv[1])\n"
-        "from pathlib import Path\n"
-        "from hermes_state import SessionDB\n"
-        "from gateway.shutdown_flush import recover_pending_to_db\n"
-        "db = SessionDB(db_path=Path(sys.argv[2]))\n"
-        "print('recovered', recover_pending_to_db(db))\n"
-        "db.close()\n")
-    proc = subprocess.run([sys.executable, "-c", boot, repo, str(tmp_path / "state.db")],
-                          capture_output=True, text=True, timeout=120,
-                          env={**__import__("os").environ, "HERMES_HOME": str(get_hermes_home())})
-    assert "recovered 1" in proc.stdout, proc.stderr[-2000:]
-    reopened = SessionDB(db_path=tmp_path / "state.db")
-    try:
-        rows = _rows(reopened, sid)
-    finally:
-        reopened.close()
+    _boot(tmp_path)
+    rows = _stored_rows(tmp_path, sid)
+    assert [r[1] for r in rows if r[0] == "user"] == [SECRET, SECRET]
+    assert [r for r in rows if r[0] == "system" and "p1" in r[1]]
+
+
+@pytest.mark.windows_only
+def test_boot_recovery_redacts_a_copy_spooled_without_a_timestamp(store, tmp_path):
+    """Round 5 (Codex, undated): the sole, undated spooled copy was resolved without an identity replay
+    could reproduce, so boot recovery stored the original text."""
+    tasks: list = []
+    adapter = _adapter(store, tasks)
+    sid = _session(store, adapter)
+    path = _spool(sid, SECRET)
+    _interrupted_recall(store, adapter, tasks, "p1", SECRET, [path])
+    _boot(tmp_path)
+    rows = _stored_rows(tmp_path, sid)
     assert rows and not [r for r in rows if SECRET in (r[1] or "")]
+
+
+@pytest.mark.windows_only
+def test_a_recall_left_open_is_settled_without_its_own_spool_file_or_a_restart(store, tmp_path, monkeypatch):
+    """Round 5 (Codex, pending_without_own_spool + starvation): open recall work was only found through
+    the conversation's own spool files and only by one boot pass, so a target stored in the database
+    stayed visible and a held spool file blocked the rest of that session's spool until a restart."""
+    from gateway.shutdown_flush import spool_dropped_transcript_message, spooled_transcript_messages
+    from hermes_state import _default_db_path
+
+    store._db.close()
+    store._db = SessionDB(db_path=_default_db_path())  # where the housekeeping tick looks
+    monkeypatch.setattr(RecallGuardMiddleware, "_REDACT_RETRY_INTERVAL_S", 0.05)
+    tasks: list = []
+    adapter = _adapter(store, tasks)
+    sid = _session(store, adapter)
+    store._db.append_message(session_id=sid, role="user", content=SECRET, timestamp=1_700_000_100.0)
+    other = _spool("another-session", "unrelated")
+    _interrupted_recall(store, adapter, tasks, "p1", SECRET, [other])
+    assert _boot(_default_db_path().parent) and SECRET not in {r[1] for r in _stored_rows(_default_db_path().parent, sid)}
+
+    from gateway.run import _housekeeping_open_recalls
+    tasks.clear()
+    store._db = SessionDB(db_path=_default_db_path())
+    held = _spool(sid, "second " + SECRET, timestamp=1_700_000_300.0)
+    assert store._db.acquire_session_turn_lease(sid, "live-turn", wait_seconds=0)
+    store._db.open_recall_request(store._db.recall_lineage(sid), request_id="p2", platform_message_id="p2",
+                                  content="second " + SECRET, replacement=RecallGuardMiddleware._REDACTED)
+    assert spool_dropped_transcript_message(sid, {"role": "assistant", "content": "unrelated reply"})
+    _housekeeping_open_recalls(SimpleNamespace(session_store=store))  # fenced: stays open, copies held
+    assert held.exists()
+    store._db.release_session_turn_lease(sid, "live-turn")
+    _housekeeping_open_recalls(SimpleNamespace(session_store=store))
+    rows = _rows(store._db, sid)
+    assert not spooled_transcript_messages({sid}) and ("assistant", "unrelated reply", 1) in rows
+    assert not [r for r in rows if SECRET in (r[1] or "")]
+
+
+def test_a_store_opened_by_the_trigger_based_build_is_upgraded(tmp_path):
+    """Round 5 (Codex, upgrade): a store created while recalls were enforced by triggers kept its
+    six-column table and the triggers, and every ordinary user append then failed. The tables are now
+    reconciled like the rest of the schema and the obsolete triggers dropped."""
+    path = tmp_path / "state.db"
+    db = SessionDB(db_path=path)
+    db.create_session("s", "cli")
+    db._execute_write(lambda conn: conn.executescript(_TRIGGER_BUILD_SCHEMA))
+    db.close()
+    db = SessionDB(db_path=path)
+    try:
+        db.append_message(session_id="s", role="user", content=SECRET, platform_message_id="p1")
+        assert _db_recall(db, "s", "p1", platform_message_id="p1") == (1, "resolved")
+        db.append_message(session_id="s", role="user", content=SECRET, platform_message_id="p1")
+        assert [r[1] for r in _rows(db, "s")] == ["[redacted]", "[redacted]"]
+        _fts_integrity(db)
+    finally:
+        db.close()
+
+
+# The recall schema of the review build that enforced recalls with triggers (a historical fixture).
+_TRIGGER_BUILD_SCHEMA = """
+DROP TABLE recalled_messages; DROP TABLE IF EXISTS recall_requests;
+CREATE TABLE recalled_messages (
+    session_id TEXT NOT NULL, platform_message_id TEXT, content TEXT, timestamp REAL,
+    replacement TEXT NOT NULL, recalled_at REAL NOT NULL);
+CREATE INDEX idx_recalled_messages_session ON recalled_messages(session_id);
+CREATE TRIGGER messages_recall_insert AFTER INSERT ON messages
+WHEN new.role = 'user' AND EXISTS (SELECT 1 FROM recalled_messages WHERE session_id = new.session_id)
+BEGIN
+    UPDATE messages SET api_content = NULL, content = (
+        SELECT r.replacement FROM recalled_messages r WHERE r.session_id = new.session_id
+          AND ((r.platform_message_id IS NOT NULL AND r.platform_message_id = new.platform_message_id)
+            OR (r.platform_message_id IS NULL AND COALESCE(new.platform_message_id, '') = ''
+                AND r.content = new.content AND r.timestamp = new.timestamp))
+        LIMIT 1)
+    WHERE id = new.id AND EXISTS (
+        SELECT 1 FROM recalled_messages r WHERE r.session_id = new.session_id
+          AND ((r.platform_message_id IS NOT NULL AND r.platform_message_id = new.platform_message_id)
+            OR (r.platform_message_id IS NULL AND COALESCE(new.platform_message_id, '') = ''
+                AND r.content = new.content AND r.timestamp = new.timestamp)));
+END;
+CREATE TRIGGER messages_recall_update AFTER UPDATE OF content, platform_message_id ON messages
+WHEN new.role = 'user' AND EXISTS (SELECT 1 FROM recalled_messages WHERE session_id = new.session_id)
+BEGIN
+    UPDATE messages SET api_content = NULL, content = (
+        SELECT r.replacement FROM recalled_messages r WHERE r.session_id = new.session_id
+          AND ((r.platform_message_id IS NOT NULL AND r.platform_message_id = new.platform_message_id)
+            OR (r.platform_message_id IS NULL AND COALESCE(new.platform_message_id, '') = ''
+                AND r.content = new.content AND r.timestamp = new.timestamp))
+        LIMIT 1)
+    WHERE id = new.id AND EXISTS (
+        SELECT 1 FROM recalled_messages r WHERE r.session_id = new.session_id AND r.replacement IS NOT new.content
+          AND ((r.platform_message_id IS NOT NULL AND r.platform_message_id = new.platform_message_id)
+            OR (r.platform_message_id IS NULL AND COALESCE(new.platform_message_id, '') = ''
+                AND r.content = new.content AND r.timestamp = new.timestamp)));
+END;
+"""

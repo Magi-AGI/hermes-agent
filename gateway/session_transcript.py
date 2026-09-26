@@ -9,7 +9,7 @@ import logging
 import threading
 import time
 from agent.turn_context import extract_api_content_sidecar
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from gateway.session import SessionEntry
@@ -41,18 +41,6 @@ class RecallHoldError(RuntimeError):
 
     def __init__(self, session_id: str):
         super().__init__(f"spooled message held for an unresolved recall in {session_id}")
-
-
-def _message_platform_id(message: Dict[str, Any]) -> Optional[str]:
-    return message.get("platform_message_id") or message.get("message_id") or None
-
-
-def _message_timestamp(message: Dict[str, Any]) -> Optional[float]:
-    """A message's timestamp as the store would persist it (epoch float), or None when it has none."""
-    from hermes_cli.timefmt import coerce_epoch
-    value = message.get("timestamp")
-    epoch = coerce_epoch(value, field="message timestamp") if value is not None else None
-    return None if epoch is None else (0.0 if epoch == 0.0 else float(epoch))
 
 
 # Message keys persisted only for assistant rows (None otherwise).
@@ -382,12 +370,26 @@ class SessionTranscriptMixin:
             logger.warning("Failed to drain transcript spool for %s: %s", session_id, exc)
 
     def _replay_spooled_message(self, session_id: str, message: Dict[str, Any]) -> None:
-        """Replay one spooled message, unless an unresolved text recall may target it: then the drain
-        stops here and the file is kept (replay order holds) until the recall resolves."""
-        holds = getattr(self._db_for_session_id(session_id), "recall_holds", None)  # None: store keeps no recalls
+        """Replay one spooled message. An open recall that may target it is settled first; while it
+        cannot be (fenced, or a spooled copy unreadable) the drain stops here and the file is kept, so
+        replay order holds, until a later drain or the housekeeping tick settles it. An undated id-less
+        copy the settlement stamped (its identity) is replayed from its rewritten file by the next
+        drain, not from this parse."""
+        db = self._db_for_session_id(session_id)
+        holds = getattr(db, "recall_holds", None)  # None: store keeps no recalls
         if holds is not None and holds(session_id, message):
-            raise RecallHoldError(session_id)
+            from gateway.transcript_recall import message_platform_id, settle_open_recalls
+            settle_open_recalls(db, session_id, queued_for=self._queued_user_copies)
+            if holds(session_id, message) or (
+                    message.get("timestamp") is None and not message_platform_id(message)):
+                raise RecallHoldError(session_id)
         self._append_transcript_message(session_id, message)
+
+    def _queued_user_copies(self, session_ids) -> List[Dict[str, Any]]:
+        """The retry queue's user messages of *session_ids* (the dicts themselves: a recall stamps them)."""
+        with self._transcript_retry_lock:
+            return [m for sid in dict.fromkeys(session_ids) for m in self._dirty_transcripts.get(sid, [])
+                    if m.get("role") == "user"]
 
     def _append_transcript_message(self, session_id: str, message: Dict[str, Any]) -> None:
         """Write one transcript row. Caller handles retry queuing."""
@@ -540,91 +542,46 @@ class SessionTranscriptMixin:
             self._clear_dirty_transcript(session_id)
             return True
 
-    # A compression rotation between resolving the lineage and the redaction's transaction closes the
-    # tip it named; re-resolve and try again this many times before handing the retry to the caller.
-    _REDACT_ROTATION_ATTEMPTS = 5
-
-    def redact_user_message(self, session_id: str, *, platform_message_id: Optional[str] = None,
-                            content: Any = None, request_id: Optional[str] = None, replacement: str) -> int:
-        """Withdraw one user message from this conversation: ``SessionDB.redact_user_message`` fences,
-        resolves the identity (over the stored rows and the copies waiting here for a retried write)
-        and records the withdrawal in one transaction, so every later write of it, including replay of
-        these copies at any time or after a restart, is overwritten by the database itself. The copies
-        still queued in memory or spooled to disk are then rewritten too.
-
-        *request_id* names this recall across retries (default: the platform id): a retry reuses the
-        text identity it resolved, a new recall of equal text never does. Raises the SessionDB fence
-        errors while a live turn or a compression holds the conversation, ``RecallTargetAmbiguousError``
-        when the text alone names several messages, and ``TranscriptSpoolIncompleteError`` when a spooled
-        copy could not be read or rewritten (an undated copy has no durable identity, so it must be
-        rewritten in place). An unreadable spool first records what is known durably: the id intent, and
-        a pending text note that holds matching id-less spooled copies from replay (live, or boot recovery
-        after a restart, which resumes the resolution). The caller retries, which is safe after a partial
-        run. Returns messages overwritten."""
-        from gateway.shutdown_flush import (
-            TranscriptSpoolIncompleteError, rewrite_spooled_message, spooled_transcript_messages)
-        from hermes_state_errors import CompressionSessionClosedError
+    def recall_message(self, session_id: str, *, request_id: str, platform_message_id: Optional[str] = None,
+                       content: Any = None, replacement: str, note: Optional[str] = None) -> Tuple[int, str]:
+        """Withdraw one user message from this conversation. The request is recorded durably first (so
+        matching retry copies are held from replay from here on, and any later drain, the housekeeping
+        tick or boot recovery can finish it), then settled over the stored rows and every copy waiting
+        here or in the spool (``gateway.transcript_recall``). Resolved: the withdrawal is recorded and
+        every later write of the message, including replay of those copies, stores *replacement*.
+        Ambiguous (the text names several messages): nothing is rewritten and *note* is written to the
+        conversation instead. Raises the SessionDB fence errors while a live turn or a compression holds
+        the conversation and ``TranscriptSpoolIncompleteError`` while a spooled copy cannot be read;
+        the caller retries with the same *request_id*. Returns ``(messages covered, outcome)``."""
+        from gateway.transcript_recall import settle_recall
         db = self._db_for_session_id(session_id)
         if not db:
-            return 0
+            return 0, "none"
         with self._get_transcript_drain_lock():
-            for attempt in range(self._REDACT_ROTATION_ATTEMPTS):
-                tip = db.get_compression_tip(self._follow_reroutes(session_id)) or session_id
-                lineage = list(reversed(db.get_compression_lineage(tip))) or [tip]
-                sessions = {session_id, *lineage}
-                with self._transcript_retry_lock:
-                    queued = [m for sid in sessions for m in self._dirty_transcripts.get(sid, [])
-                              if m.get("role") == "user"]
-                try:
-                    spooled = [(path, payload, m) for path, payload, m in spooled_transcript_messages(sessions)
-                               if m.get("role") == "user"]
-                except TranscriptSpoolIncompleteError:
-                    # Record what needs no spool snapshot, durably: the id intent (a replay of a copy carrying
-                    # the id is overwritten), and a pending text note (a replay of an id-less copy is held
-                    # until the identity is resolved, here on retry or by boot recovery after a restart).
-                    if platform_message_id:
-                        db.redact_user_message(
-                            lineage, platform_message_id=platform_message_id, request_id=request_id,
-                            replacement=replacement,
-                            retry_copies=[(_message_platform_id(m), False, None) for m in queued])
-                    if content:
-                        db.record_pending_recall(lineage, request_id=request_id or platform_message_id or "",
-                                                 content=content, replacement=replacement)
-                    raise
-                copies = queued + [m for _path, _payload, m in spooled]
-                snapshot = [(_message_platform_id(m), bool(content) and m.get("content") == content,
-                             _message_timestamp(m)) for m in copies]
-                try:
-                    changed, identity = db.redact_user_message(
-                        lineage, platform_message_id=platform_message_id, content=content, request_id=request_id,
-                        retry_copies=snapshot, replacement=replacement)
-                    break
-                except CompressionSessionClosedError:
-                    if attempt + 1 == self._REDACT_ROTATION_ATTEMPTS:
-                        raise
-            if identity is None:
-                return changed
+            lineage = db.recall_lineage(self._follow_reroutes(session_id))
+            db.open_recall_request(lineage, request_id=request_id, platform_message_id=platform_message_id,
+                                   content=content, replacement=replacement, note=note)
+            request = db.recall_request(lineage, request_id)
+            if request["status"] != "open":  # settled by an earlier attempt or another resolver
+                return 0, request["status"]
+            result = settle_recall(db, request, queued_for=self._queued_user_copies)
+            self._drain_after_recall(lineage)
+            return result
 
-            def matches(message: Dict[str, Any], descriptor) -> bool:
-                pid, text_matches, stamp = descriptor
-                if identity[0] == "id":
-                    return pid == identity[1]
-                return not pid and text_matches and stamp == identity[1]
+    def settle_open_recalls(self, db) -> None:
+        """Housekeeping: settle *db*'s open recalls with this store's retry queue in view, then replay
+        the spooled copies they held."""
+        from gateway.transcript_recall import settle_open_recalls
+        with self._get_transcript_drain_lock():
+            for request, _outcome in settle_open_recalls(db, queued_for=self._queued_user_copies):
+                self._drain_after_recall(db.recall_lineage(request["session_id"]))
 
-            with self._transcript_retry_lock:
-                for message, descriptor in zip(queued, snapshot):
-                    if matches(message, descriptor):
-                        message["content"] = replacement
-                        message.pop("api_content", None)
-                        changed += 1
-            for (path, payload, message), descriptor in zip(spooled, snapshot[len(queued):]):
-                if matches(message, descriptor):
-                    try:
-                        rewrite_spooled_message(path, payload, message, replacement)
-                    except OSError as exc:
-                        raise TranscriptSpoolIncompleteError(f"cannot rewrite {path.name}: {exc}") from exc
-                    changed += 1
-            return changed
+    def _drain_after_recall(self, lineage) -> None:
+        """Replay spool files a settled recall held (drain lock held); a still-held file stops again."""
+        spooled_sessions = self._lazy("_spooled_drop_sessions", set)
+        for sid in lineage:
+            spooled_sessions.add(sid)
+            self._drain_spooled_drops(sid)
 
     def has_input_owner(self, session_id: str, owner: str) -> bool:
         """Find this accepted input on the canonical live continuation and its ancestors.

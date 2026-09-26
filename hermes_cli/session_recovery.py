@@ -29,7 +29,7 @@ _CANONICAL_TABLES = (
 _TOPIC_TABLES = ("telegram_dm_topic_mode", "telegram_dm_topic_bindings")
 # Canonical state a store gained later: copied and verified whenever the source has it (older stores
 # do not). Recorded recalls must survive recovery, or replayed copies of withdrawn messages come back.
-_OPTIONAL_CANONICAL_TABLES = ("recalled_messages",)
+_OPTIONAL_CANONICAL_TABLES = ("recall_requests", "recalled_messages")
 
 
 def _init_delivery_ledger_schema(conn: sqlite3.Connection) -> None:

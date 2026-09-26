@@ -294,8 +294,8 @@ class SessionCompressionMixin:
             # the handoff is written through the recall normalization).
             conn.execute(
                 "INSERT INTO recalled_messages (session_id, request_id, platform_message_id, content, timestamp, "
-                "pending, replacement, recalled_at) SELECT ?, request_id, platform_message_id, content, timestamp, "
-                "pending, replacement, recalled_at FROM recalled_messages WHERE session_id = ?",
+                "replacement, recalled_at) SELECT ?, request_id, platform_message_id, content, timestamp, "
+                "replacement, recalled_at FROM recalled_messages WHERE session_id = ?",
                 (child_session_id, parent_session_id))
             total_messages, total_tool_calls = self._insert_message_rows(conn, child_session_id, messages)
             if watermark is not None:

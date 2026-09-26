@@ -166,14 +166,6 @@ def spooled_transcript_messages(session_ids) -> list:
     return found
 
 
-def rewrite_spooled_message(path, payload, message, replacement: str) -> None:
-    """Overwrite one spooled message's content in place (atomic replace of its file)."""
-    from utils import atomic_json_write
-    message["content"] = replacement
-    message.pop("api_content", None)
-    atomic_json_write(path, payload, mode=0o600, default=str)
-
-
 def drain_transcript_spool(session_id: str, replay, *, db_known_failing: bool = False) -> tuple[int, int]:
     """Replay cap-dropped transcript messages spooled for *session_id*; return ``(replayed,
     remaining)``. ``replay(message_dict)`` runs per message in drop order; a spool file is deleted
@@ -258,17 +250,20 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None) -> int:
     branch. A returned ``db`` routes the append to the profile store owning the key (multiplexed
     gateways); ``None`` falls back to ``session_db``. Returns the number of messages recovered.
     """
-    flush_files = sorted(_get_flush_dir().glob("*.json"))
-    if not flush_files:
-        return 0
     own_db = session_db is None
     if own_db:
         from hermes_state_registry import acquire
         session_db = acquire()
     recovered = 0
     try:
-        _resume_pending_recalls(session_db, flush_files)
-        for path in flush_files:
+        # Recalls a previous process left open settle first (whether or not any copy is spooled), so
+        # the copies they held replay as their outcome; one still fenced keeps its copies held.
+        from gateway.transcript_recall import settle_open_recalls
+        try:
+            settle_open_recalls(session_db)
+        except Exception as exc:
+            logger.warning("Could not settle open recalls before recovery; their copies stay held: %s", exc)
+        for path in sorted(_get_flush_dir().glob("*.json")):
             # One unparseable payload or rejected append must only skip THIS file: the file is
             # never unlinked, so aborting the pass would re-poison every later boot.
             try:
@@ -291,54 +286,6 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None) -> int:
     if recovered:
         logger.info("Recovered %d pending message(s) from shutdown flush", recovered)
     return recovered
-
-
-def _resume_pending_recalls(session_db, flush_files) -> None:
-    """Resolve text recalls left pending by a previous process (a spooled copy was unreadable then),
-    before those copies replay: against the stored rows plus every spooled copy of the conversation,
-    as the live recall would. Resolved: the replay below is written as the redaction. Ambiguous: the
-    note is dropped and the copies replay unchanged (equal text is not identity). Still fenced (a live
-    turn lease): the copies stay held for the next recovery."""
-    from hermes_state import SessionCompressionInProgressError
-    from hermes_state_errors import (
-        CompressionSessionClosedError, RecallTargetAmbiguousError, SessionTurnLeaseLostError)
-    spooled: Dict[str, list] = {}
-    for path in flush_files:
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if isinstance(payload, dict) and payload.get("reason") == TRANSCRIPT_CAP_DROP_REASON:
-            data = payload.get("data") or {}
-            if isinstance(data.get("message"), dict) and data.get("session_id"):
-                spooled.setdefault(data["session_id"], []).append(data["message"])
-    for session_id in spooled:
-        pending = session_db.pending_recalls(session_id)
-        if not pending:
-            continue
-        tip = session_db.get_compression_tip(session_id) or session_id
-        lineage = list(reversed(session_db.get_compression_lineage(tip))) or [tip]
-        copies = [m for sid in {session_id, *lineage} for m in spooled.get(sid, []) if m.get("role") == "user"]
-        for request_id, content, replacement in dict.fromkeys(pending):
-            snapshot = [(m.get("platform_message_id") or m.get("message_id") or None,
-                         content in session_db._recall_content_variants(m.get("content")),
-                         _spool_timestamp(m)) for m in copies]
-            try:
-                session_db.redact_user_message(lineage, content=content, request_id=request_id,
-                                               retry_copies=snapshot, replacement=replacement)
-            except RecallTargetAmbiguousError as exc:
-                logger.warning("Pending recall %s in %s is ambiguous (%s); its held copies replay", request_id,
-                               session_id, exc)
-                session_db.drop_pending_recall(lineage, request_id)
-            except (SessionTurnLeaseLostError, SessionCompressionInProgressError, CompressionSessionClosedError):
-                logger.info("Pending recall %s in %s is fenced; its spooled copies stay held", request_id, session_id)
-
-
-def _spool_timestamp(message: Dict[str, Any]) -> Optional[float]:
-    from hermes_cli.timefmt import coerce_epoch
-    value = message.get("timestamp")
-    epoch = coerce_epoch(value, field="message timestamp") if value is not None else None
-    return None if epoch is None else (0.0 if epoch == 0.0 else float(epoch))
 
 
 def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,

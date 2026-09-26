@@ -4717,6 +4717,25 @@ def _housekeeping_state_db_maintenance(launch: Optional[Tuple[Path, Path]] = Non
         release_or_close(_adb)
 
 
+def _housekeeping_open_recalls(runner) -> None:
+    """Settle recall requests left open (the conversation stayed busy past the adapter's retry window,
+    a spooled copy was unreadable, a previous process died) for ONE profile's state.db, and replay the
+    spooled copies they held: without this they wait for a restart. One indexed query when none is open."""
+    from hermes_state_registry import acquire, release_or_close
+    _rdb = acquire()
+    try:
+        if not _rdb.open_recall_requests():
+            return
+        store = getattr(runner, "session_store", None)
+        if store is not None:
+            store.settle_open_recalls(_rdb)
+        else:
+            from gateway.transcript_recall import settle_open_recalls
+            settle_open_recalls(_rdb)
+    finally:
+        release_or_close(_rdb)
+
+
 def _housekeeping_deferred_fts_retry() -> None:
     """A SessionDB opened while another process held the rebuild lock fails closed onto the LIKE fallback
     and the gateway stays up for days. Non-blocking, rate-limited inside SessionDB; no-op when not stale."""
@@ -4812,6 +4831,7 @@ def _start_gateway_housekeeping(
             # Default-bound now, i.e. OUTSIDE any profile scope: this is the launch home's override.
             lambda _launch=_launch_sessions_dir(getattr(runner, "config", None)):
                 _housekeeping_state_db_maintenance(_launch))),
+        (5, "Open recall settle tick", profile_scoped_chore(runner, lambda: _housekeeping_open_recalls(runner))),
         (1, "Deferred FTS retry tick", _housekeeping_deferred_fts_retry),
         # Every 5 min: finish an interrupted Codex login update / fence newly found legacy rescue
         # files even when no request arrives (credential recovery protocol, §6).

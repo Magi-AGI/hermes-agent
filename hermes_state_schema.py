@@ -954,6 +954,12 @@ class SessionSchemaMixin:
         except sqlite3.OperationalError as exc:
             logger.debug("idx_messages_platform_msg_id create skipped: %s", exc)
         self._execute_ddl_skipping_settled_triggers(cursor, DEFERRED_INDEX_SQL)  # same ordering constraint (``active``)
+        # Recall enforcement once lived in triggers on ``messages`` (never released); a store opened by
+        # that build keeps them otherwise. Probe first: DROP takes the write lock even as a no-op.
+        for obsolete in ("messages_recall_insert", "messages_recall_update"):
+            if cursor.execute("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+                              (obsolete,)).fetchone():
+                cursor.execute(f"DROP TRIGGER {obsolete}")
 
         # Heal NULL ``active`` rows on every startup: older reconciler builds added ``active``
         # without NOT NULL DEFAULT 1, so ``WHERE active = 1`` loaders hid whole histories. A

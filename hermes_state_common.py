@@ -583,6 +583,37 @@ CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usag
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
+-- A request to withdraw (recall) one user message from a conversation, keyed by the conversation's
+-- root session: ``open`` until its identity is resolved over every stored and retry copy, then
+-- ``resolved`` (guards below) or ``ambiguous`` (the text names several messages: none is rewritten,
+-- a do-not-reference note is written instead). Open requests hold matching retry copies from replay.
+CREATE TABLE IF NOT EXISTS recall_requests (
+    request_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    platform_message_id TEXT,
+    content TEXT,
+    replacement TEXT NOT NULL,
+    note TEXT,
+    status TEXT NOT NULL DEFAULT 'open',
+    created_at REAL NOT NULL,
+    settled_at REAL,
+    PRIMARY KEY (request_id, session_id)
+);
+CREATE INDEX IF NOT EXISTS idx_recall_requests_status ON recall_requests(status);
+-- A resolved withdrawal, per session of the conversation: by platform id, or for an id-less message
+-- by exact stored content at its timestamp. SessionDB writes every user row through it
+-- (``_recall_normalized``), so a late flush, retry replay (live or at boot) or another process stores
+-- the replacement.
+CREATE TABLE IF NOT EXISTS recalled_messages (
+    session_id TEXT NOT NULL,
+    request_id TEXT,
+    platform_message_id TEXT,
+    content TEXT,
+    timestamp REAL,
+    replacement TEXT NOT NULL,
+    recalled_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_recalled_messages_session ON recalled_messages(session_id);
 """
 
 # Indexes on later-added columns must run AFTER _reconcile_columns(), or executescript fails on legacy DBs.
@@ -679,23 +710,6 @@ CREATE INDEX IF NOT EXISTS idx_sessions_system_prompt_hash
 -- a small candidate set before compression-chain and preview hydration.
 CREATE INDEX IF NOT EXISTS idx_sessions_effective_activity
     ON sessions(COALESCE(last_activity_at, started_at) DESC, started_at DESC);
--- A withdrawn (recalled) user message, per session of its conversation: by platform id, or for an
--- id-less message by exact stored content at its timestamp. SessionDB writes every user row through
--- it (``_recall_normalized``), so a turn's late flush, retry-queue and spool replay (live and at boot)
--- and another Hermes process all store the replacement, and a recall survives restarts. ``request_id``
--- ties a text identity to the recall that resolved it; ``pending`` marks a text recall whose identity
--- could not be resolved yet (its spooled copies are held from replay until it is).
-CREATE TABLE IF NOT EXISTS recalled_messages (
-    session_id TEXT NOT NULL,
-    request_id TEXT,
-    platform_message_id TEXT,
-    content TEXT,
-    timestamp REAL,
-    pending INTEGER NOT NULL DEFAULT 0,
-    replacement TEXT NOT NULL,
-    recalled_at REAL NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_recalled_messages_session ON recalled_messages(session_id);
 """
 
 

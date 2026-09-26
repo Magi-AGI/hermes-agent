@@ -530,15 +530,17 @@ class RecallGuardMiddleware(InboundMiddleware):
     def _schedule_redact(cls, adapter, session_key: str, group_code: str, from_account: str, *,
                          recalled_id: str, content: Optional[str], note_if_missing: bool = False) -> None:
         """Withdraw the recalled message (targeted, fenced and recorded: see
-        ``SessionStore.redact_user_message``) on a tracked task. While a turn or compression holds the
-        conversation, or a spooled copy cannot be read or rewritten, the store refuses and this retries.
-        The withdrawal is recorded by id before the row need exist, so the interrupted turn's own late
-        write of it is overwritten by the database. ``note_if_missing`` appends the do-not-reference
-        note when nothing was stored (branch B), as does text that names several messages."""
+        ``SessionStore.recall_message``) on a tracked task. The request is durable from the first attempt:
+        while a turn or compression holds the conversation, or a spooled copy cannot be read, the store
+        refuses and this retries; past the window, a later spool drain, the housekeeping tick or boot
+        recovery finishes it. The withdrawal is recorded by id before the row need exist, so the
+        interrupted turn's own late write of it is overwritten by the database. Text naming several
+        messages rewrites none: the database writes the do-not-reference note instead.
+        ``note_if_missing`` appends that note when nothing was stored (branch B)."""
         from hermes_state import SessionCompressionInProgressError
         from gateway.shutdown_flush import TranscriptSpoolIncompleteError
-        from hermes_state_errors import (
-            CompressionSessionClosedError, RecallTargetAmbiguousError, SessionTurnLeaseLostError)
+        from hermes_state_errors import CompressionSessionClosedError, SessionTurnLeaseLostError
+        note = f'[recall] message_id="{recalled_id}" has been recalled; do not quote or reference it.'
 
         async def _run() -> None:
             store = _session_store(adapter)
@@ -549,43 +551,37 @@ class RecallGuardMiddleware(InboundMiddleware):
             except Exception as exc:
                 logger.warning("[%s] Recall: failed to resolve session: %s", adapter.name, exc)
                 return
-            started, add_note = time.monotonic(), note_if_missing
+            started = time.monotonic()
             request_id = recalled_id or uuid.uuid4().hex  # one recall, however many retries
             while True:
                 try:
-                    changed = await asyncio.to_thread(
-                        store.redact_user_message, sid, platform_message_id=recalled_id or None,
-                        content=content or None, request_id=request_id, replacement=cls._REDACTED)
+                    changed, outcome = await asyncio.to_thread(
+                        store.recall_message, sid, request_id=request_id, platform_message_id=recalled_id or None,
+                        content=content or None, replacement=cls._REDACTED, note=note)
+                    break
                 except (SessionTurnLeaseLostError, SessionCompressionInProgressError, CompressionSessionClosedError,
                         TranscriptSpoolIncompleteError):
                     # A live turn or compression owns (or just rotated) the conversation, or a spooled copy
                     # could not be inspected yet: success must mean every copy was covered, so try again.
-                    changed = None
-                except RecallTargetAmbiguousError as exc:
-                    # Equal text is not identity: rewrite nothing, and tell the model not to use it.
-                    logger.warning("[%s] Recall redact: msg_id=%s not redacted: %s", adapter.name, recalled_id, exc)
-                    add_note = True
-                    break
+                    pass
                 except Exception as exc:
                     logger.warning("[%s] Recall redact failed for msg_id=%s: %s", adapter.name, recalled_id, exc)
                     return
                 elapsed = time.monotonic() - started
-                if changed:
-                    logger.info("[%s] Recall: redacted msg_id=%s (%d row(s)), session %s",
-                                adapter.name, recalled_id, changed, session_key[:30])
-                    return
-                if changed == 0:
-                    break
                 if elapsed >= cls._REDACT_RETRY_WINDOW_S:
-                    logger.warning("[%s] Recall redact gave up on msg_id=%s: the conversation stayed busy "
-                                   "for %.0fs", adapter.name, recalled_id, elapsed)
+                    logger.warning("[%s] Recall redact deferred for msg_id=%s: the conversation stayed busy for "
+                                   "%.0fs; housekeeping finishes it", adapter.name, recalled_id, elapsed)
                     return
                 await asyncio.sleep(cls._REDACT_RETRY_INTERVAL_S)
-            if add_note:
+            if outcome == "ambiguous":
+                logger.warning("[%s] Recall: msg_id=%s names several messages; none rewritten, note written",
+                               adapter.name, recalled_id)
+            elif changed:
+                logger.info("[%s] Recall: redacted msg_id=%s (%d cop(ies)), session %s",
+                            adapter.name, recalled_id, changed, session_key[:30])
+            elif outcome == "none" and note_if_missing:
                 await asyncio.to_thread(store.append_to_transcript, sid, {
-                    "role": "system", "timestamp": datetime.now(tz=timezone.utc).isoformat(),
-                    "content": f'[recall] message_id="{recalled_id}" has been recalled; do not quote or reference it.',
-                })
+                    "role": "system", "timestamp": datetime.now(tz=timezone.utc).isoformat(), "content": note})
                 logger.info("[%s] Recall: system note for msg_id=%s (branch B)", adapter.name, recalled_id)
             else:
                 logger.debug("[%s] Recall redact: msg_id=%s was never stored, session %s",
