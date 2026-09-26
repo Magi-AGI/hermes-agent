@@ -24,7 +24,7 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set
 from hermes_constants import get_hermes_home
 from agent.skill_utils import get_disabled_skill_names
 from tools import skill_usage
-from utils import atomic_json_write
+from utils import atomic_json_write, lock_file_polled, unlock_file
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +80,8 @@ def _state_lock():
     """Serialize curator-state read-modify-writes across threads AND processes (the routine review
     fork flags skills while a scheduled pass writes its report; a stale snapshot saved late erased
     the newer flags). Fails closed: if the lock file cannot be opened or locked, raise
-    ``CuratorStateLockError`` instead of saving an unlocked snapshot (review: Codex)."""
+    ``CuratorStateLockError`` instead of saving an unlocked snapshot (review: Codex). A sibling process
+    holding it is waited out up to ``utils.BOUNDED_LOCK_WAIT_S`` (msvcrt LK_LOCK gave up after ~10 s)."""
     with _state_thread_lock:
         path = _state_file().with_name(".curator_state.lock")
         try:
@@ -90,26 +91,14 @@ def _state_lock():
             raise CuratorStateLockError(f"cannot open curator state lock {path}: {e}") from e
         with fh:
             try:
-                if os.name == "nt":
-                    import msvcrt
-                    fh.seek(0)
-                    msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)  # retries ~10s, then raises
-                else:
-                    import fcntl
-                    fcntl.flock(fh, fcntl.LOCK_EX)
+                lock_file_polled(fh)
             except OSError as e:
                 raise CuratorStateLockError(f"curator state lock unavailable: {e}") from e
             try:
                 yield
             finally:
                 with contextlib.suppress(OSError):
-                    if os.name == "nt":
-                        import msvcrt
-                        fh.seek(0)
-                        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
-                    else:
-                        import fcntl
-                        fcntl.flock(fh, fcntl.LOCK_UN)
+                    unlock_file(fh)
 
 
 def update_state(mutate: Callable[[Dict[str, Any]], None]) -> Dict[str, Any]:

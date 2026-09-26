@@ -29,6 +29,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
+from utils import lock_file_polled, unlock_file
+
 from hermes_constants import get_hermes_home
 from utils import atomic_write_bytes
 
@@ -53,15 +55,6 @@ REQUIRED_FIELDS = {"payment": ("card_number", "exp_month", "exp_year", "cvc"),
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
 _LOCK = threading.Lock()
-
-# fcntl is Unix-only; Windows locks a byte range with msvcrt (same shape as tools/skill_usage.py).
-msvcrt = None
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - platform-specific fallback
-    fcntl = None
-    with suppress(ImportError):
-        import msvcrt
 
 
 class VaultError(Exception):
@@ -222,27 +215,18 @@ class VaultStore:
     def _locked(self):
         """Serialize read-modify-write cycles across threads AND processes: the Desktop gateway, a CLI
         `hermes vault add` and a TUI slash worker all write the same ``vault.json.enc``; two unlocked
-        writers would drop each other's items."""
+        writers would drop each other's items. A sibling holding it is waited out up to
+        ``utils.BOUNDED_LOCK_WAIT_S``. The lock file is never written: Windows locks a byte past EOF,
+        and the old truncating pad raced a sibling that held the lock."""
         with _LOCK:
             self._ensure_dir()
-            lock_path = self._base / ".vault.lock"
-            if msvcrt and (not lock_path.exists() or lock_path.stat().st_size == 0):
-                lock_path.write_text(" ", encoding="utf-8")  # msvcrt needs a non-empty byte range to lock
-            with open(lock_path, "r+" if msvcrt else "a+", encoding="utf-8") as fd:
-                if fcntl:
-                    fcntl.flock(fd, fcntl.LOCK_EX)
-                elif msvcrt:
-                    fd.seek(0)
-                    msvcrt.locking(fd.fileno(), msvcrt.LK_LOCK, 1)
+            with open(self._base / ".vault.lock", "a+", encoding="utf-8") as fd:
+                lock_file_polled(fd)
                 try:
                     yield
                 finally:
                     with suppress(OSError):
-                        if fcntl:
-                            fcntl.flock(fd, fcntl.LOCK_UN)
-                        elif msvcrt:
-                            fd.seek(0)
-                            msvcrt.locking(fd.fileno(), msvcrt.LK_UNLCK, 1)
+                        unlock_file(fd)
 
     def _fernet(self):
         from cryptography.fernet import Fernet

@@ -11,7 +11,7 @@ from typing import Optional
 import uuid
 
 from hermes_constants import get_default_hermes_root
-from utils import atomic_write_text
+from utils import atomic_write_text, lock_file_polled, unlock_file
 
 _INSTALL_ID_FILENAME = "install_id"
 _INSTALL_ID_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -21,30 +21,17 @@ _INSTALL_ID_LOCK, _INSTALL_ID_PUBLICATION_LOCK = threading.Lock(), threading.Loc
 
 @contextlib.contextmanager
 def _install_id_file_lock(root: Path):
-    """Serialize identity publication across processes on POSIX and Windows."""
+    """Serialize identity publication across processes on POSIX and Windows; a sibling holding the
+    lock is waited out up to ``utils.BOUNDED_LOCK_WAIT_S`` (msvcrt LK_LOCK gave up after ~10 s)."""
     fd = os.open(root / ".install_id.lock", os.O_RDWR | os.O_CREAT, 0o600)
-    windows = os.name == "nt"
     try:
-        if windows:
-            import msvcrt
-            if os.fstat(fd).st_size == 0:
-                os.write(fd, b"\0")
-                os.fsync(fd)
-            os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
+        lock_file_polled(fd)
         try:
-            if windows:
-                os.lseek(fd, 0, os.SEEK_SET)
-                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-            else:
-                fcntl.flock(fd, fcntl.LOCK_UN)
+            yield
         finally:
-            os.close(fd)
+            unlock_file(fd)
+    finally:
+        os.close(fd)
 
 
 def _read_existing(path: Path) -> tuple[Optional[str], bool]:

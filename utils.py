@@ -56,32 +56,46 @@ def _path_thread_lock(key: Union[str, Path]) -> threading.Lock:
         return _path_thread_locks.setdefault(norm, threading.Lock())
 
 
-def _os_lock_polled(fh, deadline: float) -> None:
-    """Exclusive OS lock on byte 0 of *fh* (msvcrt / fcntl), polled non-blocking until *deadline*."""
+def _to_byte_zero(fh_or_fd) -> int:
+    """The fd of *fh_or_fd* (a file object or a raw descriptor), positioned at byte 0 for msvcrt."""
+    if isinstance(fh_or_fd, int):
+        os.lseek(fh_or_fd, 0, os.SEEK_SET)
+        return fh_or_fd
+    fh_or_fd.seek(0)
+    return fh_or_fd.fileno()
+
+
+def lock_file_polled(fh_or_fd, deadline: "float | None" = None) -> None:
+    """Exclusive OS lock on byte 0 of a file object or raw fd (msvcrt / fcntl), polled non-blocking every
+    50 ms until *deadline* (a ``time.monotonic()`` value; default now + :data:`BOUNDED_LOCK_WAIT_S`).
+    Raises TimeoutError (an OSError) past it. For callers that keep their own thread locking; others
+    use :func:`bounded_file_lock`. Windows callers that append must seek to the end themselves."""
+    if deadline is None:
+        deadline = time.monotonic() + BOUNDED_LOCK_WAIT_S
     while True:
         try:
             if os.name == "nt":
                 import msvcrt
-                fh.seek(0)
-                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                msvcrt.locking(_to_byte_zero(fh_or_fd), msvcrt.LK_NBLCK, 1)
             else:
                 import fcntl
-                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fh_or_fd if isinstance(fh_or_fd, int) else fh_or_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             return
         except OSError:
             if time.monotonic() >= deadline:
-                raise TimeoutError(f"file lock not acquired within the budget: {getattr(fh, 'name', fh)}") from None
+                raise TimeoutError(
+                    f"file lock not acquired within the budget: {getattr(fh_or_fd, 'name', fh_or_fd)}") from None
             time.sleep(_BOUNDED_LOCK_POLL_S)
 
 
-def _os_unlock(fh) -> None:
+def unlock_file(fh_or_fd) -> None:
+    """Release a lock taken with :func:`lock_file_polled`."""
     if os.name == "nt":
         import msvcrt
-        fh.seek(0)
-        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        msvcrt.locking(_to_byte_zero(fh_or_fd), msvcrt.LK_UNLCK, 1)
     else:
         import fcntl
-        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        fcntl.flock(fh_or_fd if isinstance(fh_or_fd, int) else fh_or_fd.fileno(), fcntl.LOCK_UN)
 
 
 @contextmanager
@@ -97,12 +111,12 @@ def bounded_file_lock(key: Union[str, Path], open_fh, *, wait_s: "float | None" 
         raise TimeoutError(f"file lock not acquired within the budget (another thread): {key}")
     try:
         with open_fh() as fh:
-            _os_lock_polled(fh, deadline)
+            lock_file_polled(fh, deadline)
             try:
                 yield fh
             finally:
                 with suppress(OSError):
-                    _os_unlock(fh)
+                    unlock_file(fh)
     finally:
         thread_lock.release()
 
