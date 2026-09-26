@@ -25,7 +25,8 @@ def _frames(out: io.StringIO) -> list[dict]:
     return [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
 
 
-def _wait(out: io.StringIO, predicate, timeout: float = 5.0) -> dict:
+def _wait(out: io.StringIO, predicate, timeout: float = 30.0) -> dict:
+    # A hang guard: it returns on the frame. A cold first turn on a loaded runner took > 5 s.
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         for frame in _frames(out):
