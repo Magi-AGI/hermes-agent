@@ -984,18 +984,21 @@ def _import_members(
         else:
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                if target.suffix == ".db":
+                # Credential classification takes precedence over every extension/type handler: a
+                # ``.db`` name aliasing an auth.json (a dangling symlink on a fresh install) must
+                # never reach the database path's raw extraction.
+                if codex_action == "store":
+                    why = write_restored_store(target, zf.read(member))
+                    if why is not None:
+                        errors.append(f"{label}: kept this machine's copy ({why})")
+                        continue
+                elif target.suffix == ".db":
                     # Count before the write: afterwards the dropped rows are gone.
                     before = _count_session_rows(target)
                     _import_db_member(zf, member, target, new_file_mode)
                     after = _count_session_rows(target)
                     if before and after and after[1] < before[1]:
                         db_shrunk.append((rel, before, after))
-                elif codex_action == "store":
-                    why = write_restored_store(target, zf.read(member))
-                    if why is not None:
-                        errors.append(f"{label}: kept this machine's copy ({why})")
-                        continue
                 else:
                     _extract_member_atomically(zf, member, target, new_file_mode)
                 if tighten:
@@ -1056,9 +1059,10 @@ def run_import(args) -> None:
             sys.exit(1)
         prefix = _detect_prefix(zf)
         members = [n for n in zf.namelist() if not n.endswith("/")]
-        _refuse_codex_credential_state(zf, members, prefix, hermes_root)
-        from hermes_cli.auth_codex_restore import SIGN_IN_AGAIN, brings_codex_material
-        codex_notice = brings_codex_material(_codex_restore_targets(zf, members, prefix, hermes_root))
+        from hermes_cli.auth_codex_restore import SIGN_IN_AGAIN, brings_codex_material, classification_scope
+        with classification_scope():
+            _refuse_codex_credential_state(zf, members, prefix, hermes_root)
+            codex_notice = brings_codex_material(_codex_restore_targets(zf, members, prefix, hermes_root))
         file_count = len(members)
         print(f"Backup contains {file_count} files\nTarget: {display_hermes_home()}")
         if prefix:
@@ -1414,8 +1418,10 @@ def restore_quick_snapshot(snapshot_id: str, hermes_home: Optional[Path] = None)
         # check through the writes), whichever home the process runs in.
         with authority_scope(home), restore_guard(lambda: targets, "restoring it from a snapshot"):
             restored = _restore_quick_snapshot_files(meta, snap_dir, home, snap_res, home_res)
-        from hermes_cli.auth_codex_restore import SIGN_IN_AGAIN, brings_codex_material
-        if brings_codex_material(targets):
+        from hermes_cli.auth_codex_restore import SIGN_IN_AGAIN, brings_codex_material, classification_scope
+        with authority_scope(home), classification_scope():
+            notice = brings_codex_material(targets)
+        if notice:
             logger.warning("%s", SIGN_IN_AGAIN)
     except CodexAuthorityRefused as exc:
         logger.error("%s", exc)

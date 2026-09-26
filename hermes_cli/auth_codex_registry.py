@@ -223,6 +223,16 @@ def active_store_path() -> Path:
     return _auth_file_path()
 
 
+def active_store_location() -> Path:
+    """:func:`active_store_path` for path COMPARISON only (restore classification: the file is never
+    opened through it), so it carries no test seat belt."""
+    scoped = _authority.get()
+    if scoped is not None:
+        return scoped[1]
+    from hermes_constants import get_hermes_home
+    return get_hermes_home() / "auth.json"
+
+
 def profiles_root() -> Path:
     if _authority.get() is not None:
         return root_home() / "profiles"

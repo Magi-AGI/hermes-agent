@@ -3,8 +3,11 @@
 Nothing in a backup proves that a Codex refresh token is still unspent, and restoring the credential
 authority's own files would roll its evidence back (an ACTIVE entry for a retired chain, a consumed
 token recognised as new). So every restore path — backup import, quick-snapshot restore, profile
-import, ``_external/`` members — treats Codex material specially, by the RESOLVED destination of
-each member (``backup._member_destination`` for archives):
+import, ``_external/`` members — treats Codex material specially, by BOTH the logical and the
+canonical destination of each member (``backup._member_destination`` for archives) and the identity
+of an existing file, against the canonical forms of every protected location; the most protected
+verdict wins, so an alias never erases a credential file's identity. Credential classification
+precedes every extension/type handler of the restore paths:
 
 * protocol files (registry and its preserved copies, retired-token index, ``auth.recovery/``,
   ``auth.ops/``, legacy rescue files) and Codex CLI credentials (``.codex/`` / ``$CODEX_HOME``) are
@@ -13,8 +16,9 @@ each member (``backup._member_destination`` for archives):
 * an ``auth.json`` is written ONLY at one of the protected authority's own stores, and as one
   read-merge-write under the migration lock + that store's lock with the strict writer: the
   restored content with ALL Codex material removed (a legacy-format store first converted by
-  upstream's own conversion), plus the destination's CURRENT Codex material exactly as it is. A live Codex login therefore survives a restore untouched, and no old token
-  ever lands; every other provider restores as upstream does.
+  upstream's own conversion), plus the destination's CURRENT Codex material exactly as it is. A
+  live Codex login therefore survives a restore untouched, and no old token ever lands; every other
+  provider restores as upstream does.
 
 After restoring a backup a Codex user signs in again. Restoring Codex logins (paused until proven)
 is stage 2 (design B3).
@@ -22,11 +26,14 @@ is stage 2 (design B3).
 
 from __future__ import annotations
 
+import contextvars
 import json
 import os
+import stat
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Iterator, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, Iterable, Iterator, List, Optional, Tuple
 
 from hermes_cli.auth_codex_registry import (
     LEGACY_RESCUE_NAME, MIGRATION_LOCK_NAME, OPS_DIR_NAME, PROVIDER, RECORDS_DIR_NAME, REGISTRY_NAME,
@@ -48,52 +55,20 @@ def _norm(text: str) -> str:
     return os.path.normcase(text)
 
 
+def _key(path: Path) -> str:
+    return _norm(str(path))
+
+
 def _destination(path: Path) -> Path:
     """The file a write to *path* really lands in: symlinks and junctions resolved (a missing tail
     stays as given); comparisons below are case-normalized where the platform is."""
     return canonical_path(path)
 
 
-def _known_credential_files() -> Iterable[Path]:
-    """Root-level credential files a hard link elsewhere could alias (names catch the rest)."""
-    from hermes_cli.auth_codex_evidence import retired_index_path
-    from hermes_cli.auth_codex_registry import root_store_path
-    return (root_store_path(), registry_path(), retired_index_path())
-
-
-def _is_codex_cli_file(dest: Path) -> bool:
-    if _norm(CODEX_CLI_DIR) in [_norm(p) for p in dest.parts[:-1]]:
-        return True
-    codex_home = os.environ.get("CODEX_HOME", "").strip()
-    if codex_home:
-        base = [_norm(p) for p in canonical_path(Path(os.path.expanduser(codex_home))).parts]
-        return [_norm(p) for p in dest.parts][:len(base)] == base
-    return False
-
-
-def _classify(path: Path) -> Optional[str]:
-    """``store`` (an auth.json), ``protocol`` (a Codex authority file), ``codex-cli`` (a Codex CLI
-    credential) or None, by the resolved destination — by name, directory, or identity with a
-    known credential file (hard links)."""
-    dest = _destination(path)
-    parts = [_norm(p) for p in dest.parts]
-    name = parts[-1] if parts else ""
-    if _is_codex_cli_file(dest):
-        return "codex-cli"
-    if name == _norm(AUTH_STORE_NAME):
-        return "store"
-    if any(name == _norm(n) or name.startswith(_norm(f"{n}.")) for n in _names()):
-        return "protocol"
-    if any(p in (_norm(OPS_DIR_NAME), _norm(RECORDS_DIR_NAME)) for p in parts[:-1]):
-        return "protocol"
-    if dest.exists():
-        for known in _known_credential_files():
-            try:
-                if known.exists() and os.path.samefile(dest, known):
-                    return "store" if _norm(known.name) == _norm(AUTH_STORE_NAME) else "protocol"
-            except OSError:
-                continue
-    return None
+def _logical(path: Path) -> Path:
+    """The destination as NAMED (absolute, nothing resolved): an alias must never erase what the
+    name says it is."""
+    return Path(os.path.abspath(os.fspath(path)))
 
 
 # Runtime lock files of the credential protocol. A restore never extracts one: the restorer holds
@@ -103,37 +78,177 @@ _RUNTIME_LOCK_NAMES = ("auth.lock", MIGRATION_LOCK_NAME, "nous_auth.lock", ".bac
 _LIFECYCLE_LOCK_DIR = ".locks"  # <root>/profiles/.locks/<profile>.lock (stage 2)
 
 
+@dataclass(frozen=True)
+class _Protected:
+    """The protected authority's credential locations in CANONICAL, case-normalized form, so a
+    destination that reaches one through an alias (symlink, junction, differently named file) is
+    recognised whatever it is called. ``skip_dirs`` hold protocol state (every store's
+    ``auth.recovery/``, ``auth.ops/``, the profile lifecycle locks) and Codex CLI homes."""
+    skip_dirs: FrozenSet[str]
+    codex_dirs: FrozenSet[str]
+    protocol_files: FrozenSet[str]
+    lock_files: FrozenSet[str]
+    store_files: FrozenSet[str]
+
+
+_classification: "contextvars.ContextVar[Optional[dict]]" = contextvars.ContextVar(
+    "codex_restore_classification", default=None)
+
+
+@contextmanager
+def classification_scope() -> Iterator[None]:
+    """Compute the protected locations once for one restore pass (a fresh scope every time: the
+    guarded re-check under the migration lock never reuses what an earlier pass saw)."""
+    token = _classification.set({})
+    try:
+        yield
+    finally:
+        _classification.reset(token)
+
+
+def _codex_homes() -> List[Path]:
+    homes = [Path.home() / CODEX_CLI_DIR]
+    codex_home = os.environ.get("CODEX_HOME", "").strip()
+    if codex_home:
+        homes.append(Path(os.path.expanduser(codex_home)))
+    return homes
+
+
+def _authority_stores() -> List[Path]:
+    """Every store of the protected authority: root, active, and each profile directory's auth.json
+    (present or not — a profile's protocol directories may exist before its store does)."""
+    from hermes_cli.auth_codex_registry import active_store_location, profiles_root, root_store_path
+    stores = [root_store_path(), active_store_location()]
+    try:
+        directory = profiles_root()
+        if directory.is_dir():
+            stores.extend(d / AUTH_STORE_NAME for d in sorted(directory.iterdir()) if d.is_dir())
+    except OSError:
+        pass
+    return stores
+
+
+def _protected() -> _Protected:
+    cache = _classification.get()
+    if cache is not None and "protected" in cache:
+        return cache["protected"]
+    from hermes_cli.auth_codex_evidence import retired_index_path
+    from hermes_cli.auth_codex_registry import legacy_rescue_path, ops_dir, profiles_root, root_home
+
+    def canon(p: Path) -> str:
+        return _key(canonical_path(p))
+
+    root = root_home()
+    skip_dirs = {canon(ops_dir()), canon(profiles_root() / _LIFECYCLE_LOCK_DIR)}
+    codex_dirs = set()
+    for home in _codex_homes():
+        codex_dirs.update((canon(home), _key(_logical(home))))
+    protocol_files = {canon(registry_path()), canon(retired_index_path()), canon(root / LEGACY_RESCUE_NAME)}
+    lock_files = {canon(root / MIGRATION_LOCK_NAME), canon(root / "auth.lock")}
+    store_files = set()
+    for store in _authority_stores():
+        real = canonical_path(store)
+        store_files.add(_key(real))
+        # The runtime keeps a store's records beside its CANONICAL auth.json (records_dir) and looks
+        # for rescues at every alias; its lock is the canonical store's ``.lock`` sibling.
+        skip_dirs.update((canon(real.parent / RECORDS_DIR_NAME), canon(Path(store).parent / RECORDS_DIR_NAME)))
+        protocol_files.update((canon(legacy_rescue_path(store)), canon(legacy_rescue_path(real))))
+        lock_files.add(canon(real.with_suffix(".lock")))
+    found = _Protected(frozenset(skip_dirs), frozenset(codex_dirs), frozenset(protocol_files), frozenset(lock_files),
+                       frozenset(store_files))
+    if cache is not None:
+        cache["protected"] = found
+    return found
+
+
+def _identities(prot: _Protected) -> Dict[Tuple[int, int], str]:
+    """``(st_dev, st_ino) -> kind`` of every protected file (hard links share it). Built only when a
+    destination has more than one link, once per classification scope."""
+    cache = _classification.get()
+    if cache is not None and "identities" in cache:
+        return cache["identities"]
+    out: Dict[Tuple[int, int], str] = {}
+
+    def add(path: str, kind: str) -> None:
+        try:
+            st = os.stat(path)
+        except OSError:
+            return
+        if not stat.S_ISDIR(st.st_mode):
+            out.setdefault((st.st_dev, st.st_ino), kind)
+
+    for path in prot.lock_files:
+        add(path, "lock")
+    for path in prot.protocol_files:
+        add(path, "protocol")
+    # Codex CLI homes are matched by location only: a restore publishes by rename, which replaces a
+    # hard link instead of writing through it, and a CLI home can hold thousands of session files.
+    for directory in prot.skip_dirs:
+        for dirpath, _dirs, files in os.walk(directory):
+            for name in files:
+                add(os.path.join(dirpath, name), "protocol")
+    for path in prot.store_files:
+        add(path, "store")
+    if cache is not None:
+        cache["identities"] = out
+    return out
+
+
+def _kind_by_location(path: Path, prot: _Protected) -> Optional[str]:
+    """What *path* (logical OR canonical) is, by its name, its directory and the protected
+    locations: ``lock``, ``codex-cli``, ``protocol``, ``store`` or None."""
+    key = _key(path)
+    parts = [_norm(p) for p in path.parts]
+    name = parts[-1] if parts else ""
+    ancestors = {_key(p) for p in path.parents}
+    if (name in {_norm(n) for n in _RUNTIME_LOCK_NAMES} or key in prot.lock_files
+            or (name.startswith(_norm("auth.")) and name.endswith(_norm(".lock")))
+            or (name.endswith(_norm(".lock")) and _norm(_LIFECYCLE_LOCK_DIR) in parts[:-1])):
+        return "lock"
+    if _norm(CODEX_CLI_DIR) in parts[:-1] or ancestors & prot.codex_dirs:
+        return "codex-cli"
+    if (any(name == _norm(n) or name.startswith(_norm(f"{n}.")) for n in _names())
+            or any(p in (_norm(OPS_DIR_NAME), _norm(RECORDS_DIR_NAME)) for p in parts[:-1])
+            or key in prot.protocol_files or ancestors & prot.skip_dirs):
+        return "protocol"
+    if name == _norm(AUTH_STORE_NAME) or key in prot.store_files:
+        return "store"
+    return None
+
+
+_PRECEDENCE = ("lock", "codex-cli", "protocol", "store")
+
+
+def _classify(path: Path) -> Optional[str]:
+    """``lock``, ``codex-cli``, ``protocol``, ``store`` or None for a write to *path*, judged by BOTH
+    its logical destination (the name) and its canonical destination (where the bytes land), plus
+    the identity of an existing file (hard links). The most protected verdict wins, so an alias
+    can never erase a credential file's identity in either direction."""
+    prot = _protected()
+    logical, dest = _logical(Path(path)), _destination(Path(path))
+    kinds = {_kind_by_location(logical, prot), _kind_by_location(dest, prot)}
+    try:
+        st = os.stat(dest)
+        if st.st_nlink > 1 and not stat.S_ISDIR(st.st_mode):
+            kinds.add(_identities(prot).get((st.st_dev, st.st_ino)))
+    except OSError:
+        pass
+    return next((k for k in _PRECEDENCE if k in kinds), None)
+
+
 def is_runtime_lock(path: Path) -> bool:
-    """A protocol lock file, by its resolved destination: the migration lock, any auth store lock
-    (``auth.lock`` / ``auth.*.lock``), the Nous shared-store lock, a profile lifecycle lock — or a
-    file that IS the root's migration / store lock under another name (hard link)."""
-    dest = _destination(path)
-    name = _norm(dest.name)
-    if name in {_norm(n) for n in _RUNTIME_LOCK_NAMES}:
-        return True
-    if name.startswith(_norm("auth.")) and name.endswith(_norm(".lock")):
-        return True
-    if name.endswith(_norm(".lock")) and _norm(_LIFECYCLE_LOCK_DIR) in [_norm(p) for p in dest.parts[:-1]]:
-        return True
-    if dest.exists():
-        from hermes_cli.auth_codex_registry import root_home
-        for known in (root_home() / MIGRATION_LOCK_NAME, root_home() / "auth.lock"):
-            try:
-                if known.exists() and os.path.samefile(dest, known):
-                    return True
-            except OSError:
-                continue
-    return False
+    """A protocol lock file by its logical or canonical destination or identity: the migration
+    lock, any auth store lock (``auth.lock`` / ``auth.*.lock`` / a store's canonical ``.lock``), the
+    Nous shared-store lock, a profile lifecycle lock."""
+    return _classify(path) == "lock"
 
 
 def restore_action(path: Path) -> Optional[str]:
     """What a restore does with a member bound for *path*: ``skip`` (a Codex protocol file, a Codex
     CLI credential, a runtime lock: never written), ``store`` (an auth.json: written through
     :func:`write_restored_store`) or None (an ordinary file: restored as upstream does)."""
-    if is_runtime_lock(path):
-        return "skip"
     kind = _classify(path)
-    if kind in ("protocol", "codex-cli"):
+    if kind in ("lock", "protocol", "codex-cli"):
         return "skip"
     return "store" if kind == "store" else None
 
@@ -154,13 +269,13 @@ def _is_independent_root(directory: Path) -> bool:
     return False
 
 
-def _is_managed_store(dest: Path) -> bool:
-    """*dest* (resolved) is one of the PROTECTED authority's own credential stores: its active store,
-    its root ``auth.json``, or ``profiles/<id>/auth.json`` of a profile directory that is not an
-    independent root. Decided by this structure, never by directory containment."""
-    from hermes_cli.auth_codex_registry import active_store_path, root_home
+def _is_store_location(dest: Path) -> bool:
+    """*dest* is one of the PROTECTED authority's own credential stores: its active store, its root
+    ``auth.json``, or ``profiles/<id>/auth.json`` of a profile directory that is not an independent
+    root. Decided by this structure, never by directory containment."""
+    from hermes_cli.auth_codex_registry import active_store_location, root_home
     from hermes_constants import PROFILE_ID_RE
-    if _norm(str(dest)) == _norm(str(canonical_path(active_store_path()))):
+    if _norm(str(dest)) == _norm(str(canonical_path(active_store_location()))):
         return True
     root = canonical_path(root_home())
     root_parts = [_norm(p) for p in root.parts]
@@ -174,6 +289,19 @@ def _is_managed_store(dest: Path) -> bool:
             and bool(PROFILE_ID_RE.match(rel[1])) and not _is_independent_root(root / rel[0] / rel[1]))
 
 
+def _is_managed_store(target: Path) -> bool:
+    """A restored auth.json bound for *target* may be merged there: its canonical destination is one
+    of the protected authority's stores, or its LOGICAL destination is and the alias stays in the
+    same directory (a profile's auth.json that is a differently named file beside it — the runtime
+    reads that file as the profile's store). An alias that leaves the store's directory for an
+    unmanaged place (another root) is refused."""
+    dest = _destination(target)
+    if _is_store_location(dest):
+        return True
+    logical = _logical(target)
+    return _is_store_location(logical) and _key(dest.parent) == _key(canonical_path(logical.parent))
+
+
 def check_restore(targets: Iterable[Tuple[Path, Callable[[], bytes]]], action: str) -> None:
     """Refuse (:class:`CodexAuthorityRefused`) a restore that would write an ``auth.json`` anywhere but
     one of the protected authority's own stores (another root, an independent root nested in this
@@ -181,10 +309,9 @@ def check_restore(targets: Iterable[Tuple[Path, Callable[[], bytes]]], action: s
     for target, _load in targets:
         if restore_action(Path(target)) != "store":
             continue
-        dest = _destination(Path(target))
-        if not _is_managed_store(dest):
+        if not _is_managed_store(Path(target)):
             raise CodexAuthorityRefused(
-                f"The backup would write Hermes credentials outside this installation ({dest}); "
+                f"The backup would write Hermes credentials outside this installation ({_destination(Path(target))}); "
                 f"{action} isn't supported for them.")
 
 
@@ -207,12 +334,16 @@ def brings_codex_material(targets: Iterable[Tuple[Path, Callable[[], bytes]]]) -
 def restore_guard(targets_fn: Callable[[], Iterable[Tuple[Path, Callable[[], bytes]]]],
                   action: str) -> Iterator[None]:
     """The migration lock is held across the check and every write of a restore that touches
-    credential stores: no Codex sign-in, import or bootstrap can interleave with a store merge."""
+    credential stores: no Codex sign-in, import or bootstrap can interleave with a store merge. The
+    protected locations are recomputed under the lock and serve every write of the restore."""
     targets = list(targets_fn())
-    if not any(restore_action(Path(t)) == "store" for t, _ in targets):
-        yield
+    with classification_scope():
+        stores = any(restore_action(Path(t)) == "store" for t, _ in targets)
+    if not stores:
+        with classification_scope():
+            yield
         return
-    with migration_lock():
+    with migration_lock(), classification_scope():
         check_restore(targets, action)
         yield
 

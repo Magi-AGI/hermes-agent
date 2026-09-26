@@ -1993,17 +1993,19 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
         # Codex credential material never comes back with a profile (stage 1): Codex protocol files
         # and runtime locks are dropped, the profile's auth.json loses its Codex material.
         from hermes_cli.auth_codex_registry import CodexAuthorityRefused
-        from hermes_cli.auth_codex_restore import restore_action, restore_guard, strip_codex_bytes
-        for staged_file in [f for f in final_source.rglob("*") if f.is_file()]:
-            action = restore_action(profile_dir / staged_file.relative_to(final_source))
-            if action == "skip":
-                staged_file.unlink()
-            elif action == "store":
-                stripped = strip_codex_bytes(staged_file.read_bytes())
-                if stripped is None:
-                    staged_file.unlink()  # cannot be checked for Codex material: not imported
-                else:
-                    staged_file.write_bytes(stripped)
+        from hermes_cli.auth_codex_restore import (
+            classification_scope, restore_action, restore_guard, strip_codex_bytes)
+        with classification_scope():
+            for staged_file in [f for f in final_source.rglob("*") if f.is_file()]:
+                action = restore_action(profile_dir / staged_file.relative_to(final_source))
+                if action == "skip":
+                    staged_file.unlink()
+                elif action == "store":
+                    stripped = strip_codex_bytes(staged_file.read_bytes())
+                    if stripped is None:
+                        staged_file.unlink()  # cannot be checked for Codex material: not imported
+                    else:
+                        staged_file.write_bytes(stripped)
         staged = [(profile_dir / f.relative_to(final_source), f.read_bytes)
                   for f in final_source.rglob("*") if f.is_file()]
         try:
