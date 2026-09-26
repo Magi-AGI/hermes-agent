@@ -83,7 +83,7 @@ def _iter_source_files():
     for dirpath, dirnames, filenames in os.walk(REPO_ROOT, onerror=lambda _e: None):
         dirnames[:] = [
             d for d in dirnames
-            if d not in EXCLUDED_DIR_PARTS and not is_other_checkout(Path(dirpath) / d)
+            if d not in EXCLUDED_DIR_PARTS and not is_other_checkout(Path(dirpath) / d, REPO_ROOT)
         ]
         for name in filenames:
             if not name.endswith(".py"):

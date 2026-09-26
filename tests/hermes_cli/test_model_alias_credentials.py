@@ -810,7 +810,7 @@ class TestNoProductionCodeMutatesTheAliasCacheInPlace:
         for dirpath, dirnames, filenames in os.walk(repo, onerror=lambda _e: None):
             dirnames[:] = [
                 d for d in dirnames
-                if d not in skip and not is_other_checkout(pathlib.Path(dirpath) / d)
+                if d not in skip and not is_other_checkout(pathlib.Path(dirpath) / d, repo)
             ]
             for name in filenames:
                 if name.endswith(".py"):

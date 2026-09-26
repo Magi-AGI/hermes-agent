@@ -191,7 +191,7 @@ def iter_files(root: Path | None = None):
         excluded = SKIP_DIRS | (ROOT_SKIP_DIRS if here == root else set())
         dirnames[:] = sorted(
             d for d in dirnames
-            if d not in excluded and (rel_here / d) not in SKIP_REL_DIRS and not is_other_checkout(here / d)
+            if d not in excluded and (rel_here / d) not in SKIP_REL_DIRS and not is_other_checkout(here / d, root)
         )
         for filename in sorted(filenames):
             path = here / filename

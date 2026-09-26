@@ -469,7 +469,7 @@ def iter_files(paths: Iterable[Path]) -> Iterable[Path]:
             for root, dirs, files in os.walk(p):
                 # prune excluded dirs in-place for speed
                 dirs[:] = [d for d in dirs
-                           if d not in EXCLUDED_DIRS and not is_other_checkout(Path(root) / d)]
+                           if d not in EXCLUDED_DIRS and not is_other_checkout(Path(root) / d, Path(p))]
                 for fname in files:
                     fpath = Path(root) / fname
                     if should_scan_file(fpath):

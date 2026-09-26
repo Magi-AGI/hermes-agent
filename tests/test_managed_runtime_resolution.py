@@ -143,7 +143,7 @@ def _source_files() -> list[Path]:
                 d for d in dirnames
                 if d not in _EXEMPT_DIRS and not _is_packaging_copy(d)
             ]
-        dirnames[:] = [d for d in dirnames if not is_other_checkout(Path(dirpath) / d)]
+        dirnames[:] = [d for d in dirnames if not is_other_checkout(Path(dirpath) / d, REPO_ROOT)]
         for fname in filenames:
             if fname.endswith(".py"):
                 files.append(Path(dirpath) / fname)

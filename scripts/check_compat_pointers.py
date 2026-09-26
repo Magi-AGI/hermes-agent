@@ -38,7 +38,7 @@ def _py_files():
     for dirpath, dirnames, filenames in os.walk(ROOT):
         excluded = ROOT_SKIP_DIRS if Path(dirpath) == ROOT else DEPENDENCY_DIRS
         dirnames[:] = [name for name in dirnames
-                       if name not in excluded and not is_other_checkout(Path(dirpath) / name)]
+                       if name not in excluded and not is_other_checkout(Path(dirpath) / name, ROOT)]
         for filename in filenames:
             if not filename.endswith(".py") or filename == "check_compat_pointers.py":
                 continue
