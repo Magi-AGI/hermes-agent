@@ -211,5 +211,7 @@ def test_contended_ownership_probe_fails_quickly_without_blocking_socket(
         blocker.rollback()
         blocker.close()
 
-    assert time.monotonic() - started < 0.5
+    # "Quickly" means the probe's 50 ms busy timeout, not SQLite's 10 s default the admission path
+    # used to block the socket on; 5 s tells those apart even on a loaded runner (0.5 s did not).
+    assert time.monotonic() - started < 5.0
     assert result["error"]["code"] == 5122
