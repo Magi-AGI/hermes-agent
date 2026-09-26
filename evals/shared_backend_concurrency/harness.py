@@ -30,6 +30,7 @@ import argparse
 import itertools
 import json
 import os
+import random
 import socket
 import statistics
 import subprocess
@@ -68,7 +69,9 @@ def _make_model_handler(state: ModelState):
         def do_GET(self):
             if state.hang_models.is_set():
                 time.sleep(30)
-            body = json.dumps({"data": [{"id": MODEL_ID, "context_length": 128000}]}).encode()
+            # models.dev: an empty registry (a failed refresh to the loader), never a fake catalog.
+            body = (b"{}" if self.path.startswith("/models-dev")
+                    else json.dumps({"data": [{"id": MODEL_ID, "context_length": 128000}]}).encode())
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -150,10 +153,14 @@ class Metrics:
         self.errors = []                          # {phase, method, code, message}
         self.refused = 0
         self.approvals = 0
+        self.busy_retries = 0
+        self.successes = defaultdict(int)          # (phase, method) -> calls answered with a result
 
     def record(self, phase: str, method: str, seconds: float, error: dict | None) -> None:
         with self.lock:
             self.latency[(phase, method)].append(seconds)
+            if not error:
+                self.successes[(phase, method)] += 1
             if error:
                 self.errors.append({"phase": phase, "method": method, "code": error.get("code"),
                                     "message": str(error.get("message"))[:200], "retry": (error.get("data") or {}).get("retry")})
@@ -211,19 +218,31 @@ class Window:
         ws.send(json.dumps(reply))
 
     def rpc(self, phase: str, method: str, params: dict, timeout: float = 180.0):
-        rid = next(self._ids)
+        """One call as the desktop makes it: a BUSY (5037) marked retry "auto" is retried with the shared
+        client's jittered backoff inside the same budget, and the sample is the time to the FINAL answer."""
         started = time.monotonic()
-        self.ws.send(json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}))
-        with self.cond:
-            ok = self.cond.wait_for(lambda: rid in self.pending, timeout=timeout)
-            frame = self.pending.pop(rid, None)
-        elapsed = time.monotonic() - started
-        error = frame.get("error") if frame else {"code": "timeout", "message": f"no reply in {timeout}s"}
+        deadline = started + timeout
+        attempt = 0
+        while True:
+            attempt += 1
+            rid = next(self._ids)
+            self.ws.send(json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}))
+            with self.cond:
+                self.cond.wait_for(lambda: rid in self.pending, timeout=max(0.0, deadline - time.monotonic()))
+                frame = self.pending.pop(rid, None)
+            error = frame.get("error") if frame else {"code": "timeout", "message": f"no reply in {timeout}s"}
+            data = (error or {}).get("data") or {}
+            if error and error.get("code") == 5037 and data.get("retry") == "auto":
+                delay = (data.get("retry_after_ms") or 500) / 1000 * min(attempt, 4) * random.uniform(0.5, 1.5)
+                if time.monotonic() + delay < deadline:
+                    with self.metrics.lock:
+                        self.metrics.busy_retries += 1
+                    time.sleep(delay)
+                    continue
+            break
         if phase != "-":
-            self.metrics.record(phase, method, elapsed, error)
-        if not ok or error:
-            return None
-        return frame.get("result")
+            self.metrics.record(phase, method, time.monotonic() - started, error)
+        return None if error else frame.get("result")
 
     def wait_turn_end(self, since: float, timeout: float = 180.0) -> list:
         """Events for this session after *since* up to the first message.complete / error."""
@@ -242,6 +261,30 @@ class Window:
 
 
 # ── measurements outside the RPC path ─────────────────────────────────────────────────────────
+
+class NetworkWatch(threading.Thread):
+    """Every non-loopback connection the backend tree opens during the run (there must be none)."""
+
+    def __init__(self, root_pid: int) -> None:
+        super().__init__(daemon=True)
+        self.root_pid, self.remote, self.stop = root_pid, set(), threading.Event()
+
+    def run(self) -> None:
+        import psutil
+        while not self.stop.is_set():
+            try:
+                tree = [psutil.Process(self.root_pid), *psutil.Process(self.root_pid).children(recursive=True)]
+            except psutil.Error:
+                tree = []
+            for proc in tree:
+                try:
+                    for conn in proc.net_connections(kind="inet"):
+                        if conn.raddr and conn.raddr.ip not in ("127.0.0.1", "::1"):
+                            self.remote.add(f"{proc.pid}->{conn.raddr.ip}:{conn.raddr.port}")
+                except psutil.Error:
+                    continue
+            self.stop.wait(1.0)
+
 
 class HealthMonitor(threading.Thread):
     """GET /api/health every 0.5 s: the backend loop's responsiveness (loop-drift proxy)."""
@@ -323,28 +366,46 @@ def main() -> int:
               "agent": {"max_turns": 4}, "toolsets": ["terminal"], "platform_toolsets": {"gui": ["terminal"], "cli": ["terminal"]},
               "terminal": {"backend": "local", "cwd": str(workdir)},
               "memory": {"memory_enabled": False, "user_profile_enabled": False},
+              "stt": {"enabled": False},  # the local STT prewarm would download a Whisper model
+              # Background catalog fetches stay on loopback (the guard would refuse them anyway).
+              "model_catalog": {"enabled": False},
+              "models_dev": {"url": f"http://127.0.0.1:{args.port + 1}/models-dev.json"},
               "auxiliary": {"compression": {"provider": "custom", "model": MODEL_ID, "base_url": f"http://127.0.0.1:{args.port + 1}/v1"}}}
     (home / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
     (home / ".env").write_text("OPENAI_API_KEY=local-fixture\n", encoding="utf-8")
     (home / "SOUL.md").write_text("You are a deterministic test assistant.\n", encoding="utf-8")
     (home / ".no-bundled-skills").touch()
-    env = {k: v for k, v in os.environ.items()
-           if not (k.startswith("HERMES_") or "API_KEY" in k or "TOKEN" in k or k in ("PYTHONPATH", "PYTEST_PLUGINS"))}
+    if (repo / ".env").exists():
+        # hermes_cli.main loads (and may sanitize in place) the checkout's .env at startup.
+        raise SystemExit(f"{repo / '.env'} exists: the backend would read and may rewrite it; move it aside first")
+    # Start from the OS basics only: inherited cache overrides (HF_HOME, XDG_*, pip/uv caches), proxies,
+    # credentials or HERMES_* settings must not reach the throwaway backend.
+    keep = {"SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "PATH", "NUMBER_OF_PROCESSORS", "OS",
+            "PROCESSOR_ARCHITECTURE", "PROCESSOR_IDENTIFIER", "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)",
+            "COMMONPROGRAMFILES", "LANG", "LC_ALL"}
+    env = {k: v for k, v in os.environ.items() if k.upper() in keep}
     # Machine-wide locations must not be the real user's: on Windows Path.home() reads USERPROFILE (not
     # HOME), and the host-backend lock + rendezvous record live under it by default. A throwaway backend
     # there could claim the host lock and be offered to the LIVE desktop as its backend.
     os_home = home / "os-home"
-    for sub in ("AppData/Local", "AppData/Roaming", "state", "gateway-locks"):
+    for sub in ("AppData/Local", "AppData/Roaming", "state", "gateway-locks", "cache", "tmp", "managed"):
         (os_home / sub).mkdir(parents=True, exist_ok=True)
     env.update(HERMES_HOME=str(home), HOME=str(os_home), USERPROFILE=str(os_home),
                LOCALAPPDATA=str(os_home / "AppData" / "Local"), APPDATA=str(os_home / "AppData" / "Roaming"),
                XDG_STATE_HOME=str(os_home / "state"), HERMES_GATEWAY_LOCK_DIR=str(os_home / "gateway-locks"),
-               HERMES_DASHBOARD_SESSION_TOKEN=TOKEN, HERMES_IGNORE_RULES="1", PYTHONPATH=str(repo),
+               XDG_CACHE_HOME=str(os_home / "cache"), HF_HOME=str(os_home / "cache" / "hf"),
+               TEMP=str(os_home / "tmp"), TMP=str(os_home / "tmp"), HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1",
+               # An EMPTY managed scope: otherwise a system one (/etc/hermes) could override the fake route.
+               HERMES_MANAGED_DIR=str(os_home / "managed"),
+               HERMES_DASHBOARD_SESSION_TOKEN=TOKEN, HERMES_IGNORE_RULES="1",
+               # netguard/ first: its sitecustomize refuses (and logs) every non-loopback connect.
+               PYTHONPATH=os.pathsep.join((str(Path(__file__).resolve().parent / "netguard"), str(repo))),
+               HERMES_HARNESS_EGRESS_LOG=str(args.out / "egress-refused.log"),
                OPENAI_API_KEY="local-fixture")
     serve_log = (args.out / "serve.log").open("w", encoding="utf-8")
     proc = subprocess.Popen([sys.executable, "-m", "hermes_cli.main", "serve", "--isolated", "--port", str(args.port)],
                             cwd=repo, env=env, stdin=subprocess.DEVNULL, stdout=serve_log, stderr=subprocess.STDOUT)
-    report: dict = {"windows": args.windows, "home": str(home), "backend_pid": proc.pid,
+    report: dict = {"windows": args.windows, "freeze_requested": bool(args.freeze), "home": str(home), "backend_pid": proc.pid,
                     "sha": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()}
     metrics = Metrics()
     health = HealthMonitor(args.port)
@@ -360,6 +421,8 @@ def main() -> int:
                 time.sleep(0.5)
         report["sockets_before"] = socket_states(args.port)
         health.start()
+        network = NetworkWatch(proc.pid)
+        network.start()
 
         # A: cold start
         t0 = time.monotonic()
@@ -457,8 +520,9 @@ def main() -> int:
         def reopen(w):
             w.connect()
             resumed = w.rpc("E", "session.resume", {"session_id": w.stored_id, "source": "desktop"})
-            if resumed and resumed.get("session_id"):
-                w.session_id = resumed["session_id"]
+            if not (isinstance(resumed, dict) and resumed.get("session_id") and isinstance(resumed.get("messages"), list)):
+                raise RuntimeError(f"window {w.index}: session.resume returned no usable snapshot: {str(resumed)[:200]}")
+            w.session_id = resumed["session_id"]
         report["phase_E_failures"] = [repr(r) for r in run_parallel([lambda w=w: reopen(w) for w in live]) if r]
         report["phase_E_s"] = round(time.monotonic() - t0, 2)
         if sampler is not None:
@@ -469,10 +533,17 @@ def main() -> int:
         time.sleep(60)
         report["sockets_after_60s"] = socket_states(args.port)
 
+        network.stop.set()
+        report["non_loopback_connections"] = sorted(network.remote)
+        egress = args.out / "egress-refused.log"
+        report["egress_refused"] = egress.read_text(encoding="utf-8").splitlines() if egress.exists() else []
         if args.freeze:
             health.stop.set()  # phase F freezes the backend on purpose: it is not loop drift
             health.join(timeout=20)
-            report["phase_F"] = freeze_phase(proc.pid, args.port, args.out, repo)
+            try:
+                report["phase_F"] = freeze_phase(proc.pid, args.port, args.out, repo)
+            except Exception as exc:  # noqa: BLE001 - a requested phase that failed is a failed grade
+                report["phase_F"] = {"error": repr(exc)}
     finally:
         health.stop.set()
         for w in windows:
@@ -486,7 +557,8 @@ def main() -> int:
     report["latency"] = {f"{phase}:{method}": {"n": len(v), "p50": pct(v, 0.5), "p95": pct(v, 0.95), "max": round(max(v), 3)}
                          for (phase, method), v in sorted(metrics.latency.items())}
     report["errors"] = metrics.errors
-    report["busy_refusals"] = sum(1 for e in metrics.errors if e["code"] == 5037)
+    report["busy_retries"] = metrics.busy_retries
+    report["successes"] = {f"{phase}:{method}": n for (phase, method), n in sorted(metrics.successes.items())}
     report["live_owner_errors"] = [e for e in metrics.errors if "live owner" in e["message"]]
     report["refused_connections"] = metrics.refused
     report["approvals_answered"] = metrics.approvals
@@ -500,10 +572,17 @@ def main() -> int:
 def grade(report: dict, metrics: Metrics) -> dict:
     resume = metrics.latency.get(("E", "session.resume"), [])
     options = metrics.latency.get(("B", "model.options"), [])
+    windows = report["windows"]
+    resumed_ok = metrics.successes.get(("E", "session.resume"), 0)
+    options_ok = metrics.successes.get(("B", "model.options"), 0)
+    freeze = report.get("phase_F")
     before = int(report.get("sockets_before", {}).get("FinWait2", 0))
     after = int(report.get("sockets_after_60s", {}).get("FinWait2", 0))
     completes = report.get("turn_message_complete_counts", [])
     return {
+        # Latency grades only mean something when EVERY window's call succeeded (a refusal is fast).
+        "every_resume_succeeded": {"value": f"{resumed_ok}/{windows}", "pass": resumed_ok == windows},
+        "every_model_options_succeeded": {"value": f"{options_ok}/{windows}", "pass": options_ok == windows},
         "resume_p95_lt_2s": {"value": pct(resume, 0.95), "pass": bool(resume) and pct(resume, 0.95) < 2.0},
         "resume_max_lt_10s": {"value": max(resume) if resume else None, "pass": bool(resume) and max(resume) < 10.0},
         "model_options_p95_lt_3s": {"value": pct(options, 0.95), "pass": bool(options) and pct(options, 0.95) < 3.0},
@@ -518,10 +597,20 @@ def grade(report: dict, metrics: Metrics) -> dict:
         "stop_ends_turn_within_5s": {"value": report.get("stops"),
                                      "pass": all(isinstance(r, dict) and r["status"] == "interrupted"
                                                  and r["stop_to_turn_end_s"] < 5.0 for r in report.get("stops", []))},
-        "no_unexpected_rpc_errors": {"value": len([e for e in report["errors"] if e["code"] != 5037]),
-                                     "pass": not [e for e in report["errors"] if e["code"] != 5037]},
+        # Busy retries are normal and inside the latency samples; any error still standing after them
+        # (an unrecovered 5037 included) is a failure.
+        "no_rpc_errors_after_retries": {"value": len(report["errors"]), "pass": not report["errors"]},
+        "no_non_loopback_connections": {"value": report.get("non_loopback_connections"),
+                                        "pass": not report.get("non_loopback_connections")},
+        # Informational: background fetches the guard refused (they must fail soft, never block a phase).
+        "egress_refused_by_guard": {"value": report.get("egress_refused"), "pass": True},
         "all_windows_opened_and_reopened": {"value": [report["phase_A_failures"], report["phase_E_failures"]],
                                             "pass": not report["phase_A_failures"] and not report["phase_E_failures"]},
+        **({"freeze_phase_D7": {
+            "value": freeze,
+            "pass": isinstance(freeze, dict) and freeze.get("dumped_whole_tree") is True and freeze.get("dump_exit") == 0
+                    and all(str(p).startswith("silent") for p in freeze.get("health_probes_while_frozen", []))}}
+           if report.get("freeze_requested") else {}),
     }
 
 
