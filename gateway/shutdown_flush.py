@@ -18,6 +18,7 @@ import logging
 import os
 import time
 import uuid
+import zlib
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -136,6 +137,13 @@ class TranscriptSpoolIncompleteError(OSError):
     """Some spooled transcript files could not be read, so a search of the spool is incomplete."""
 
 
+def spool_message_timestamp(path: Path, payload: Dict[str, Any]) -> float:
+    """The timestamp an undated spooled message replays with, the same for every reader (live drain,
+    boot recovery, a recall resolving it) and every time: derived from its spool file, never written
+    back to it. A recall matches that copy by it."""
+    return float(payload.get("ts") or 0) + (zlib.crc32(path.name.encode("utf-8")) % 999_983 + 1) * 1e-6
+
+
 def spooled_transcript_messages(session_ids) -> list:
     """``(path, payload, message)`` for every spooled transcript message of *session_ids*. Raises
     ``TranscriptSpoolIncompleteError`` when the directory or any file cannot be read (a sharing lock,
@@ -179,7 +187,7 @@ def drain_transcript_spool(session_id: str, replay, *, db_known_failing: bool = 
     except Exception as exc:
         logger.debug("Cannot scan transcript spool: %s", exc)
         return 0, 0
-    entries = []
+    entries, payload_of = [], {}
     for path in candidates:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -197,8 +205,11 @@ def drain_transcript_spool(session_id: str, replay, *, db_known_failing: bool = 
             path.unlink(missing_ok=True)
             continue
         entries.append((payload.get("ts", 0), payload.get("seq", 0), path.name, path, message))
+        payload_of[path] = payload
     ordered, replayed, remaining = sorted(entries, key=lambda e: e[:3]), 0, 0
     for idx, (_ts, _seq, _name, path, message) in enumerate(ordered):
+        if message.get("timestamp") is None:
+            message = {**message, "timestamp": spool_message_timestamp(path, payload_of[path])}
         try:
             replay(message)
         except Exception as exc:
@@ -240,7 +251,7 @@ def _serialise_value(value: Any) -> Optional[dict]:
     return {"text": str(value)}
 
 
-def recover_pending_to_db(session_db=None, *, session_resolver=None) -> int:
+def recover_pending_to_db(session_db=None, *, session_resolver=None, settle_recalls=None) -> int:
     """Replay flush-dir ``*.json`` files via ``SessionDB.append_message``, deleting each on success.
 
     ``session_db=None`` opens (and afterwards releases) the shared default ``state.db``.
@@ -248,7 +259,9 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None) -> int:
     ``SessionStore.resolve_session_id_for_key``) is required for real flush files: adapter
     ``MessageEvent`` objects carry no ``session_id``, so without it every recovery lands in the skip
     branch. A returned ``db`` routes the append to the profile store owning the key (multiplexed
-    gateways); ``None`` falls back to ``session_db``. Returns the number of messages recovered.
+    gateways); ``None`` falls back to ``session_db``. ``settle_recalls(db)`` settles open recalls
+    first; a gateway whose adapters already run passes ``SessionStore.settle_open_recalls`` so its
+    retry queue is part of the snapshot. Returns the number of messages recovered.
     """
     own_db = session_db is None
     if own_db:
@@ -260,7 +273,7 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None) -> int:
         # the copies they held replay as their outcome; one still fenced keeps its copies held.
         from gateway.transcript_recall import settle_open_recalls
         try:
-            settle_open_recalls(session_db)
+            (settle_recalls or settle_open_recalls)(session_db)
         except Exception as exc:
             logger.warning("Could not settle open recalls before recovery; their copies stay held: %s", exc)
         for path in sorted(_get_flush_dir().glob("*.json")):
@@ -307,7 +320,8 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
         # The platform id too, as live replay writes it: a recall recorded by id must still match.
         session_db.append_message(session_id=spooled_sid, role=message.get("role", "unknown"),
                                   content=message.get("content") or "",
-                                  timestamp=message.get("timestamp") or payload.get("ts"),
+                                  timestamp=(message["timestamp"] if message.get("timestamp") is not None
+                                             else spool_message_timestamp(path, payload)),
                                   platform_message_id=(message.get("platform_message_id")
                                                        or message.get("message_id")))
         return True

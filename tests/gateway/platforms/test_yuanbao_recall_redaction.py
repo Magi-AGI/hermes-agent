@@ -318,12 +318,11 @@ def test_the_fence_applies_when_nothing_is_stored_yet_or_only_an_undated_retry_c
 
 
 @pytest.mark.windows_only
-def test_an_undated_spooled_copy_that_cannot_be_stamped_yet_is_retried_and_replays_as_the_redaction(store):
-    """Round 3 (Codex): the spool was readable but its update failed; the recall task ended and the
-    next replay restored an id-less original beside its redacted copy. An undated copy (spooled by an
-    earlier build) must first get a durable timestamp, or replay cannot be matched to the withdrawal."""
-    from gateway.shutdown_flush import (
-        TRANSCRIPT_CAP_DROP_REASON, TranscriptSpoolIncompleteError, _get_flush_dir, _write_payload)
+def test_an_undated_spooled_copy_is_redacted_on_replay_without_rewriting_its_file(store):
+    """Round 3 (Codex): a readable spool file whose update failed replayed its original text. An undated
+    copy's identity now comes from its file, the same for every reader, so the recall needs no write:
+    a copy that cannot be replaced still replays as the redaction."""
+    from gateway.shutdown_flush import TRANSCRIPT_CAP_DROP_REASON, _get_flush_dir, _write_payload
 
     tasks: list = []
     adapter = _adapter(store, tasks)
@@ -334,12 +333,11 @@ def test_an_undated_spooled_copy_that_cannot_be_stamped_yet_is_retried_and_repla
     store._spooled_drop_sessions = {sid}
     release = _hold_windows_file(path, 0x1)  # FILE_SHARE_READ only: readable, not replaceable
     try:
-        with pytest.raises(TranscriptSpoolIncompleteError):
-            store.recall_message(sid, request_id="r1", content=SECRET, replacement=RecallGuardMiddleware._REDACTED)
+        assert store.recall_message(sid, request_id="r1", content=SECRET,
+                                    replacement=RecallGuardMiddleware._REDACTED)[1] == "resolved"
     finally:
         release()
-    for n in range(2):  # the first drain settles and stamps the held copy, the next replays it
-        store.append_to_transcript(sid, {"role": "assistant", "content": f"next {n}"})
+    store.append_to_transcript(sid, {"role": "assistant", "content": "next"})  # replays the spool
     assert not [r for r in _rows(db, sid) if SECRET in (r[1] or "")]
     assert ("user", RecallGuardMiddleware._REDACTED, 1) in _rows(db, sid)
 
@@ -674,4 +672,145 @@ BEGIN
             OR (r.platform_message_id IS NULL AND COALESCE(new.platform_message_id, '') = ''
                 AND r.content = new.content AND r.timestamp = new.timestamp)));
 END;
+"""
+
+
+def test_a_stale_concurrent_resolver_cannot_change_a_copy_identity_after_settlement(store, monkeypatch):
+    """Round 6 (Codex, stamp_race): two resolvers read one undated spool copy; the first settled it and
+    recorded its guard, then the second, from its stale read, rewrote the file with another timestamp
+    and replay restored the text. No resolver writes the copy now: its identity is the file's."""
+    import gateway.shutdown_flush as shutdown_flush
+    from gateway.transcript_recall import settle_recall
+
+    tasks: list = []
+    adapter = _adapter(store, tasks)
+    sid = _session(store, adapter)
+    db = store._db
+    _spool(sid, SECRET)
+    lineage = db.recall_lineage(sid)
+    db.open_recall_request(lineage, request_id="r1", platform_message_id=None, content=SECRET,
+                           replacement=RecallGuardMiddleware._REDACTED)
+    request = db.recall_request(lineage, "r1")
+    real_scan = shutdown_flush.spooled_transcript_messages
+    outcomes = []
+
+    def first_resolver_wins_in_the_gap(sessions):
+        stale = real_scan(sessions)
+        if not outcomes:
+            monkeypatch.setattr(shutdown_flush, "spooled_transcript_messages", real_scan)
+            outcomes.append(settle_recall(db, dict(request)))
+        return stale
+
+    monkeypatch.setattr(shutdown_flush, "spooled_transcript_messages", first_resolver_wins_in_the_gap)
+    outcomes.append(settle_recall(db, dict(request)))
+    assert [o[1] for o in outcomes] == ["resolved", "resolved"]
+    shutdown_flush.recover_pending_to_db(db)
+    rows = _rows(db, sid)
+    assert rows and not [r for r in rows if SECRET in (r[1] or "")]
+
+
+def test_an_undated_copy_is_never_taken_for_another_message_with_an_equal_timestamp(store, monkeypatch):
+    """Round 6 (Codex, stamp_collision): the timestamp generated for an undated copy could equal a
+    stored message's, and the two distinct messages were redacted as one. An undated copy is always
+    a message of its own: with another candidate the recall is ambiguous."""
+    import itertools
+
+    import gateway.shutdown_flush as shutdown_flush
+    import gateway.transcript_recall as transcript_recall
+
+    stamp = 1_700_000_100.0
+    tasks: list = []
+    adapter = _adapter(store, tasks)
+    sid = _session(store, adapter)
+    db = store._db
+    db.append_message(session_id=sid, role="user", content=SECRET, timestamp=stamp)
+    _spool(sid, SECRET)
+    monkeypatch.setattr(transcript_recall, "time", SimpleNamespace(time=lambda: stamp), raising=False)
+    monkeypatch.setattr(transcript_recall, "_STAMP_SEQ", itertools.count(), raising=False)
+    monkeypatch.setattr(shutdown_flush, "spool_message_timestamp", lambda _path, _payload: stamp, raising=False)
+    assert store.recall_message(sid, request_id="r1", content=SECRET, replacement=RecallGuardMiddleware._REDACTED,
+                                note="[recall] withdrawn")[1] == "ambiguous"
+    assert (("user", SECRET, 1)) in _rows(db, sid)
+
+
+def test_startup_recovery_settles_with_the_live_retry_queue_in_view(store):
+    """Round 6 (Codex, boot_queue): the gateway recovers after its adapters start, but startup
+    settlement ignored the store's retry queue: with the exact recalled id queued there, it took an
+    older, unrelated message with the same text for the target."""
+    from gateway.run import _recover_pending_transcripts
+    from hermes_state import _default_db_path
+
+    store._db.close()
+    store._db = SessionDB(db_path=_default_db_path())  # the store startup recovery opens
+    tasks: list = []
+    adapter = _adapter(store, tasks)
+    sid = _session(store, adapter)
+    db = store._db
+    db.append_message(session_id=sid, role="user", content=SECRET, timestamp=1_700_000_100.0)
+    db.open_recall_request(db.recall_lineage(sid), request_id="p1", platform_message_id="p1", content=SECRET,
+                           replacement=RecallGuardMiddleware._REDACTED)
+    with store._transcript_retry_lock:
+        store._dirty_transcripts[sid] = [
+            {"role": "user", "content": SECRET, "message_id": "p1", "timestamp": 1_700_000_200.0}]
+    _recover_pending_transcripts(SimpleNamespace(session_store=store))
+    store.append_to_transcript(sid, {"role": "assistant", "content": "next"})  # flushes the queue
+    assert [r[1] for r in _rows(db, sid) if r[0] == "user"] == [SECRET, RecallGuardMiddleware._REDACTED]
+
+
+def test_pruning_a_compressed_ancestor_keeps_an_open_recall_on_the_surviving_conversation(store, tmp_path):
+    """Round 6 (Codex, prune_open_request): the request was anchored only on the conversation's root;
+    pruning that ended ancestor detached it, and it settled as "none" while the surviving continuation
+    kept the recalled text. Every session of the conversation now anchors it."""
+    from gateway.transcript_recall import settle_open_recalls
+
+    tasks: list = []
+    adapter = _adapter(store, tasks)
+    sid = _session(store, adapter)
+    db = store._db
+    assert db.try_acquire_compression_lock(sid, "compressor")
+    db.publish_compression_child(parent_session_id=sid, child_session_id="child", source="yuanbao",
+                                 messages=[{"role": "user", "content": SECRET, "platform_message_id": "p1"}],
+                                 compression_lock_holder="compressor")
+    db.release_compression_lock(sid, "compressor")
+    db.open_recall_request(db.recall_lineage("child"), request_id="p1", platform_message_id="p1", content=SECRET,
+                           replacement=RecallGuardMiddleware._REDACTED)
+    db.prune_sessions(older_than_days=None, source="yuanbao", exclude_active_write_guards=True)
+    assert db.get_session(sid) is None and db.get_session("child") is not None
+    settle_open_recalls(db)
+    db.append_message(session_id="child", role="user", content=SECRET, platform_message_id="p1")
+    rows = _rows(db, "child")
+    assert rows and not [r for r in rows if SECRET in (r[1] or "")]
+
+
+def test_a_recall_left_pending_by_the_previous_review_build_is_resumed(tmp_path):
+    """Round 6 (Codex, upgrade_r5_pending): a store written by the build that kept unresolved text
+    recalls as ``pending`` rows was opened without carrying them over, and boot recovery replayed the
+    recalled text. They are migrated into open requests."""
+    from gateway.shutdown_flush import recover_pending_to_db
+
+    path = tmp_path / "state.db"
+    db = SessionDB(db_path=path)
+    db.create_session("s", "yuanbao")
+    db._execute_write(lambda conn: conn.executescript(_PENDING_BUILD_SCHEMA))
+    db.close()
+    _spool("s", SECRET, timestamp=1_700_000_100.0)
+    db = SessionDB(db_path=path)
+    try:
+        recover_pending_to_db(db)
+        rows = _rows(db, "s")
+        assert rows and not [r for r in rows if SECRET in (r[1] or "")]
+    finally:
+        db.close()
+
+
+# The recall schema of the review build that kept unresolved text recalls as pending rows, with an id
+# record and a pending text record for one recall (a historical fixture).
+_PENDING_BUILD_SCHEMA = f"""
+DROP TABLE recalled_messages; DROP TABLE IF EXISTS recall_requests;
+CREATE TABLE recalled_messages (
+    session_id TEXT NOT NULL, request_id TEXT, platform_message_id TEXT, content TEXT, timestamp REAL,
+    pending INTEGER NOT NULL DEFAULT 0, replacement TEXT NOT NULL, recalled_at REAL NOT NULL);
+CREATE INDEX idx_recalled_messages_session ON recalled_messages(session_id);
+INSERT INTO recalled_messages VALUES ('s', 'p1', 'p1', NULL, NULL, 0, '[redacted]', 1);
+INSERT INTO recalled_messages VALUES ('s', 'p1', NULL, '{SECRET}', NULL, 1, '[redacted]', 1);
 """

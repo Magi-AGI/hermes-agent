@@ -297,6 +297,11 @@ class SessionCompressionMixin:
                 "replacement, recalled_at) SELECT ?, request_id, platform_message_id, content, timestamp, "
                 "replacement, recalled_at FROM recalled_messages WHERE session_id = ?",
                 (child_session_id, parent_session_id))
+            conn.execute(  # and an unsettled one stays anchored in the continuation
+                "INSERT OR IGNORE INTO recall_requests (request_id, session_id, platform_message_id, content, "
+                "replacement, note, status, created_at) SELECT request_id, ?, platform_message_id, content, "
+                "replacement, note, status, created_at FROM recall_requests WHERE session_id = ? AND status = 'open'",
+                (child_session_id, parent_session_id))
             total_messages, total_tool_calls = self._insert_message_rows(conn, child_session_id, messages)
             if watermark is not None:
                 # Clone the parent's concurrent tail into the child after the handoff;

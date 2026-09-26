@@ -4717,6 +4717,20 @@ def _housekeeping_state_db_maintenance(launch: Optional[Tuple[Path, Path]] = Non
         release_or_close(_adb)
 
 
+def _recover_pending_transcripts(runner) -> int:
+    """Startup replay of the shutdown flush / transcript spool into the launch store. Runs after
+    ``runner.start()``, so adapters may already have queued transcript retries: open recalls settle
+    through the session store, with that queue in the snapshot."""
+    from gateway.shutdown_flush import recover_pending_to_db
+    recovered = recover_pending_to_db(
+        session_resolver=runner.session_store.resolve_session_id_for_key,
+        settle_recalls=runner.session_store.settle_open_recalls,
+    )
+    if recovered:
+        logger.info("Recovered %d pending message(s) from shutdown flush", recovered)
+    return recovered
+
+
 def _housekeeping_open_recalls(runner) -> None:
     """Settle recall requests left open (the conversation stayed busy past the adapter's retry window,
     a spooled copy was unreadable, a previous process died) for ONE profile's state.db, and replay the
@@ -5853,15 +5867,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         _shutdown_gateway_health_export(runner)
         return False
 
-    def _recover_pending() -> None:
-        from gateway.shutdown_flush import recover_pending_to_db
-        recovered = recover_pending_to_db(
-            session_resolver=runner.session_store.resolve_session_id_for_key,
-        )
-        if recovered:
-            logger.info("Recovered %d pending message(s) from shutdown flush", recovered)
-
-    _best_effort(_recover_pending)
+    _best_effort(lambda: _recover_pending_transcripts(runner))
     if runner.should_exit_cleanly:
         _shutdown_gateway_health_export(runner)
         if runner.exit_reason:

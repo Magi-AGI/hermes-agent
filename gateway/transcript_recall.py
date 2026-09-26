@@ -2,16 +2,17 @@
 
 A recall is first recorded durably (``SessionDB.open_recall_request``); from then on matching retry
 copies are held from replay. ``settle_recall`` finishes it: it needs the COMPLETE set of copies waiting
-for a retried write (the in-process retry queue, when there is one, and every spool file), gives each
-undated candidate copy a durable timestamp so it has an identity replay will reproduce, and hands the
-snapshot to ``SessionDB.resolve_recall``, which decides and records the outcome in one fenced
-transaction. The same routine serves the live recall, a held live replay, boot recovery and the
-gateway housekeeping tick, so no path completes a recall differently or depends on another to run.
+for a retried write (the in-process retry queue, when there is one, and every spool file) and hands
+their identities to ``SessionDB.resolve_recall``, which decides and records the outcome in one fenced
+transaction. An undated copy is its own message: a spooled one is identified by the timestamp its
+file implies (``spool_message_timestamp``, which every replay uses too, so nothing is written back to
+the file), a queued one is stamped in memory and marked; neither is ever taken for another message
+with an equal timestamp. The same routine serves the live recall, a held live replay, boot recovery
+and the gateway housekeeping tick, so no path completes a recall differently.
 """
 
 from __future__ import annotations
 
-import itertools
 import logging
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -21,7 +22,9 @@ logger = logging.getLogger(__name__)
 # A compression rotation between resolving the lineage and the resolution's transaction closes the
 # tip it named; re-resolve and try again this many times before handing the retry to the caller.
 _ROTATION_ATTEMPTS = 5
-_STAMP_SEQ = itertools.count()
+# Marks a queued copy that had no timestamp until a recall stamped it (in memory; it is written, or
+# spooled, with the mark): it stays its own message however its timestamp compares.
+OWN_STAMP_KEY = "recall_own_stamp"
 
 QueuedFor = Callable[[Sequence[str]], List[Dict[str, Any]]]
 
@@ -37,42 +40,32 @@ def message_timestamp(message: Dict[str, Any]) -> Optional[float]:
     return None if epoch is None else float(epoch)
 
 
-def _fresh_stamp() -> float:
-    # Distinct per copy: two undated copies are two messages, never one identity.
-    return time.time() + next(_STAMP_SEQ) % 1000 * 1e-6
-
-
 def settle_recall(db, request: Dict[str, Any], *, queued_for: Optional[QueuedFor] = None) -> Tuple[int, str]:
     """Resolve one open request; ``(rows and copies covered, outcome)``, outcome ``resolved``, ``none``,
     ``ambiguous`` or a settled request's status. Raises ``TranscriptSpoolIncompleteError`` when any
-    spooled copy cannot be read or stamped, and the SessionDB fence errors while a live turn or a
-    compression holds the conversation: the request stays open and its copies held. *queued_for*
-    returns the retry queue's user copies of the given sessions (caller holds the drain lock)."""
-    from gateway.shutdown_flush import TranscriptSpoolIncompleteError, spooled_transcript_messages
+    spooled copy cannot be read, and the SessionDB fence errors while a live turn or a compression
+    holds the conversation: the request stays open and its copies held. *queued_for* returns the retry
+    queue's user copies of the given sessions (caller holds the drain lock)."""
+    from gateway.shutdown_flush import spool_message_timestamp, spooled_transcript_messages
     from hermes_state_errors import CompressionSessionClosedError
-    from utils import atomic_json_write
 
     for attempt in range(_ROTATION_ATTEMPTS):
         lineage = db.recall_lineage(request["session_id"])
-        queued = [m for m in (queued_for(lineage) if queued_for else []) if m.get("role") == "user"]
-        spooled = [(path, payload, m) for path, payload, m in spooled_transcript_messages(lineage)
-                   if m.get("role") == "user"]
-
-        def candidate(message: Dict[str, Any]) -> bool:
-            return db.recall_text_matches(request, message)
-
-        for message in queued:
-            if candidate(message) and message_timestamp(message) is None:
-                message["timestamp"] = _fresh_stamp()  # written with it: the queue holds this dict
-        for path, payload, message in spooled:
-            if candidate(message) and message_timestamp(message) is None:
-                message["timestamp"] = _fresh_stamp()
-                try:
-                    atomic_json_write(path, payload, mode=0o600, default=str)
-                except OSError as exc:
-                    raise TranscriptSpoolIncompleteError(f"cannot stamp {path.name}: {exc}") from exc
-        copies = queued + [m for _path, _payload, m in spooled]
-        snapshot = [(message_platform_id(m), candidate(m), message_timestamp(m)) for m in copies]
+        snapshot = []
+        for message in (queued_for(lineage) if queued_for else []):
+            if message.get("role") != "user":
+                continue
+            if message_timestamp(message) is None and db.recall_text_matches(request, message):
+                message["timestamp"], message[OWN_STAMP_KEY] = time.time(), True  # the queue holds this dict
+            snapshot.append((message_platform_id(message), db.recall_text_matches(request, message),
+                             message_timestamp(message), bool(message.get(OWN_STAMP_KEY))))
+        for path, payload, message in spooled_transcript_messages(lineage):
+            if message.get("role") != "user":
+                continue
+            stamp = message_timestamp(message)
+            snapshot.append((message_platform_id(message), db.recall_text_matches(request, message),
+                             spool_message_timestamp(path, payload) if stamp is None else stamp,
+                             stamp is None or bool(message.get(OWN_STAMP_KEY))))
         try:
             changed, outcome, identity = db.resolve_recall(
                 lineage, request_id=request["request_id"], retry_copies=snapshot)
@@ -82,7 +75,7 @@ def settle_recall(db, request: Dict[str, Any], *, queued_for: Optional[QueuedFor
                 raise
     if identity is not None:
         kind, key = identity
-        changed += sum(1 for pid, text_matches, stamp in snapshot
+        changed += sum(1 for pid, text_matches, stamp, _own in snapshot
                        if (pid == key if kind == "id" else (not pid and text_matches and stamp == key)))
     return changed, outcome
 

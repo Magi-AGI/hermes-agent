@@ -341,4 +341,4 @@ def test_drain_transcript_spool_skips_parseable_non_dict_payload(tmp_path, monke
 
     replayed = []
     assert drain_transcript_spool("sess-1", replayed.append) == (1, 0)
-    assert replayed == [{"role": "user", "content": "hi"}]
+    assert [(m["role"], m["content"]) for m in replayed] == [("user", "hi")]

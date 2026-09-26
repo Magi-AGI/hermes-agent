@@ -745,6 +745,28 @@ class SessionSchemaMixin:
                 os.replace(tmp, cache_path)
         return table_columns
 
+    @staticmethod
+    def _migrate_review_build_recalls(cursor: sqlite3.Cursor) -> None:
+        """Stores opened by the unreleased review builds of recall redaction: drop the triggers one
+        enforced recalls with, and turn another's ``pending`` text notes (an unresolved recall) into open
+        requests, with the platform id its id record kept. Probes first: a DROP or DELETE takes the
+        write lock even as a no-op."""
+        for obsolete in ("messages_recall_insert", "messages_recall_update"):
+            if cursor.execute("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+                              (obsolete,)).fetchone():
+                cursor.execute(f"DROP TRIGGER {obsolete}")
+        columns = {row[1] for row in cursor.execute('PRAGMA table_info("recalled_messages")')}
+        if "pending" not in columns or not cursor.execute(
+                "SELECT 1 FROM recalled_messages WHERE pending = 1 LIMIT 1").fetchone():
+            return
+        cursor.execute(
+            "INSERT OR IGNORE INTO recall_requests (request_id, session_id, platform_message_id, content, "
+            "replacement, created_at) SELECT COALESCE(r.request_id, ''), r.session_id, ("
+            "SELECT i.platform_message_id FROM recalled_messages i WHERE i.session_id = r.session_id "
+            "AND i.request_id IS r.request_id AND i.platform_message_id IS NOT NULL LIMIT 1), "
+            "r.content, r.replacement, r.recalled_at FROM recalled_messages r WHERE r.pending = 1")
+        cursor.execute("DELETE FROM recalled_messages WHERE pending = 1")
+
     def _reconcile_columns(self, cursor: sqlite3.Cursor) -> None:
         """ADD every SCHEMA_SQL column missing from the live tables (SCHEMA_SQL is the single
         source of truth; column additions need no version-gated migration)."""
@@ -954,12 +976,7 @@ class SessionSchemaMixin:
         except sqlite3.OperationalError as exc:
             logger.debug("idx_messages_platform_msg_id create skipped: %s", exc)
         self._execute_ddl_skipping_settled_triggers(cursor, DEFERRED_INDEX_SQL)  # same ordering constraint (``active``)
-        # Recall enforcement once lived in triggers on ``messages`` (never released); a store opened by
-        # that build keeps them otherwise. Probe first: DROP takes the write lock even as a no-op.
-        for obsolete in ("messages_recall_insert", "messages_recall_update"):
-            if cursor.execute("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?",
-                              (obsolete,)).fetchone():
-                cursor.execute(f"DROP TRIGGER {obsolete}")
+        self._migrate_review_build_recalls(cursor)
 
         # Heal NULL ``active`` rows on every startup: older reconciler builds added ``active``
         # without NOT NULL DEFAULT 1, so ``WHERE active = 1`` loaders hid whole histories. A

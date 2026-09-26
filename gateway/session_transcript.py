@@ -372,16 +372,13 @@ class SessionTranscriptMixin:
     def _replay_spooled_message(self, session_id: str, message: Dict[str, Any]) -> None:
         """Replay one spooled message. An open recall that may target it is settled first; while it
         cannot be (fenced, or a spooled copy unreadable) the drain stops here and the file is kept, so
-        replay order holds, until a later drain or the housekeeping tick settles it. An undated id-less
-        copy the settlement stamped (its identity) is replayed from its rewritten file by the next
-        drain, not from this parse."""
+        replay order holds, until a later drain or the housekeeping tick settles it."""
         db = self._db_for_session_id(session_id)
         holds = getattr(db, "recall_holds", None)  # None: store keeps no recalls
         if holds is not None and holds(session_id, message):
-            from gateway.transcript_recall import message_platform_id, settle_open_recalls
+            from gateway.transcript_recall import settle_open_recalls
             settle_open_recalls(db, session_id, queued_for=self._queued_user_copies)
-            if holds(session_id, message) or (
-                    message.get("timestamp") is None and not message_platform_id(message)):
+            if holds(session_id, message):
                 raise RecallHoldError(session_id)
         self._append_transcript_message(session_id, message)
 
