@@ -175,6 +175,8 @@ def test_compression_latency_records_delayed_first_provider_chunk():
     # upstream's contract; the refusal itself is covered in test_compression_route_guard.py.
     with (
         patch("agent.auxiliary_client.time", clock),
+        # Anything the call caches on the driven clock is dropped with it.
+        patch("agent.auxiliary_client._managed_local_cache", (0.0, "")),
         patch("agent.auxiliary_client._compression_client_allowed", return_value=True),
         patch("agent.auxiliary_client._acquire_sync_aux_semaphore", return_value=_DelayedSemaphore()),
         patch("agent.auxiliary_client._get_cached_client", side_effect=_resolve_client),
@@ -323,6 +325,8 @@ def test_bedrock_converse_ttfp_waits_for_the_nonstreaming_response():
 
     with (
         patch("agent.auxiliary_client.time", clock),
+        # Anything the call caches on the driven clock is dropped with it.
+        patch("agent.auxiliary_client._managed_local_cache", (0.0, "")),
         patch("agent.auxiliary_client._get_auxiliary_task_config", return_value=config),
         patch(
             "agent.auxiliary_client._get_cached_client",
