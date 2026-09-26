@@ -1378,19 +1378,16 @@ class TestRunCommandSttIdleTimeout:
         from tools.transcription_command import _run_command_stt
 
         script = tmp_path / "progress_then_exit.py"
-        # The de-flake is budget, not ordering: the first tick was always
-        # printed before the first sleep. What changed is the idle window
-        # (0.1s -> 0.25s, 5x the 50ms tick period) so process spawn latency
-        # under loaded CI or on Windows can no longer eat the whole window
-        # before the first stderr chunk is read, plus a longer heartbeat
-        # sequence whose ~400ms runtime still exceeds the idle window, so a
-        # pass still proves the progress extension.
+        # The window must outlast process spawn before the first stderr chunk
+        # (0.25 s did not on a loaded Windows runner; 0.1 s before that), and
+        # the run must outlast the window with every gap well inside it:
+        # 2 s window, 0.4 s ticks, ~3.2 s runtime.
         script.write_text(
             "\n".join([
                 "import sys, time",
                 "print('tick 0', file=sys.stderr, flush=True)",
                 "for idx in range(1, 9):",
-                "    time.sleep(0.05)",
+                "    time.sleep(0.4)",
                 "    print(f'tick {idx}', file=sys.stderr, flush=True)",
                 "print('done', flush=True)",
             ]),
@@ -1399,7 +1396,7 @@ class TestRunCommandSttIdleTimeout:
 
         result = _run_command_stt(
             self._shell_command(sys.executable, "-u", str(script)),
-            timeout=0.25,
+            timeout=2.0,
         )
 
         assert result.returncode == 0
@@ -1425,11 +1422,11 @@ class TestRunCommandSttIdleTimeout:
         # comfortably exceed process spawn latency on a loaded runner, or the
         # child is killed before its first stderr line is ever read and the
         # pre-stall-output assertion fails spuriously. 30s of silence still
-        # trips a 0.25s window by a wide margin.
+        # trips a 2s window by a wide margin.
         with pytest.raises(subprocess.TimeoutExpired) as excinfo:
             _run_command_stt(
                 self._shell_command(sys.executable, "-u", str(script)),
-                timeout=0.25,
+                timeout=2.0,
             )
 
         assert "starting pass 1" in (excinfo.value.stderr or "")
