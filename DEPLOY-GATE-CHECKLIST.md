@@ -79,11 +79,11 @@ Status key: DONE (on sync branch, triad-approved) / OPEN / IN PROGRESS / VERIFY 
 ## E. Skills (plan phase 5)
 | # | item | status |
 |---|---|---|
-| E1 | Pass A remainder (private-wiki-backup-environments, decko-local-browser-write-flows, AUDIT sweep) | DONE in audit repo (T6, c2f36ce..fdaa866 approved by both; f83e848 wording-only nits pending a quick sign-off); live apply = F10 |
-| E2 | Pass B: slim triad-review-workflows, persistent-agent-triad, wiki-source-triangulation; collapse reference sprawl; delete superseded | DONE in audit repo (T6, same range; incl. Pass C name removal across 162 files); live apply = F10 |
-| E5 | Skill-learning bug (T6 finding): Hermes's learner treats reviewer text Lake pastes as Lake's own corrections. Hermes code fix; confirming from real transcripts needs Lake's OK to read a COPY of claudetriad/state.db | OPEN / LAKE |
-| E6 | Team skills export without personal skills (job-application-workflows, household-finance reference, business-entity-formation-planning); minor upstream skill issues (format_findings broken with no callers; bundled grounded-citations references archived research-paper-writing) | LAKE (optional export) / OPEN (minor) |
-| E3 | `curator.consolidate` decision (after Pass B) | LAKE |
+| E1 | Pass A remainder (private-wiki-backup-environments, decko-local-browser-write-flows, AUDIT sweep) | DONE (T6, both reviewers through f83e848, incl. Pass C depersonalization); live apply = F10 |
+| E2 | Pass B: slim triad-review-workflows, persistent-agent-triad, wiki-source-triangulation; collapse reference sprawl; delete superseded | DONE (T6, both reviewers through f83e848); live apply = F10 |
+| E5 | Skill-learning bug (T6 finding): Hermes's learner treats reviewer text Lake pastes as Lake's own corrections. Hermes code fix; confirming from real transcripts needs Lake's OK to read a COPY of claudetriad/state.db | OPEN - owner needed (Hermes learner code: injected summaries / consent blocks / pasted reviewer text treated as Lake's words). Recommended owner: T6 |
+| E6 | Team skills export without personal skills (job-application-workflows, household-finance reference, business-entity-formation-planning); minor upstream skill issues (format_findings broken with no callers; bundled grounded-citations references archived research-paper-writing) | DONE (T6: team zip export/team-skills-5eb0696.zip, host IPs placeholdered, both reviewers); minor upstream skill issues noted, no deploy impact |
+| E3 | `curator.consolidate` decision (after Pass B) | LAKE (after E5: start with `hermes curator run --dry-run --consolidate`) |
 | E4 | Lake's additional skills-improvement ideas | LAKE |
 
 ## F. Deploy (last)
@@ -95,7 +95,7 @@ measurement and does not gate the deploy. This changes timing only, not the rule
 | F1 | Freeze the exact reviewed commit + matching desktop build (pinned Node v26.10.0), matching Python dependencies, STT capability, and `web_dist` | OPEN |
 | F2 | Restart the messaging gateway in the same window (re-identify its process; old PID 49956 is historical) | LAKE |
 | F3 | `hermes doctor` as the last deploy step (config-version migration) | OPEN |
-| F10 | Skills live apply (T6 audit repo): with all sessions, gateway and desktop backend stopped: `apply_to_live.py --apply` (plans 78 modified / 106 added / 527 removed, backs up first, refuses on drift), `--verify`, then the six printed `hermes -p claudetriad curator archive` commands (reversible via curator restore). Do it in the deploy window | LAKE |
+| F10 | T6 tooling + F10-PROCEDURE.md approved through a3538b6 (both reviewers); T6 runs the drift merge the day before deploy (4 known live drifts, genuine lessons). Skills live apply (T6 audit repo): with all sessions, gateway and desktop backend stopped: `apply_to_live.py --apply` (plans 78 modified / 106 added / 527 removed, backs up first, refuses on drift), `--verify`, then the six printed `hermes -p claudetriad curator archive` commands (reversible via curator restore). Do it in the deploy window | LAKE |
 | F7 | Verified (restore-tested) backups of state.db / compaction.db, saved windows (Roaming\Hermes), skills, and credential-protocol state | OPEN |
 | F8 | Tested credential ROLLBACK policy: restoring an old auth.json after rotation can replay consumed tokens, and old code ignores the new registry's fences, so a backup alone is not a safe rollback. Define and test the rollback path | OPEN |
 | F9 | Relay (`hermes dashboard`) restart by verified PID, fresh-process check (new PID StartTime), phone path verified | LAKE |
