@@ -13,6 +13,9 @@ precedes every extension/type handler of the restore paths:
   ``auth.ops/``, legacy rescue files) and Codex CLI credentials (``.codex/`` / ``$CODEX_HOME``) are
   never written;
 * runtime lock files are never written (``is_runtime_lock``);
+* the protected inventory is complete or the write is refused (a location that cannot be inspected
+  is never treated as absent), and no restore path writes THROUGH an existing file: every restored
+  file is published by write-temp + fsync + replace, so another hard link keeps its content;
 * an ``auth.json`` is written ONLY at one of the protected authority's own stores, and as one
   read-merge-write under the migration lock + that store's lock with the strict writer: the
   restored content with ALL Codex material removed (a legacy-format store first converted by
@@ -27,6 +30,7 @@ is stage 2 (design B3).
 from __future__ import annotations
 
 import contextvars
+import errno
 import json
 import os
 import stat
@@ -86,6 +90,7 @@ class _Protected:
     ``auth.recovery/``, ``auth.ops/``, the profile lifecycle locks) and Codex CLI homes."""
     skip_dirs: FrozenSet[str]
     codex_dirs: FrozenSet[str]
+    codex_files: FrozenSet[str]
     protocol_files: FrozenSet[str]
     lock_files: FrozenSet[str]
     store_files: FrozenSet[str]
@@ -114,17 +119,44 @@ def _codex_homes() -> List[Path]:
     return homes
 
 
+def _missing(exc: OSError) -> bool:
+    return isinstance(exc, (FileNotFoundError, NotADirectoryError)) or exc.errno in (errno.ENOENT, errno.ENOTDIR)
+
+
+def _refuse_incomplete(what: str, exc: object) -> CodexAuthorityRefused:
+    return CodexAuthorityRefused(
+        f"This restore can't tell which files hold this installation's credentials ({what}: {exc}); "
+        "nothing was restored. Fix the access problem (or run `hermes auth migrate --rebuild` for an "
+        "unreadable registry) and restore again.")
+
+
 def _authority_stores() -> List[Path]:
-    """Every store of the protected authority: root, active, and each profile directory's auth.json
-    (present or not — a profile's protocol directories may exist before its store does)."""
-    from hermes_cli.auth_codex_registry import active_store_location, profiles_root, root_store_path
+    """Every store of the protected authority: root, active, each profile directory's auth.json
+    (present or not — a profile's protocol directories may exist before its store does), and every
+    store the REGISTRY names (chain owners, their rows' stores, unfinished ops' stores): a registered
+    home outside ``profiles/`` belongs to this authority whichever home runs the restore. An
+    enumeration that fails (anything but absence) raises :class:`CodexAuthorityRefused`."""
+    from hermes_cli.auth_codex_registry import active_store_location, profiles_root, read_registry, root_store_path
     stores = [root_store_path(), active_store_location()]
+    directory = profiles_root()
     try:
-        directory = profiles_root()
-        if directory.is_dir():
-            stores.extend(d / AUTH_STORE_NAME for d in sorted(directory.iterdir()) if d.is_dir())
-    except OSError:
-        pass
+        with os.scandir(directory) as entries:
+            dirs = sorted(Path(e.path) for e in entries if e.is_dir())
+    except OSError as exc:
+        if not _missing(exc):
+            raise _refuse_incomplete(f"the profiles directory {directory}", exc) from exc
+        dirs = []
+    stores.extend(d / AUTH_STORE_NAME for d in dirs)
+    view = read_registry()
+    if view.status == "unreadable":
+        raise _refuse_incomplete(f"the credential registry {registry_path()}", view.error)
+    keys = set()
+    for entry in view.chains.values():
+        keys.add(entry.get("owner"))
+        keys.update(r.get("store") for r in entry.get("rows", ()))
+    for op in view.ops.values():
+        keys.update(op.get("stores") or ())
+    stores.extend(Path(k) for k in sorted(k for k in keys if isinstance(k, str) and k))
     return stores
 
 
@@ -140,9 +172,10 @@ def _protected() -> _Protected:
 
     root = root_home()
     skip_dirs = {canon(ops_dir()), canon(profiles_root() / _LIFECYCLE_LOCK_DIR)}
-    codex_dirs = set()
+    codex_dirs, codex_files = set(), set()
     for home in _codex_homes():
         codex_dirs.update((canon(home), _key(_logical(home))))
+        codex_files.add(canon(home / AUTH_STORE_NAME))
     protocol_files = {canon(registry_path()), canon(retired_index_path()), canon(root / LEGACY_RESCUE_NAME)}
     lock_files = {canon(root / MIGRATION_LOCK_NAME), canon(root / "auth.lock")}
     store_files = set()
@@ -154,44 +187,56 @@ def _protected() -> _Protected:
         skip_dirs.update((canon(real.parent / RECORDS_DIR_NAME), canon(Path(store).parent / RECORDS_DIR_NAME)))
         protocol_files.update((canon(legacy_rescue_path(store)), canon(legacy_rescue_path(real))))
         lock_files.add(canon(real.with_suffix(".lock")))
-    found = _Protected(frozenset(skip_dirs), frozenset(codex_dirs), frozenset(protocol_files), frozenset(lock_files),
-                       frozenset(store_files))
+    found = _Protected(frozenset(skip_dirs), frozenset(codex_dirs), frozenset(codex_files), frozenset(protocol_files),
+                       frozenset(lock_files), frozenset(store_files))
     if cache is not None:
         cache["protected"] = found
     return found
 
 
-def _identities(prot: _Protected) -> Dict[Tuple[int, int], str]:
-    """``(st_dev, st_ino) -> kind`` of every protected file (hard links share it). Built only when a
-    destination has more than one link, once per classification scope."""
+def _identities(prot: _Protected) -> Tuple[Dict[Tuple[int, int], str], Optional[str]]:
+    """``((st_dev, st_ino) -> kind, problem)`` for every protected file (hard links share it): the
+    stores, protocol files and everything under the protocol directories, the locks, and the Codex
+    CLI credential files (``auth.json`` of each CLI home; its sessions are not scanned). *problem*
+    names the first protected location that could not be INSPECTED (absence is not a problem): the
+    inventory is then incomplete and a multi-link destination it cannot rule out is refused. Built
+    only when a destination has more than one link, once per classification scope."""
     cache = _classification.get()
     if cache is not None and "identities" in cache:
         return cache["identities"]
     out: Dict[Tuple[int, int], str] = {}
+    problems: List[str] = []
 
     def add(path: str, kind: str) -> None:
         try:
             st = os.stat(path)
-        except OSError:
+        except OSError as exc:
+            if not _missing(exc):
+                problems.append(f"{path}: {exc}")
             return
         if not stat.S_ISDIR(st.st_mode):
             out.setdefault((st.st_dev, st.st_ino), kind)
 
+    def walk_error(exc: OSError) -> None:
+        if not _missing(exc):
+            problems.append(f"{exc.filename}: {exc}")
+
     for path in prot.lock_files:
         add(path, "lock")
+    for path in prot.codex_files:
+        add(path, "codex-cli")
     for path in prot.protocol_files:
         add(path, "protocol")
-    # Codex CLI homes are matched by location only: a restore publishes by rename, which replaces a
-    # hard link instead of writing through it, and a CLI home can hold thousands of session files.
     for directory in prot.skip_dirs:
-        for dirpath, _dirs, files in os.walk(directory):
+        for dirpath, _dirs, files in os.walk(directory, onerror=walk_error):
             for name in files:
                 add(os.path.join(dirpath, name), "protocol")
     for path in prot.store_files:
         add(path, "store")
+    found = (out, problems[0] if problems else None)
     if cache is not None:
-        cache["identities"] = out
-    return out
+        cache["identities"] = found
+    return found
 
 
 def _kind_by_location(path: Path, prot: _Protected) -> Optional[str]:
@@ -205,7 +250,7 @@ def _kind_by_location(path: Path, prot: _Protected) -> Optional[str]:
             or (name.startswith(_norm("auth.")) and name.endswith(_norm(".lock")))
             or (name.endswith(_norm(".lock")) and _norm(_LIFECYCLE_LOCK_DIR) in parts[:-1])):
         return "lock"
-    if _norm(CODEX_CLI_DIR) in parts[:-1] or ancestors & prot.codex_dirs:
+    if _norm(CODEX_CLI_DIR) in parts[:-1] or ancestors & prot.codex_dirs or key in prot.codex_files:
         return "codex-cli"
     if (any(name == _norm(n) or name.startswith(_norm(f"{n}.")) for n in _names())
             or any(p in (_norm(OPS_DIR_NAME), _norm(RECORDS_DIR_NAME)) for p in parts[:-1])
@@ -216,23 +261,29 @@ def _kind_by_location(path: Path, prot: _Protected) -> Optional[str]:
     return None
 
 
-_PRECEDENCE = ("lock", "codex-cli", "protocol", "store")
+# ``unknown``: the destination exists but whether it IS a protected file could not be established
+# (it could not be inspected, or it has other links and the protected inventory is incomplete).
+_PRECEDENCE = ("lock", "codex-cli", "protocol", "unknown", "store")
 
 
 def _classify(path: Path) -> Optional[str]:
-    """``lock``, ``codex-cli``, ``protocol``, ``store`` or None for a write to *path*, judged by BOTH
-    its logical destination (the name) and its canonical destination (where the bytes land), plus
-    the identity of an existing file (hard links). The most protected verdict wins, so an alias
-    can never erase a credential file's identity in either direction."""
+    """``lock``, ``codex-cli``, ``protocol``, ``unknown``, ``store`` or None for a write to *path*,
+    judged by BOTH its logical destination (the name) and its canonical destination (where the bytes
+    land), plus the identity of an existing file (hard links). The most protected verdict wins, so
+    an alias can never erase a credential file's identity in either direction."""
     prot = _protected()
     logical, dest = _logical(Path(path)), _destination(Path(path))
     kinds = {_kind_by_location(logical, prot), _kind_by_location(dest, prot)}
     try:
         st = os.stat(dest)
+    except OSError as exc:
+        if not _missing(exc):
+            kinds.add("unknown")
+    else:
         if st.st_nlink > 1 and not stat.S_ISDIR(st.st_mode):
-            kinds.add(_identities(prot).get((st.st_dev, st.st_ino)))
-    except OSError:
-        pass
+            identities, problem = _identities(prot)
+            kind = identities.get((st.st_dev, st.st_ino))
+            kinds.add(kind if kind is not None or problem is None else "unknown")
     return next((k for k in _PRECEDENCE if k in kinds), None)
 
 
@@ -245,12 +296,20 @@ def is_runtime_lock(path: Path) -> bool:
 
 def restore_action(path: Path) -> Optional[str]:
     """What a restore does with a member bound for *path*: ``skip`` (a Codex protocol file, a Codex
-    CLI credential, a runtime lock: never written), ``store`` (an auth.json: written through
-    :func:`write_restored_store`) or None (an ordinary file: restored as upstream does)."""
+    CLI credential, a runtime lock: never written), ``refuse`` (an existing destination whose
+    protection could not be established: never written, reported as an error), ``store`` (an
+    auth.json: written through :func:`write_restored_store`) or None (an ordinary file: restored as
+    upstream does, always published by atomic replace — never written through an existing file)."""
     kind = _classify(path)
     if kind in ("lock", "protocol", "codex-cli"):
         return "skip"
+    if kind == "unknown":
+        return "refuse"
     return "store" if kind == "store" else None
+
+
+REFUSED_UNVERIFIABLE = ("not restored: it could not be checked against the credential files it might be "
+                        "linked to")
 
 
 # Files whose presence makes a directory an INDEPENDENT Hermes authority (its own registry, lock,

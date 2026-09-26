@@ -508,6 +508,48 @@ def _foreign_db_holder_pids(db_path: Path) -> Optional[List[int]]:
     return pids
 
 
+def _has_other_links(path: Path) -> bool:
+    """*path* is an existing file with more than one hard link (or cannot be inspected: treated as
+    linked, so nothing writes through it on a guess)."""
+    try:
+        return os.stat(path).st_nlink > 1
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def _replace_published(tmp_name: str, target: Path) -> str:
+    """Publish *tmp_name* onto *target* by REPLACING its directory entry, never by writing into the
+    existing file: a restore must not change the content of another hard link to the old inode.
+    ``atomic_replace`` keeps its symlink handling and its copy / in-place fallbacks for a file with
+    one link (nothing else shares that inode); a file with other links is only ever ``os.replace``d.
+    """
+    real = os.path.realpath(target) if os.path.islink(target) else str(target)
+    if _has_other_links(Path(real)):
+        os.replace(tmp_name, real)
+        return real
+    return atomic_replace(tmp_name, target)
+
+
+def _publish_file_atomically(src: Path, dst: Path) -> None:
+    """Restore file *src* onto *dst* the way ``shutil.copy2`` would (bytes, mode, times) but by
+    write-temp-in-the-same-directory + fsync + replace: ``copy2`` opens an existing destination for
+    writing, which writes THROUGH a hard link into every other name of that inode."""
+    fd, tmp_name = tempfile.mkstemp(dir=str(dst.parent), prefix=f".{dst.name[:80]}.", suffix=".partial")
+    try:
+        with os.fdopen(fd, "wb") as out, open(src, "rb") as data:
+            shutil.copyfileobj(data, out)
+            out.flush()
+            os.fsync(out.fileno())
+        shutil.copystat(src, tmp_name)
+        _replace_published(tmp_name, dst)
+    except BaseException:
+        with suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+
+
 def _safe_restore_db(src: Path, dst: Path) -> bool:
     """Restore snapshot *src* into live *dst* through the backup() API; unlink+move fallback.
 
@@ -516,7 +558,12 @@ def _safe_restore_db(src: Path, dst: Path) -> bool:
     The fallback runs ONLY when no other process or in-process connection holds the file
     (replacing the inode under a live holder is the #90950 split-brain); otherwise it fails closed
     (``False``) and the caller reports the file as skipped.
+
+    A destination with OTHER hard links is never page-copied: that writes through the shared inode
+    and changes every other link's content. It is replaced (the unlink+move path) instead.
     """
+    if _has_other_links(dst):
+        return _unlink_move_restore_db(src, dst)
     try:
         dst_conn = sqlite3.connect(str(dst))
         # Checkpoint first so the backup starts clean rather than writing on top of a deep WAL.
@@ -817,7 +864,7 @@ def _extract_member_atomically(
                 shutil.copyfileobj(src, dst)
             dst.flush()
             os.fsync(dst.fileno())
-        real_path = Path(atomic_replace(tmp_name, target))
+        real_path = Path(_replace_published(tmp_name, target))
         # Owner first, mode second (as ``atomic_yaml_write``): chown drops setuid/setgid and
         # ``mode`` no longer carries them, so neither step can re-elevate the restored file.
         _restore_file_owner(real_path, owner)
@@ -960,7 +1007,7 @@ def _import_members(
     restored = restored_external = 0
     home_dir = Path.home().resolve()
     new_file_mode = default_new_file_mode()  # once: every member is published via mkstemp (0600)
-    from hermes_cli.auth_codex_restore import restore_action, write_restored_store
+    from hermes_cli.auth_codex_restore import REFUSED_UNVERIFIABLE, restore_action, write_restored_store
     for member in members:
         dest = _member_destination(member, prefix, hermes_root, home_dir)
         if dest.skipped_runtime:
@@ -970,6 +1017,9 @@ def _import_members(
         # Credential recovery protocol, stage 1: Codex protocol files and Codex CLI credentials are
         # never restored; an auth.json is merged without the backup's Codex material.
         codex_action = restore_action(target) if rel else None
+        if codex_action == "refuse":
+            errors.append(f"{member if external else rel}: {REFUSED_UNVERIFIABLE}")
+            continue
         if codex_action == "skip":
             skipped_runtime.append(member if external else rel)
             continue
@@ -1060,9 +1110,14 @@ def run_import(args) -> None:
         prefix = _detect_prefix(zf)
         members = [n for n in zf.namelist() if not n.endswith("/")]
         from hermes_cli.auth_codex_restore import SIGN_IN_AGAIN, brings_codex_material, classification_scope
-        with classification_scope():
-            _refuse_codex_credential_state(zf, members, prefix, hermes_root)
-            codex_notice = brings_codex_material(_codex_restore_targets(zf, members, prefix, hermes_root))
+        from hermes_cli.auth_codex_registry import CodexAuthorityRefused
+        try:
+            with classification_scope():
+                _refuse_codex_credential_state(zf, members, prefix, hermes_root)
+                codex_notice = brings_codex_material(_codex_restore_targets(zf, members, prefix, hermes_root))
+        except CodexAuthorityRefused as exc:
+            print(f"Error: {exc}")
+            sys.exit(1)
         file_count = len(members)
         print(f"Backup contains {file_count} files\nTarget: {display_hermes_home()}")
         if prefix:
@@ -1432,7 +1487,7 @@ def restore_quick_snapshot(snapshot_id: str, hermes_home: Optional[Path] = None)
 
 def _restore_quick_snapshot_files(meta: Dict[str, Any], snap_dir: Path, home: Path, snap_res: Path,
                                   home_res: Path) -> int:
-    from hermes_cli.auth_codex_restore import restore_action, write_restored_store
+    from hermes_cli.auth_codex_restore import REFUSED_UNVERIFIABLE, restore_action, write_restored_store
     restored = 0
     for rel in meta.get("files", {}):
         src = snap_dir / rel
@@ -1444,6 +1499,9 @@ def _restore_quick_snapshot_files(meta: Dict[str, Any], snap_dir: Path, home: Pa
             continue
         codex_action = restore_action(dst)
         if codex_action == "skip":  # Codex protocol state is never restored (stage 1)
+            continue
+        if codex_action == "refuse":
+            logger.error("%s %s", rel, REFUSED_UNVERIFIABLE)
             continue
         dst.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -1460,7 +1518,7 @@ def _restore_quick_snapshot_files(meta: Dict[str, Any], snap_dir: Path, home: Pa
                     logger.error("Failed to restore %s: live-safe restore refused", rel)
                     continue
             else:
-                shutil.copy2(src, dst)
+                _publish_file_atomically(src, dst)
             restored += 1
         except (OSError, PermissionError) as exc:
             logger.error("Failed to restore %s: %s", rel, exc)
