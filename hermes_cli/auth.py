@@ -751,20 +751,30 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
         return attach_witness(WitnessedStore(_empty_auth_store()), Witness(key, sha, False))
 
     witness = Witness(key, sha, True)
-    if isinstance(raw, dict) and (
-        isinstance(raw.get("providers"), dict) or isinstance(raw.get("credential_pool"), dict)):
+    if _is_modern_auth_store(raw):
         raw.setdefault("providers", {})
         if isinstance(raw.get("providers"), dict):
             _migrate_stale_nous_portal_url(raw["providers"])
         return attach_witness(WitnessedStore(raw), witness)
+    return attach_witness(WitnessedStore(_auth_store_from_legacy(raw)), witness)
 
+
+def _is_modern_auth_store(raw: Any) -> bool:
+    return isinstance(raw, dict) and (
+        isinstance(raw.get("providers"), dict) or isinstance(raw.get("credential_pool"), dict))
+
+
+def _auth_store_from_legacy(raw: Any) -> Dict[str, Any]:
+    """The store a parsed ``auth.json`` that is NOT in the modern format loads as: the legacy
+    ``systems`` format converted (its Nous login kept), anything else an empty store. Shared with
+    the restore merge (``auth_codex_restore``), which must convert BEFORE adding a provider section:
+    a store with ``providers`` is read as modern and its legacy sections are never converted."""
     if isinstance(raw, dict) and isinstance(raw.get("systems"), dict):  # legacy "systems" format
         systems = raw["systems"]
         providers = {"nous": systems["nous_portal"]} if "nous_portal" in systems else {}
-        return attach_witness(WitnessedStore({
-            **_empty_auth_store(), "providers": providers,
-            "active_provider": "nous" if providers else None}), witness)
-    return attach_witness(WitnessedStore(_empty_auth_store()), witness)
+        return {**_empty_auth_store(), "providers": providers,
+                "active_provider": "nous" if providers else None}
+    return _empty_auth_store()
 
 
 def _save_private_json(target: Path, data: Any, *, fsync_dir: bool = False, **dump_kwargs: Any) -> None:

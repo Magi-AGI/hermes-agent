@@ -12,8 +12,8 @@ each member (``backup._member_destination`` for archives):
 * runtime lock files are never written (``is_runtime_lock``);
 * an ``auth.json`` is written ONLY at one of the protected authority's own stores, and as one
   read-merge-write under the migration lock + that store's lock with the strict writer: the
-  restored content with ALL Codex material removed, plus the destination's CURRENT Codex material
-  exactly as it is. A live Codex login therefore survives a restore untouched, and no old token
+  restored content with ALL Codex material removed (a legacy-format store first converted by
+  upstream's own conversion), plus the destination's CURRENT Codex material exactly as it is. A live Codex login therefore survives a restore untouched, and no old token
   ever lands; every other provider restores as upstream does.
 
 After restoring a backup a Codex user signs in again. Restoring Codex logins (paused until proven)
@@ -240,6 +240,11 @@ def merge_without_codex(restored: Dict[str, Any], current: Optional[Dict[str, An
     """*restored* with all Codex material removed, plus *current*'s Codex material exactly as it is.
     A restored ``active_provider`` naming Codex yields to the destination's current one."""
     merged = json.loads(json.dumps(restored))
+    from hermes_cli.auth import _auth_store_from_legacy, _is_modern_auth_store
+    if not _is_modern_auth_store(merged):
+        # Upstream's own conversion FIRST: once a Codex section is added below, the store reads as
+        # the modern format and a legacy one (``systems.nous_portal``) would never be converted.
+        merged = _auth_store_from_legacy(merged)
     for section in _CODEX_SECTIONS:
         block = merged.get(section)
         if isinstance(block, dict):
