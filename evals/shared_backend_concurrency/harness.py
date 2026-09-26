@@ -400,7 +400,10 @@ def main() -> int:
                HERMES_DASHBOARD_SESSION_TOKEN=TOKEN, HERMES_IGNORE_RULES="1",
                # netguard/ first: its sitecustomize refuses (and logs) every non-loopback connect.
                PYTHONPATH=os.pathsep.join((str(Path(__file__).resolve().parent / "netguard"), str(repo))),
-               HERMES_HARNESS_EGRESS_LOG=str(args.out / "egress-refused.log"),
+               HARNESS_EGRESS_LOG=str(args.out / "egress-refused.log"),
+               # D6 only: the harness sitecustomize admits the fixture model as a compaction route in
+               # THIS throwaway backend (the real guard refuses it); nothing else changes.
+               HARNESS_ALLOW_FIXTURE_COMPACTION="1",
                OPENAI_API_KEY="local-fixture")
     serve_log = (args.out / "serve.log").open("w", encoding="utf-8")
     proc = subprocess.Popen([sys.executable, "-m", "hermes_cli.main", "serve", "--isolated", "--port", str(args.port)],
@@ -431,7 +434,7 @@ def main() -> int:
             seed = [{"role": "user", "content": f"seed question {i}"} if i % 2 == 0 else
                     {"role": "assistant", "content": f"seed answer {i} " + "detail " * 40} for i in range(40)]
             created = w.rpc("A", "session.create", {"source": "desktop", "cwd": str(workdir), "title": f"window {w.index}",
-                                                    **({"messages": seed} if w.index < 4 else {})})
+                                                    **({"messages": seed} if w.index < 5 else {})})
             w.session_id, w.stored_id = created["session_id"], created["stored_session_id"]
         report["phase_A_failures"] = [repr(r) for r in run_parallel([lambda w=w: open_window(w) for w in windows]) if r]
         report["phase_A_s"] = round(time.monotonic() - t0, 2)
@@ -447,7 +450,7 @@ def main() -> int:
         report["phase_B_s"] = round(time.monotonic() - t0, 2)
 
         # C: turns + stops + background reads
-        turners, stoppers, readers = live[4:16], live[16:19], live[19:]
+        turners, stoppers, readers = live[5:17], live[17:20], live[20:]
         submitted: dict = {}
 
         def take_turn(w, kind):
@@ -491,16 +494,26 @@ def main() -> int:
             (dupes if hits > 1 else lost if accepted and hits == 0 else []).append(w.index)
         report["submits_lost"], report["submits_duplicated"] = lost, dupes
 
-        # D: compaction under load
-        compactors, typists = live[:4], live[4:12]
+        # D (D6): compaction under load, through the real dispatch -> llm lane -> compaction path. First
+        # one compaction alone (the baseline), then four at once while other windows keep typing. The
+        # fixture summarizes in a fixed --compress-delay, so any extra time is the backend's own.
+        # Provider throughput (the ~8 min seen live) is NOT measured here.
+        def compress(w, phase):
+            started = time.monotonic()
+            result = w.rpc(phase, "session.compress", {"session_id": w.session_id}, timeout=600) or {}
+            return {"window": w.index, "status": result.get("status"), "s": round(time.monotonic() - started, 2)}
+
+        report["compaction_alone"] = compress(live[4], "D0")
+        compactors, typists = live[:4], live[5:13]
         t0 = time.monotonic()
         stop_typing = time.monotonic() + 3 * args.compress_delay + 5
 
         def keep_typing(w):
             while time.monotonic() < stop_typing:
                 w.rpc("D", "slash.exec", {"session_id": w.session_id, "command": "/help"})
-        run_parallel([lambda w=w: w.rpc("D", "session.compress", {"session_id": w.session_id}, timeout=600) for w in compactors]
-                     + [lambda w=w: keep_typing(w) for w in typists])
+        results = run_parallel([lambda w=w: compress(w, "D") for w in compactors]
+                               + [lambda w=w: keep_typing(w) for w in typists])
+        report["compactions_concurrent"] = [r if isinstance(r, dict) else repr(r) for r in results[:len(compactors)]]
         report["phase_D_s"] = round(time.monotonic() - t0, 2)
 
         # E: reconnect burst
@@ -606,12 +619,28 @@ def grade(report: dict, metrics: Metrics) -> dict:
         "egress_refused_by_guard": {"value": report.get("egress_refused"), "pass": True},
         "all_windows_opened_and_reopened": {"value": [report["phase_A_failures"], report["phase_E_failures"]],
                                             "pass": not report["phase_A_failures"] and not report["phase_E_failures"]},
+        "every_compaction_compressed_D6": {
+            "value": [report.get("compaction_alone"), report.get("compactions_concurrent")],
+            "pass": all(isinstance(r, dict) and r.get("status") == "compressed"
+                        for r in [report.get("compaction_alone"), *(report.get("compactions_concurrent") or [])])},
+        # Four at once must not queue behind each other in the backend: each takes about as long as one.
+        "compactions_not_serialized_D6": {
+            "value": {"alone_s": (report.get("compaction_alone") or {}).get("s"),
+                      "concurrent_max_s": max((r.get("s", 0) for r in report.get("compactions_concurrent") or []
+                                               if isinstance(r, dict)), default=None)},
+            "pass": _compactions_parallel(report)},
         **({"freeze_phase_D7": {
             "value": freeze,
             "pass": isinstance(freeze, dict) and freeze.get("dumped_whole_tree") is True and freeze.get("dump_exit") == 0
                     and all(str(p).startswith("silent") for p in freeze.get("health_probes_while_frozen", []))}}
            if report.get("freeze_requested") else {}),
     }
+
+
+def _compactions_parallel(report: dict) -> bool:
+    alone = (report.get("compaction_alone") or {}).get("s")
+    concurrent = [r.get("s") for r in report.get("compactions_concurrent") or [] if isinstance(r, dict)]
+    return bool(alone and len(concurrent) == 4 and max(concurrent) <= 1.5 * alone + 1.0)
 
 
 def freeze_phase(root_pid: int, port: int, out: Path, repo: Path) -> dict:
