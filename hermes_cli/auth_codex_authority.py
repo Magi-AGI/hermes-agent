@@ -38,8 +38,8 @@ logger = logging.getLogger("hermes_cli.auth")
 
 # ── Dispatcher (§6) ───────────────────────────────────────────────────────────────────────────
 
-def _bootstrap(fence_all: Optional[str] = None) -> Dict[str, Any]:
-    paths = all_store_paths()
+def _bootstrap(fence_all: Optional[str] = None, paths: Optional[List[Path]] = None) -> Dict[str, Any]:
+    paths = list(paths) if paths is not None else all_store_paths()
     with store_locks(paths):  # a consistent snapshot of every store to plan from
         view = read_registry()
         payload = plan_registration(view, load_snapshots(paths), only_unregistered=False,

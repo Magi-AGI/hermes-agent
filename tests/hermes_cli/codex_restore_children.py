@@ -185,3 +185,26 @@ def runtime_startup(tmp: Path, userhome: Path, hermes_home: Path) -> dict:
         raise AssertionError(f"runtime startup failed: {err[-2000:]}") from exc
     result["presented"] = presented.read_text(encoding="utf-8").split() if presented.exists() else []
     return result
+
+
+# A quick-snapshot restore into an explicit home that DIES (os._exit) right after its files were
+# written, before the fence ran.
+SNAPSHOT_DIER = r'''
+import os, sys
+from pathlib import Path
+snapshot_id, home = sys.argv[1:3]
+from hermes_cli import backup
+real = backup._restore_quick_snapshot_files
+def extract_then_die(*a, **k):
+    real(*a, **k)
+    os._exit(137)
+backup._restore_quick_snapshot_files = extract_then_die
+backup.restore_quick_snapshot(snapshot_id, hermes_home=Path(home))
+print("SURVIVED")
+'''
+
+
+def run_in(code: str, args, userhome: Path, hermes_home: Path, timeout: float = 180):
+    proc = spawn_in(code, args, userhome, hermes_home)
+    out, err = proc.communicate(timeout=timeout)
+    return proc.returncode, out, err

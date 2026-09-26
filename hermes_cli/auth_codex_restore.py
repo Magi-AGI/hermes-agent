@@ -25,7 +25,7 @@ import json
 import os
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, Optional, Tuple
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from hermes_cli.auth_codex_registry import (
     LEGACY_RESCUE_NAME, MIGRATION_LOCK_NAME, OPS_DIR_NAME, RECORDS_DIR_NAME, REGISTRY_NAME, RESTORE_BARRIER_NAME,
@@ -272,7 +272,7 @@ def restore_guard(targets_fn: Callable[[], Iterable[Tuple[Path, Callable[[], byt
         check_restore(targets, action)
         barrier = _brings_codex_material(targets)
         if barrier:
-            write_restore_barrier(action)
+            write_restore_barrier(action, _restore_scope(targets))
         try:
             yield
         finally:
@@ -285,11 +285,40 @@ def restore_guard(targets_fn: Callable[[], Iterable[Tuple[Path, Callable[[], byt
 RESTORED_REASON = "restored-from-backup"
 
 
-def write_restore_barrier(action: str) -> None:
+def _restore_scope(targets: Iterable[Tuple[Path, Callable[[], bytes]]]) -> Dict[str, list]:
+    """Every destination store / protocol path the restore will write, resolved."""
+    scope: Dict[str, list] = {"stores": [], "protocol": []}
+    for target, _load in targets:
+        kind = _classify(Path(target))
+        if kind is not None:
+            scope["stores" if kind == "store" else "protocol"].append(str(_destination(Path(target))))
+    return scope
+
+
+def write_restore_barrier(action: str, scope: Optional[Dict[str, list]] = None) -> None:
+    """Committed BEFORE the first byte is extracted: the action and the COMPLETE scope (every
+    destination store / protocol path, resolved), so recovery fences exactly what the restore could
+    have written, whichever home the recovering process runs from."""
     from hermes_cli.auth_codex_registry import utc_now
     from hermes_cli.auth_credential_io import encode_json, require_committed, write_credential_file
+    scope = scope or {"stores": [], "protocol": []}
     require_committed(write_credential_file(restore_barrier_path(), encode_json(
-        {"version": 1, "action": action, "at": utc_now()})), "the Codex restore barrier")
+        {"version": 2, "action": action, "at": utc_now(), "stores": sorted(set(scope.get("stores", []))),
+         "protocol": sorted(set(scope.get("protocol", [])))})), "the Codex restore barrier")
+
+
+def _barrier_stores() -> List[Path]:
+    """The destination stores the pending restore recorded. A barrier that cannot be read proves
+    nothing about its scope: raise (the barrier stays; admission stays refused)."""
+    from hermes_cli.auth_credential_io import read_bytes_retrying
+    try:
+        data = json.loads(read_bytes_retrying(restore_barrier_path()).decode("utf-8"))
+        return [Path(p) for p in data.get("stores", [])]
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError, AttributeError) as exc:
+        raise RuntimeError(f"the Codex restore barrier {restore_barrier_path()} is unreadable ({exc}); "
+                           "restored logins stay paused until it can be read") from exc
 
 
 def restore_barrier_pending() -> bool:
@@ -313,15 +342,24 @@ def fence_restored() -> None:
         STATE_RETIRED, preserve_unreadable_registry, read_registry, store_locks, write_registry)
     from hermes_cli.auth_credential_io import unlink_retrying
 
+    from hermes_cli.auth_credential_io import store_key
+    # Exactly the stores the restore recorded (whatever home THIS process runs from) plus its own
+    # view; the barrier is cleared only after every one of them is fenced. Each step below is
+    # idempotent and the registry records the progress, so a crash here just repeats it.
     paths = all_store_paths()
+    known = {store_key(p) for p in paths}
+    for store in _barrier_stores():
+        if store_key(store) not in known and store.exists():
+            known.add(store_key(store))
+            paths.append(store)
     view = read_registry()
     if view.status == "unreadable":
         preserve_unreadable_registry()
         retain_orphan_records(paths)
-        _bootstrap(fence_all=RESTORED_REASON)
+        _bootstrap(fence_all=RESTORED_REASON, paths=paths)
     elif view.status == "absent":
         if _codex_material_present(paths):
-            _bootstrap(fence_all=RESTORED_REASON)
+            _bootstrap(fence_all=RESTORED_REASON, paths=paths)
     else:
         data = _json.loads(_json.dumps(view.data))
         for entry in data["chains"].values():
