@@ -573,7 +573,7 @@ def main() -> int:
             health.stop.set()  # phase F freezes the backend on purpose: it is not loop drift
             health.join(timeout=20)
             try:
-                report["phase_F"] = freeze_phase(proc.pid, args.port, args.out, repo, args.node_dir)
+                report["phase_F"] = freeze_phase(proc.pid, args.port, args.out, repo, args.node_dir, env)
             except Exception as exc:  # noqa: BLE001 - a requested phase that failed is a failed grade
                 report["phase_F"] = {"error": repr(exc)}
     finally:
@@ -670,7 +670,8 @@ def _compactions_parallel(report: dict) -> bool:
     return bool(alone and len(concurrent) == 4 and max(concurrent) <= 1.5 * alone + 1.0)
 
 
-def freeze_phase(root_pid: int, port: int, out: Path, repo: Path, node_dir: Path | None = None) -> dict:
+def freeze_phase(root_pid: int, port: int, out: Path, repo: Path, node_dir: Path | None = None,
+                 sealed_env: dict | None = None) -> dict:
     """The 09-07 signature on a real backend: suspend every process, then what the D7 supervisor sees.
     With *node_dir*, the desktop's liveness supervisor itself decides, dumps and kills it (vitest
     e2e, clock scaled 120 s -> 3 s); otherwise the harness only dumps the tree."""
@@ -694,7 +695,7 @@ def freeze_phase(root_pid: int, port: int, out: Path, repo: Path, node_dir: Path
             probes.append(f"silent after {time.monotonic() - started:.1f}s ({type(exc).__name__})")
     if node_dir is not None:
         return {"tree": tree, "health_probes_while_frozen": probes,
-                **_supervisor_e2e(root_pid, port, out, repo, node_dir, tree)}
+                **_supervisor_e2e(root_pid, port, out, repo, node_dir, tree, sealed_env or {})}
     dump = subprocess.run([sys.executable, "-m", "hermes_cli.freeze_dump", str(root_pid), str(out / "freeze-dumps")],
                           cwd=repo, capture_output=True, text=True, timeout=180)
     files = [line for line in dump.stdout.splitlines() if line.strip()]
@@ -702,24 +703,36 @@ def freeze_phase(root_pid: int, port: int, out: Path, repo: Path, node_dir: Path
             "dumped_whole_tree": len(files) == len(tree), "stderr": dump.stderr[-500:]}
 
 
-def _supervisor_e2e(root_pid: int, port: int, out: Path, repo: Path, node_dir: Path, tree: list) -> dict:
+def _supervisor_e2e(root_pid: int, port: int, out: Path, repo: Path, node_dir: Path, tree: list,
+                    sealed_env: dict) -> dict:
+    """Run the desktop's liveness supervisor (vitest e2e) against the frozen backend.
+
+    Sealed like the backend (T1 r4, Codex): the SAME minimal environment (temp home, caches, empty
+    managed scope, netguard on PYTHONPATH for the Python dump child), never the parent's credentials,
+    NODE_OPTIONS or real user dirs; vitest is started with the pinned node.exe from the installed
+    package (no npx resolution) and npm is forced offline. Absolute paths throughout: vitest runs with
+    apps/desktop as its working directory."""
     import psutil
+    out, repo = out.resolve(), repo.resolve()
     dump_dir, result_path = out / "freeze-dumps", out / "supervisor-e2e.json"
     target = {"pid": root_pid, "baseUrl": f"http://127.0.0.1:{port}", "python": sys.executable, "repo": str(repo),
               "dumpDir": str(dump_dir), "resultPath": str(result_path)}
-    env = {**os.environ, "LIVENESS_E2E_TARGET": json.dumps(target),
-           "PATH": os.pathsep.join((str(node_dir), os.environ.get("PATH", "")))}
-    npx = str(node_dir / ("npx.cmd" if sys.platform == "win32" else "npx"))
-    run = subprocess.run([npx, "vitest", "run", "--project", "electron", "electron/backend-liveness.e2e.test.ts"],
-                         cwd=repo / "apps" / "desktop", env=env, capture_output=True, text=True, timeout=300,
-                         shell=sys.platform == "win32")
+    npm_cache = Path(sealed_env.get("TEMP") or out) / "npm-cache"
+    env = {**sealed_env, "LIVENESS_E2E_TARGET": json.dumps(target),
+           "PATH": os.pathsep.join((str(node_dir), sealed_env.get("PATH", ""))),
+           "npm_config_offline": "true", "npm_config_cache": str(npm_cache)}
+    node = str(node_dir / ("node.exe" if sys.platform == "win32" else "node"))
+    vitest = repo / "node_modules" / "vitest" / "vitest.mjs"
+    run = subprocess.run([node, str(vitest), "run", "--project", "electron", "electron/backend-liveness.e2e.test.ts"],
+                         cwd=repo / "apps" / "desktop", env=env, capture_output=True, text=True,
+                         encoding="utf-8", errors="replace", timeout=300)
     result = json.loads(result_path.read_text(encoding="utf-8")) if result_path.exists() else {}
     dumps = sorted(p.name for p in dump_dir.glob("*.dmp")) if dump_dir.exists() else []
     return {"supervisor": result, "supervisor_exit": run.returncode, "dumps": dumps,
             "dumped_whole_tree": len(dumps) == len(tree),
             "tree_gone": not any(psutil.pid_exists(pid) for pid in tree),
             "dump_exit": 0 if run.returncode == 0 else run.returncode,
-            "vitest_tail": (run.stdout + run.stderr)[-800:]}
+            "vitest_tail": ((run.stdout or "") + (run.stderr or ""))[-800:]}
 
 
 if __name__ == "__main__":
