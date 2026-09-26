@@ -20,6 +20,17 @@ from __future__ import annotations
 import pytest
 
 from tools.file_operations import ShellFileOperations
+from tools.environments.local import _find_bash
+
+
+def _run_bash(command: str, cwd=None, stdin_data=None):
+    """Run *command* the way the local backend does: its Git Bash on Windows (a bare ``bash`` there
+    resolves to System32's WSL launcher first) and stdin as UTF-8 bytes (text-mode stdin turns
+    ``\\n`` into ``\\r\\n`` on Windows)."""
+    import subprocess
+    proc = subprocess.run([_find_bash(), "-c", command], cwd=cwd, capture_output=True,
+                          input=None if stdin_data is None else stdin_data.encode("utf-8", "surrogateescape"))
+    return {"output": (proc.stdout + proc.stderr).decode("utf-8", "replace"), "returncode": proc.returncode}
 
 
 class _FakeEnv:
@@ -36,7 +47,6 @@ class _FakeEnv:
         self.calls: list[dict] = []
 
     def execute(self, command: str, cwd: str = None, **kwargs) -> dict:
-        import subprocess
         self.calls.append({"command": command, "cwd": cwd})
         # Simulate cd by updating self.cwd (the real env does the same
         # via _extract_cwd_from_output after a successful command)
@@ -45,18 +55,7 @@ class _FakeEnv:
             self.cwd = new
             return {"output": "", "returncode": 0}
         # Actually run the command — handle stdin via subprocess
-        stdin_data = kwargs.get("stdin_data")
-        proc = subprocess.run(
-            ["bash", "-c", command],
-            cwd=cwd or self.cwd,
-            input=stdin_data,
-            capture_output=True,
-            text=True,
-        )
-        return {
-            "output": proc.stdout + proc.stderr,
-            "returncode": proc.returncode,
-        }
+        return _run_bash(command, cwd=cwd or self.cwd, stdin_data=kwargs.get("stdin_data"))
 
 
 class _WrapperEnv:
@@ -70,11 +69,8 @@ class _WrapperEnv:
 
     def execute(self, command, cwd=None, **kwargs):
         import shlex
-        import subprocess
         script = f"builtin cd -- {shlex.quote(cwd)} || exit 126\n{command}"
-        proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, encoding="utf-8",
-                              input=kwargs.get("stdin_data"))
-        return {"output": proc.stdout + proc.stderr, "returncode": proc.returncode}
+        return _run_bash(script, stdin_data=kwargs.get("stdin_data"))
 
 
 class TestShellFileOpsCwdTracking:
@@ -114,10 +110,7 @@ class TestShellFileOpsCwdTracking:
 
         class _NoCwdEnv:
             def execute(self, command, cwd=None, **kwargs):
-                import subprocess
-                proc = subprocess.run(["bash", "-c", command], cwd=cwd,
-                                      capture_output=True, text=True)
-                return {"output": proc.stdout, "returncode": proc.returncode}
+                return _run_bash(command, cwd=cwd)
 
         env = _NoCwdEnv()
         ops = ShellFileOperations(env, cwd=str(dir_a))

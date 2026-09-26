@@ -18,6 +18,7 @@ import subprocess
 import pytest
 
 from tools.terminal_tool_sudo import _rewrite_compound_background as rewrite
+from tools.environments.local import _find_bash
 
 
 class TestRewrites:
@@ -190,7 +191,7 @@ class TestRewriteIsValidBash:
     def test_rewrite_parses(self, command):
         rewritten = rewrite(command)
         result = subprocess.run(
-            ["bash", "-n", "-c", rewritten],
+            [_find_bash(), "-n", "-c", rewritten],
             capture_output=True,
             text=True,
         )
@@ -202,7 +203,7 @@ class TestRewriteIsValidBash:
         # End-to-end: the command after the backgrounded compound must run.
         rewritten = rewrite("echo first && true & echo SECOND_RAN")
         result = subprocess.run(
-            ["bash", "-c", rewritten], capture_output=True, text=True
+            [_find_bash(), "-c", rewritten], capture_output=True, text=True
         )
         assert result.returncode == 0
         assert "SECOND_RAN" in result.stdout

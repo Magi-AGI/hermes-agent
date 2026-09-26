@@ -15,12 +15,13 @@ import pytest
 from tools.environments.base_output import _pipe_stdin
 from tools.environments.local import LocalEnvironment
 from tools.file_operations import ShellFileOperations
+from tools.environments.local import _find_bash
 
 
 def _cat_to_file_proc(out_path):
     """A real child that copies its stdin to a file, byte for byte."""
     return subprocess.Popen(
-        ["bash", "-c", f"cat > {shlex.quote(str(out_path))}"],
+        [_find_bash(), "-c", f"cat > {shlex.quote(str(out_path))}"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -191,7 +192,7 @@ class TestPipeStdinRemainingBranches:
     def test_bytes_input_passes_through_untouched(self, tmp_path):
         out = tmp_path / "out.bin"
         proc = subprocess.Popen(
-            ["bash", "-c", f"cat > {shlex.quote(str(out))}"],
+            [_find_bash(), "-c", f"cat > {shlex.quote(str(out))}"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True,
             encoding="utf-8", errors="replace",
@@ -208,7 +209,7 @@ class TestPipeStdinRemainingBranches:
 
     def test_stdin_none_records_runtime_error(self, tmp_path):
         proc = subprocess.Popen(
-            ["bash", "-c", "exit 0"],
+            [_find_bash(), "-c", "exit 0"],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True,
             encoding="utf-8", errors="replace",

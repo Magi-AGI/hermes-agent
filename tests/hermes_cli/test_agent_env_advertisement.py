@@ -21,6 +21,7 @@ import os
 import subprocess
 
 from hermes_cli.main import _advertise_agent_env
+from tools.environments.local import _find_bash
 
 # Registry id — must stay in sync with huggingface.js agent-harnesses.ts.
 HARNESS_ID = "hermes-agent"
@@ -80,14 +81,14 @@ class TestWrapCommandAdvertisesHarness:
         clean_env = {k: v for k, v in os.environ.items()
                      if k not in ("AI_AGENT", "HERMES_AGENT")}
         out = subprocess.run(
-            ["bash", "-c", wrapped], capture_output=True, text=True,
+            [_find_bash(), "-c", wrapped], capture_output=True, text=True,
             env=clean_env, timeout=30,
         )
         assert f"AI={HARNESS_ID} HERMES=true" in out.stdout
 
         outer_env = dict(clean_env, AI_AGENT="pi", HERMES_AGENT="false")
         out = subprocess.run(
-            ["bash", "-c", wrapped], capture_output=True, text=True,
+            [_find_bash(), "-c", wrapped], capture_output=True, text=True,
             env=outer_env, timeout=30,
         )
         assert "AI=pi HERMES=false" in out.stdout

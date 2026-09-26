@@ -20,6 +20,7 @@ import subprocess
 import pytest
 
 from tools.file_operations import ShellFileOperations
+from tools.environments.local import _find_bash
 
 # Big enough to prove containment, small enough to keep the test fast.
 GIANT = 5 * 1024 * 1024  # 5MB single line
@@ -36,7 +37,7 @@ class RecordingEnv:
 
     def execute(self, command, timeout=60, **kwargs):
         proc = subprocess.run(
-            ["bash", "-c", command],
+            [_find_bash(), "-c", command],
             capture_output=True, text=True, errors="replace",
             timeout=timeout + 30,
         )

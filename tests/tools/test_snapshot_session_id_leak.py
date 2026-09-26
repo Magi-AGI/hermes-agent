@@ -29,6 +29,7 @@ from tools.environments.base_session_env import (
     _SNAPSHOT_EXCLUDED_ENV_REGEX,
     _export_dump_excluding_session_vars,
 )
+from tools.environments.local import _find_bash
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +130,7 @@ def test_export_dump_drops_every_bridged_var_and_the_delegation_marker():
     scoped = [*_VAR_MAP, DELEGATED_CHILD_ENV_MARKER]
     exports = "; ".join([f'export {n}="x"' for n in scoped] + ['export HERMES_HOME="/h"', 'export MYVAR="keep"'])
     out = subprocess.run(
-        ["bash", "-c", f"{exports}; {_export_dump_excluding_session_vars('/dev/stdout')}"],
+        [_find_bash(), "-c", f"{exports}; {_export_dump_excluding_session_vars('/dev/stdout')}"],
         capture_output=True, text=True, check=True).stdout
     leaked = [n for n in scoped if f"declare -x {n}=" in out]
     assert not leaked, f"persisted into the snapshot: {leaked}"
