@@ -12,6 +12,74 @@ from hermes_cli.web_routers import profiles
 
 # Hang guard for the burst tests below; every wait in them ends on an event.
 _HANG_GUARD = 30.0
+_REAL_LOCK = threading.Lock
+
+
+class _LockWatch:
+    """Stands in for ``threading`` while the single-flight decorator builds its locks, and records
+    which threads have queued on a lock another thread holds. ``scan_started()`` (called from the
+    fake scan) counts scans and notes the locks the scanning thread holds at that moment."""
+
+    def __init__(self):
+        self.cond = threading.Condition(_REAL_LOCK())
+        self.scans = 0
+        self._scan_locks = ()
+        self._locks = []
+        self._queued = {}
+
+    def Lock(self):  # noqa: N802 - the threading.Lock factory the decorator calls
+        lock = _WatchedLock(self)
+        self._locks.append(lock)
+        return lock
+
+    def __getattr__(self, name):
+        return getattr(threading, name)
+
+    def scan_started(self):
+        me = threading.get_ident()
+        with self.cond:
+            self.scans += 1
+            if self.scans == 1:
+                self._scan_locks = tuple(lock for lock in self._locks if lock.owner == me)
+            self.cond.notify_all()
+
+    def queued(self, lock, thread_id):
+        with self.cond:
+            self._queued.setdefault(lock, set()).add(thread_id)
+            self.cond.notify_all()
+
+    def wait_for_burst(self, followers, timeout):
+        def ready():
+            waiting = set().union(*(self._queued.get(lock, set()) for lock in self._scan_locks))
+            return self.scans > 1 or len(waiting) >= followers
+
+        with self.cond:
+            return self.cond.wait_for(ready, timeout)
+
+
+class _WatchedLock:
+    def __init__(self, watch):
+        self._lock, self._watch, self.owner = _REAL_LOCK(), watch, None
+
+    def acquire(self, blocking=True, timeout=-1):
+        me = threading.get_ident()
+        if self.owner not in (None, me):
+            self._watch.queued(self, me)
+        acquired = self._lock.acquire(blocking, timeout)
+        if acquired:
+            self.owner = me
+        return acquired
+
+    def release(self):
+        self.owner = None
+        self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
 
 
 class SidebarCacheTests(unittest.TestCase):
@@ -22,27 +90,23 @@ class SidebarCacheTests(unittest.TestCase):
         profiles._sidebar_profile_cache_clear()
         self.addCleanup(profiles._sidebar_profile_cache_clear)
 
-    def _burst(self, workers, call, entered, release):
-        """Run ``call`` from ``workers`` threads and release the scan only after the first one is
-        inside it and every caller has started, so the whole burst overlaps one in-flight scan
-        (a 1 s wait for the first entry and a 50 ms guess at the rest raced a loaded runner).
-        The TTL is long so no straggler can outlive the cached result either."""
-        arrived = threading.Semaphore(0)
-
-        def caller():
-            arrived.release()
-            return call()
-
+    def _burst(self, watch, workers, call, release):
+        """Run ``call`` from ``workers`` threads and hold the one scan until every other caller is
+        queued on a lock that scan holds, i.e. has missed the cache while the scan was in flight.
+        (A 1 s wait for the first entry plus a 50 ms guess at the rest raced a loaded runner; an
+        arrival signal before the call let a caller that came late read the finished cache and
+        never meet the single-flight lock.) A second scan ends the wait at once and fails below.
+        The long TTL keeps a queued caller from outliving the cached result."""
         with mock.patch.object(profiles, "_SIDEBAR_CACHE_TTL_SECONDS", 3600.0), \
                 ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(caller) for _ in range(workers)]
+            futures = [pool.submit(call) for _ in range(workers)]
             try:
-                self.assertTrue(entered.wait(timeout=_HANG_GUARD))
-                for _ in range(workers):
-                    self.assertTrue(arrived.acquire(timeout=_HANG_GUARD))
+                self.assertTrue(watch.wait_for_burst(workers - 1, timeout=_HANG_GUARD))
             finally:
                 release.set()
-            return [future.result(timeout=_HANG_GUARD) for future in futures]
+            results = [future.result(timeout=_HANG_GUARD) for future in futures]
+        self.assertEqual(watch.scans, 1)
+        return results
 
     def test_profile_cache_uses_db_and_wal_fingerprint_and_defensive_copies(self):
         with tempfile.TemporaryDirectory() as root:
@@ -96,23 +160,19 @@ class SidebarCacheTests(unittest.TestCase):
 
     def test_coalesces_concurrent_identical_scans(self):
         workers = 12
-        entered = threading.Event()
         release = threading.Event()
-        calls = 0
-        calls_lock = threading.Lock()
+        watch = _LockWatch()
 
-        @profiles._sidebar_singleflight_cache
         def scan(profile="all"):
-            nonlocal calls
-            with calls_lock:
-                calls += 1
-            entered.set()
+            watch.scan_started()
             self.assertTrue(release.wait(timeout=_HANG_GUARD))
             return {"profile": profile, "rows": []}
 
-        results = self._burst(workers, lambda: scan("default"), entered, release)
+        with mock.patch.object(profiles, "threading", watch):
+            scan = profiles._sidebar_singleflight_cache(scan)
 
-        self.assertEqual(calls, 1)
+        results = self._burst(watch, workers, lambda: scan("default"), release)
+
         self.assertEqual(results, [{"profile": "default", "rows": []}] * workers)
 
     def test_expires(self):
@@ -196,27 +256,32 @@ class SidebarCacheTests(unittest.TestCase):
         # background sync + sidebar refreshes overlap identical requests. One scan must
         # serve the whole burst, and no two callers may share the same payload object.
         workers = 8
-        entered = threading.Event()
         release = threading.Event()
-        scans = 0
-        scans_lock = threading.Lock()
+        watch = _LockWatch()
 
         def fake_read(name, home, errors, fn):
-            nonlocal scans
-            with scans_lock:
-                scans += 1
-            entered.set()
+            watch.scan_started()
             self.assertTrue(release.wait(timeout=_HANG_GUARD))
             return None
 
+        # The endpoint's own body under a single-flight wrapper whose locks are observable; the
+        # registered route carries the same decorator (checked last).
+        with mock.patch.object(profiles, "threading", watch):
+            tree = profiles._sidebar_singleflight_cache(profiles.get_profiles_projects_tree.__wrapped__)
         with mock.patch.object(profiles, "_profile_targets", return_value=[("default", Path("/nonexistent"))]), \
                 mock.patch.object(profiles, "_read_profile_db", side_effect=fake_read):
-            results = self._burst(workers, profiles.get_profiles_projects_tree, entered, release)
+            results = self._burst(watch, workers, tree, release)
 
-        self.assertEqual(scans, 1)
         self.assertEqual(len({id(r) for r in results}), workers)
         self.assertEqual(results, [results[0]] * workers)
         self.assertEqual(results[0]["projects"], [])
+
+        # The registered endpoint is the single-flight one: a repeat inside the TTL scans nothing.
+        reads = []
+        with mock.patch.object(profiles, "_profile_targets", return_value=[("default", Path("/nonexistent"))]), \
+                mock.patch.object(profiles, "_read_profile_db", side_effect=lambda *a: reads.append(a)):
+            self.assertEqual(profiles.get_profiles_projects_tree(), profiles.get_profiles_projects_tree())
+        self.assertEqual(len(reads), 1)
 
 
 if __name__ == "__main__":
