@@ -885,3 +885,49 @@ def test_skill_patch_off_silent_verbose_shows_diff():
     )
     assert len(verbose) == 1
     assert "demo" in verbose[0] and "→" in verbose[0]
+
+
+def test_review_prompt_names_runtime_inserted_user_rows_and_keeps_history_intact(monkeypatch):
+    """E5 (T6): the learner reads every user-role message as the user. Runtime-inserted rows
+    (compaction summaries, task-list restores, background-process notices, system notes) must be
+    named in the review's own prompt as not the user's words, while the history it replays stays
+    byte-identical (same-model forks reuse the parent's cached prefix). Words the user typed,
+    including a /steer row, are never listed."""
+    from agent.prompt_builder import format_steer_marker
+
+    captured = {}
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            self._session_messages = []
+
+        def run_conversation(self, **kwargs):
+            captured.update(kwargs)
+
+        def close(self):
+            pass
+
+        def release_clients(self):
+            pass
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+
+    snapshot = [
+        {"role": "user", "content": "please stop asking me to confirm every step"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "[CONTEXT COMPACTION — REFERENCE ONLY] recap: exact approval phrase required"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "[IMPORTANT: Background process proc_1 completed normally (exit code 0).]"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": format_steer_marker("use the smaller deck").strip()},
+        {"role": "assistant", "content": "done"},
+    ]
+    before = [dict(m) for m in snapshot]
+    AIAgent._spawn_background_review(_bare_agent(), messages_snapshot=snapshot, review_memory=True)
+
+    prompt = captured["user_message"]
+    assert "message 2:" in prompt and "message 4:" in prompt  # the two runtime rows are named
+    assert "message 0:" not in prompt and "message 6:" not in prompt  # typed words and /steer are not
+    assert "not the user's own" in prompt
+    assert captured["conversation_history"] == before  # replayed history untouched (cache parity)

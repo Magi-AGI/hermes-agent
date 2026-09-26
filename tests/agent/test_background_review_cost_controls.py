@@ -193,3 +193,22 @@ def test_unresolvable_review_provider_falls_back_with_visible_warning(caplog):
     warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert warnings and all("no-such-provider" in w and "review-model" in w for w in warnings)
     assert len(emitted) == 1 and "no-such-provider" in emitted[0]  # once per agent on the user rail
+
+
+def test_digest_labels_runtime_inserted_user_rows_as_not_the_user():
+    """E5 (T6): a compaction summary or task-list restore sits in the user role but is runtime text.
+    The routed digest must not present it as `USER:` (the learner treats USER lines as the user's own
+    corrections); a row the user typed is still `USER:`."""
+    msgs = [
+        _msg("user", "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns... exact approval phrase required"),
+        _msg("assistant", "ok"),
+        _msg("user", "[Your active task list was preserved across context compression]\n- [ ] a"),
+        _msg("assistant", "ok"),
+        _msg("user", "please stop asking me to confirm every step"),
+        _msg("assistant", "understood"),
+    ] + [_msg("user", f"u{i}") if i % 2 == 0 else _msg("assistant", f"a{i}") for i in range(12)]
+    digest = br._digest_history(msgs, tail=10)[0]["content"]
+    assert "USER: [CONTEXT COMPACTION" not in digest
+    assert "USER: [Your active task list" not in digest
+    assert "[CONTEXT COMPACTION" in digest  # still visible, just not attributed to the user
+    assert "USER: please stop asking me to confirm every step" in digest
