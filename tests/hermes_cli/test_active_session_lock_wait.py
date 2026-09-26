@@ -83,3 +83,42 @@ def test_a_dozen_claims_queue_behind_a_long_holder_and_all_succeed(tmp_path):
     refused = {i: r[1] for i, r in results.items() if r[1] is not None}
     assert len(results) == 12, f"only {len(results)} of 12 claims returned behind a busy lock"
     assert not refused, f"claims refused behind a busy lock: {refused}"
+
+
+_HOLD_FOREVER = """
+import os, sys, time
+with open(sys.argv[1], "a+b") as fh:
+    fh.seek(0)
+    if os.name == "nt":
+        import msvcrt
+        msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+    print("held", flush=True)
+    time.sleep(60)
+"""
+
+
+def test_a_holder_that_never_lets_go_makes_waiters_fail_closed_at_the_budget(tmp_path, monkeypatch):
+    """Same contract on every OS: the claim fails CLOSED at the budget, never blocks forever
+    (POSIX flock(LOCK_EX) used to wait unbounded) and never gives up early."""
+    from hermes_cli import active_sessions
+
+    home = tmp_path / "home"
+    _state, lock_path = active_sessions._lease_paths(registry_home=home)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(active_sessions, "_LOCK_WAIT_S", 2.0)
+    holder = subprocess.Popen([sys.executable, "-c", _HOLD_FOREVER, str(lock_path)], stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        started = time.monotonic()
+        with pytest.raises(RuntimeError, match="lock unavailable"):
+            with active_sessions._FileLock(lock_path):
+                pass
+        waited = time.monotonic() - started
+    finally:
+        holder.kill()
+        holder.wait(timeout=10)
+
+    assert 1.5 <= waited < 10.0, f"gave up after {waited:.1f}s against a 2 s budget"

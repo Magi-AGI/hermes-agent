@@ -195,7 +195,8 @@ def _lease_paths(
 # the holder (starved of the GIL by agent builds) kept the lock past that, and every waiter was
 # refused "could not safely reserve this session" (4090) at the same instant. Threads of one
 # process now queue on a per-file thread lock (no polling among themselves), and the cross-process
-# file lock is polled every 50 ms up to this budget.
+# file lock (msvcrt on Windows, fcntl on POSIX, both non-blocking) is polled every 50 ms up to this
+# budget; a holder that never lets go makes waiters fail CLOSED here instead of hanging forever.
 _LOCK_WAIT_S = 30.0
 _LOCK_POLL_S = 0.05
 _THREAD_LOCKS: dict[str, threading.Lock] = {}
@@ -226,7 +227,17 @@ def _flock(fh, *, lock: bool, deadline: float | None = None) -> None:
                 time.sleep(_LOCK_POLL_S)
     else:
         import fcntl
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX if lock else fcntl.LOCK_UN)
+        if not lock:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            return
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except BlockingIOError:
+                if deadline is None or time.monotonic() >= deadline:
+                    raise
+                time.sleep(_LOCK_POLL_S)
 
 
 class _FileLock:
