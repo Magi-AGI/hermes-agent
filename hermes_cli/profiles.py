@@ -1565,7 +1565,9 @@ def _delete_confirmed_profile(canon: str, profile_dir: Path, gw_running: bool, w
     # transports and release cached stderr handles, including completed probes.
     from hermes_constants import hermes_home_key
     from tools.mcp_tool_lifecycle import shutdown_mcp_servers
+    from tools.mcp_tool_stderr import sinks_released
     shutdown_mcp_servers(scope=hermes_home_key(profile_dir))
+    mcp_log_busy = not sinks_released(hermes_home_key(profile_dir))
 
     # Release this process's holographic memory-store connections into the profile. The
     # Desktop's main serve process opens memory_store.db for every profile and is
@@ -1599,6 +1601,8 @@ def _delete_confirmed_profile(canon: str, profile_dir: Path, gw_running: bool, w
     # 4. Remove profile directory
     remove_error: Exception | None = None
     try:
+        if mcp_log_busy:
+            raise RuntimeError("an MCP server's stderr log in it is still being written; retry the delete")
         _rmtree_with_retry(profile_dir, _rmtree_make_writable)
         print(f"✓ Removed {profile_dir}")
     except Exception as e:
@@ -2146,11 +2150,15 @@ def _rename_checked_profile(old_canon: str, new_canon: str, old_dir: Path, new_d
     # handle would otherwise stay cached under the old key after the move.
     from hermes_constants import hermes_home_key
     from tools.mcp_tool_lifecycle import shutdown_mcp_servers
+    from tools.mcp_tool_stderr import sinks_released
     shutdown_mcp_servers(scope=hermes_home_key(old_dir))
 
-    # 2. Rename directory. If the move fails (cross-device EXDEV, permissions, a racing writer),
-    # undo the unroute so the profile is never stranded tombstoned-but-present.
+    # 2. Rename directory. If the move fails (cross-device EXDEV, permissions, a racing writer, an
+    # MCP stderr log still being written into it), undo the unroute so the profile is never stranded
+    # tombstoned-but-present.
     try:
+        if not sinks_released(hermes_home_key(old_dir)):
+            raise RuntimeError(f"an MCP server's stderr log in {old_dir} is still being written; retry the rename")
         old_dir.rename(new_dir)
     except Exception:
         if live_mux:

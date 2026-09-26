@@ -70,8 +70,10 @@ def append_to_log(path: Path, text: str) -> None:
 
 # Batches waiting for the writer thread; past this the drain drops (and counts) instead of waiting.
 _QUEUE_MAX = 256
-# How long a profile shutdown waits for a sink's in-flight append before it gives up on it.
+# How long a profile shutdown waits for a sink's in-flight append; past it the profile operation
+# refuses to move the directory (see ``sinks_released``) instead of racing the open handle.
 _CLOSE_JOIN_S = 5.0
+_WRITER_POLL_S = 0.2
 
 _sinks_lock = threading.Lock()
 _sinks: "dict[str, set]" = {}
@@ -93,6 +95,8 @@ class StderrSink:
         self._refilled_at = time.monotonic()
         self._dropped = 0
         self._queue: "queue.Queue" = queue.Queue(maxsize=_QUEUE_MAX)
+        # End of stream and close are events, not queued sentinels: a full queue must not lose them.
+        self._eof = threading.Event()
         self._closed = threading.Event()
         with _sinks_lock:
             _sinks.setdefault(scope, set()).add(self)
@@ -115,8 +119,6 @@ class StderrSink:
         """Stop writing to the log and wait for an in-flight append to finish (profile shutdown:
         the directory may be renamed or deleted next). True when the writer has exited."""
         self._closed.set()
-        with contextlib.suppress(queue.Full):
-            self._queue.put_nowait(None)
         self.writer_thread.join(timeout=_CLOSE_JOIN_S)
         return not self.writer_thread.is_alive()
 
@@ -157,8 +159,7 @@ class StderrSink:
             if pending and self._admit(len(pending)):
                 self._queue_lines([pending])
             self._dropped_note()
-            with contextlib.suppress(queue.Full):
-                self._queue.put_nowait(None)
+            self._eof.set()
             with contextlib.suppress(OSError):
                 self._reader.close()
 
@@ -172,7 +173,13 @@ class StderrSink:
 
     def _write_loop(self) -> None:
         try:
-            while (text := self._queue.get()) is not None:
+            while True:
+                try:
+                    text = self._queue.get(timeout=_WRITER_POLL_S)
+                except queue.Empty:
+                    if self._closed.is_set() or self._eof.is_set():
+                        return
+                    continue
                 if not self._closed.is_set():
                     append_to_log(self.log_path, text)
         finally:
@@ -184,13 +191,24 @@ class StderrSink:
                         del _sinks[self.scope]
 
 
-def close_sinks(scope: Optional[str] = None) -> None:
-    """Close every sink of profile home *scope* (all when None) and wait for their appends."""
+def close_sinks(scope: Optional[str] = None) -> bool:
+    """Close every sink of profile home *scope* (all when None) and wait for their appends. False when
+    one is still inside an append after ``_CLOSE_JOIN_S``: its log file is still open."""
     with _sinks_lock:
         targets = [sink for key, sinks in _sinks.items() if scope is None or key == scope for sink in sinks]
+    released = True
     for sink in targets:
         if not sink.close():
+            released = False
             logger.warning("MCP stderr log for '%s' did not close within %.0fs", sink.server_name, _CLOSE_JOIN_S)
+    return released
+
+
+def sinks_released(scope: str) -> bool:
+    """True when no sink of profile home *scope* can still hold its log open (profile rename and
+    delete check this after shutdown and refuse to move the directory otherwise)."""
+    with _sinks_lock:
+        return not _sinks.get(scope)
 
 
 def open_stderr_sink(server_name: str, home: Optional[Path] = None) -> StderrSink:

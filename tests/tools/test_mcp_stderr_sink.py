@@ -5,6 +5,8 @@ import subprocess
 import sys
 import textwrap
 
+import pytest
+
 from tools import mcp_tool_stderr
 
 _FLOOD = """
@@ -29,7 +31,8 @@ def _run_child(sink, code: str, tmp_path) -> None:
     sink.release_writer()
     proc.wait(timeout=60)
     sink.thread.join(timeout=30)
-    assert not sink.thread.is_alive()
+    sink.writer_thread.join(timeout=30)  # the log is complete only once the writer has finished
+    assert not sink.thread.is_alive() and not sink.writer_thread.is_alive()
 
 
 def test_a_flooding_server_is_rate_capped_and_the_loss_is_reported(tmp_path):
@@ -108,3 +111,91 @@ def test_profile_shutdown_waits_for_an_in_flight_append_before_the_directory_mov
     shutdown_mcp_servers(scope=hermes_home_key(home))
     os.rename(home, tmp_path / "profiles" / "moved")  # raised PermissionError while the append was open
     assert "last words" in (tmp_path / "profiles" / "moved" / "logs" / "mcp-stderr.log").read_text(encoding="utf-8")
+
+
+_TRICKLE = """
+import sys, time
+for i in range(40):
+    sys.stderr.write("line %d" % i + chr(10))
+    sys.stderr.flush()
+    time.sleep(0.01)
+"""
+
+
+def test_end_of_stream_is_seen_even_when_the_queue_is_full(tmp_path, monkeypatch):
+    """Round 2 (Codex): EOF was a queued sentinel, dropped when the queue was full, and the writer then
+    waited forever with the sink still registered."""
+    import threading
+
+    from hermes_constants import hermes_home_key
+
+    monkeypatch.setattr(mcp_tool_stderr, "_QUEUE_MAX", 4)
+    release = threading.Event()
+    real_append = mcp_tool_stderr.append_to_log
+
+    def held_append(path, text):
+        release.wait(20)  # the disk stalls until every line has been read and the queue is full
+        real_append(path, text)
+
+    monkeypatch.setattr(mcp_tool_stderr, "append_to_log", held_append)
+    sink = mcp_tool_stderr.open_stderr_sink("trickle", home=tmp_path)
+    script = tmp_path / "trickle.py"
+    script.write_text(textwrap.dedent(_TRICKLE), encoding="utf-8")
+    proc = subprocess.Popen([sys.executable, str(script)], stderr=sink.writer, stdin=subprocess.DEVNULL)
+    sink.release_writer()
+    proc.wait(timeout=30)
+    sink.thread.join(timeout=30)
+    assert not sink.thread.is_alive() and sink._queue.full()
+    release.set()
+    sink.writer_thread.join(timeout=10)
+    assert not sink.writer_thread.is_alive()
+    assert mcp_tool_stderr.sinks_released(hermes_home_key(tmp_path))
+
+
+def test_a_profile_rename_refuses_while_a_stderr_append_still_holds_the_log(tmp_path, monkeypatch):
+    """Round 2 (Codex): past the close timeout, shutdown returned with the append still open and the
+    rename failed with WinError 5 midway. The rename now refuses cleanly (tombstone rolled back) and
+    succeeds once the append is done."""
+    import threading
+    from pathlib import Path
+
+    from hermes_cli import profiles
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(profiles, "_cleanup_gateway_service", lambda *_: None)
+    monkeypatch.setattr(profiles, "_notify_multiplexer", lambda *_: None)
+    monkeypatch.setattr(profiles, "_live_default_multiplexer", lambda: False)
+    monkeypatch.setattr(mcp_tool_stderr, "_CLOSE_JOIN_S", 0.3)
+    old_dir = profiles.create_profile("mcp-slow-log", no_alias=True)
+    in_append, release = threading.Event(), threading.Event()
+
+    def stuck_append(path, text):
+        if "last words" not in text:
+            return
+        with open(path, "a", encoding="utf-8") as fh:
+            in_append.set()
+            release.wait(30)
+            fh.write(text)
+
+    monkeypatch.setattr(mcp_tool_stderr, "append_to_log", stuck_append)
+    token = set_hermes_home_override(old_dir)
+    try:
+        sink = mcp_tool_stderr.open_stderr_sink("slow")
+    finally:
+        reset_hermes_home_override(token)
+    sink.writer.write("last words" + chr(10))
+    sink.release_writer()
+    assert in_append.wait(10)
+    try:
+        with pytest.raises(RuntimeError, match="still being written"):
+            profiles.rename_profile("mcp-slow-log", "mcp-slow-log-2")
+        assert old_dir.is_dir()
+    finally:
+        release.set()
+    sink.writer_thread.join(timeout=10)
+    new_dir = profiles.rename_profile("mcp-slow-log", "mcp-slow-log-2")
+    assert new_dir.is_dir() and not old_dir.exists()
