@@ -349,6 +349,8 @@ def main() -> int:
     parser.add_argument("--stuck-catalog", action="store_true", help="hang the model server's /models during phase B")
     parser.add_argument("--freeze", action="store_true", help="phase F: suspend the backend tree and dump it")
     parser.add_argument("--pyspy", type=Path, help="py-spy executable: sample the backend during phase E")
+    parser.add_argument("--node-dir", type=Path, help="Node directory: phase F runs the desktop's D7 liveness "
+                                                       "supervisor (apps/desktop, vitest) against the frozen backend")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     repo = args.repo.resolve()
@@ -450,7 +452,7 @@ def main() -> int:
         report["phase_B_s"] = round(time.monotonic() - t0, 2)
 
         # C: turns + stops + background reads
-        turners, stoppers, readers = live[5:17], live[17:20], live[20:]
+        turners, stoppers, stream_stoppers, readers = live[5:17], live[17:20], live[20:22], live[22:]
         submitted: dict = {}
 
         def take_turn(w, kind):
@@ -470,6 +472,20 @@ def main() -> int:
             w.wait_turn_end(since, timeout=60)
             return {"status": status, "stop_to_turn_end_s": round(time.monotonic() - started, 2)}
 
+        def stop_while_streaming(w):
+            """Stop a turn that is already streaming: wait for its first message.delta, then interrupt."""
+            since = time.monotonic()
+            w.rpc("C", "prompt.submit", {"session_id": w.session_id, "text": "long answer please [slow]"})
+            with w.cond:
+                streamed = w.cond.wait_for(lambda: any(
+                    at >= since and p.get("session_id") == w.session_id and p.get("type") == "message.delta"
+                    for at, p in w.events), timeout=60)
+            started = time.monotonic()
+            status = (w.rpc("C", "session.interrupt", {"session_id": w.session_id}) or {}).get("status")
+            w.wait_turn_end(started, timeout=60)
+            return {"streamed_before_stop": bool(streamed), "status": status,
+                    "stop_to_turn_end_s": round(time.monotonic() - started, 2)}
+
         def keep_reading(w, until):
             while time.monotonic() < until:
                 w.rpc("C", "session.list", {"limit": 50})
@@ -478,11 +494,14 @@ def main() -> int:
         kinds = ["plain", "tool", "approval"]
         results = run_parallel([lambda w=w, k=kinds[i % 3]: take_turn(w, k) for i, w in enumerate(turners)]
                                + [lambda w=w: stop_turn(w) for w in stoppers]
+                               + [lambda w=w: stop_while_streaming(w) for w in stream_stoppers]
                                + [lambda w=w: keep_reading(w, time.monotonic() + 20) for w in readers])
         report["phase_C_s"] = round(time.monotonic() - t0, 2)
         completes = results[:len(turners)]
         report["turn_message_complete_counts"] = completes
         report["stops"] = [r if isinstance(r, dict) else repr(r) for r in results[len(turners):len(turners) + len(stoppers)]]
+        first = len(turners) + len(stoppers)
+        report["streaming_stops"] = [r if isinstance(r, dict) else repr(r) for r in results[first:first + len(stream_stoppers)]]
 
         # lost / duplicated submits: the stored transcript holds each prompt exactly once
         dupes, lost = [], []
@@ -554,7 +573,7 @@ def main() -> int:
             health.stop.set()  # phase F freezes the backend on purpose: it is not loop drift
             health.join(timeout=20)
             try:
-                report["phase_F"] = freeze_phase(proc.pid, args.port, args.out, repo)
+                report["phase_F"] = freeze_phase(proc.pid, args.port, args.out, repo, args.node_dir)
             except Exception as exc:  # noqa: BLE001 - a requested phase that failed is a failed grade
                 report["phase_F"] = {"error": repr(exc)}
     finally:
@@ -607,6 +626,11 @@ def grade(report: dict, metrics: Metrics) -> dict:
         "every_turn_completed_once": {"value": completes, "pass": all(c == 1 for c in completes)},
         "no_live_owner_errors_D4": {"value": len(report["live_owner_errors"]), "pass": not report["live_owner_errors"]},
         # Beyond Lake's list (review note: stop responsiveness during bursts): a stop ends its turn in 5 s.
+        "stop_while_streaming_ends_turn_within_5s": {
+            "value": report.get("streaming_stops"),
+            "pass": bool(report.get("streaming_stops")) and all(
+                isinstance(r, dict) and r["streamed_before_stop"] and r["status"] == "interrupted"
+                and r["stop_to_turn_end_s"] < 5.0 for r in report["streaming_stops"])},
         "stop_ends_turn_within_5s": {"value": report.get("stops"),
                                      "pass": all(isinstance(r, dict) and r["status"] == "interrupted"
                                                  and r["stop_to_turn_end_s"] < 5.0 for r in report.get("stops", []))},
@@ -632,7 +656,10 @@ def grade(report: dict, metrics: Metrics) -> dict:
         **({"freeze_phase_D7": {
             "value": freeze,
             "pass": isinstance(freeze, dict) and freeze.get("dumped_whole_tree") is True and freeze.get("dump_exit") == 0
-                    and all(str(p).startswith("silent") for p in freeze.get("health_probes_while_frozen", []))}}
+                    and all(str(p).startswith("silent") for p in freeze.get("health_probes_while_frozen", []))
+                    # With the supervisor e2e: it acted (dump before kill) and the frozen tree is gone.
+                    and ("supervisor" not in freeze or (freeze.get("tree_gone") is True
+                                                        and freeze["supervisor"].get("killed") is True))}}
            if report.get("freeze_requested") else {}),
     }
 
@@ -643,8 +670,10 @@ def _compactions_parallel(report: dict) -> bool:
     return bool(alone and len(concurrent) == 4 and max(concurrent) <= 1.5 * alone + 1.0)
 
 
-def freeze_phase(root_pid: int, port: int, out: Path, repo: Path) -> dict:
-    """The 09-07 signature on a real backend: suspend every process, then what the D7 supervisor sees."""
+def freeze_phase(root_pid: int, port: int, out: Path, repo: Path, node_dir: Path | None = None) -> dict:
+    """The 09-07 signature on a real backend: suspend every process, then what the D7 supervisor sees.
+    With *node_dir*, the desktop's liveness supervisor itself decides, dumps and kills it (vitest
+    e2e, clock scaled 120 s -> 3 s); otherwise the harness only dumps the tree."""
     import ctypes
 
     import psutil
@@ -663,11 +692,34 @@ def freeze_phase(root_pid: int, port: int, out: Path, repo: Path) -> dict:
             probes.append("answered")
         except Exception as exc:  # noqa: BLE001
             probes.append(f"silent after {time.monotonic() - started:.1f}s ({type(exc).__name__})")
+    if node_dir is not None:
+        return {"tree": tree, "health_probes_while_frozen": probes,
+                **_supervisor_e2e(root_pid, port, out, repo, node_dir, tree)}
     dump = subprocess.run([sys.executable, "-m", "hermes_cli.freeze_dump", str(root_pid), str(out / "freeze-dumps")],
                           cwd=repo, capture_output=True, text=True, timeout=180)
     files = [line for line in dump.stdout.splitlines() if line.strip()]
     return {"tree": tree, "health_probes_while_frozen": probes, "dump_exit": dump.returncode, "dumps": files,
             "dumped_whole_tree": len(files) == len(tree), "stderr": dump.stderr[-500:]}
+
+
+def _supervisor_e2e(root_pid: int, port: int, out: Path, repo: Path, node_dir: Path, tree: list) -> dict:
+    import psutil
+    dump_dir, result_path = out / "freeze-dumps", out / "supervisor-e2e.json"
+    target = {"pid": root_pid, "baseUrl": f"http://127.0.0.1:{port}", "python": sys.executable, "repo": str(repo),
+              "dumpDir": str(dump_dir), "resultPath": str(result_path)}
+    env = {**os.environ, "LIVENESS_E2E_TARGET": json.dumps(target),
+           "PATH": os.pathsep.join((str(node_dir), os.environ.get("PATH", "")))}
+    npx = str(node_dir / ("npx.cmd" if sys.platform == "win32" else "npx"))
+    run = subprocess.run([npx, "vitest", "run", "--project", "electron", "electron/backend-liveness.e2e.test.ts"],
+                         cwd=repo / "apps" / "desktop", env=env, capture_output=True, text=True, timeout=300,
+                         shell=sys.platform == "win32")
+    result = json.loads(result_path.read_text(encoding="utf-8")) if result_path.exists() else {}
+    dumps = sorted(p.name for p in dump_dir.glob("*.dmp")) if dump_dir.exists() else []
+    return {"supervisor": result, "supervisor_exit": run.returncode, "dumps": dumps,
+            "dumped_whole_tree": len(dumps) == len(tree),
+            "tree_gone": not any(psutil.pid_exists(pid) for pid in tree),
+            "dump_exit": 0 if run.returncode == 0 else run.returncode,
+            "vitest_tail": (run.stdout + run.stderr)[-800:]}
 
 
 if __name__ == "__main__":
