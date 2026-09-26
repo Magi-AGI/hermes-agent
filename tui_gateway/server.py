@@ -2250,7 +2250,10 @@ def _schedule_mcp_late_refresh(sid: str, agent) -> None:
             seen = generation
             if done:
                 return
-    threading.Thread(target=_wait_then_refresh, name=f"tui-mcp-late-refresh-{sid}", daemon=True).start()
+    # The caller's context, not a bare thread's: under a multiplexed backend the session's profile
+    # (home, secret scope) decides which discovery to follow and which registry to rebuild from.
+    from agent.memory_provider import spawn_context_thread
+    spawn_context_thread(_wait_then_refresh, name=f"tui-mcp-late-refresh-{sid}").start()
 
 
 class _RuntimeFallbackResolution(NamedTuple):
