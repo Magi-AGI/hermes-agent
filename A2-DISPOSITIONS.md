@@ -56,15 +56,24 @@ lowercase name. It now asserts the directory's real entries and content (still o
 `agent@Example-Host.local` → `someone`), which holds on every filesystem and still catches both a second file
 (case-sensitive hosts) and an overwrite (case-insensitive hosts).
 
-## Found alongside, NOT in A17 (different causes; left for the coordinator)
+## Found alongside, NOT in A17
 
-In the same bare-`bash` test files, 5 more failures have other host-specific causes. All are test assumptions,
-none looked like a product defect:
+In the same bare-`bash` test files, 5 more failures had other host-specific causes; all are test assumptions,
+none a product defect.
+
+**Fixed (both in `tests/tools/test_docker_environment.py`; the second one also wrote mangled-name junk files
+into the checkout on every Windows run, WSL treating `C:\...` as a relative file name):**
+
+- `test_persistent_bind_mounts_survive_a_session_key_task_id`: asserted no `:` in the bind source and exactly
+  one `:` in the spec, but a Windows host path keeps its drive colon (`C:\...`, which Docker Desktop parses).
+  Both checks now look past `os.path.splitdrive`; a session key's colons are still caught on every host.
+- `test_wrapped_exec_scopes_explicit_forward_env_across_profiles`: its fake `docker exec` ran the in-container
+  command with a bare `bash` (WSL here, exit 126). It now uses `_find_bash()`.
+
+**Left for the coordinator (they touch the conftest live-system guard, which deserves its own review):**
 
 | Test | Cause on Windows | Suggested disposition |
 |---|---|---|
-| `tests/tools/test_docker_environment.py::test_persistent_bind_mounts_survive_a_session_key_task_id` | asserts no `:` in the bind source, but a Windows host path always carries its drive colon (`C:\…`), which Docker Desktop accepts | test: check the source after `os.path.splitdrive` |
-| `tests/tools/test_docker_environment.py::test_wrapped_exec_scopes_explicit_forward_env_across_profiles` | its fake `docker exec` runs the in-container command with a bare `bash` (WSL here); exit 126 | test: simulate the container with `_find_bash()`, or mark `linux_only` |
 | `tests/test_live_system_guard_self_test.py::test_pty_spawn_systemctl_blocked` | `pty` needs `termios` (POSIX-only module) | mark `linux_only` (pty is POSIX) |
-| `tests/test_live_system_guard_self_test.py::test_os_kill_blocks_foreign_pid` | `FOREIGN_PID = 1` is init on POSIX but does not exist on Windows; the guard rightly treats a missing PID as stale and lets the call through, and `os.kill(1, …)` then raises WinError 87. **Not a guard hole**: a live foreign PID is still blocked | test: pick the foreign PID per host (never a real target), or mark POSIX |
-| `tests/test_live_system_guard.py::test_gateway_start_inside_a_container_exec_is_not_blocked` | the "docker" stub is a `#!/bin/sh` script (not executable on Windows) and the guard sees a Windows path argv | mark POSIX, or a `.cmd` stub on Windows |
+| `tests/test_live_system_guard_self_test.py::test_os_kill_blocks_foreign_pid` | `FOREIGN_PID = 1` is init on POSIX but does not exist on Windows; the guard rightly treats a missing PID as stale and lets the call through, and `os.kill(1, …)` then raises WinError 87. **Not a guard hole**: a live foreign PID is still blocked | test: a per-host foreign PID that exists and cannot be harmed (PID 4, System, on Windows) |
+| `tests/test_live_system_guard.py::test_gateway_start_inside_a_container_exec_is_not_blocked` | the guard's `_first_token_basename` splits with POSIX `shlex` and on `/` only, so `C:\...\stub-bin\docker` is not recognised as `docker` and the call is blocked (a Windows false positive of the guard, tests only); and the `#!/bin/sh` stub cannot execute on Windows anyway | guard: basename on both separators (and `.exe`) with non-POSIX `shlex` on Windows; test: a `.cmd` stub on Windows, or mark POSIX |
