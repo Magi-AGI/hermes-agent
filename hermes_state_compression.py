@@ -291,11 +291,12 @@ class SessionCompressionMixin:
                 source=source, model=model, model_config=model_config, system_prompt=system_prompt,
                 cwd=cwd, profile_name=profile_name)
             # A recall of the parent's conversation covers the continuation too (records before rows:
-            # the handoff and the cloned tail are written through the recall triggers).
+            # the handoff is written through the recall normalization).
             conn.execute(
-                "INSERT INTO recalled_messages (session_id, platform_message_id, content, timestamp, replacement, "
-                "recalled_at) SELECT ?, platform_message_id, content, timestamp, replacement, recalled_at "
-                "FROM recalled_messages WHERE session_id = ?", (child_session_id, parent_session_id))
+                "INSERT INTO recalled_messages (session_id, request_id, platform_message_id, content, timestamp, "
+                "pending, replacement, recalled_at) SELECT ?, request_id, platform_message_id, content, timestamp, "
+                "pending, replacement, recalled_at FROM recalled_messages WHERE session_id = ?",
+                (child_session_id, parent_session_id))
             total_messages, total_tool_calls = self._insert_message_rows(conn, child_session_id, messages)
             if watermark is not None:
                 # Clone the parent's concurrent tail into the child after the handoff;

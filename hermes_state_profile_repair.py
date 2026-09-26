@@ -194,7 +194,10 @@ class SessionProfileRepairMixin:
                 "SELECT * FROM messages WHERE session_id = ? ORDER BY id", (session_id,))]
             usage = [dict(r) for r in conn.execute(
                 "SELECT * FROM session_model_usage WHERE session_id = ?", (session_id,))]
-            return {"session": dict(session), "system_prompt": prompt, "messages": messages, "usage": usage}
+            recalls = [dict(r) for r in conn.execute(
+                "SELECT * FROM recalled_messages WHERE session_id = ?", (session_id,))]
+            return {"session": dict(session), "system_prompt": prompt, "messages": messages, "usage": usage,
+                    "recalls": recalls}
         return self._read_retrying_ioerr(_read)
 
     def import_moved_session(self, payload: Dict[str, Any], *, profile_name: str) -> str:
@@ -214,6 +217,8 @@ class SessionProfileRepairMixin:
                 session["parent_session_id"] = None
             session["system_prompt_hash"] = self._store_system_prompt(conn, payload.get("system_prompt"))
             self._insert_row(conn, "sessions", session, skip=frozenset())
+            for recall in payload.get("recalls") or []:  # recorded withdrawals travel with the conversation
+                self._insert_row(conn, "recalled_messages", {**recall, "session_id": session_id}, skip=frozenset())
             for message in payload.get("messages") or []:
                 self._insert_row(conn, "messages", {**message, "session_id": session_id}, skip=_MESSAGE_MOVE_SKIP)
             for usage in payload.get("usage") or []:
@@ -238,6 +243,7 @@ class SessionProfileRepairMixin:
             conn.execute("UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id = ?", (session_id,))
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM session_model_usage WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM recalled_messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             self._delete_unreferenced_system_prompts(conn)
             return True

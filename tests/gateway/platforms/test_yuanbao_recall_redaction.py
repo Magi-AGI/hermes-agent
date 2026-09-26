@@ -379,3 +379,128 @@ def test_a_pending_recall_survives_a_restart_and_boot_recovery_honours_it(store,
     finally:
         reopened.close()
     assert rows and not [r for r in rows if SECRET in (r[1] or "")]
+
+
+def _fts_hits(db, word):
+    hits = {}
+    with db._read_ctx() as conn:
+        for table in ("messages_fts", "messages_fts_trigram"):
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE name = ?", (table,)).fetchone():
+                hits[table] = conn.execute(f"SELECT COUNT(*) FROM {table} WHERE {table} MATCH ?", (word,)).fetchone()[0]
+    return hits
+
+
+def _fts_integrity(db):
+    with db._lock:
+        for table in ("messages_fts", "messages_fts_trigram"):
+            if db._conn.execute("SELECT 1 FROM sqlite_master WHERE name = ?", (table,)).fetchone():
+                db._conn.execute(f"INSERT INTO {table}({table}, rank) VALUES('integrity-check', 1)")
+
+
+def test_an_upgraded_store_keeps_its_search_index_consistent_through_a_recall(tmp_path):
+    """Round 4 (Codex, P1): on a store upgraded under existing FTS triggers the recall rewrite ran
+    before the index saw the original, leaving the withdrawn words searchable and the index
+    failing its integrity check. Withdrawn rows are now written as their replacement."""
+    path = tmp_path / "upgraded.db"
+    old = SessionDB(db_path=path)
+    old.create_session("s", "cli")
+    old.append_message(session_id="s", role="user", content="secretword here", platform_message_id="p1")
+    old._execute_write(lambda conn: conn.executescript(  # the store as it was before recalls existed
+        "DROP TABLE recalled_messages; DROP TRIGGER IF EXISTS messages_recall_insert; "
+        "DROP TRIGGER IF EXISTS messages_recall_update;"))
+    old.close()
+    db = SessionDB(db_path=path)
+    try:
+        db.redact_user_message(["s"], platform_message_id="p1", content="secretword here", replacement="[redacted]")
+        db.append_message(session_id="s", role="user", content="secretword here", platform_message_id="p1")  # a late copy
+        row_id = db.append_message(session_id="s", role="user", content="other", platform_message_id="p1")
+        db.set_user_message_content("s", row_id, "secretword again")  # a prologue rewrite of a withdrawn row
+        _fts_integrity(db)
+        assert all(n == 0 for n in _fts_hits(db, "secretword").values()), _fts_hits(db, "secretword")
+        assert {r[1] for r in _rows(db, "s")} == {"[redacted]"}
+    finally:
+        db.close()
+
+
+def test_a_new_recall_of_equal_text_is_not_mistaken_for_an_earlier_one(tmp_path):
+    """Round 4 (Codex): the first text recall's identity (timestamp 100) was reused for every later
+    recall of the same text, so the message at 200 stayed visible."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("s", "cli")
+        db.append_message(session_id="s", role="user", content="repeat", timestamp=1_700_000_100.0)
+        assert db.redact_user_message(["s"], content="repeat", request_id="r1", replacement="[x]")[0] == 1
+        db.append_message(session_id="s", role="user", content="repeat", timestamp=1_700_000_200.0)
+        assert db.redact_user_message(["s"], content="repeat", request_id="r2", replacement="[x]")[0] == 1
+        assert [r[1] for r in _rows(db, "s")] == ["[x]", "[x]"]
+    finally:
+        db.close()
+
+
+def test_recorded_recalls_survive_recovery_and_a_profile_move(tmp_path):
+    """Round 4 (Codex): recovery and session moves dropped the recall records, so a replayed copy of
+    a withdrawn message came back in the recovered or destination store."""
+    from hermes_cli.session_recovery import recover_session_database
+
+    source = SessionDB(db_path=tmp_path / "source.db")
+    source.create_session("s", "cli")
+    source.append_message(session_id="s", role="user", content=SECRET, platform_message_id="p1")
+    source.redact_user_message(["s"], platform_message_id="p1", replacement="[redacted]")
+    payload = source.export_session_for_move("s")
+    source.close()
+
+    report = recover_session_database(tmp_path / "source.db", tmp_path / "recovered.db")
+    assert report.get("complete", True)
+    target = SessionDB(db_path=tmp_path / "moved.db")
+    target.import_moved_session(payload, profile_name="elsewhere")
+    for path, db in (("recovered", SessionDB(db_path=tmp_path / "recovered.db")), ("moved", target)):
+        try:
+            db.append_message(session_id="s", role="user", content=SECRET, platform_message_id="p1")
+            assert not [r for r in _rows(db, "s") if SECRET in (r[1] or "")], path
+        finally:
+            db.close()
+
+
+@pytest.mark.windows_only
+def test_an_unresolved_text_recall_survives_a_restart_and_boot_recovery_resolves_it(store, tmp_path):
+    """Round 4 (Codex): an id recall whose unreadable spooled copy had NO id recorded only the id; a
+    fresh process's boot recovery then inserted the original text. The unresolved text identity is now
+    a durable pending note: replay holds the copy and boot recovery resolves it first."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    from gateway.shutdown_flush import TranscriptSpoolIncompleteError, spool_dropped_transcript_message
+    from hermes_constants import get_hermes_home
+
+    tasks: list = []
+    adapter = _adapter(store, tasks)
+    sid = _session(store, adapter)
+    path = spool_dropped_transcript_message(sid, {"role": "user", "content": SECRET, "timestamp": 1_700_000_100.0})
+    release = _hold_windows_file(path, 0)
+    try:
+        with pytest.raises(TranscriptSpoolIncompleteError):
+            store.redact_user_message(sid, platform_message_id="p1", content=SECRET,
+                                      replacement=RecallGuardMiddleware._REDACTED)
+    finally:
+        release()
+    store._db.close()
+    repo = str(Path(__file__).resolve().parents[3])
+    boot = (
+        "import sys; sys.path.insert(0, sys.argv[1])\n"
+        "from pathlib import Path\n"
+        "from hermes_state import SessionDB\n"
+        "from gateway.shutdown_flush import recover_pending_to_db\n"
+        "db = SessionDB(db_path=Path(sys.argv[2]))\n"
+        "print('recovered', recover_pending_to_db(db))\n"
+        "db.close()\n")
+    proc = subprocess.run([sys.executable, "-c", boot, repo, str(tmp_path / "state.db")],
+                          capture_output=True, text=True, timeout=120,
+                          env={**__import__("os").environ, "HERMES_HOME": str(get_hermes_home())})
+    assert "recovered 1" in proc.stdout, proc.stderr[-2000:]
+    reopened = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        rows = _rows(reopened, sid)
+    finally:
+        reopened.close()
+    assert rows and not [r for r in rows if SECRET in (r[1] or "")]

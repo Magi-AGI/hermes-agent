@@ -18,7 +18,8 @@ from hermes_cli.session_schema_history import SCHEMA_HISTORY, reachable_physical
 
 from hermes_state_ids import SESSION_ID_PATTERN  # timestamp prefix: strongest sentinel for schema-less rows
 from hermes_cli.session_recovery import (
-    _AUXILIARY_TABLE_SCHEMAS, _AUXILIARY_TABLES, _CANONICAL_TABLES, _count_rows, _immediate_transaction,
+    _AUXILIARY_TABLE_SCHEMAS, _AUXILIARY_TABLES, _CANONICAL_TABLES, _OPTIONAL_CANONICAL_TABLES, _count_rows,
+    _immediate_transaction,
     _placeholder_titles, _quoted_columns, _table_columns,
 )
 
@@ -662,7 +663,7 @@ def _execute_insert(
 def _copy_direct_tables(lf_conn: sqlite3.Connection, dest: sqlite3.Connection) -> dict[str, int]:
     """Copy rows .recover managed to attribute to real canonical tables."""
     copied: dict[str, int] = {}
-    for table in (*_CANONICAL_TABLES, *_AUXILIARY_TABLES):
+    for table in (*_CANONICAL_TABLES, *_OPTIONAL_CANONICAL_TABLES, *_AUXILIARY_TABLES):
         source_columns = _table_columns(lf_conn, table)
         if not source_columns:
             continue

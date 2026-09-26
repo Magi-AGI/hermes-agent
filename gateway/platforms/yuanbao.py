@@ -550,11 +550,12 @@ class RecallGuardMiddleware(InboundMiddleware):
                 logger.warning("[%s] Recall: failed to resolve session: %s", adapter.name, exc)
                 return
             started, add_note = time.monotonic(), note_if_missing
+            request_id = recalled_id or uuid.uuid4().hex  # one recall, however many retries
             while True:
                 try:
                     changed = await asyncio.to_thread(
                         store.redact_user_message, sid, platform_message_id=recalled_id or None,
-                        content=content or None, replacement=cls._REDACTED)
+                        content=content or None, request_id=request_id, replacement=cls._REDACTED)
                 except (SessionTurnLeaseLostError, SessionCompressionInProgressError, CompressionSessionClosedError,
                         TranscriptSpoolIncompleteError):
                     # A live turn or compression owns (or just rotated) the conversation, or a spooled copy

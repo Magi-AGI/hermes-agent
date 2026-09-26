@@ -36,6 +36,13 @@ def _spool_dropped(session_id: str, message: Dict[str, Any]):
         return None
 
 
+class RecallHoldError(RuntimeError):
+    """A spooled message is held from replay while a text recall that may target it is unresolved."""
+
+    def __init__(self, session_id: str):
+        super().__init__(f"spooled message held for an unresolved recall in {session_id}")
+
+
 def _message_platform_id(message: Dict[str, Any]) -> Optional[str]:
     return message.get("platform_message_id") or message.get("message_id") or None
 
@@ -366,13 +373,21 @@ class SessionTranscriptMixin:
             with self._transcript_retry_lock:
                 known_failing = bool(self._transcript_append_failures.get(session_id))
             _replayed, remaining = drain_transcript_spool(
-                session_id, lambda message: self._append_transcript_message(session_id, message),
+                session_id, lambda message: self._replay_spooled_message(session_id, message),
                 db_known_failing=known_failing,
             )
             if not remaining:
                 spooled_sessions.discard(session_id)
         except Exception as exc:
             logger.warning("Failed to drain transcript spool for %s: %s", session_id, exc)
+
+    def _replay_spooled_message(self, session_id: str, message: Dict[str, Any]) -> None:
+        """Replay one spooled message, unless an unresolved text recall may target it: then the drain
+        stops here and the file is kept (replay order holds) until the recall resolves."""
+        holds = getattr(self._db_for_session_id(session_id), "recall_holds", None)  # None: store keeps no recalls
+        if holds is not None and holds(session_id, message):
+            raise RecallHoldError(session_id)
+        self._append_transcript_message(session_id, message)
 
     def _append_transcript_message(self, session_id: str, message: Dict[str, Any]) -> None:
         """Write one transcript row. Caller handles retry queuing."""
@@ -530,18 +545,22 @@ class SessionTranscriptMixin:
     _REDACT_ROTATION_ATTEMPTS = 5
 
     def redact_user_message(self, session_id: str, *, platform_message_id: Optional[str] = None,
-                            content: Any = None, replacement: str) -> int:
+                            content: Any = None, request_id: Optional[str] = None, replacement: str) -> int:
         """Withdraw one user message from this conversation: ``SessionDB.redact_user_message`` fences,
         resolves the identity (over the stored rows and the copies waiting here for a retried write)
         and records the withdrawal in one transaction, so every later write of it, including replay of
         these copies at any time or after a restart, is overwritten by the database itself. The copies
         still queued in memory or spooled to disk are then rewritten too.
 
-        Raises the SessionDB fence errors while a live turn or a compression holds the conversation,
-        ``RecallTargetAmbiguousError`` when the text alone names several messages, and
-        ``TranscriptSpoolIncompleteError`` when a spooled copy could not be read or rewritten (an
-        undated copy has no durable identity, so it must be rewritten in place); the caller retries,
-        which is safe after a partial run. Returns messages overwritten."""
+        *request_id* names this recall across retries (default: the platform id): a retry reuses the
+        text identity it resolved, a new recall of equal text never does. Raises the SessionDB fence
+        errors while a live turn or a compression holds the conversation, ``RecallTargetAmbiguousError``
+        when the text alone names several messages, and ``TranscriptSpoolIncompleteError`` when a spooled
+        copy could not be read or rewritten (an undated copy has no durable identity, so it must be
+        rewritten in place). An unreadable spool first records what is known durably: the id intent, and
+        a pending text note that holds matching id-less spooled copies from replay (live, or boot recovery
+        after a restart, which resumes the resolution). The caller retries, which is safe after a partial
+        run. Returns messages overwritten."""
         from gateway.shutdown_flush import (
             TranscriptSpoolIncompleteError, rewrite_spooled_message, spooled_transcript_messages)
         from hermes_state_errors import CompressionSessionClosedError
@@ -560,19 +579,24 @@ class SessionTranscriptMixin:
                     spooled = [(path, payload, m) for path, payload, m in spooled_transcript_messages(sessions)
                                if m.get("role") == "user"]
                 except TranscriptSpoolIncompleteError:
+                    # Record what needs no spool snapshot, durably: the id intent (a replay of a copy carrying
+                    # the id is overwritten), and a pending text note (a replay of an id-less copy is held
+                    # until the identity is resolved, here on retry or by boot recovery after a restart).
                     if platform_message_id:
-                        # The id intent needs no spool snapshot: record it now, so a replay of the unread
-                        # copy (live, or at boot after a restart) is overwritten while this retries.
                         db.redact_user_message(
-                            lineage, platform_message_id=platform_message_id, replacement=replacement,
+                            lineage, platform_message_id=platform_message_id, request_id=request_id,
+                            replacement=replacement,
                             retry_copies=[(_message_platform_id(m), False, None) for m in queued])
+                    if content:
+                        db.record_pending_recall(lineage, request_id=request_id or platform_message_id or "",
+                                                 content=content, replacement=replacement)
                     raise
                 copies = queued + [m for _path, _payload, m in spooled]
                 snapshot = [(_message_platform_id(m), bool(content) and m.get("content") == content,
                              _message_timestamp(m)) for m in copies]
                 try:
                     changed, identity = db.redact_user_message(
-                        lineage, platform_message_id=platform_message_id, content=content,
+                        lineage, platform_message_id=platform_message_id, content=content, request_id=request_id,
                         retry_copies=snapshot, replacement=replacement)
                     break
                 except CompressionSessionClosedError:
