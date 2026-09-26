@@ -22,6 +22,8 @@ in-flight build instead of starting another one after it.
 
 from __future__ import annotations
 
+import atexit
+import concurrent.futures
 import dataclasses
 import json
 import os
@@ -33,6 +35,12 @@ from utils import file_signature
 
 MODEL_OPTIONS = SingleFlight()
 SESSION_LIST = SingleFlight()
+
+# Joiners' responses are written here, one task per recipient: a transport write can wait up to
+# ws._WS_WRITE_TIMEOUT_S for a slow peer, and writing inline in the shared future's callbacks made
+# every later joiner (and the leader's own reply) wait behind that one window.
+_DELIVERY = concurrent.futures.ThreadPoolExecutor(max_workers=32, thread_name_prefix="tui-rpc-deliver")
+atexit.register(lambda: _DELIVERY.shutdown(wait=False, cancel_futures=True))
 
 _MODEL_OPTIONS_PROFILE_FILES = (".env", "auth.json")
 
@@ -104,5 +112,11 @@ def respond(flight: SingleFlight, key: Hashable | None, rid: Any, compute: Calla
         finally:
             retirement.release()
 
-    shared.add_done_callback(deliver)
+    def schedule(done) -> None:
+        try:
+            _DELIVERY.submit(deliver, done)
+        except RuntimeError:  # delivery pool shut down (process exit): nothing will write it
+            retirement.release()
+
+    shared.add_done_callback(schedule)
     return None

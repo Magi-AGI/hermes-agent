@@ -148,3 +148,47 @@ def test_a_request_after_a_managed_config_write_never_joins_the_earlier_build(op
     gate.set()
     first.join(timeout=10)
     second.join(timeout=10)
+
+
+class _SlowPeer(_Capture):
+    """A window whose socket is backed up: every write blocks for a while (WSTransport waits up to 10 s)."""
+
+    def __init__(self, delay: float) -> None:
+        super().__init__()
+        self.delay = delay
+
+    def write(self, obj: dict) -> bool:
+        time.sleep(self.delay)
+        return super().write(obj)
+
+
+def test_one_slow_window_never_delays_the_others_or_keeps_the_finished_build_joinable(options_handler, monkeypatch):
+    import tui_gateway.server as server
+    from tui_gateway import rpc_coalesce
+    from tui_gateway.rpc_lanes import LaneSet, SingleFlight
+
+    _handler, builds, gate, _home = options_handler
+    monkeypatch.setattr(server, "_lanes", LaneSet())
+    monkeypatch.setattr(rpc_coalesce, "MODEL_OPTIONS", SingleFlight())
+    monkeypatch.delitem(server._contracts.METHODS, "model.options", raising=False)
+    healthy, slow = _Capture(), _SlowPeer(delay=5.0)
+
+    server.dispatch({"id": "leader", "method": "model.options", "params": {}}, healthy)
+    assert _wait(lambda: builds["n"] == 1)
+    server.dispatch({"id": "slow", "method": "model.options", "params": {}}, slow)
+    for i in range(5):
+        server.dispatch({"id": f"w{i}", "method": "model.options", "params": {}}, healthy)
+    time.sleep(0.2)
+    released = time.monotonic()
+    gate.set()
+
+    assert _wait(lambda: all(k in healthy.frames for k in ("leader", "w0", "w1", "w2", "w3", "w4")), timeout=2.0), (
+        "healthy windows waited behind one slow window's write")
+    assert time.monotonic() - released < 2.0
+    # The build is finished; the slow window is still being written to. A new request must build afresh.
+    gate.clear()
+    server.dispatch({"id": "later", "method": "model.options", "params": {}}, healthy)
+    assert _wait(lambda: builds["n"] == 2, timeout=2.0), "a later request joined the finished build"
+    gate.set()
+    assert _wait(lambda: "slow" in slow.frames and "later" in healthy.frames, timeout=10)
+    server._lanes.shutdown()

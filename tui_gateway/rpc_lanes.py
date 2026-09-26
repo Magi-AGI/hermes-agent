@@ -232,19 +232,24 @@ class SingleFlight:
             return shared, True
 
     def lead(self, key: Hashable, shared: concurrent.futures.Future, compute: Callable[[], Any]) -> Any:
-        """Run *compute* as the leader of *shared*, publish its outcome, and retire the key."""
+        """Run *compute* as the leader of *shared*, retire the key, then publish the outcome.
+
+        Retired FIRST: publishing runs the joiners' callbacks, and a flight still registered while
+        they run would let a later caller join a finished computation."""
         try:
             result = compute()
         except BaseException as exc:
+            self._retire(key, shared)
             shared.set_exception(exc)
             raise
-        else:
-            shared.set_result(result)
-            return result
-        finally:
-            with self._lock:
-                if self._inflight.get(key) is shared:
-                    del self._inflight[key]
+        self._retire(key, shared)
+        shared.set_result(result)
+        return result
+
+    def _retire(self, key: Hashable, shared: concurrent.futures.Future) -> None:
+        with self._lock:
+            if self._inflight.get(key) is shared:
+                del self._inflight[key]
 
     def run(self, key: Hashable, compute: Callable[[], Any]) -> Any:
         """Blocking form: lead, or wait on the leader in this thread."""
