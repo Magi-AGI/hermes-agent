@@ -304,3 +304,64 @@ def test_a_server_flooding_stderr_cannot_grow_the_log_without_bound(tmp_path):
     assert result["status"]["unity"]["status"] == "failed"
     assert log.stat().st_size < 1024 * 1024  # the server wrote ~7 MB
     assert "bytes of stderr dropped" in log.read_text(encoding="utf-8", errors="replace")
+
+
+_HELPER_SERVER = """
+import os, subprocess, sys
+from mcp.server import MCPServer
+helper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+open(os.environ["HELPER_PIDFILE"], "w").write(str(helper.pid))
+mcp = MCPServer(os.environ["SERVER_NAME"])
+
+@mcp.tool()
+def ping() -> str:
+    return "pong-" + os.environ["SERVER_NAME"]
+
+if __name__ == "__main__":
+    mcp.run(transport="stdio")
+"""
+
+_STOP_ONE_CHILD = """
+import json, os, sys, time
+repo, home = sys.argv[1], sys.argv[2]
+sys.path.insert(0, repo)
+os.environ["HERMES_HOME"] = home
+from tools.mcp_tool_discovery import discover_mcp_tools, get_mcp_status
+from tools.mcp_tool_lifecycle import shutdown_mcp_servers
+from model_tools import handle_function_call
+discover_mcp_tools()
+before = {e["name"]: e["status"] for e in get_mcp_status()}
+shutdown_mcp_servers(names={"alpha"})
+time.sleep(3)  # past the escaped-descendant grace
+reply = handle_function_call("mcp__beta__ping", {})
+import psutil
+beta_helper = int(open(os.environ["BETA_PIDFILE"]).read())
+print("RESULT " + json.dumps({"before": before, "reply": reply,
+                              "beta_helper_alive": psutil.pid_exists(beta_helper)}), flush=True)
+shutdown_mcp_servers()
+os._exit(0)
+"""
+
+
+def test_stopping_one_server_leaves_a_concurrently_started_neighbour_intact(tmp_path):
+    """Ownership, not just identity: two servers started together each saw the other's root in
+    their child-PID window, so tearing one down killed the other's interpreter and helper."""
+    server = _script(tmp_path, "helper_server.py", _HELPER_SERVER)
+    child = _script(tmp_path, "stop_one_child.py", _STOP_ONE_CHILD)
+    home = tmp_path / "home"
+    pidfiles = {name: tmp_path / f"{name}.pid" for name in ("alpha", "beta")}
+    _write_home(home, {name: {"command": sys.executable, "args": [str(server)],
+                              "env": {"HELPER_PIDFILE": str(pf), "SERVER_NAME": name}}
+                       for name, pf in pidfiles.items()})
+    env = {k: v for k, v in os.environ.items() if not k.endswith(("_API_KEY", "_TOKEN"))}
+    env.update({"HERMES_HOME": str(home), "PYTHONPATH": str(_REPO_ROOT), "BETA_PIDFILE": str(pidfiles["beta"])})
+    try:
+        result = _result(subprocess.Popen([sys.executable, str(child), str(_REPO_ROOT), str(home)], env=env,
+                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                          encoding="utf-8"))
+    finally:
+        for pf in pidfiles.values():
+            _kill_leftover(pf)
+    assert result["before"] == {"alpha": "connected", "beta": "connected"}
+    assert result["beta_helper_alive"] is True
+    assert "pong-beta" in result["reply"], result["reply"]

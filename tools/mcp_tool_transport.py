@@ -7,13 +7,14 @@ import asyncio
 import os
 import urllib.parse
 import urllib.request
+import uuid
 from contextlib import asynccontextmanager
 from typing import Dict, Optional, Set
 from utils import normalize_proxy_url
 from agent.proxy_bypass import is_loopback_host, should_bypass_proxy
 from agent import runtime_cwd as _runtime_cwd
 from tools.mcp_tool_errors import NonMcpEndpointError, _apply_identity_header, _describe_http_failure, _handshake_answered_with_unsupported_version, _handshake_rejected_as_modern, _is_streamable_http_rejection, _make_http_rejection_recorder, _make_mcp_body_cap_transport, _make_redirect_header_stripper, _resolve_client_cert, _unwrap_exception_group
-from tools.mcp_tool_lifecycle import _filter_mcp_children, _orphan_stdio_pid_servers, _orphan_stdio_pids, _stdio_pgids, _stdio_pids
+from tools.mcp_tool_lifecycle import _orphan_stdio_pid_servers, _orphan_stdio_pids, _stdio_pgids, _stdio_pids
 from tools.mcp_tool_common import _core
 from tools import mcp_tool_config as _config
 from tools import mcp_tool_lifecycle as _lifecycle
@@ -302,8 +303,11 @@ class MCPServerTransportMixin:
         stdio_cwd = config.get("cwd")
         if stdio_cwd is None:
             stdio_cwd = _runtime_cwd.resolve_context_cwd() or None
+        # Ownership token (see ``_lifecycle.SPAWN_TOKEN_ENV``); the SDK merges its default env under ours.
+        spawn_token = uuid.uuid4().hex
+        safe_env = {**(safe_env or {}), _lifecycle.SPAWN_TOKEN_ENV: spawn_token}
         server_params = _core.StdioServerParameters(
-            command=command, args=args, env=safe_env or None, cwd=stdio_cwd,
+            command=command, args=args, env=safe_env, cwd=stdio_cwd,
             # Windows pipes can split non-UTF-8 bytes at chunk boundaries; substitute, don't raise.
             encoding_error_handler="replace")
         # Reap orphans of prior attempts first (else retries pile up zombie pairs); unscoped on purpose;
@@ -324,9 +328,10 @@ class MCPServerTransportMixin:
         try:
             async with _core.stdio_client(server_params, errlog=stderr_sink.writer) as (read_stream, write_stream):
                 stderr_sink.release_writer()  # spawned: the child holds its own copy now
-                # New PIDs for force-kill cleanup, minus non-MCP children (slash_worker, LSP) racing
-                # into the window: they share the TUI's pgid — leaking them would killpg() the TUI.
-                new_pids = _filter_mcp_children(_lifecycle._snapshot_child_pids() - pids_before)
+                # This spawn's own root(s) for force-kill cleanup: the child-PID delta also holds other
+                # servers starting concurrently and non-MCP children (slash_worker, LSP, sharing the
+                # TUI's pgid, so tracking them would killpg() the TUI); the spawn token picks ours.
+                new_pids = _lifecycle._claim_spawned_roots(_lifecycle._snapshot_child_pids() - pids_before, spawn_token)
                 if new_pids:
                     self._track_spawned_children(new_pids)
                 self._stdio_child_pids = set(new_pids)  # so in-flight calls fail fast when the child dies
@@ -337,7 +342,7 @@ class MCPServerTransportMixin:
                         connect_timeout = float(config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT))
                         return await self._serve_session(session, connect_timeout, mark_lifecycle=True)
                 finally:  # before the SDK tears the tree down: afterwards escaped descendants are unreachable
-                    descendants = _lifecycle._snapshot_descendants(new_pids)
+                    descendants = _lifecycle._snapshot_owned_tree(spawn_token)
         finally:  # clean exit, exceptions AND cancellation
             stderr_sink.release_writer()
             if new_pids:

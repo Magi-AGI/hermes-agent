@@ -54,24 +54,49 @@ def _snapshot_child_pids() -> set:
         return set()
 
 
-def _snapshot_descendants(pids) -> list:
-    """``(pid, create_time)`` of every live descendant of the stdio children *pids*, taken while
-    their tree is still intact (a descendant is only reachable through its parent while that
-    parent lives)."""
+# Each stdio spawn carries a unique token in its env; the processes whose env holds it are that
+# server's, and nothing else is. Descendants inherit it. A process-wide child-PID delta is not
+# ownership: two servers starting together each see the other's root in their window.
+SPAWN_TOKEN_ENV = "HERMES_MCP_SPAWN"
+
+
+def _carries_token(proc, token: str) -> bool:
+    try:
+        return proc.environ().get(SPAWN_TOKEN_ENV) == token
+    except Exception:  # noqa: BLE001 -- unreadable env (gone, denied): never claim it
+        return False
+
+
+def _claim_spawned_roots(pids, token: str) -> set:
+    """The direct children among *pids* that this spawn (``token``) started."""
     try:
         import psutil
     except ImportError:
-        return []
-    found = []
+        return _filter_mcp_children(set(pids))
+    claimed = set()
     for pid in pids:
         try:
-            children = psutil.Process(pid).children(recursive=True)
+            if _carries_token(psutil.Process(pid), token):
+                claimed.add(pid)
         except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             continue
-        for child in children:
+    return claimed
+
+
+def _snapshot_owned_tree(token: str) -> list:
+    """``(pid, create_time)`` of every live process this spawn owns, taken while the tree is intact
+    (an escaped descendant is only reachable through its parent while that parent lives)."""
+    try:
+        import psutil
+        candidates = psutil.Process(os.getpid()).children(recursive=True)
+    except Exception:  # noqa: BLE001 -- no psutil / no snapshot: nothing is claimed
+        return []
+    found = []
+    for proc in candidates:
+        if _carries_token(proc, token):
             try:
-                found.append((child.pid, child.create_time()))
-            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                found.append((proc.pid, proc.create_time()))
+            except Exception:  # noqa: BLE001 -- raced away
                 continue
     return found
 
