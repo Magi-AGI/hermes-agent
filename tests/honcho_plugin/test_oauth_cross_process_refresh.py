@@ -58,10 +58,17 @@ def test_waiter_adopts_the_siblings_rotation_instead_of_replaying_the_refresh_to
     assert (token, refreshed) == ("hch-at-sibling", True)
 
 
-def test_a_sibling_stuck_holding_the_lock_fails_open_without_an_exchange(tmp_path, monkeypatch):
+def test_callers_queued_behind_a_stuck_sibling_wait_it_out_once_and_never_exchange(tmp_path, monkeypatch):
+    """Past the lock budget the refresh fails open under the failure cooldown, and that cooldown is seen by
+    every caller already queued on the process mutex and by a forced refresh (A18 r1, Codex): one
+    cross-process wait in all, not one per caller while holding the process-wide mutex."""
+    import threading
+
     import utils
 
-    monkeypatch.setattr(utils, "BOUNDED_LOCK_WAIT_S", 1.0)
+    monkeypatch.setattr(utils, "BOUNDED_LOCK_WAIT_S", 2.0)
+    waits = []
+    monkeypatch.setattr(oauth, "lock_file_polled", lambda fh: waits.append(1) or utils.lock_file_polled(fh))
     path = tmp_path / "honcho.json"
     path.write_text(json.dumps({"hosts": {"hermes": _block("hch-at-old", "hch-rt-old", 10_000)}}), encoding="utf-8")
     exchanged = []
@@ -70,11 +77,19 @@ def test_a_sibling_stuck_holding_the_lock_fails_open_without_an_exchange(tmp_pat
                             "error": "invalid_grant"}))
     sibling = subprocess.Popen([sys.executable, "-c", _SIBLING, str(path), "60", "{}"],
                                stdout=subprocess.PIPE, text=True)
+    results = []
     try:
         assert sibling.stdout.readline().strip() == "locked"
-        token, refreshed = oauth.ensure_fresh_token(path, "hermes")
+        callers = [threading.Thread(target=lambda: results.append(oauth.ensure_fresh_token(path, "hermes")))
+                   for _ in range(3)]
+        for caller in callers:
+            caller.start()
+        for caller in callers:
+            caller.join(30)
+        forced = oauth.force_refresh_token(path, "hermes", failed_access_token="hch-at-old")
     finally:
         sibling.kill()
         sibling.wait()
     assert exchanged == [], "the refresh token was spent while another process held the refresh lock"
-    assert (token, refreshed) == ("hch-at-old", False)
+    assert results == [("hch-at-old", False)] * 3 and forced is None
+    assert len(waits) == 1, f"{len(waits)} cross-process waits on one stuck sibling"

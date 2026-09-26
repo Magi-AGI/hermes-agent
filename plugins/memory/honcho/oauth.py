@@ -14,7 +14,7 @@ import json
 import logging
 import threading
 import time
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -80,8 +80,14 @@ def _config_refresh_lock(path: Path):
             with suppress(OSError):
                 unlock_file(fh)
 
+def _cross_process_lock(path: Path, cooling: bool):
+    """``_config_refresh_lock`` unless the grant is in its failure cooldown (checked under ``_refresh_lock``):
+    then the caller only reads, since every exchange is gated on that same ``cooling``, so callers queued
+    behind a timed-out attempt never each wait out a stuck sibling again (A18 r1, Codex)."""
+    return nullcontext() if cooling else _config_refresh_lock(path)
+
 def _refresh_lock_busy(key: tuple[str, str], host: str) -> None:
-    """Callers fail open; the cooldown keeps waiting threads from each queueing another full wait."""
+    """Called while still holding ``_refresh_lock``, so the next queued caller already sees the cooldown."""
     _refresh_failure_at[key] = time.monotonic()
     logger.warning("Honcho OAuth refresh for host %s skipped: another process holds the refresh lock", host)
 
@@ -336,22 +342,24 @@ def ensure_fresh_token(
     if not cred.is_expired(now=now) or _in_failure_cooldown(key):
         return cred.access_token, False
 
-    try:
-        with _refresh_lock, _config_refresh_lock(path):
-            # Re-read under both locks: another thread/process may have just rotated — adopt theirs.
-            current = _load_cred(path, host) or cred
-            if not current.is_expired(now=now):
-                return current.access_token, current.access_token != cred.access_token
-            # The lock holder we waited on may have just failed; fail open too.
-            if _grant_is_dead(key, current) or _in_failure_cooldown(key):
-                return current.access_token, False
-            rotated = _rotate_and_persist(path, host, key, current, now=now)
-            if rotated is not None:
-                logger.info("Honcho OAuth token refreshed for host %s", host)
-            return (rotated.access_token, True) if rotated is not None else (current.access_token, False)
-    except _RefreshLockBusy:
-        _refresh_lock_busy(key, host)
-        return cred.access_token, False
+    with _refresh_lock:
+        cooling = _in_failure_cooldown(key)
+        try:
+            with _cross_process_lock(path, cooling):
+                # Re-read under both locks: another thread/process may have just rotated — adopt theirs.
+                current = _load_cred(path, host) or cred
+                if not current.is_expired(now=now):
+                    return current.access_token, current.access_token != cred.access_token
+                # The lock holder we waited on may have just failed; fail open too.
+                if cooling or _grant_is_dead(key, current):
+                    return current.access_token, False
+                rotated = _rotate_and_persist(path, host, key, current, now=now)
+                if rotated is not None:
+                    logger.info("Honcho OAuth token refreshed for host %s", host)
+                return (rotated.access_token, True) if rotated is not None else (current.access_token, False)
+        except _RefreshLockBusy:
+            _refresh_lock_busy(key, host)
+            return cred.access_token, False
 
 def force_refresh_token(path: Path, host: str, *, failed_access_token: str | None = None) -> str | None:
     """Rotate ``host``'s token now, ignoring local expiry (recovers a 401 on a token the local clock
@@ -359,30 +367,32 @@ def force_refresh_token(path: Path, host: str, *, failed_access_token: str | Non
     adopt its grant, since replaying the single-use refresh token can revoke the whole grant."""
     now = time.time()
     key = (str(path), host)
-    try:
-        with _refresh_lock, _config_refresh_lock(path):
-            cred = _load_cred(path, host)
-            if cred is None:
-                _expiry_cache.pop(key, None)
-                return None
-            # Adopting a sibling's rotation is a disk read, so it comes before the exchange gates: disk, not
-            # the expiry cache, is the signal (the cache is empty in sibling processes).
-            cached = _expiry_cache.get(key)
-            moved_off_failed = failed_access_token and cred.access_token != failed_access_token
-            moved_off_cached = cached is not None and cred.access_token != cached[1]
-            if (moved_off_failed or moved_off_cached) and not cred.is_expired(now=now):
-                _expiry_cache[key] = (cred.expires_at, cred.access_token)
-                return cred.access_token
-            # Dead grant, or an exchange just failed transiently: callers fail open.
-            if _grant_is_dead(key, cred) or _in_failure_cooldown(key):
-                return None
-            rotated = _rotate_and_persist(path, host, key, cred, now=now, op_label="forced refresh")
-            if rotated is not None:
-                logger.info("Honcho OAuth token force-refreshed for host %s after an auth failure", host)
-            return rotated.access_token if rotated is not None else None
-    except _RefreshLockBusy:
-        _refresh_lock_busy(key, host)
-        return None
+    with _refresh_lock:
+        cooling = _in_failure_cooldown(key)
+        try:
+            with _cross_process_lock(path, cooling):
+                cred = _load_cred(path, host)
+                if cred is None:
+                    _expiry_cache.pop(key, None)
+                    return None
+                # Adopting a sibling's rotation is a disk read, so it comes before the exchange gates: disk, not
+                # the expiry cache, is the signal (the cache is empty in sibling processes).
+                cached = _expiry_cache.get(key)
+                moved_off_failed = failed_access_token and cred.access_token != failed_access_token
+                moved_off_cached = cached is not None and cred.access_token != cached[1]
+                if (moved_off_failed or moved_off_cached) and not cred.is_expired(now=now):
+                    _expiry_cache[key] = (cred.expires_at, cred.access_token)
+                    return cred.access_token
+                # Dead grant, or an exchange just failed transiently: callers fail open.
+                if cooling or _grant_is_dead(key, cred):
+                    return None
+                rotated = _rotate_and_persist(path, host, key, cred, now=now, op_label="forced refresh")
+                if rotated is not None:
+                    logger.info("Honcho OAuth token force-refreshed for host %s after an auth failure", host)
+                return rotated.access_token if rotated is not None else None
+        except _RefreshLockBusy:
+            _refresh_lock_busy(key, host)
+            return None
 
 def install_grant(
     path: Path, host: str, grant: dict[str, Any], *,
