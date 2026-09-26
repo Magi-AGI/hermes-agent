@@ -72,7 +72,7 @@ def _claim_spawned_roots(pids, token: str) -> set:
     try:
         import psutil
     except ImportError:
-        return _filter_mcp_children(set(pids))
+        return set()  # ownership cannot be verified: claim nothing rather than a neighbour's root
     claimed = set()
     for pid in pids:
         try:
