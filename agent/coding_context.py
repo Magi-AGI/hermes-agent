@@ -57,7 +57,12 @@ _JS_LOCKFILES = (
 _VERIFY_TARGETS = ("test", "tests", "lint", "typecheck", "check", "build", "fmt", "format")
 _MAX_VERIFY_COMMANDS = 8
 _MAX_FACT_FILE_BYTES = 256 * 1024
-_GIT_TIMEOUT = 2.5
+# Shared deadline for the session-start git probes, which run concurrently. Measured on a loaded
+# desktop (A19a, 2026-09-26): warm probes, even 20 simultaneous session starts under CPU load,
+# stayed under ~3 s; the first `git status` in a freshly created large worktree took 5-13 s and is
+# reported as unknown rather than delaying the first turn.
+_GIT_TIMEOUT = 5.0
+_GIT_UNAVAILABLE = "unknown (git probe unavailable at session start)"
 # Per-model edit-format steering toward the `patch` mode each family was trained on (unknown
 # families get nothing). GPT/Codex get V4A for ALL edits incl. single-file: codex-rs ships
 # apply_patch as its ONLY editor. Anthropic and most open-weight coders were RL'd on str_replace
@@ -423,12 +428,51 @@ def _git(cwd: Path, *args: str) -> str:
     return bounded_git_probe(["git", "-C", str(cwd), *args], timeout=_GIT_TIMEOUT)
 
 
+# The snapshot's probes. A successful `status --porcelain=2 --branch` always prints branch headers
+# and `rev-parse` always prints its two paths, so "" from them means the probe failed; the other
+# two read "" as a normal state only where `status` says so (detached HEAD, no commits yet).
+_SNAPSHOT_PROBES = {
+    "status": ("status", "--porcelain=2", "--branch"),
+    "head": ("symbolic-ref", "--short", "-q", "HEAD"),
+    "dirs": ("rev-parse", "--git-dir", "--git-common-dir"),
+    "log": ("log", "-3", "--pretty=%h %s"),
+}
+
+
+def _collect_snapshot_git(root: Path) -> dict[str, Optional[str]]:
+    """Run the snapshot probes concurrently under one shared deadline: probe name -> stdout, or
+    ``None`` for a probe still running when the deadline passed (its thread finishes its own
+    bounded cleanup in the background). Sequential probes each had their own budget, so four
+    slow ones cost four budgets."""
+    import threading
+    import time
+
+    from agent.memory_provider import spawn_context_thread
+
+    results: dict[str, str] = {}
+    finished = threading.Condition()
+
+    def probe(name: str, args: tuple[str, ...]) -> None:
+        out = _git(root, *args)
+        with finished:
+            results[name] = out
+            finished.notify_all()
+
+    deadline = time.monotonic() + _GIT_TIMEOUT
+    for name, args in _SNAPSHOT_PROBES.items():
+        spawn_context_thread(probe, name=f"workspace-snapshot-git-{name}", args=(name, args)).start()
+    with finished:
+        finished.wait_for(lambda: len(results) == len(_SNAPSHOT_PROBES),
+                          timeout=max(deadline - time.monotonic(), 0.0))
+        return {name: results.get(name) for name in _SNAPSHOT_PROBES}
+
+
 def _parse_status(porcelain: str) -> tuple[dict[str, str], dict[str, int]]:
     """Parse ``git status --porcelain=2 --branch`` into branch + counts."""
     branch: dict[str, str] = {}
     counts = {"staged": 0, "modified": 0, "untracked": 0, "conflicts": 0}
     for line in porcelain.splitlines():
-        if line.startswith(("# branch.head", "# branch.upstream")):
+        if line.startswith(("# branch.oid", "# branch.head", "# branch.upstream")):
             parts = line.split(maxsplit=2)
             branch[parts[1].removeprefix("branch.")] = parts[-1]
         elif line.startswith("# branch.ab"):
@@ -520,34 +564,53 @@ def build_coding_workspace_block(cwd: Optional[str | Path] = None) -> str:
     git_root, root = _workspace_roots(cwd)
     if root is None:
         return ""
-    lines = [
-        "Workspace (snapshot at session start — re-check with `git` before acting on it):",
-        f"- Root: {root}",
-    ]
+    lines = [f"- Root: {root}"]
+    incomplete = False
     if git_root is not None:
-        branch, counts = _parse_status(_git(root, "status", "--porcelain=2", "--branch"))
-        head = branch.get("head", "")
-        if head == "(detached)":
+        # A probe that did not answer is reported as unknown, never as a normal state: an empty
+        # `status` used to read as "Status: clean" with no Branch line. Pinned once per session,
+        # so these fixed strings keep the system prompt byte-stable.
+        got = _collect_snapshot_git(root)
+        status_ok = bool(got["status"])
+        branch, counts = _parse_status(got["status"] or "")
+        head = branch.get("head", "") if status_ok else (got["head"] or "")
+        if status_ok and head == "(detached)":
             lines.append("- Branch: (detached HEAD)")
         elif head:
             ahead, behind = branch.get("ahead", "0"), branch.get("behind", "0")
             upstream = f" \u2192 {branch['upstream']}" if branch.get("upstream") else ""
             ab = f" (ahead {ahead}, behind {behind})" if upstream and (ahead, behind) != ("0", "0") else ""
             lines.append(f"- Branch: {head}{upstream}{ab}")
+        else:
+            lines.append(f"- Branch: {_GIT_UNAVAILABLE}")
+            incomplete = True
 
         # Linked worktree: say so (branches/stashes are shared state) but do NOT expose
         # the primary tree path — a second absolute path makes the model run commands
         # in the wrong directory.
-        git_dir, common_dir = _git(root, "rev-parse", "--git-dir"), _git(root, "rev-parse", "--git-common-dir")
-        if git_dir and common_dir and Path(git_dir).resolve() != Path(common_dir).resolve():
-            lines.append("- Worktree: linked (git state shared with primary tree)")
+        dirs = (got["dirs"] or "").splitlines()
+        if len(dirs) == 2:
+            if (root / dirs[0]).resolve() != (root / dirs[1]).resolve():
+                lines.append("- Worktree: linked (git state shared with primary tree)")
+        else:
+            lines.append(f"- Worktree: {_GIT_UNAVAILABLE}")
+            incomplete = True
 
-        dirty = [f"{n} {label}" for label, n in counts.items() if n]
-        lines.append(f"- Status: {', '.join(dirty) if dirty else 'clean'}")
+        if status_ok:
+            dirty = [f"{n} {label}" for label, n in counts.items() if n]
+            lines.append(f"- Status: {', '.join(dirty) if dirty else 'clean'}")
+        else:
+            lines.append(f"- Status: {_GIT_UNAVAILABLE}")
+            incomplete = True
 
-        recent = _git(root, "log", "-3", "--pretty=%h %s")
+        recent = got["log"]
         if recent:
             lines.extend(["- Recent commits:", *(f"    {c}" for c in recent.splitlines())])
+        elif not (status_ok and branch.get("oid") == "(initial)"):  # no commits yet is normal
+            lines.append(f"- Recent commits: {_GIT_UNAVAILABLE}")
+            incomplete = True
+    note = ", incomplete: some git probes were unavailable" if incomplete else ""
+    lines.insert(0, f"Workspace (snapshot at session start{note} — re-check with `git` before acting on it):")
 
     f = detect_project_facts(root)
     if f.manifests:

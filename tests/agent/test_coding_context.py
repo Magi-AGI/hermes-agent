@@ -124,6 +124,117 @@ class TestWorkspaceBlock:
         assert "clean" not in block.split("Status:")[1].splitlines()[0]
 
 
+_UNKNOWN = "unknown (git probe unavailable at session start)"
+
+
+def _git_probes_fail(monkeypatch, *subcommands):
+    """git probes whose subcommand is in ``subcommands`` give nothing back, as a timed-out or
+    failed ``bounded_git_probe`` does; the rest run for real."""
+    real = cc.bounded_git_probe
+
+    def probe(argv, timeout):
+        return "" if any(sub in argv for sub in subcommands) else real(argv, timeout=timeout)
+
+    monkeypatch.setattr(cc, "bounded_git_probe", probe)
+
+
+class TestWorkspaceSnapshotProbeFailures:
+    """A git probe that did not answer is reported as unknown, never as a normal state, and the
+    other probes' facts survive (A19a: a failed `git status` read as "Status: clean" with no Branch
+    line; under load or on a fresh large worktree it took longer than its budget)."""
+
+    def test_failed_status_is_unknown_not_clean_and_the_branch_survives(self, tmp_path, monkeypatch):
+        _git_init(tmp_path)
+        (tmp_path / "main.py").write_text("print('changed')\n")
+        _git_probes_fail(monkeypatch, "status")
+        block = cc.build_coding_workspace_block(tmp_path)
+        assert f"- Status: {_UNKNOWN}" in block and "Status: clean" not in block
+        assert "- Branch: main" in block  # from the cheap symbolic-ref probe
+        assert "init commit" in block
+        assert "incomplete" in block.splitlines()[0]
+
+    @pytest.mark.parametrize(("subcommand", "unknown_line", "kept"), [
+        ("log", f"- Recent commits: {_UNKNOWN}", ["- Branch: main", "- Status: clean"]),
+        ("rev-parse", f"- Worktree: {_UNKNOWN}", ["- Branch: main", "- Status: clean", "init commit"]),
+        ("symbolic-ref", None, ["- Branch: main", "- Status: clean", "init commit"]),  # status still names it
+    ])
+    def test_one_failed_probe_leaves_the_others_facts(self, tmp_path, monkeypatch, subcommand, unknown_line, kept):
+        _git_init(tmp_path)
+        _git_probes_fail(monkeypatch, subcommand)
+        block = cc.build_coding_workspace_block(tmp_path)
+        for line in kept:
+            assert line in block, (line, block)
+        if unknown_line:
+            assert unknown_line in block and "incomplete" in block.splitlines()[0]
+        else:
+            assert _UNKNOWN not in block and "incomplete" not in block
+
+    def test_every_probe_failed(self, tmp_path, monkeypatch):
+        _git_init(tmp_path)
+        _git_probes_fail(monkeypatch, "status", "symbolic-ref", "rev-parse", "log")
+        block = cc.build_coding_workspace_block(tmp_path)
+        for fact in ("Branch", "Worktree", "Status", "Recent commits"):
+            assert f"- {fact}: {_UNKNOWN}" in block, fact
+        assert "clean" not in block and "incomplete" in block.splitlines()[0]
+
+    def test_a_probe_past_the_shared_deadline_is_unknown_without_waiting_for_it(self, tmp_path, monkeypatch):
+        import threading
+        import time
+
+        _git_init(tmp_path)
+        real, stuck = cc.bounded_git_probe, threading.Event()
+
+        def probe(argv, timeout):
+            if "status" in argv:
+                stuck.wait(60)  # a git that never answers inside the budget
+                return ""
+            return real(argv, timeout=timeout)
+
+        monkeypatch.setattr(cc, "bounded_git_probe", probe)
+        monkeypatch.setattr(cc, "_GIT_TIMEOUT", 1.0)
+        try:
+            started = time.monotonic()
+            block = cc.build_coding_workspace_block(tmp_path)
+            elapsed = time.monotonic() - started
+        finally:
+            stuck.set()
+        assert f"- Status: {_UNKNOWN}" in block and "- Branch: main" in block
+        assert elapsed < 10.0  # the shared 1 s deadline, far from the 60 s stuck probe
+
+    # Normal absence is not failure: complete snapshot, no "unknown".
+    def test_no_commits_yet_is_normal(self, tmp_path):
+        (tmp_path / "main.py").write_text("print('hi')\n")
+        subprocess.run([shutil.which("git"), "-C", str(tmp_path), "init", "-q", "-b", "main"], check=True)
+        block = cc.build_coding_workspace_block(tmp_path)
+        assert "- Branch: main" in block and "Recent commits" not in block
+        assert _UNKNOWN not in block and "incomplete" not in block
+
+    def test_detached_head_and_no_upstream_are_normal(self, tmp_path):
+        _git_init(tmp_path)
+        block = cc.build_coding_workspace_block(tmp_path)
+        assert "- Branch: main\n" in block + "\n"  # no upstream: no arrow, still complete
+        subprocess.run([shutil.which("git"), "-C", str(tmp_path), "checkout", "-q", "--detach"], check=True)
+        block = cc.build_coding_workspace_block(tmp_path)
+        assert "- Branch: (detached HEAD)" in block
+        assert _UNKNOWN not in block and "incomplete" not in block
+
+    def test_incomplete_snapshot_is_byte_identical_on_rebuild_after_git_recovers(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+
+        from agent import system_prompt
+
+        _git_init(tmp_path)
+        monkeypatch.setattr(system_prompt, "resolve_context_cwd", lambda: tmp_path)
+        agent = SimpleNamespace(valid_tool_names={"terminal"}, platform="cli", model="gpt-4o",
+                                _frozen_workspace_snapshot=None)
+        with monkeypatch.context() as broken:
+            _git_probes_fail(broken, "status")
+            first = system_prompt._coding_parts(agent)
+        assert first[1] and _UNKNOWN in first[1][0]
+        assert cc.build_coding_workspace_block(tmp_path).count(_UNKNOWN) == 0  # git has recovered
+        assert system_prompt._coding_parts(agent) == first
+
+
 # ── project facts (verify-loop detection) ───────────────────────────────────
 
 class TestProjectFacts:
