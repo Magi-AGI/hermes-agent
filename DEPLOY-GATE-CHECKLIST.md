@@ -30,6 +30,7 @@ Status key: DONE (on sync branch, triad-approved) / OPEN / IN PROGRESS / VERIFY 
 | A9 | Flaky under load: fast-lane first-chunk timing, late-ack TTL (`test_late_ack_handlers_are_bounded_by_ttl_and_cap`), update-handoff-marker PowerShell, `test_peer_dm_into_open_bot_chat` (streamed), `test_profiles_sidebar_cache.py::test_projects_tree_coalesces_concurrent_scans_and_returns_copies` (1 s wait; flaked under load 2/2 full runs) | IN PROGRESS (T5: 4 original named flakes + file-state ordering + TUI MCP-wait + runner self-test DONE; the later-added sidebar-cache flake is OPEN, T5 taking it next, then A16) |
 | A16 | Unowned older flakes (09-06 baseline): test_hosted_room_prompt_fence, test_compute_host_turn_protocol, test_slash_worker_mcp_discovery, test_transcription_tools, test_auxiliary_explicit_cancellation, test_coding_context; plus ~10 desktop electron tests that spawn real processes under vitest's 5 s default (set one testTimeout for the electron project) | OPEN (candidate for T5 follow-up) |
 | A17 | A2 dispositions recorded by T5 (same failure on base): test_file_ops_cwd_tracking::test_patch_returns_success_only_when_file_actually_written; 42 tests/scripts/install/ (Linux install script under Git Bash); 1 test_contributor_map (case-insensitive FS) | DISPOSITION NEEDED at A2 |
+| A18 | From T1: six more files use the same 10 s lock pattern (curator, trajectory, vault_store, plugins_state, install_identity, honcho/oauth); `_skill_mutation_locks` doesn't clean up when a later lock fails (pre-existing); upstream `persistence_live.py` leaves real USERPROFILE in place so its test backend can reach the real host-lock folder | OPEN (unowned) |
 | A10 | Bucket C residual R3: the first turn of a NEW session skips the durable lease (no session row yet, `agent/turn_facade_lease.py:310`). Prove production entry points serialize concurrent first turns for the same new session id, or fix it | DONE (Codex + Antigravity; on sync branch a9378a1ee3..8607f59f02). Lake chose A: keep upstream derived-id grouping |
 | A13 | TUI `prompt.submit` checks `running` and claims it under two separate lock acquisitions (`tui_gateway/methods_prompt.py:637-639` vs `:551`): two submits in one process can both pass; only the durable lease backstops it (found by A10 audit) | DONE (5b0e027a7b; Codex + Antigravity) |
 | A14 | Lease admission: a FAILED row probe is treated as "row exists" and sets `_session_db_created=True`, which suppresses lazy row creation for a genuinely new session (pre-existing; found by A10 audit) | DONE (92b23cfb66; Codex + Antigravity) |
@@ -52,13 +53,13 @@ Status key: DONE (on sync branch, triad-approved) / OPEN / IN PROGRESS / VERIFY 
 |---|---|---|
 | G1 | Compute-host latch reset + safe in-process fallback + stdin-EOF instrumentation (incl. A6) | OPEN |
 | G2 | Saved windows persist until explicit Forget (not "mirror live windows"): ordinary closes keep entries, duplicate-session windows stay distinct, age/count never evict | LARGELY DONE via A4; VERIFY in live check |
-| G3 | Config-load convoy (upstream-main lock-free reads need Lake's explicit OK: exception to stable-release policy) | OPEN / LAKE |
-| G4 | Shared-gateway concurrency (DESIGN-SHARED-GATEWAY-CONCURRENCY-2026-09-24.md, option A approved with notes) | OPEN |
+| G3 | Config-load convoy (upstream-main lock-free reads need Lake's explicit OK: exception to stable-release policy) | DONE (T1: 4 upstream/main config.py lock-free read commits cherry-picked, config.py only) |
+| G4 | Shared-gateway concurrency (DESIGN-SHARED-GATEWAY-CONCURRENCY-2026-09-24.md, option A approved with notes) | DONE (T1 magi/track-gateway, Codex + Antigravity; on sync branch through 6951c62e10; 27-window harness 20/20 grades) |
 | G5 | Compaction summary growth + renderer V8 heap retention | OPEN |
 | G6 | "Gateway down" stale-warning reattach (renderer) | OPEN |
 | G7 | Dropped-submit root cause (live submit trace); `routedRuntimeId` globally null | OPEN |
 | G8 | MCP startup, full original scope: discovery must not block useful service after readiness is announced. Checks: cold cache, expired token, unavailable server, concurrent-profile startup; bounded discovery; child cleanup. Any dedupe keeps auth/config distinctions (a matching URL is not identity). Includes schema-cache `ttl_ms=0` | OPEN |
-| G9 | Hygiene: state.db rotating backup; Unity MCP backoff + log rotation; session-list staleness; bootstrap reset storm (single-flight, move earlier per Codex); prompt-null rebuild | OPEN |
+| G9 | Hygiene: state.db rotating backup; Unity MCP backoff + log rotation; session-list staleness; bootstrap reset storm (DONE by T1); prompt-null rebuild | OPEN |
 | G10 | Remaining futures-audit timeout sites (account/billing refresh safety, status probe, Home Assistant, TTS, delegation interrupt join, context_references) | OPEN |
 | G11 | Plugin autocomplete bounding — only if a plugin provider is installed | VERIFY (none installed?) |
 
@@ -68,10 +69,10 @@ Status key: DONE (on sync branch, triad-approved) / OPEN / IN PROGRESS / VERIFY 
 | D1 | Backend-pool disown recurrence: ownership + port release of a detached `gateway run` (:8642 squatted through quit-all), not only compute-host children; cross-link G1 child lifecycle | OPEN |
 | D2 | Terminal-tool 420 s hang across compute-host respawns: terminal launcher/worker tree + pipe cleanup across respawns; never root-caused | OPEN |
 | D3 | Two problems: (a) a running post-tool hook wedging a worker; (b) a descendant keeping subprocess output pipes open. Orphan-future cancellation fixes neither | OPEN |
-| D4 | Session-ownership lease race ("already has a live owner") — re-verify on the synced lease model | VERIFY |
+| D4 | Session-ownership lease race ("already has a live owner") — re-verify on the synced lease model | DONE (T1 re-verified on the synced lease model) |
 | D5 | Session-message OOM (unbounded fetchall) — upstream paging `49e6d661a0` arrives with sync | VERIFY |
-| D6 | Compaction slowed under concurrent load (up to ~8 min) — measure under G4/G5 | VERIFY |
-| D7 | 09-07 whole-process freeze (all threads frozen). Closure = resolution or validated mitigation; a watcher or dump is diagnosis only. Capture native stacks where Python dumps are identical | OPEN |
+| D6 | Compaction slowed under concurrent load (up to ~8 min) — measure under G4/G5 | MEASURED (T1 harness); confirm on live workload in F5 |
+| D7 | 09-07 whole-process freeze (all threads frozen). Closure = resolution or validated mitigation; a watcher or dump is diagnosis only. Capture native stacks where Python dumps are identical | DONE (T1: freeze supervisor detect/dump/kill tested against a real frozen backend; desktop auto-restart after kill = existing crash-recovery path, confirm in F5) |
 | D8 | OS freeze via 8 GB Hermes spike (2026-08-26) — memory bound under G5 | VERIFY |
 | D9 | New-window session-selection regression — fixed in A4 (82972e687a port); confirm live | VERIFY |
 
@@ -96,5 +97,5 @@ measurement and does not gate the deploy. This changes timing only, not the rule
 | F8 | Tested credential ROLLBACK policy: restoring an old auth.json after rotation can replay consumed tokens, and old code ignores the new registry's fences, so a backup alone is not a safe rollback. Define and test the rollback path | OPEN |
 | F9 | Relay (`hermes dashboard`) restart by verified PID, fresh-process check (new PID StartTime), phone path verified | LAKE |
 | F4 | A4 live check (criteria 3-4 + rounds 3-6 additions); per-renderer memory telemetry survives reboot (schtasks) | LAKE |
-| F5 | Active acceptance on the real ~27-window workload: concurrent prompts, tools, approvals, stop, reconnect, compaction, rewind; persisted results + resource recovery checked; the shared-gateway design's acceptance notes. Idle health probes are not enough | OPEN |
+| F5 | (T1 carry-forward: model-picker latency 1.6-3.72 s vs a 3 s limit, watch it; desktop auto-restart after a D7 freeze-kill not exercised by the harness) Active acceptance on the real ~27-window workload: concurrent prompts, tools, approvals, stop, reconnect, compaction, rewind; persisted results + resource recovery checked; the shared-gateway design's acceptance notes. Idle health probes are not enough | OPEN |
 | F6 | Post-deploy: Lake resumes workstreams; measure skill_view/day + views/write vs 200.7 / 2.21 | POST-DEPLOY |
