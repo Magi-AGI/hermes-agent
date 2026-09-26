@@ -279,7 +279,7 @@ def verify(out: Path) -> List[str]:
                 try:
                     integrity, tables = _integrity(restored), _table_counts(restored)
                 except sqlite3.DatabaseError as exc:
-                    problems.append(f"restored database does not open ({exc}): {entry['path']}")
+                    problems.append(f"restored database cannot be read ({exc}): {entry['path']}")
                     continue
                 if integrity != "ok":
                     problems.append(f"restored database fails integrity_check ({integrity}): {entry['path']}")
