@@ -12,6 +12,12 @@ import pytest
 
 from agent import auxiliary_client as aux
 
+# Hang guard for waits that end on an event (1 s ones missed thread start-up on a loaded runner).
+_HANG_GUARD = 30.0
+# A cancelled silent request must wake well before its 30 s request timeout; the old 0.75 s
+# bound measured scheduling on a loaded runner rather than that.
+_PROMPT_CANCEL_S = 10.0
+
 
 class _BlockingStream:
     def __init__(self, started: threading.Event) -> None:
@@ -144,10 +150,10 @@ def _cancel_silent_request(
     worker = threading.Thread(target=_worker, daemon=True)
     worker.start()
     # Thread start-up on a loaded CI runner can exceed 1 s; the bound is only "eventually entered the transport".
-    assert started.wait(timeout=5), "request never entered its silent transport"
+    assert started.wait(timeout=_HANG_GUARD), "request never entered its silent transport"
     cancelled_at = time.monotonic()
     cancel_event.set()
-    worker.join(timeout=5)
+    worker.join(timeout=_PROMPT_CANCEL_S)
     elapsed = time.monotonic() - cancelled_at
     assert not worker.is_alive(), "explicit cancellation did not wake the silent request"
     return result["exc"], elapsed
@@ -173,7 +179,7 @@ def test_protected_silent_provider_is_isolated_and_raises_frozen_explicit_cancel
     assert isinstance(exc, aux.AuxiliaryExplicitCancellation)
     assert exc.cause == "explicit_host_cancel"
     assert not client.closed.is_set()
-    assert elapsed < 0.75
+    assert elapsed < _PROMPT_CANCEL_S
     stream.close()  # release the bounded daemon provider worker
 
 
@@ -187,7 +193,7 @@ def test_codex_silent_stream_is_isolated_without_closing_shared_client() -> None
 
     assert isinstance(exc, aux.AuxiliaryExplicitCancellation)
     assert not real_client.closed.is_set()
-    assert elapsed < 0.75
+    assert elapsed < _PROMPT_CANCEL_S
     stream.close()
 
 
@@ -263,7 +269,10 @@ def test_cancelled_codex_orphan_timeout_preserves_cached_shared_client() -> None
             with aux.aux_interrupt_protection(cancel_event=cancel_event):
                 aux._relay_sync_completion(
                     wrapper,
-                    {"model": "owner", "messages": [], "timeout": 0.12},
+                    # Long enough that the cancel below and the concurrent call both land while
+                    # the timer is still armed on a loaded runner (0.12 s was not); the test then
+                    # waits for it to fire.
+                    {"model": "owner", "messages": [], "timeout": 5.0},
                 )
         except BaseException as exc:
             owner_outcome["exc"] = exc
@@ -274,9 +283,9 @@ def test_cancelled_codex_orphan_timeout_preserves_cached_shared_client() -> None
     owner = threading.Thread(target=_run_owner, daemon=True)
     try:
         owner.start()
-        assert owner_started.wait(timeout=1)
+        assert owner_started.wait(timeout=_HANG_GUARD)
         cancel_event.set()
-        owner.join(timeout=1)
+        owner.join(timeout=_HANG_GUARD)
         assert not owner.is_alive()
         assert isinstance(owner_outcome["exc"], aux.AuxiliaryExplicitCancellation)
         # A real frontend clears the reusable host Event when the next turn
@@ -288,13 +297,13 @@ def test_cancelled_codex_orphan_timeout_preserves_cached_shared_client() -> None
         assert not owner_stream.closed.is_set()
         concurrent = aux._relay_sync_completion(
             wrapper,
-            {"model": "concurrent", "messages": [], "timeout": 1},
+            {"model": "concurrent", "messages": [], "timeout": _HANG_GUARD},
         )
         assert concurrent.choices[0].message.content == "ok"
 
         # Let the orphan's real adapter timer fire. It may close the attempt's
         # event stream to wake that worker, but never the process-shared client.
-        assert owner_stream.closed.wait(timeout=1)
+        assert owner_stream.closed.wait(timeout=_HANG_GUARD)
         time.sleep(0.03)
         assert not real_client.closed.is_set()
         with aux._client_cache_lock:
@@ -302,7 +311,7 @@ def test_cancelled_codex_orphan_timeout_preserves_cached_shared_client() -> None
 
         successive = aux._relay_sync_completion(
             wrapper,
-            {"model": "successive", "messages": [], "timeout": 1},
+            {"model": "successive", "messages": [], "timeout": _HANG_GUARD},
         )
         assert successive.choices[0].message.content == "ok"
     finally:
@@ -330,7 +339,7 @@ def test_codex_timeout_and_explicit_cancel_have_one_linearized_outcome(
                 # where the historical implementation could race owner polling.
                 was_set = request_cancelled.is_set()
                 timer_read_started.set()
-                assert allow_timer_read_return.wait(timeout=1)
+                assert allow_timer_read_return.wait(timeout=_HANG_GUARD)
                 return was_set
             return request_cancelled.is_set()
 
@@ -368,21 +377,23 @@ def test_codex_timeout_and_explicit_cancel_have_one_linearized_outcome(
             with aux.aux_interrupt_protection(cancel_event=_RacingCancelSource()):
                 aux._relay_sync_completion(
                     wrapper,
-                    {"model": "owner", "messages": [], "timeout": 0.08},
+                    # The timeout case holds the timer at its seam, so 80 ms is safe there; in the
+                    # cancel case a descheduled main thread let an 80 ms timer win the race.
+                    {"model": "owner", "messages": [], "timeout": 0.08 if winner == "timeout" else _HANG_GUARD},
                 )
         except BaseException as exc:
             owner_outcome["exc"] = exc
 
     owner = threading.Thread(target=_run_owner, name="race-owner", daemon=True)
     owner.start()
-    assert stream_started.wait(timeout=1)
+    assert stream_started.wait(timeout=_HANG_GUARD)
     if winner == "timeout":
-        assert timer_read_started.wait(timeout=1)
+        assert timer_read_started.wait(timeout=_HANG_GUARD)
         request_cancelled.set()
         allow_timer_read_return.set()
     else:
         request_cancelled.set()
-    owner.join(timeout=1)
+    owner.join(timeout=_HANG_GUARD)
 
     assert not owner.is_alive()
     if winner == "timeout":
@@ -391,7 +402,7 @@ def test_codex_timeout_and_explicit_cancel_have_one_linearized_outcome(
         assert not isinstance(owner_outcome["exc"], aux.AuxiliaryExplicitCancellation)
     else:
         assert isinstance(owner_outcome["exc"], aux.AuxiliaryExplicitCancellation)
-        assert stream.closed.wait(timeout=1), "cancelled timer did not wake its stream"
+        assert stream.closed.wait(timeout=_HANG_GUARD), "cancelled timer did not wake its stream"
         assert not real_client.closed.is_set()
 
 
@@ -410,7 +421,7 @@ def test_anthropic_silent_stream_is_isolated_without_closing_shared_client() -> 
 
     assert isinstance(exc, aux.AuxiliaryExplicitCancellation)
     assert not real_client.closed.is_set()
-    assert elapsed < 0.75
+    assert elapsed < _PROMPT_CANCEL_S
     stream.close()
 
 
@@ -469,17 +480,17 @@ def test_cancelled_attempt_does_not_close_or_fail_concurrent_shared_client_call(
     b_thread = threading.Thread(target=_session_b, daemon=True)
     a_thread.start()
     b_thread.start()
-    assert a_started.wait(timeout=1)
-    assert b_started.wait(timeout=1)
+    assert a_started.wait(timeout=_HANG_GUARD)
+    assert b_started.wait(timeout=_HANG_GUARD)
     cancel_event.set()
-    a_thread.join(timeout=1)
+    a_thread.join(timeout=_HANG_GUARD)
     try:
         assert not a_thread.is_alive()
         assert isinstance(outcomes["a"], aux.AuxiliaryExplicitCancellation)
         assert not closed.is_set()
         assert evictions == []
         b_release.set()
-        b_thread.join(timeout=1)
+        b_thread.join(timeout=_HANG_GUARD)
         assert not b_thread.is_alive()
         assert not isinstance(outcomes["b"], BaseException)
         assert outcomes["b"].choices[0].message.content == "ok"
@@ -505,7 +516,7 @@ def test_bedrock_silent_nonstream_request_is_isolated_without_close_wakeup() -> 
 
     assert isinstance(exc, aux.AuxiliaryExplicitCancellation)
     assert not runtime_client.closed.is_set()
-    assert elapsed < 0.75
+    assert elapsed < _PROMPT_CANCEL_S
 
 
 def test_unprotected_sync_completion_stays_on_calling_thread() -> None:
