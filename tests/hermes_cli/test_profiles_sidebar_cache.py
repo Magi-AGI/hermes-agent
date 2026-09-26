@@ -3,13 +3,15 @@
 import inspect
 import tempfile
 import threading
-import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
 from hermes_cli.web_routers import profiles
+
+# Hang guard for the burst tests below; every wait in them ends on an event.
+_HANG_GUARD = 30.0
 
 
 class SidebarCacheTests(unittest.TestCase):
@@ -19,6 +21,28 @@ class SidebarCacheTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         profiles._sidebar_profile_cache_clear()
         self.addCleanup(profiles._sidebar_profile_cache_clear)
+
+    def _burst(self, workers, call, entered, release):
+        """Run ``call`` from ``workers`` threads and release the scan only after the first one is
+        inside it and every caller has started, so the whole burst overlaps one in-flight scan
+        (a 1 s wait for the first entry and a 50 ms guess at the rest raced a loaded runner).
+        The TTL is long so no straggler can outlive the cached result either."""
+        arrived = threading.Semaphore(0)
+
+        def caller():
+            arrived.release()
+            return call()
+
+        with mock.patch.object(profiles, "_SIDEBAR_CACHE_TTL_SECONDS", 3600.0), \
+                ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(caller) for _ in range(workers)]
+            try:
+                self.assertTrue(entered.wait(timeout=_HANG_GUARD))
+                for _ in range(workers):
+                    self.assertTrue(arrived.acquire(timeout=_HANG_GUARD))
+            finally:
+                release.set()
+            return [future.result(timeout=_HANG_GUARD) for future in futures]
 
     def test_profile_cache_uses_db_and_wal_fingerprint_and_defensive_copies(self):
         with tempfile.TemporaryDirectory() as root:
@@ -83,15 +107,10 @@ class SidebarCacheTests(unittest.TestCase):
             with calls_lock:
                 calls += 1
             entered.set()
-            self.assertTrue(release.wait(timeout=2))
+            self.assertTrue(release.wait(timeout=_HANG_GUARD))
             return {"profile": profile, "rows": []}
 
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(scan, "default") for _ in range(workers)]
-            self.assertTrue(entered.wait(timeout=1))
-            time.sleep(0.05)
-            release.set()
-            results = [future.result(timeout=2) for future in futures]
+        results = self._burst(workers, lambda: scan("default"), entered, release)
 
         self.assertEqual(calls, 1)
         self.assertEqual(results, [{"profile": "default", "rows": []}] * workers)
@@ -187,17 +206,12 @@ class SidebarCacheTests(unittest.TestCase):
             with scans_lock:
                 scans += 1
             entered.set()
-            self.assertTrue(release.wait(timeout=2))
+            self.assertTrue(release.wait(timeout=_HANG_GUARD))
             return None
 
         with mock.patch.object(profiles, "_profile_targets", return_value=[("default", Path("/nonexistent"))]), \
-                mock.patch.object(profiles, "_read_profile_db", side_effect=fake_read), \
-                ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(profiles.get_profiles_projects_tree) for _ in range(workers)]
-            self.assertTrue(entered.wait(timeout=1))
-            time.sleep(0.05)
-            release.set()
-            results = [future.result(timeout=2) for future in futures]
+                mock.patch.object(profiles, "_read_profile_db", side_effect=fake_read):
+            results = self._burst(workers, profiles.get_profiles_projects_tree, entered, release)
 
         self.assertEqual(scans, 1)
         self.assertEqual(len({id(r) for r in results}), workers)
