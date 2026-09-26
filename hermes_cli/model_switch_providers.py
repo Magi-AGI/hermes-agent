@@ -6,6 +6,7 @@ Split out of ``hermes_cli/model_switch.py``; every moved name is re-imported the
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import http.client
 import os
@@ -578,10 +579,58 @@ def _group_display_name(display_name: str) -> str:
     return grp_display or display_name
 
 
+# A normal picker open (not an explicit refresh) probes the CURRENT custom endpoint live, and every
+# window of a profile opens the picker at once: against a hung endpoint (a stalled local model server)
+# that held model.options ~12 s for everyone. The foreground wait is bounded; past it the row is built
+# from the cache while the same probe finishes in the background (warming the cache for the next open),
+# one probe per endpoint identity however many windows ask.
+_CURRENT_PROBE_BUDGET_S = 1.5
+_BUDGET_EXPIRED = object()
+_background_probes: dict[tuple, tuple[concurrent.futures.Future, float]] = {}
+_background_probes_lock = _threading.Lock()
+
+
+def _probe_identity(api_key: Any, api_url: str, native_catalog_provider: str, has_explicit_models: bool,
+                    headers: dict | None, api_mode: str | None) -> tuple:
+    """A matching URL is not identity: the credential and headers are part of it."""
+    import hashlib
+    import json as _json
+    key_part = f"callable:{id(api_key)}" if callable(api_key) else hashlib.sha256(str(api_key or "").encode()).hexdigest()
+    return (api_url, native_catalog_provider, has_explicit_models, api_mode, key_part,
+            _json.dumps(headers or {}, sort_keys=True, default=str))
+
+
+def _bounded_live_probe(identity: tuple, fetch, budget_s: float):
+    """``fetch()`` with a foreground wait of *budget_s* PER PROBE (a second caller, another row of the
+    same build or another window, waits only what is left of it); the probe keeps running
+    (single-flight per identity, with the first caller's context: profile home and secret scope) when
+    the wait gives up. Raises TimeoutError past the budget."""
+    import contextvars
+    with _background_probes_lock:
+        entry = _background_probes.get(identity)
+        if entry is None:
+            future = concurrent.futures.Future()
+            entry = _background_probes[identity] = (future, time.monotonic())
+            ctx = contextvars.copy_context()
+
+            def run() -> None:
+                try:
+                    future.set_result(ctx.run(fetch))
+                except BaseException as exc:  # noqa: BLE001 - delivered to the waiters
+                    future.set_exception(exc)
+                finally:
+                    with _background_probes_lock:
+                        if _background_probes.get(identity, (None,))[0] is future:
+                            del _background_probes[identity]
+            _threading.Thread(target=run, name="picker-current-endpoint-probe", daemon=True).start()
+    future, started = entry
+    return future.result(timeout=max(0.0, budget_s - (time.monotonic() - started)))
+
+
 def _discover_endpoint_models(
     api_key: Any, api_url: str, native_catalog_provider: str, has_explicit_models: bool, *,
     headers: dict | None, api_mode: str | None, probe_live: bool, discovery_allowed: bool,
-    for_picker: bool) -> tuple[list | None, bool]:
+    for_picker: bool, foreground_budget_s: float | None = None) -> tuple[list | None, bool]:
     """Return ``(models, native_catalog_empty)`` for a custom endpoint row.
 
     ``probe_live`` runs the native-aware picker fetch; otherwise, when discovery is allowed, a
@@ -590,19 +639,29 @@ def _discover_endpoint_models(
     declare a catalog), never the cache read — applying it to the read re-pins the endpoint to
     its declared subset. Returns ``(None, False)`` when nothing usable was found."""
     timeout = 1.5 if for_picker else 5.0
+    live_models = None
     if probe_live:
-        try:
-            live_models = _fetch_picker_live_models(
+        def fetch():
+            return _fetch_picker_live_models(
                 api_key, api_url, native_catalog_provider, has_explicit_models,
                 headers=headers, timeout=timeout, api_mode=api_mode)
+        try:
+            if foreground_budget_s is None:
+                live_models = fetch()
+            else:
+                live_models = _bounded_live_probe(
+                    _probe_identity(api_key, api_url, native_catalog_provider, has_explicit_models, headers, api_mode),
+                    fetch, foreground_budget_s)
             is_native = isinstance(live_models, _NativePickerModelList)
             if is_native and has_explicit_models:
                 return None, False
             if live_models is not None and (live_models or not has_explicit_models or is_native):
                 return live_models, (is_native and not live_models)
+        except concurrent.futures.TimeoutError:
+            live_models = _BUDGET_EXPIRED
         except Exception:
             pass
-    elif discovery_allowed:
+    if (not probe_live or live_models is _BUDGET_EXPIRED) and discovery_allowed:
         try:
             from hermes_cli.models import cached_fetch_api_models
             cached_models = cached_fetch_api_models(
@@ -773,7 +832,8 @@ class _PickerBuild:
         discovered, native_catalog_empty = _discover_endpoint_models(
             api_key, api_url, native_provider, has_explicit_models,
             headers=headers, api_mode=api_mode, probe_live=probe_live,
-            discovery_allowed=discovery_allowed, for_picker=self.for_picker)
+            discovery_allowed=discovery_allowed, for_picker=self.for_picker,
+            foreground_budget_s=None if self.refresh else _CURRENT_PROBE_BUDGET_S)
         return discovered, native_catalog_empty, probe_live
 
 
@@ -1033,7 +1093,7 @@ def _lap_bare_custom_row(b: _PickerBuild, custom_providers: list | None) -> None
         discovered, native_catalog_empty = _discover_endpoint_models(
             "", api_url, "custom", False, headers=None, api_mode=None,
             probe_live=bool(b.refresh or b.probe_current_custom_provider), discovery_allowed=True,
-            for_picker=b.for_picker)
+            for_picker=b.for_picker, foreground_budget_s=None if b.refresh else _CURRENT_PROBE_BUDGET_S)
         if discovered is not None:
             models = discovered
     except Exception:
