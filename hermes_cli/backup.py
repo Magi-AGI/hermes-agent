@@ -532,22 +532,87 @@ def _replace_published(tmp_name: str, target: Path) -> str:
     return atomic_replace(tmp_name, target)
 
 
-def _publish_file_atomically(src: Path, dst: Path) -> None:
-    """Restore file *src* onto *dst* the way ``shutil.copy2`` would (bytes, mode, times) but by
-    write-temp-in-the-same-directory + fsync + replace: ``copy2`` opens an existing destination for
-    writing, which writes THROUGH a hard link into every other name of that inode."""
-    fd, tmp_name = tempfile.mkstemp(dir=str(dst.parent), prefix=f".{dst.name[:80]}.", suffix=".partial")
+def _stage_copy(src: Path, dst: Path, suffix: str) -> str:
+    """Copy *src* into a NEW, uniquely named file beside *dst* (``mkstemp``: ``O_CREAT|O_EXCL``, so a
+    pre-existing name — say, a hard link to a credential file planted at a predictable temp name —
+    is never opened), written through that fresh handle, fsynced, with *src*'s mode and times."""
+    fd, tmp_name = tempfile.mkstemp(dir=str(dst.parent), prefix=f".{dst.name[:80]}.", suffix=suffix)
     try:
         with os.fdopen(fd, "wb") as out, open(src, "rb") as data:
             shutil.copyfileobj(data, out)
             out.flush()
             os.fsync(out.fileno())
         shutil.copystat(src, tmp_name)
+    except BaseException:
+        with suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+    return tmp_name
+
+
+def _publish_file_atomically(src: Path, dst: Path) -> None:
+    """Restore file *src* onto *dst* the way ``shutil.copy2`` would (bytes, mode, times) but by
+    write-temp-in-the-same-directory + fsync + replace: ``copy2`` opens an existing destination for
+    writing, which writes THROUGH a hard link into every other name of that inode."""
+    tmp_name = _stage_copy(src, dst, ".partial")
+    try:
         _replace_published(tmp_name, dst)
     except BaseException:
         with suppress(OSError):
             os.unlink(tmp_name)
         raise
+
+
+_DB_SIDECARS = ("-wal", "-shm", "-journal")
+
+
+def _publish_db_replacing(src: Path, dst: Path) -> None:
+    """Replace database *dst* with the image *src* WITHOUT ever deleting or writing into the current
+    file; the caller has already excluded live holders.
+
+    1. stage *src* into an exclusively created temp file beside *dst* (fsynced);
+    2. move each existing sidecar (-wal / -shm / -journal: they belong to the OLD database) aside to
+       an exclusively reserved unique name;
+    3. ``os.replace`` the staged file over *dst* (one rename: no window without a database);
+    4. only then delete the set-aside sidecars.
+
+    Order: at every point the path holds either the OLD database (with its own sidecars, or with
+    them set aside intact) or the NEW one with no sidecars — never a new image beside an old WAL,
+    which SQLite would replay over it. Any failure before step 3 moves the sidecars back and leaves
+    *dst* untouched (raised); a crash there leaves the old database consistent as of its last
+    checkpoint with its WAL / journal preserved under the ``.aside`` names. A failure in step 4
+    only leaves those aside files behind. A symlinked *dst* is published at its target, like every
+    other restored file."""
+    if os.path.islink(dst):
+        dst = Path(os.path.realpath(dst))
+    tmp_name = _stage_copy(src, dst, ".dbrestore")
+    reserved: list[str] = []
+    moved: list[tuple[str, Path]] = []
+    try:
+        for suffix in _DB_SIDECARS:
+            sidecar = dst.with_name(dst.name + suffix)
+            if not os.path.lexists(sidecar):
+                continue
+            fd, aside = tempfile.mkstemp(dir=str(dst.parent), prefix=f".{sidecar.name[:80]}.", suffix=".aside")
+            os.close(fd)
+            reserved.append(aside)
+            os.replace(sidecar, aside)
+            moved.append((aside, sidecar))
+        os.replace(tmp_name, dst)
+    except BaseException:
+        for aside, sidecar in reversed(moved):
+            with suppress(OSError):
+                os.replace(aside, sidecar)
+        for aside in reserved:
+            if all(aside != a for a, _ in moved):
+                with suppress(OSError):
+                    os.unlink(aside)
+        with suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+    for aside, _sidecar in moved:
+        with suppress(OSError):
+            os.unlink(aside)
 
 
 def _safe_restore_db(src: Path, dst: Path) -> bool:
@@ -560,28 +625,30 @@ def _safe_restore_db(src: Path, dst: Path) -> bool:
     (``False``) and the caller reports the file as skipped.
 
     A destination with OTHER hard links is never page-copied: that writes through the shared inode
-    and changes every other link's content. It is replaced (the unlink+move path) instead.
+    and changes every other link's content. It is replaced (:func:`_replace_restore_db`) instead.
     """
     if _has_other_links(dst):
-        return _unlink_move_restore_db(src, dst)
+        return _replace_restore_db(src, dst)
     try:
-        dst_conn = sqlite3.connect(str(dst))
-        # Checkpoint first so the backup starts clean rather than writing on top of a deep WAL.
-        with suppress(Exception):
-            dst_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        with closing(sqlite3.connect(f"file:{src}?mode=ro", uri=True)) as src_conn:
-            src_conn.backup(dst_conn)
-        dst_conn.close()
+        # Closed on every path: a handle left open by a failed page copy blocks the replacement
+        # below on Windows (WinError 32).
+        with closing(sqlite3.connect(str(dst))) as dst_conn:
+            # Checkpoint first so the backup starts clean rather than writing on top of a deep WAL.
+            with suppress(Exception):
+                dst_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            with closing(sqlite3.connect(f"file:{src}?mode=ro", uri=True)) as src_conn:
+                src_conn.backup(dst_conn)
         with suppress(Exception):
             dst.chmod(src.stat().st_mode)
         return True
     except Exception as exc:
         logger.warning("SQLite safe restore failed for %s -> %s: %s", src, dst, exc)
-        return _unlink_move_restore_db(src, dst)
+        return _replace_restore_db(src, dst)
 
 
-def _unlink_move_restore_db(src: Path, dst: Path) -> bool:
-    """Fallback restore: unlink+move. Only safe when no process holds the DB open.
+def _replace_restore_db(src: Path, dst: Path) -> bool:
+    """Fallback restore: replace the file (:func:`_publish_db_replacing`). Only safe when no process
+    holds the DB open; on any failure the current database and its sidecars are kept.
 
     Replacing the inode under a live holder is the #90950 corruption class (the holder keeps
     writing through a deleted-inode fd and loses its WAL index), so fail closed. The foreign-pid
@@ -592,22 +659,18 @@ def _unlink_move_restore_db(src: Path, dst: Path) -> bool:
     try:
         holders = _foreign_db_holder_pids(dst)
         if holders:
-            logger.error("Refusing unlink+move restore of %s: process(es) %s still "
+            logger.error("Refusing replacement restore of %s: process(es) %s still "
                          "hold the database or its WAL open. Stop them and retry.", dst, holders)
             return False
-        with offline_file_access(dst, what="unlink+move restore of"):
-            tmp = dst.parent / f".{dst.name}.snap_restore"
-            shutil.copy2(src, tmp)
-            dst.unlink(missing_ok=True)
-            # The snapshot owns no WAL, so any -wal/-shm here belongs to the DB just unlinked (a
+        with offline_file_access(dst, what="replacement restore of"):
+            # The snapshot owns no WAL, so any -wal/-shm here belongs to the DB being replaced (a
             # killed gateway leaves them — exactly when a restore runs); SQLite would replay that
             # foreign WAL over the restored file: "malformed" or resurrected post-snapshot rows.
-            for _sidecar_suffix in ("-wal", "-shm", "-journal"):
-                dst.with_name(dst.name + _sidecar_suffix).unlink(missing_ok=True)
-            shutil.move(str(tmp), str(dst))
+            # _publish_db_replacing retires them with no window where the two are mismatched.
+            _publish_db_replacing(src, dst)
         return True
     except LiveConnectionError as exc2:
-        logger.error("Refusing unlink+move restore of %s: %s Close the in-process "
+        logger.error("Refusing replacement restore of %s: %s Close the in-process "
                      "database handles (or restart Hermes) and retry.", dst, exc2)
         return False
     except Exception as exc2:

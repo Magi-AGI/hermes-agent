@@ -14,8 +14,10 @@ precedes every extension/type handler of the restore paths:
   never written;
 * runtime lock files are never written (``is_runtime_lock``);
 * the protected inventory is complete or the write is refused (a location that cannot be inspected
-  is never treated as absent), and no restore path writes THROUGH an existing file: every restored
-  file is published by write-temp + fsync + replace, so another hard link keeps its content;
+  is never treated as absent), and no restore writes into a file that has another name: restored
+  files are staged in exclusively created temp files and published by fsync + replace, so another
+  hard link keeps its content (write-in-place remains only for single-link files: the rename
+  fallbacks of ``atomic_replace`` and the live page copy of a session database);
 * an ``auth.json`` is written ONLY at one of the protected authority's own stores, and as one
   read-merge-write under the migration lock + that store's lock with the strict writer: the
   restored content with ALL Codex material removed (a legacy-format store first converted by
