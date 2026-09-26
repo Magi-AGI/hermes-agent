@@ -9,6 +9,11 @@ import { test } from 'vitest'
 const REPO_ROOT = path.resolve(__dirname, '..', '..', '..')
 const POSIX_SCRIPT = path.join(REPO_ROOT, 'scripts', 'desktop-update', 'posix.sh')
 const WINDOWS_SCRIPT = path.join(REPO_ROOT, 'scripts', 'desktop-update', 'windows.ps1')
+// Hang guards, not latency bounds. Each case runs the real hand-off script three times back to back;
+// on Windows that is ~3 s idle (PowerShell start + the script's Add-Type compile) and past vitest's
+// 5 s default on a loaded machine, which failed the test after every run had succeeded.
+const RUN_TIMEOUT_MS = 60_000
+const TEST_TIMEOUT_MS = 3 * RUN_TIMEOUT_MS + 10_000
 
 function sandbox(tag: string) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), `hermes-handoff-marker-${tag}-`))
@@ -35,7 +40,8 @@ function runPosix(installRoot: string, startedAt?: string) {
 
   return spawnSync('/bin/bash', [POSIX_SCRIPT, '--daemonized', '--install-root', installRoot, '--self-test-marker'], {
     env,
-    encoding: 'utf8'
+    encoding: 'utf8',
+    timeout: RUN_TIMEOUT_MS
   })
 }
 
@@ -62,7 +68,7 @@ function runWindows(installRoot: string, startedAt?: string) {
       '-NoMarkerCleanup',
       '-SelfTestMarker'
     ],
-    { env, encoding: 'utf8' }
+    { env, encoding: 'utf8', timeout: RUN_TIMEOUT_MS }
   )
 }
 
@@ -98,10 +104,18 @@ function assertScriptHandoff(run: (installRoot: string, startedAt?: string) => R
   )
 }
 
-test.skipIf(process.platform === 'win32')('POSIX hand-off preserves the Desktop marker acquisition time', () => {
-  assertScriptHandoff(runPosix)
-})
+test.skipIf(process.platform === 'win32')(
+  'POSIX hand-off preserves the Desktop marker acquisition time',
+  () => {
+    assertScriptHandoff(runPosix)
+  },
+  TEST_TIMEOUT_MS
+)
 
-test.skipIf(process.platform !== 'win32')('PowerShell hand-off preserves the Desktop marker acquisition time', () => {
-  assertScriptHandoff(runWindows)
-})
+test.skipIf(process.platform !== 'win32')(
+  'PowerShell hand-off preserves the Desktop marker acquisition time',
+  () => {
+    assertScriptHandoff(runWindows)
+  },
+  TEST_TIMEOUT_MS
+)
