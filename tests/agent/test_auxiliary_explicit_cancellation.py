@@ -26,14 +26,23 @@ _SILENT_FAKES: list[Any] = []
 
 
 @pytest.fixture(autouse=True)
-def _release_silent_fakes():
+def _settle_threads_started_by_the_test():
+    """On every exit path: release each fake and test gate, cancel watchdog timers that have not
+    fired, then join every thread the test started (owners, provider workers, timers) within the
+    hang guard and fail on any survivor. A failed assertion mid-test otherwise left owners and a
+    watchdog blocked on unreleased gates after teardown."""
+    before = set(threading.enumerate())
     yield
     while _SILENT_FAKES:
         _SILENT_FAKES.pop().release()
-    # Released provider workers unwind on their own; settle them within a bound.
-    for worker in threading.enumerate():
-        if worker.name == "hermes-protected-aux-provider":
-            worker.join(timeout=_HANG_GUARD)
+    started = [t for t in threading.enumerate() if t not in before]
+    for thread in started:
+        if isinstance(thread, threading.Timer):
+            thread.cancel()  # a pending one never runs; a running one finishes once released
+    for thread in started:
+        thread.join(timeout=_HANG_GUARD)
+    survivors = [t.name for t in started if t.is_alive()]
+    assert not survivors, f"threads outlived teardown: {survivors}"
 
 
 class _Silent:
@@ -394,6 +403,7 @@ def test_codex_timeout_and_explicit_cancel_have_one_linearized_outcome(
     """Timeout and explicit cancel can never produce a mixed owner/cleanup result."""
     timer_read_started = threading.Event()
     allow_timer_read_return = threading.Event()
+    _SILENT_FAKES.append(SimpleNamespace(release=allow_timer_read_return.set))  # teardown releases the gate
     request_cancelled = threading.Event()
     stream_started = threading.Event()
     # The watchdog expires only once the provider is inside the stream (timeout case: the seam
