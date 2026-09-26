@@ -105,14 +105,33 @@ def test_a_backup_never_brings_codex_material_back(codex_home, tmp_path, quiet_b
         assert started["presented"] == []
 
 
-def test_a_restore_that_dies_midway_leaves_no_codex_material_from_the_backup(codex_home, tmp_path):
+@pytest.mark.parametrize("install", ["fresh", "live-codex-login"])
+def test_a_restore_that_dies_midway_leaves_no_codex_material_from_the_backup(codex_home, tmp_path, install):
+    """A restorer killed right after the store merge; then a SEPARATE process starts normally and
+    forces a refresh: no backup token is presented (nothing at all on a fresh install; only the live
+    login's own token otherwise), and the live login is exactly as before."""
+    from hermes_cli.auth_codex_authority import authority_dispatch
     root, endpoint = codex_home
+    userhome = tmp_path / "userhome"
     (root / "config.yaml").write_text("model: {}\n", encoding="utf-8")
     archive, backup_tokens = _archive(tmp_path, endpoint)
-    proc, log, _gate = restore(archive, tmp_path, tmp_path / "userhome", point="after-auth-json", mode="die")
+    live = None
+    if install == "live-codex-login":
+        live = endpoint.issue()
+        write_store(root, singleton=live)
+        assert authority_dispatch() == "bootstrapped"
+    before_protocol = _protocol_state(root)
+    before_codex = _codex_sections(read_json(root / "auth.json")) if live else None
+    proc, log, _gate = restore(archive, tmp_path, userhome, point="after-auth-json", mode="die")
     out, err = proc.communicate(timeout=180)
     assert proc.returncode == 137, err[-2000:]
-    assert _protocol_state(root) == {}, "a protocol file came from the backup"
-    assert not (tmp_path / "userhome" / ".codex").exists()
+    assert _protocol_state(root) == before_protocol, "a protocol file came from the backup"
+    assert not (userhome / ".codex").exists()
     on_disk = (root / "auth.json").read_text(encoding="utf-8") if (root / "auth.json").exists() else ""
     assert not any(token in on_disk for token in backup_tokens), "Codex tokens from the backup are on disk"
+    if live:
+        assert _codex_sections(read_json(root / "auth.json")) == before_codex, "the live Codex login was changed"
+
+    started = runtime_startup(tmp_path, userhome, root)
+    assert not backup_tokens & set(started["presented"]), f"a backup token reached the endpoint: {started}"
+    assert started["presented"] == ([live[1]] if live else []), started
