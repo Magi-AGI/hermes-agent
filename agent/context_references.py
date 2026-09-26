@@ -199,8 +199,12 @@ def preprocess_context_references(
 
 def _run_detached(coro):
     """``asyncio.run`` without its executor join: an expansion abandoned at its deadline may still hold
-    a ``to_thread`` worker (web extraction does), and ``asyncio.run``'s teardown would wait for it."""
+    a ``to_thread`` worker (web extraction does). ``asyncio.run``'s teardown would wait for it, and a
+    stock executor's workers are joined again at interpreter exit even after ``shutdown(wait=False)``;
+    daemon workers are neither."""
+    from tools.daemon_pool import DaemonThreadPoolExecutor
     loop = asyncio.new_event_loop()
+    loop.set_default_executor(DaemonThreadPoolExecutor(thread_name_prefix="context-ref"))
     try:
         return loop.run_until_complete(coro)
     finally:

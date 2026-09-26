@@ -121,3 +121,41 @@ def test_hung_url_reference_fails_alone_at_the_expand_deadline(tmp_path):
     assert not res.blocked
     assert "CONTENT[https://ok.example/y]" in res.message
     assert any("stalled.example" in w and "timed out" in w for w in res.warnings)
+
+
+_EXIT_PROBE = """
+import asyncio, os, sys, threading, time
+sys.path.insert(0, sys.argv[1])
+home = sys.argv[2]
+os.environ["HERMES_HOME"] = home
+from agent.context_references import preprocess_context_references
+stuck = threading.Event()  # never set: the abandoned worker would wait forever
+
+async def fetch(url):
+    await asyncio.to_thread(stuck.wait)
+    return "never"
+
+result = preprocess_context_references("see @url:https://stuck.example/x", cwd=home, context_length=100000,
+                                       url_fetcher=fetch)
+print("returned", result.warnings, flush=True)
+"""
+
+
+def test_an_abandoned_fetch_worker_does_not_hold_process_exit(tmp_path):
+    """Round 1 (Codex): the caller came back at the deadline, but a stock executor's worker is joined
+    at interpreter exit, so a one-shot process hung on a fetch that never answers."""
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+
+    (tmp_path / "config.yaml").write_text(
+        "timeouts:\n  context_references:\n    expand: 0.3\n", encoding="utf-8")
+    script = tmp_path / "exit_probe.py"
+    script.write_text(_EXIT_PROBE, encoding="utf-8")
+    repo = str(Path(__file__).resolve().parents[2])
+    started = time.monotonic()
+    proc = subprocess.run([sys.executable, str(script), repo, str(tmp_path)], capture_output=True, text=True,
+                          timeout=90)
+    assert "returned" in proc.stdout, proc.stderr[-2000:]
+    assert time.monotonic() - started < 60  # the probe itself imports the agent stack
