@@ -513,36 +513,53 @@ class SessionTranscriptMixin:
             self._clear_dirty_transcript(session_id)
             return True
 
+    # A compression rotation between resolving the lineage and the redaction's transaction closes the
+    # tip it named; re-resolve and try again this many times before handing the retry to the caller.
+    _REDACT_ROTATION_ATTEMPTS = 5
+
     def redact_user_message(self, session_id: str, *, platform_message_id: Optional[str] = None,
                             content: Any = None, replacement: str) -> int:
-        """Overwrite one withdrawn user message wherever it is stored for this conversation: the
-        durable rows of its compression lineage (see ``SessionDB.redact_user_message``) and any copy
-        still queued here for a retried write, which would otherwise re-insert it later. Nothing else
-        in the transcript is rewritten. Raises the SessionDB fence errors while a live turn or a
-        compression holds the conversation; the caller retries once it ends. Returns rows changed."""
+        """Overwrite one withdrawn user message wherever this conversation stores it: the durable rows
+        of its compression lineage (``SessionDB.redact_user_message``), a copy queued here for a retried
+        write, and a copy spooled to disk for replay; either would write it back later. One identity
+        rule for all three: the platform message id, else the exact text on id-less messages only.
+        Raises the SessionDB fence errors while a live turn or a compression holds the conversation
+        (and ``RecallTargetAmbiguousError``); the caller retries. Returns messages overwritten."""
+        from hermes_state_errors import CompressionSessionClosedError
         db = self._db_for_session_id(session_id)
         if not db:
             return 0
         with self._get_transcript_drain_lock():
-            tip = self._follow_reroutes(session_id)
-            with contextlib.suppress(Exception):
-                tip = db.get_compression_tip(tip) or tip
-            try:
+            for attempt in range(self._REDACT_ROTATION_ATTEMPTS):
+                tip = db.get_compression_tip(self._follow_reroutes(session_id)) or session_id
                 lineage = list(reversed(db.get_compression_lineage(tip))) or [tip]
-            except Exception:
-                lineage = [tip]
-            changed = db.redact_user_message(
-                lineage, platform_message_id=platform_message_id, content=content, replacement=replacement)
+                try:
+                    changed, matched_by = db.redact_user_message(
+                        lineage, platform_message_id=platform_message_id, content=content, replacement=replacement)
+                    break
+                except CompressionSessionClosedError:
+                    if attempt + 1 == self._REDACT_ROTATION_ATTEMPTS:
+                        raise
+            by_content = bool(content) and matched_by != "id"
+
+            def matches(message: Dict[str, Any]) -> bool:
+                if message.get("role") != "user":
+                    return False
+                message_id = message.get("platform_message_id") or message.get("message_id")
+                if message_id:
+                    return bool(platform_message_id) and message_id == platform_message_id
+                return by_content and message.get("content") == content
+
+            sessions = {session_id, *lineage}
             with self._transcript_retry_lock:
-                for sid in {session_id, *lineage}:
+                for sid in sessions:
                     for queued in self._dirty_transcripts.get(sid, []):
-                        if queued.get("role") == "user" and (
-                                (platform_message_id and platform_message_id in (
-                                    queued.get("platform_message_id"), queued.get("message_id")))
-                                or (content and queued.get("content") == content)):
+                        if matches(queued):
                             queued["content"] = replacement
                             queued.pop("api_content", None)
                             changed += 1
+            from gateway.shutdown_flush import redact_spooled_transcript_messages
+            changed += redact_spooled_transcript_messages(sessions, matches, replacement)
             return changed
 
     def has_input_owner(self, session_id: str, owner: str) -> bool:

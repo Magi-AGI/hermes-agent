@@ -150,6 +150,11 @@ class SessionTurnLeaseLostError(RuntimeError):
     be persisting a newer turn, and landing this one would interleave a stale reply."""
 
 
+class RecallTargetAmbiguousError(ValueError):
+    """A withdrawn message identified only by its text matches more than one logical message, so
+    no row is rewritten (equal text is not message identity)."""
+
+
 class StateDbReplacedError(RuntimeError):
     """The state.db path no longer names the file this SessionDB opened
     (out-of-band cp/mv/restore). In-place FTS repair and fail-open trigger

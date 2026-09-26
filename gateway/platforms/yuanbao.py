@@ -537,7 +537,8 @@ class RecallGuardMiddleware(InboundMiddleware):
         that long for a row the interrupted turn has not written yet; ``note_if_missing`` appends the
         do-not-reference note when nothing was stored (branch B)."""
         from hermes_state import SessionCompressionInProgressError
-        from hermes_state_errors import SessionTurnLeaseLostError
+        from hermes_state_errors import (
+            CompressionSessionClosedError, RecallTargetAmbiguousError, SessionTurnLeaseLostError)
 
         async def _run() -> None:
             store = _session_store(adapter)
@@ -548,14 +549,19 @@ class RecallGuardMiddleware(InboundMiddleware):
             except Exception as exc:
                 logger.warning("[%s] Recall: failed to resolve session: %s", adapter.name, exc)
                 return
-            started = time.monotonic()
+            started, add_note = time.monotonic(), note_if_missing
             while True:
                 try:
                     changed = await asyncio.to_thread(
                         store.redact_user_message, sid, platform_message_id=recalled_id or None,
                         content=content or None, replacement=cls._REDACTED)
-                except (SessionTurnLeaseLostError, SessionCompressionInProgressError):
-                    changed = None  # a live turn or compression owns the conversation: after it
+                except (SessionTurnLeaseLostError, SessionCompressionInProgressError, CompressionSessionClosedError):
+                    changed = None  # a live turn or compression owns (or just rotated) the conversation
+                except RecallTargetAmbiguousError as exc:
+                    # Equal text is not identity: rewrite nothing, and tell the model not to use it.
+                    logger.warning("[%s] Recall redact: msg_id=%s not redacted: %s", adapter.name, recalled_id, exc)
+                    add_note = True
+                    break
                 except Exception as exc:
                     logger.warning("[%s] Recall redact failed for msg_id=%s: %s", adapter.name, recalled_id, exc)
                     return
@@ -571,7 +577,7 @@ class RecallGuardMiddleware(InboundMiddleware):
                                    "for %.0fs", adapter.name, recalled_id, elapsed)
                     return
                 await asyncio.sleep(cls._REDACT_RETRY_INTERVAL_S)
-            if note_if_missing:
+            if add_note:
                 await asyncio.to_thread(store.append_to_transcript, sid, {
                     "role": "system", "timestamp": datetime.now(tz=timezone.utc).isoformat(),
                     "content": f'[recall] message_id="{recalled_id}" has been recalled; do not quote or reference it.',

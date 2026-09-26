@@ -93,3 +93,83 @@ def test_a_live_turn_holding_the_conversation_defers_the_redaction(store, monkey
     held = asyncio.run(recall())
     assert any(SECRET == r[1] for r in held), "redacted under a live turn's lease"
     assert not [r for r in _rows(db, sid) if SECRET in (r[1] or "")]
+
+
+def _recall(adapter, tasks, recalled_id, content):
+    async def run():
+        RecallGuardMiddleware._patch_transcript(adapter, recalled_id, "", "u1", content)
+        await asyncio.wait_for(asyncio.gather(*tasks), 30)
+    asyncio.run(run())
+
+
+def test_equal_text_is_not_identity(store):
+    """Content is only a fallback for id-less rows, and only for ONE logical message: a same-text
+    message with its own id, or several id-less occurrences, are never rewritten (round 1, Codex)."""
+    tasks: list = []
+    adapter = _adapter(store, tasks)
+    sid = _session(store, adapter)
+    db = store._db
+    db.append_message(session_id=sid, role="user", content="ok", platform_message_id="other")
+    db.append_message(session_id=sid, role="user", content="ok")
+    with store._transcript_retry_lock:
+        store._dirty_transcripts[sid] = [{"role": "user", "content": "ok", "message_id": "other2"}]
+    _recall(adapter, tasks, "missing", "ok")
+    rows = _rows(db, sid)
+    assert ("user", "ok", 1) in rows and rows.count(("user", RecallGuardMiddleware._REDACTED, 1)) == 1
+    assert store._dirty_transcripts[sid][0]["content"] == "ok"
+
+    tasks.clear()
+    db.append_message(session_id=sid, role="user", content="again")
+    db._execute_write(lambda conn: conn.execute(
+        "UPDATE messages SET timestamp = timestamp - 60 WHERE session_id = ? AND content = 'again'", (sid,)))
+    db.append_message(session_id=sid, role="user", content="again")
+    _recall(adapter, tasks, "missing2", "again")
+    rows = _rows(db, sid)
+    assert rows.count(("user", "again", 1)) == 2  # ambiguous: nothing rewritten
+    assert any(r[0] == "system" and "missing2" in r[1] for r in rows)  # the model is told instead
+
+
+def test_a_compression_rotation_mid_recall_is_followed_to_the_new_tip(store, tmp_path):
+    tasks: list = []
+    adapter = _adapter(store, tasks)
+    sid = _session(store, adapter)
+    db = store._db
+    db.append_message(session_id=sid, role="user", content=SECRET, platform_message_id="p1")
+    sibling = SessionDB(db_path=tmp_path / "state.db")
+    original = db.redact_user_message
+    rotated = []
+
+    def rotate_first(ids, **kw):
+        if not rotated:
+            rotated.append(True)
+            assert sibling.try_acquire_compression_lock(sid, "compressor")
+            sibling.publish_compression_child(
+                parent_session_id=sid, child_session_id="child", source="yuanbao",
+                messages=[{"role": "user", "content": SECRET, "platform_message_id": "p1"}],
+                compression_lock_holder="compressor")
+            sibling.release_compression_lock(sid, "compressor")
+        return original(ids, **kw)
+
+    db.redact_user_message = rotate_first
+    try:
+        _recall(adapter, tasks, "p1", SECRET)
+    finally:
+        sibling.close()
+    assert rotated
+    for session in (sid, "child"):
+        assert not [r for r in _rows(db, session) if SECRET in (r[1] or "")], session
+
+
+def test_a_spooled_copy_is_not_replayed_after_the_recall(store):
+    from gateway.shutdown_flush import spool_dropped_transcript_message
+
+    tasks: list = []
+    adapter = _adapter(store, tasks)
+    sid = _session(store, adapter)
+    db = store._db
+    db.append_message(session_id=sid, role="user", content=SECRET, platform_message_id="p1")
+    assert spool_dropped_transcript_message(sid, {"role": "user", "content": SECRET, "message_id": "p1"})
+    store._spooled_drop_sessions = {sid}
+    _recall(adapter, tasks, "p1", SECRET)
+    store.append_to_transcript(sid, {"role": "assistant", "content": "next"})  # drains the spool first
+    assert not [r for r in _rows(db, sid) if SECRET in (r[1] or "")]

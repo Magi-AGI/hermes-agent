@@ -132,6 +132,35 @@ def spool_dropped_transcript_message(session_id: str, message: Dict[str, Any]) -
         return None
 
 
+def redact_spooled_transcript_messages(session_ids, matches, replacement: str) -> int:
+    """Overwrite, in place, the content of spooled transcript messages of *session_ids* for which
+    ``matches(message)`` is true: a withdrawn message waiting in the spool would otherwise be written
+    back by the next replay after its durable copy was redacted. Returns messages rewritten."""
+    try:
+        candidates = list(_get_flush_dir().glob("pending-*.json"))
+    except Exception as exc:
+        logger.debug("Cannot scan transcript spool: %s", exc)
+        return 0
+    wanted, rewritten = set(session_ids), 0
+    for path in candidates:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if (not isinstance(payload, dict) or payload.get("reason") != TRANSCRIPT_CAP_DROP_REASON
+                or payload.get("session_key") not in wanted):
+            continue
+        message = (payload.get("data") or {}).get("message")
+        if not isinstance(message, dict) or not matches(message):
+            continue
+        message["content"] = replacement
+        message.pop("api_content", None)
+        from utils import atomic_json_write
+        atomic_json_write(path, payload, mode=0o600, default=str)
+        rewritten += 1
+    return rewritten
+
+
 def drain_transcript_spool(session_id: str, replay, *, db_known_failing: bool = False) -> tuple[int, int]:
     """Replay cap-dropped transcript messages spooled for *session_id*; return ``(replayed,
     remaining)``. ``replay(message_dict)`` runs per message in drop order; a spool file is deleted
