@@ -5,7 +5,9 @@ skipped by inspection although import writes them under the user's home (so
 ``_external/<home-relative hermes root>/auth.chains.json`` replaced the registry unguarded), and
 names were compared case-sensitively (``AUTH.JSON`` is the same file as ``auth.json`` on a
 case-insensitive filesystem). One destination resolver now serves both, and classification uses
-the resolved, canonical, case-normalized destination. Fake credentials only.
+the resolved, canonical, case-normalized destination: a Codex protocol file is never written
+whatever path it is named by, and an auth.json by any name keeps the destination's Codex login.
+Fake credentials only.
 """
 
 import json
@@ -43,8 +45,7 @@ def _import(tmp_path, members):
         zf.writestr("config.yaml", "model: {}\n")
         for name, data in members.items():
             zf.writestr(name, data)
-    with pytest.raises(SystemExit):
-        backup.run_import(SimpleNamespace(zipfile=str(archive), force=True))
+    backup.run_import(SimpleNamespace(zipfile=str(archive), force=True))
 
 
 def _alias_dir(link, target):
@@ -88,4 +89,10 @@ def test_a_differently_cased_store_name_is_the_same_store(home_root, tmp_path):
     store = {"version": 1, "providers": {"openai-codex": {"tokens": {
         "access_token": spent[0], "refresh_token": spent[1]}}}, "active_provider": "openai-codex"}
     _import(tmp_path, {"AUTH.JSON": json.dumps(store)})
-    assert _auth_files(root) == before, "auth.json was overwritten through a differently cased name"
+    after = _auth_files(root)
+    assert {k: v for k, v in after.items() if k != "auth.json"} == \
+        {k: v for k, v in before.items() if k != "auth.json"}
+    kept, now = json.loads(before["auth.json"]), json.loads(after["auth.json"])
+    assert now["providers"]["openai-codex"] == kept["providers"]["openai-codex"], \
+        "the differently cased name replaced the live Codex login"
+    assert spent[1] not in after["auth.json"].decode("utf-8")

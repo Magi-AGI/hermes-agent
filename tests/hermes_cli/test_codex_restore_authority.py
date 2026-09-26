@@ -1,13 +1,12 @@
 """A restore writes credential state only into the authority it protects (stage 1).
 
-The guard (state check, migration lock, barrier, fence) belongs to ONE Hermes root. Directory
-containment is not authority membership: an independent root nested inside the restoring root
-kept its own registry and locks, so old state restored into it was never fenced and replayed; and a
-restore into another root held only the restorer's own lock, so a Codex sign-in landing there
-between the check and the write was overwritten. A restore now writes an auth store or protocol
-file only at one of the protected authority's own managed locations; an explicit quick-snapshot
-restore into another home runs the whole guard under THAT home's authority (its migration lock
-held from validation through the write, its barrier and fence). Fake credentials only.
+The guard (destination check, migration lock, Codex-stripping store merge) belongs to ONE Hermes
+root. Directory containment is not authority membership: an independent root nested inside the
+restoring root keeps its own registry and locks; and a restore into another root that held only the
+restorer's own lock let a Codex sign-in land there between the check and the write, then overwrote
+it. A restore writes an auth store only at one of the protected authority's own stores; an explicit
+quick-snapshot restore into another home runs the whole guard under THAT home's authority (its
+migration lock held from validation through the write). Fake credentials only.
 """
 
 import json
@@ -67,13 +66,15 @@ def test_a_snapshot_restore_into_another_home_is_guarded_by_that_home(codex_home
     root_a, endpoint = codex_home
     home_b = tmp_path / "hermes-b"
     home_b.mkdir()
-    write_store(home_b, singleton=endpoint.issue())  # B: Codex tokens, no authority state yet
+    old = endpoint.issue()
+    write_store(home_b, singleton=old)  # B's snapshot holds a Codex login ...
     snapshot_id = backup.create_quick_snapshot(label="b", hermes_home=home_b)
+    live = endpoint.issue()
+    write_store(home_b, singleton=live)  # ... that B has since replaced
     assert backup.restore_quick_snapshot(snapshot_id, hermes_home=home_b) is True
-    chains = registry(home_b)["chains"].values()
-    assert chains and all(c["fence"]["reason"] == "restored-from-backup" for c in chains), \
-        "B's restored login must land fenced under B's own authority"
-    assert not (root_a / "auth.chains.json").exists() and not (root_a / "auth.restore-barrier.json").exists()
+    tokens = json.loads((home_b / "auth.json").read_text(encoding="utf-8"))["providers"]["openai-codex"]["tokens"]
+    assert (tokens["access_token"], tokens["refresh_token"]) == live, "B's current Codex login was not kept"
+    assert not (root_a / "auth.chains.json").exists(), "the process's own root was touched"
 
 
 def test_a_sign_in_into_the_target_home_cannot_land_between_check_and_write(codex_home, tmp_path):

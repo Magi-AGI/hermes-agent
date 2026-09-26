@@ -38,8 +38,8 @@ logger = logging.getLogger("hermes_cli.auth")
 
 # ── Dispatcher (§6) ───────────────────────────────────────────────────────────────────────────
 
-def _bootstrap(fence_all: Optional[str] = None, paths: Optional[List[Path]] = None) -> Dict[str, Any]:
-    paths = list(paths) if paths is not None else all_store_paths()
+def _bootstrap(fence_all: Optional[str] = None) -> Dict[str, Any]:
+    paths = all_store_paths()
     with store_locks(paths):  # a consistent snapshot of every store to plan from
         view = read_registry()
         payload = plan_registration(view, load_snapshots(paths), only_unregistered=False,
@@ -84,20 +84,8 @@ def _codex_material_present(paths: Iterable[Path]) -> bool:
     return False
 
 
-def _resolve_restore_barrier() -> bool:
-    """A restore that brought Codex material in never completed its fence: finish it FIRST, before
-    any bootstrap could register the restored rows as active (auth_codex_restore)."""
-    from hermes_cli.auth_codex_restore import fence_restored, restore_barrier_pending
-    if not restore_barrier_pending():
-        return False
-    fence_restored()
-    return True
-
-
 def dispatch_locked() -> str:
     """The dispatcher body; caller holds the migration lock and no store lock."""
-    if _resolve_restore_barrier():
-        return "restore-fenced"
     view = read_registry()
     if view.status == "unreadable":
         preserve_unreadable_registry()
@@ -141,8 +129,7 @@ def dispatch_needed() -> bool:
     """Unfinished ops to roll forward (incl. an ``unrecoverable`` one whose payload may read again),
     or payloads left by an op that never reached its decision."""
     view = read_registry()
-    from hermes_cli.auth_codex_restore import restore_barrier_pending
-    return (view.status == "absent" or restore_barrier_pending()
+    return (view.status == "absent"
             or any(op.get("status") in ("running", "unrecoverable") for op in view.ops.values())
             or (ops_dir().is_dir() and any(ops_dir().glob("*.json"))))
 
@@ -153,8 +140,7 @@ def startup_dispatch() -> str:
         view = read_registry()
         paths = all_store_paths()
         if view.status == "absent":
-            from hermes_cli.auth_codex_restore import restore_barrier_pending
-            if not _codex_material_present(paths) and not ops_dir().is_dir() and not restore_barrier_pending():
+            if not _codex_material_present(paths) and not ops_dir().is_dir():
                 return "idle"
         elif not dispatch_needed() and not unrecorded_legacy_rescues(view):
             return "idle"
@@ -168,7 +154,6 @@ def startup_dispatch() -> str:
 def _ready_view() -> RegistryView:
     """Registry ready for an ownership op (restore fenced, bootstrapped, unfinished ops rolled
     forward)."""
-    _resolve_restore_barrier()
     recover_ops()
     view = read_registry()
     if view.status == "absent":
@@ -183,10 +168,6 @@ def _run_with_all_stores(build) -> Any:
         raise RuntimeError("Codex ownership operations must not run inside an auth-store lock")
     from hermes_cli.auth_credential_io import path_memo
     with migration_lock(), path_memo():
-        # An interrupted restore's fence is finished FIRST, before any branch below (an unreadable
-        # registry skips _ready_view) and before the store locks: otherwise this op's new chain
-        # would be fenced as restored by the next dispatch.
-        _resolve_restore_barrier()
         view = read_registry()
         if view.status == "unreadable":
             view = None

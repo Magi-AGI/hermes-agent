@@ -45,8 +45,7 @@ def test_a_restore_never_touches_the_lock_it_holds(codex_home, tmp_path):
     extracted = [os.path.normcase(line) for line in log.read_text(encoding="utf-8").splitlines()]
     assert not [p for p in extracted if p.endswith(".lock")], f"lock files were extracted: {extracted}"
     assert _identity(lock) == held, "the lock file was replaced or rewritten"
-    live = [c for c in registry(root)["chains"].values() if c["state"] != "retired"]
-    assert live and all(c["fence"]["reason"] == "restored-from-backup" for c in live)
+    assert not (root / "auth.chains.json").exists(), "no Codex authority state comes from a restore"
 
 
 def test_an_external_alias_of_the_lock_is_not_extracted_either(codex_home, tmp_path, monkeypatch):

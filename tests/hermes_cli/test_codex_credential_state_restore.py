@@ -1,11 +1,9 @@
 """Restoring a backup can never roll the Codex authority protocol back (stage 1).
 
-Every protocol file — ``auth.json``, the registry ``auth.chains.json``, the retired-token index,
-the chain records under ``auth.recovery/`` and the ownership payloads under ``auth.ops/`` — is
-credential state. The old guard looked only at ``auth.json`` and only at stores holding a
-non-retired chain, so after a logout an older backup brought back an ACTIVE registry entry AND the
-refresh token that chain had already spent. Stage 1 refuses such restores (restoring credential
-state is a stage-2 protocol that must preserve fences). Fake credentials only.
+An older backup taken before a logout carries an ACTIVE registry entry and the refresh token that
+chain has since spent. On every restore path (backup import, quick snapshot, profile import) the
+protocol files are never written and the restored auth.json loses its Codex material, so neither
+the entry nor the spent token comes back; the rest of the restore proceeds. Fake credentials only.
 """
 
 import io
@@ -69,18 +67,16 @@ def test_an_older_backup_cannot_reinstate_a_retired_chain_or_its_spent_token(cod
     before = {k: v for k, v in _files(root).items() if k.startswith("auth")}
 
     if path == "backup-import":
-        with pytest.raises(SystemExit):
-            backup.run_import(SimpleNamespace(zipfile=str(archive), force=True))
+        backup.run_import(SimpleNamespace(zipfile=str(archive), force=True))
     elif path == "profile-import":
         from hermes_cli.profiles import import_profile
-        with pytest.raises(ValueError, match="Codex"):
-            import_profile(str(archive))
-        assert not (root / "profiles" / "imported" / "auth.json").exists()
+        imported = import_profile(str(archive)) / "auth.json"
+        assert r0[1] not in imported.read_text(encoding="utf-8"), "the spent token came back with the profile"
     else:
-        assert backup.restore_quick_snapshot(snapshot_id, hermes_home=root) is False
+        assert backup.restore_quick_snapshot(snapshot_id, hermes_home=root) is True
 
-    after = {k: v for k, v in _files(root).items() if k.startswith("auth")}
-    assert after == before, "credential state was restored from the backup"
+    after = {k: v for k, v in _files(root).items() if k.startswith("auth") and k != "auth.json"}
+    assert after == {k: v for k, v in before.items() if k != "auth.json"}, "protocol state came from the backup"
     assert all(c["state"] != "active" for c in registry(root)["chains"].values())
     store = json.loads((root / "auth.json").read_text(encoding="utf-8"))
     assert r0[1] not in json.dumps(store), "the spent refresh token is back in auth.json"

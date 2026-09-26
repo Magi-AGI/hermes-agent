@@ -45,9 +45,6 @@ MIGRATION_LOCK_NAME = "auth.migration.lock"
 OPS_DIR_NAME = "auth.ops"
 RECORDS_DIR_NAME = "auth.recovery"
 LEGACY_RESCUE_NAME = "auth.codex-rotation-rescue.json"
-# Written BEFORE a restore brings Codex credential material in; honoured by every dispatcher and
-# refresh admission until the restored chains are durably fenced (auth_codex_restore).
-RESTORE_BARRIER_NAME = "auth.restore-barrier.json"
 SINGLETON = "singleton"
 
 STATE_ACTIVE, STATE_FENCED, STATE_RETIRED = "active", "fenced", "retired"
@@ -72,7 +69,6 @@ _FENCE_REASON_TEXT = {
     "retired": "this login was replaced by a newer sign-in",
     "unregistered": "this credential is not registered yet",
     "unverified-history": "Hermes could not check this credential against its login history",
-    "restored-from-backup": "this login was restored from a backup and its refresh token may already have been used",
 }
 
 
@@ -196,7 +192,7 @@ def authority_root_for(home: Path) -> Path:
 
 @contextmanager
 def authority_scope(home: Path) -> Iterator[Path]:
-    """Run protocol code (registry, locks, barrier, fence, store enumeration) for the authority that
+    """Run protocol code (registry, locks, store enumeration, restore merges) for the authority that
     owns *home* instead of the process's own root. Yields that root."""
     from hermes_constants import _expand_hermes_home
     root = authority_root_for(home)
@@ -236,10 +232,6 @@ def profiles_root() -> Path:
 
 def registry_path() -> Path:
     return root_home() / REGISTRY_NAME
-
-
-def restore_barrier_path() -> Path:
-    return root_home() / RESTORE_BARRIER_NAME
 
 
 def ops_dir() -> Path:

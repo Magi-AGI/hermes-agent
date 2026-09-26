@@ -960,12 +960,19 @@ def _import_members(
     restored = restored_external = 0
     home_dir = Path.home().resolve()
     new_file_mode = default_new_file_mode()  # once: every member is published via mkstemp (0600)
+    from hermes_cli.auth_codex_restore import restore_action, write_restored_store
     for member in members:
         dest = _member_destination(member, prefix, hermes_root, home_dir)
         if dest.skipped_runtime:
             skipped_runtime.append(dest.rel)
             continue
         external, rel, target, root = dest.external, dest.rel, dest.target, dest.root
+        # Credential recovery protocol, stage 1: Codex protocol files and Codex CLI credentials are
+        # never restored; an auth.json is merged without the backup's Codex material.
+        codex_action = restore_action(target) if rel else None
+        if codex_action == "skip":
+            skipped_runtime.append(member if external else rel)
+            continue
         tighten = (target.suffix in {".json", ".env", ".conf"} or target.name in _SECRET_FILE_NAMES) if external \
             else target.name in _SECRET_FILE_NAMES
         if not rel:
@@ -984,6 +991,11 @@ def _import_members(
                     after = _count_session_rows(target)
                     if before and after and after[1] < before[1]:
                         db_shrunk.append((rel, before, after))
+                elif codex_action == "store":
+                    why = write_restored_store(target, zf.read(member))
+                    if why is not None:
+                        errors.append(f"{label}: kept this machine's copy ({why})")
+                        continue
                 else:
                     _extract_member_atomically(zf, member, target, new_file_mode)
                 if tighten:
@@ -1045,6 +1057,8 @@ def run_import(args) -> None:
         prefix = _detect_prefix(zf)
         members = [n for n in zf.namelist() if not n.endswith("/")]
         _refuse_codex_credential_state(zf, members, prefix, hermes_root)
+        from hermes_cli.auth_codex_restore import SIGN_IN_AGAIN, brings_codex_material
+        codex_notice = brings_codex_material(_codex_restore_targets(zf, members, prefix, hermes_root))
         file_count = len(members)
         print(f"Backup contains {file_count} files\nTarget: {display_hermes_home()}")
         if prefix:
@@ -1095,6 +1109,8 @@ def run_import(args) -> None:
             for pname in restored_profiles:
                 print(f"  hermes -p {pname} gateway install")
         _revive_gateway_after_import(hermes_root)
+        if codex_notice:
+            print(f"\nNote: {SIGN_IN_AGAIN}")
         print("Done. Your Hermes configuration has been restored.")
 
 
@@ -1388,15 +1404,19 @@ def restore_quick_snapshot(snapshot_id: str, hermes_home: Optional[Path] = None)
         meta = json.load(f)
     snap_res, home_res = snap_dir.resolve(), home.resolve()
     # Codex credential state (auth.json and the authority's files) is never rolled back (credential
-    # recovery protocol, stage 1): checked and written under the migration lock.
+    # recovery protocol, stage 1): Codex material is never restored; stores are merged under the
+    # migration lock of the authority that owns THIS home.
     from hermes_cli.auth_codex_registry import CodexAuthorityRefused, authority_scope
     from hermes_cli.auth_codex_restore import restore_guard
     targets = [(home / rel, (lambda r=rel: (snap_dir / r).read_bytes())) for rel in meta.get("files", {})]
     try:
         # The guard runs under the authority that owns THIS home (its migration lock held from the
-        # check through the writes, its barrier and fence), whichever home the process runs in.
+        # check through the writes), whichever home the process runs in.
         with authority_scope(home), restore_guard(lambda: targets, "restoring it from a snapshot"):
             restored = _restore_quick_snapshot_files(meta, snap_dir, home, snap_res, home_res)
+        from hermes_cli.auth_codex_restore import SIGN_IN_AGAIN, brings_codex_material
+        if brings_codex_material(targets):
+            logger.warning("%s", SIGN_IN_AGAIN)
     except CodexAuthorityRefused as exc:
         logger.error("%s", exc)
         return False
@@ -1406,6 +1426,7 @@ def restore_quick_snapshot(snapshot_id: str, hermes_home: Optional[Path] = None)
 
 def _restore_quick_snapshot_files(meta: Dict[str, Any], snap_dir: Path, home: Path, snap_res: Path,
                                   home_res: Path) -> int:
+    from hermes_cli.auth_codex_restore import restore_action, write_restored_store
     restored = 0
     for rel in meta.get("files", {}):
         src = snap_dir / rel
@@ -1415,9 +1436,17 @@ def _restore_quick_snapshot_files(meta: Dict[str, Any], snap_dir: Path, home: Pa
             continue
         if not src.exists():
             continue
+        codex_action = restore_action(dst)
+        if codex_action == "skip":  # Codex protocol state is never restored (stage 1)
+            continue
         dst.parent.mkdir(parents=True, exist_ok=True)
         try:
-            if dst.suffix == ".db":
+            if codex_action == "store":
+                why = write_restored_store(dst, src.read_bytes())
+                if why is not None:
+                    logger.error("Kept this machine's %s: %s", rel, why)
+                    continue
+            elif dst.suffix == ".db":
                 # Through the backup API so live connections see the restored data instead of
                 # stale pages from a replaced inode (#65942).
                 if not _safe_restore_db(src, dst):

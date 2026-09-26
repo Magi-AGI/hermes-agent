@@ -1,22 +1,23 @@
-"""Stage-1 refusal of restoring Codex credential state (credential recovery protocol, RULE-P1).
+"""Stage-1 restore rule: a restore NEVER brings Codex credential material back.
 
-Every file of the protocol is credential state: ``auth.json`` (any store), the registry
-``auth.chains.json`` (and its preserved copies), the retired-token index, chain records under
-``auth.recovery/``, ownership payloads under ``auth.ops/``, the migration lock and legacy rescue
-files. Restoring an older copy of any of them can roll the protocol back — an ACTIVE registry entry
-for a chain that was retired, a refresh token that was already spent — so until stage 2 implements
-restoration as an ownership operation that preserves fences, a restore (backup import, quick
-snapshot, profile import) that would write such a file is REFUSED whenever this install already
-has Codex authority state (newer protocol evidence is never overwritten or merged). Restoring onto
-an install that never had any (a fresh machine) is allowed, but nothing in a backup proves its
-refresh tokens are unspent: every Codex chain it brings in lands FENCED ``restored-from-backup``
-behind a restore barrier (:func:`restore_guard`, :func:`fence_restored`); the exit is a fresh
-sign-in. Other providers' credentials restore unchanged. Members are classified by their resolved
-destination (``backup._member_destination`` for archives).
+Nothing in a backup proves that a Codex refresh token is still unspent, and restoring the credential
+authority's own files would roll its evidence back (an ACTIVE entry for a retired chain, a consumed
+token recognised as new). So every restore path — backup import, quick-snapshot restore, profile
+import, ``_external/`` members — treats Codex material specially, by the RESOLVED destination of
+each member (``backup._member_destination`` for archives):
 
-Callers run :func:`check_restore` and the file writes inside :func:`restore_guard`, which holds the
-migration lock: no sign-in, import or bootstrap can register anything between the check and the
-write (the check is re-run under the lock).
+* protocol files (registry and its preserved copies, retired-token index, ``auth.recovery/``,
+  ``auth.ops/``, legacy rescue files) and Codex CLI credentials (``.codex/`` / ``$CODEX_HOME``) are
+  never written;
+* runtime lock files are never written (``is_runtime_lock``);
+* an ``auth.json`` is written ONLY at one of the protected authority's own stores, and as one
+  read-merge-write under the migration lock + that store's lock with the strict writer: the
+  restored content with ALL Codex material removed, plus the destination's CURRENT Codex material
+  exactly as it is. A live Codex login therefore survives a restore untouched, and no old token
+  ever lands; every other provider restores as upstream does.
+
+After restoring a backup a Codex user signs in again. Restoring Codex logins (paused until proven)
+is stage 2 (design B3).
 """
 
 from __future__ import annotations
@@ -25,19 +26,22 @@ import json
 import os
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, Optional, Tuple
 
 from hermes_cli.auth_codex_registry import (
-    LEGACY_RESCUE_NAME, MIGRATION_LOCK_NAME, OPS_DIR_NAME, RECORDS_DIR_NAME, REGISTRY_NAME, RESTORE_BARRIER_NAME,
-    CodexAuthorityRefused, all_store_paths, migration_lock, ops_dir, registry_path, restore_barrier_path)
+    LEGACY_RESCUE_NAME, MIGRATION_LOCK_NAME, OPS_DIR_NAME, PROVIDER, RECORDS_DIR_NAME, REGISTRY_NAME,
+    CodexAuthorityRefused, migration_lock, registry_path)
 from hermes_cli.auth_credential_io import canonical_path
 
 AUTH_STORE_NAME = "auth.json"
+CODEX_CLI_DIR = ".codex"
+SIGN_IN_AGAIN = ("Codex logins are never restored from a backup (only this machine's current Codex login is "
+                 "kept). If you use Codex, sign in again with `hermes auth codex`.")
 
 
 def _names() -> Tuple[str, ...]:
     from hermes_cli.auth_codex_evidence import RETIRED_INDEX_NAME
-    return (REGISTRY_NAME, RETIRED_INDEX_NAME, MIGRATION_LOCK_NAME, LEGACY_RESCUE_NAME, RESTORE_BARRIER_NAME)
+    return (REGISTRY_NAME, RETIRED_INDEX_NAME, MIGRATION_LOCK_NAME, LEGACY_RESCUE_NAME)
 
 
 def _norm(text: str) -> str:
@@ -54,15 +58,28 @@ def _known_credential_files() -> Iterable[Path]:
     """Root-level credential files a hard link elsewhere could alias (names catch the rest)."""
     from hermes_cli.auth_codex_evidence import retired_index_path
     from hermes_cli.auth_codex_registry import root_store_path
-    return (root_store_path(), registry_path(), retired_index_path(), restore_barrier_path())
+    return (root_store_path(), registry_path(), retired_index_path())
+
+
+def _is_codex_cli_file(dest: Path) -> bool:
+    if _norm(CODEX_CLI_DIR) in [_norm(p) for p in dest.parts[:-1]]:
+        return True
+    codex_home = os.environ.get("CODEX_HOME", "").strip()
+    if codex_home:
+        base = [_norm(p) for p in canonical_path(Path(os.path.expanduser(codex_home))).parts]
+        return [_norm(p) for p in dest.parts][:len(base)] == base
+    return False
 
 
 def _classify(path: Path) -> Optional[str]:
-    """``store`` (an auth.json), ``protocol`` (a Codex authority file) or None, by the resolved
-    destination — by name, directory, or identity with a known credential file (hard links)."""
+    """``store`` (an auth.json), ``protocol`` (a Codex authority file), ``codex-cli`` (a Codex CLI
+    credential) or None, by the resolved destination — by name, directory, or identity with a
+    known credential file (hard links)."""
     dest = _destination(path)
     parts = [_norm(p) for p in dest.parts]
     name = parts[-1] if parts else ""
+    if _is_codex_cli_file(dest):
+        return "codex-cli"
     if name == _norm(AUTH_STORE_NAME):
         return "store"
     if any(name == _norm(n) or name.startswith(_norm(f"{n}.")) for n in _names()):
@@ -80,8 +97,8 @@ def _classify(path: Path) -> Optional[str]:
 
 
 # Runtime lock files of the credential protocol. A restore never extracts one: the restorer holds
-# the migration lock while it extracts, and replacing a held lock file (a new inode on POSIX) lets
-# another process lock the replacement and run recovery underneath the restore.
+# the migration lock while it writes, and replacing a held lock file (a new inode on POSIX) lets
+# another process lock the replacement and act underneath the restore.
 _RUNTIME_LOCK_NAMES = ("auth.lock", MIGRATION_LOCK_NAME, "nous_auth.lock", ".backup.lock")
 _LIFECYCLE_LOCK_DIR = ".locks"  # <root>/profiles/.locks/<profile>.lock (stage 2)
 
@@ -109,41 +126,22 @@ def is_runtime_lock(path: Path) -> bool:
     return False
 
 
-def is_protocol_file(path: Path) -> bool:
-    """A Codex authority protocol file (not ``auth.json`` itself), by its resolved destination."""
-    return _classify(path) == "protocol"
-
-
-def is_credential_state(path: Path) -> bool:
-    return _classify(path) is not None
-
-
-def authority_has_state() -> bool:
-    """True once this install has Codex authority state of any kind (then restoring an older copy
-    of credential state could roll it back)."""
-    from hermes_cli.auth_codex_evidence import retired_index_path
-    from hermes_cli.auth_codex_records import records_dir
-    if (registry_path().exists() or retired_index_path().exists() or ops_dir().exists()
-            or restore_barrier_path().exists()):
-        return True
-    return any(records_dir(p).is_dir() for p in all_store_paths())
-
-
-def _has_codex_material(load: Callable[[], bytes]) -> bool:
-    from hermes_cli import auth_codex_rows as rows_mod
-    try:
-        store = json.loads(load().decode("utf-8-sig"))
-    except Exception:
-        return True  # cannot tell: fail closed
-    if not isinstance(store, dict):
-        return True
-    return any(any(rows_mod.row_tokens(store, row)) for row in rows_mod.codex_rows(store))
+def restore_action(path: Path) -> Optional[str]:
+    """What a restore does with a member bound for *path*: ``skip`` (a Codex protocol file, a Codex
+    CLI credential, a runtime lock: never written), ``store`` (an auth.json: written through
+    :func:`write_restored_store`) or None (an ordinary file: restored as upstream does)."""
+    if is_runtime_lock(path):
+        return "skip"
+    kind = _classify(path)
+    if kind in ("protocol", "codex-cli"):
+        return "skip"
+    return "store" if kind == "store" else None
 
 
 # Files whose presence makes a directory an INDEPENDENT Hermes authority (its own registry, lock,
-# evidence, barrier, ops or profiles): never part of the enclosing root's managed locations.
-_INDEPENDENT_ROOT_MARKERS = (REGISTRY_NAME, MIGRATION_LOCK_NAME, "auth.chains.retired.json", RESTORE_BARRIER_NAME,
-                             OPS_DIR_NAME, "profiles")
+# evidence, ops or profiles): never part of the enclosing root's managed stores.
+_INDEPENDENT_ROOT_MARKERS = (REGISTRY_NAME, MIGRATION_LOCK_NAME, "auth.chains.retired.json", OPS_DIR_NAME,
+                             "profiles")
 
 
 def _is_independent_root(directory: Path) -> bool:
@@ -156,228 +154,149 @@ def _is_independent_root(directory: Path) -> bool:
     return False
 
 
-def _relative_parts(dest: Path, base: Path) -> Optional[list]:
-    base_parts = [_norm(p) for p in base.parts]
-    parts = [_norm(p) for p in dest.parts]
-    return parts[len(base_parts):] if parts[:len(base_parts)] == base_parts else None
-
-
-def _managed_kind(dest: Path) -> Optional[str]:
-    """``store`` / ``protocol`` when *dest* (resolved) is one of the PROTECTED authority's own managed
-    credential locations, else None. The authority's locations are its root's auth.json and protocol
-    files, and each profile store ``profiles/<id>/auth.json`` with its records and rescue file — a
-    profile directory that carries its own authority markers is an independent root, not a store of
-    this one. Membership is decided by this structure, never by directory containment."""
+def _is_managed_store(dest: Path) -> bool:
+    """*dest* (resolved) is one of the PROTECTED authority's own credential stores: its active store,
+    its root ``auth.json``, or ``profiles/<id>/auth.json`` of a profile directory that is not an
+    independent root. Decided by this structure, never by directory containment."""
     from hermes_cli.auth_codex_registry import active_store_path, root_home
     from hermes_constants import PROFILE_ID_RE
-    # The authority's ACTIVE store is one of its stores even when it is not ``<root>/auth.json``
-    # or ``profiles/<id>/auth.json`` (HERMES_HOME = a directory beneath the root).
-    active = canonical_path(active_store_path())
-    if _norm(str(dest)) == _norm(str(active)):
-        return "store"
-    active_rel = _relative_parts(dest, active.parent)
-    if active_rel and (active_rel == [_norm(LEGACY_RESCUE_NAME)]
-                       or (len(active_rel) >= 2 and active_rel[0] == _norm(RECORDS_DIR_NAME))):
-        return "protocol"
+    if _norm(str(dest)) == _norm(str(canonical_path(active_store_path()))):
+        return True
     root = canonical_path(root_home())
     root_parts = [_norm(p) for p in root.parts]
     parts = [_norm(p) for p in dest.parts]
     if parts[:len(root_parts)] != root_parts:
-        return None
-    rel = list(dest.parts[len(root_parts):])
-    norm_rel = parts[len(root_parts):]
-    if not rel:
-        return None
-
-    def classify_in(base_rel, allow_registry):
-        if base_rel == [_norm(AUTH_STORE_NAME)]:
-            return "store"
-        if len(base_rel) >= 2 and base_rel[0] == _norm(RECORDS_DIR_NAME):
-            return "protocol"
-        if base_rel == [_norm(LEGACY_RESCUE_NAME)]:
-            return "protocol"
-        if allow_registry:
-            if len(base_rel) >= 2 and base_rel[0] == _norm(OPS_DIR_NAME):
-                return "protocol"
-            if len(base_rel) == 1 and any(base_rel[0] == _norm(n) or base_rel[0].startswith(_norm(f"{n}."))
-                                          for n in _names()):
-                return "protocol"
-        return None
-
-    if norm_rel[0] == _norm("profiles"):
-        if len(rel) < 3 or not PROFILE_ID_RE.match(rel[1]) or _is_independent_root(root / rel[0] / rel[1]):
-            return None
-        return classify_in(norm_rel[2:], allow_registry=False)
-    return classify_in(norm_rel, allow_registry=True)
+        return False
+    rel, norm_rel = list(dest.parts[len(root_parts):]), parts[len(root_parts):]
+    if norm_rel == [_norm(AUTH_STORE_NAME)]:
+        return True
+    return (len(rel) == 3 and norm_rel[0] == _norm("profiles") and norm_rel[2] == _norm(AUTH_STORE_NAME)
+            and bool(PROFILE_ID_RE.match(rel[1])) and not _is_independent_root(root / rel[0] / rel[1]))
 
 
 def check_restore(targets: Iterable[Tuple[Path, Callable[[], bytes]]], action: str) -> None:
-    """Raise :class:`CodexAuthorityRefused` if restoring these ``(target path, bytes loader)`` pairs
-    would overwrite Codex credential state unsafely (module docstring)."""
-    from hermes_cli.auth_codex_authority import refuse_if_registered_store
-    has_state: Optional[bool] = None
-    for target, load in targets:
-        kind = _classify(Path(target))
-        if kind is None:
+    """Refuse (:class:`CodexAuthorityRefused`) a restore that would write an ``auth.json`` anywhere but
+    one of the protected authority's own stores (another root, an independent root nested in this
+    one, an unmanaged path): the merge below protects THIS authority only."""
+    for target, _load in targets:
+        if restore_action(Path(target)) != "store":
             continue
-        target = _destination(Path(target))
-        if _managed_kind(target) is None:
-            # The state check, lock, barrier and fence below protect THIS authority only: a
-            # credential store or protocol file anywhere else — another root, an independent root
-            # nested in this one, an unmanaged path — would land there unprotected.
+        dest = _destination(Path(target))
+        if not _is_managed_store(dest):
             raise CodexAuthorityRefused(
-                f"The backup would write Hermes credentials outside this installation ({target}); "
+                f"The backup would write Hermes credentials outside this installation ({dest}); "
                 f"{action} isn't supported for them.")
-        if kind == "store":
-            refuse_if_registered_store(target, action)
-        if has_state is None:
-            has_state = authority_has_state()
-        if not has_state:
-            continue
-        if kind == "protocol":
-            raise CodexAuthorityRefused(
-                f"The backup contains Hermes's Codex login records ({target.name}); {action} would roll "
-                "your Codex login state back, which isn't supported yet. Restore without them, or sign "
-                "in to Codex again after restoring.")
-        if _has_codex_material(load):
-            raise CodexAuthorityRefused(
-                f"The backup's {target.name} holds Codex tokens that Hermes may already have used; "
-                f"{action} isn't supported for them yet. Sign in to Codex again instead.")
 
 
-def _brings_codex_material(targets: Iterable[Tuple[Path, Callable[[], bytes]]]) -> bool:
+def brings_codex_material(targets: Iterable[Tuple[Path, Callable[[], bytes]]]) -> bool:
+    """Whether the restore carries Codex material that it will NOT restore (for the user notice)."""
     for target, load in targets:
         kind = _classify(Path(target))
-        if kind == "protocol" or (kind == "store" and _has_codex_material(load)):
+        if kind in ("protocol", "codex-cli"):
             return True
+        if kind == "store":
+            try:
+                if codex_material(json.loads(load().decode("utf-8-sig"))):
+                    return True
+            except Exception:
+                return True
     return False
 
 
 @contextmanager
 def restore_guard(targets_fn: Callable[[], Iterable[Tuple[Path, Callable[[], bytes]]]],
                   action: str) -> Iterator[None]:
-    """Hold the migration lock across the check and the restore's writes (only when the restore
-    touches credential state; otherwise no lock is taken).
-
-    A restore that brings Codex credential material in (Codex tokens in an auth.json, or any
-    protocol file) writes the RESTORE BARRIER before the first byte is extracted and fences every
-    restored chain afterwards (:func:`fence_restored`). Until the fence is durable the barrier
-    stays, and every dispatcher, ownership op and refresh admission resolves it first — so a crash
-    at any step never leaves a restored credential refreshable."""
+    """The migration lock is held across the check and every write of a restore that touches
+    credential stores: no Codex sign-in, import or bootstrap can interleave with a store merge."""
     targets = list(targets_fn())
-    if not any(is_credential_state(t) for t, _ in targets):
+    if not any(restore_action(Path(t)) == "store" for t, _ in targets):
         yield
         return
     with migration_lock():
         check_restore(targets, action)
-        barrier = _brings_codex_material(targets)
-        if barrier:
-            write_restore_barrier(action, _restore_scope(targets))
-        try:
-            yield
-        finally:
-            if barrier:
-                fence_restored()
+        yield
 
 
-# ── the restore barrier (credential recovery protocol, restores are never trusted) ─────────────
+# ── The Codex-stripping store merge ────────────────────────────────────────────────────────────
 
-RESTORED_REASON = "restored-from-backup"
-
-
-def _restore_scope(targets: Iterable[Tuple[Path, Callable[[], bytes]]]) -> Dict[str, list]:
-    """Every destination store / protocol path the restore will write, resolved."""
-    scope: Dict[str, list] = {"stores": [], "protocol": []}
-    for target, _load in targets:
-        kind = _classify(Path(target))
-        if kind is not None:
-            scope["stores" if kind == "store" else "protocol"].append(str(_destination(Path(target))))
-    return scope
+_CODEX_SECTIONS = ("providers", "credential_pool", "suppressed_sources")
 
 
-def write_restore_barrier(action: str, scope: Optional[Dict[str, list]] = None) -> None:
-    """Committed BEFORE the first byte is extracted: the action and the COMPLETE scope (every
-    destination store / protocol path, resolved), so recovery fences exactly what the restore could
-    have written, whichever home the recovering process runs from."""
-    from hermes_cli.auth_codex_registry import utc_now
-    from hermes_cli.auth_credential_io import encode_json, require_committed, write_credential_file
-    scope = scope or {"stores": [], "protocol": []}
-    require_committed(write_credential_file(restore_barrier_path(), encode_json(
-        {"version": 2, "action": action, "at": utc_now(), "stores": sorted(set(scope.get("stores", []))),
-         "protocol": sorted(set(scope.get("protocol", [])))})), "the Codex restore barrier")
+def codex_material(store: Any) -> Dict[str, Any]:
+    """The Codex material of a parsed store: ``{section: value}`` for every section holding it."""
+    out: Dict[str, Any] = {}
+    if not isinstance(store, dict):
+        return out
+    for section in _CODEX_SECTIONS:
+        block = store.get(section)
+        if isinstance(block, dict) and PROVIDER in block:
+            out[section] = block[PROVIDER]
+    if store.get("active_provider") == PROVIDER:
+        out["active_provider"] = PROVIDER
+    return out
 
 
-def _barrier_stores() -> List[Path]:
-    """The destination stores the pending restore recorded. A barrier that cannot be read proves
-    nothing about its scope: raise (the barrier stays; admission stays refused)."""
-    from hermes_cli.auth_credential_io import read_bytes_retrying
+def merge_without_codex(restored: Dict[str, Any], current: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """*restored* with all Codex material removed, plus *current*'s Codex material exactly as it is.
+    A restored ``active_provider`` naming Codex yields to the destination's current one."""
+    merged = json.loads(json.dumps(restored))
+    for section in _CODEX_SECTIONS:
+        block = merged.get(section)
+        if isinstance(block, dict):
+            block.pop(PROVIDER, None)
+    current = current if isinstance(current, dict) else {}
+    for section, value in codex_material(current).items():
+        if section == "active_provider":
+            continue
+        merged.setdefault(section, {})
+        if not isinstance(merged[section], dict):
+            merged[section] = {}
+        merged[section][PROVIDER] = json.loads(json.dumps(value))
+    if merged.get("active_provider") == PROVIDER:
+        if current.get("active_provider") is not None:
+            merged["active_provider"] = current["active_provider"]
+        else:
+            merged.pop("active_provider", None)
+    return merged
+
+
+def strip_codex_bytes(data: bytes) -> Optional[bytes]:
+    """A restored auth.json's bytes with its Codex material removed (no destination material to
+    keep: a new store). None when the bytes do not parse (never written: they cannot be checked)."""
+    from hermes_cli.auth_credential_io import encode_json
     try:
-        data = json.loads(read_bytes_retrying(restore_barrier_path()).decode("utf-8"))
-        return [Path(p) for p in data.get("stores", [])]
-    except FileNotFoundError:
-        return []
-    except (OSError, ValueError, AttributeError) as exc:
-        raise RuntimeError(f"the Codex restore barrier {restore_barrier_path()} is unreadable ({exc}); "
-                           "restored logins stay paused until it can be read") from exc
+        restored = json.loads(data.decode("utf-8-sig"))
+    except Exception:
+        return None
+    if not isinstance(restored, dict):
+        return None
+    return encode_json(merge_without_codex(restored, None))
 
 
-def restore_barrier_pending() -> bool:
-    return restore_barrier_path().exists()
-
-
-def fence_restored() -> None:
-    """Make every Codex chain the restore could have brought in durably FENCED
-    (``restored-from-backup``), then clear the barrier. Idempotent; the caller holds the migration
-    lock and no store lock. Nothing a backup holds proves its refresh tokens are still unspent, so
-    no restored chain is ever refreshed: the exit is a fresh sign-in (``--retry-refresh`` refuses
-    this fence). Ownership ops restored with the registry are never rolled forward: their entries
-    are dropped and their payloads archived as ``restored`` (their chains are fenced here)."""
-    import json as _json
-
-    from hermes_cli.auth_codex_authority import _bootstrap, _codex_material_present
-    from hermes_cli.auth_codex_evidence import retain_orphan_records
-    from hermes_cli.auth_codex_ops import _archive_payload, run_op
-    from hermes_cli.auth_codex_plans import load_snapshots, plan_registration
-    from hermes_cli.auth_codex_registry import (
-        STATE_RETIRED, preserve_unreadable_registry, read_registry, store_locks, write_registry)
-    from hermes_cli.auth_credential_io import unlink_retrying
-
-    from hermes_cli.auth_credential_io import store_key
-    # Exactly the stores the restore recorded (whatever home THIS process runs from) plus its own
-    # view; the barrier is cleared only after every one of them is fenced. Each step below is
-    # idempotent and the registry records the progress, so a crash here just repeats it.
-    paths = all_store_paths()
-    known = {store_key(p) for p in paths}
-    for store in _barrier_stores():
-        if store_key(store) not in known and store.exists():
-            known.add(store_key(store))
-            paths.append(store)
-    view = read_registry()
-    if view.status == "unreadable":
-        preserve_unreadable_registry()
-        retain_orphan_records(paths)
-        _bootstrap(fence_all=RESTORED_REASON, paths=paths)
-    elif view.status == "absent":
-        if _codex_material_present(paths):
-            _bootstrap(fence_all=RESTORED_REASON, paths=paths)
-    else:
-        data = _json.loads(_json.dumps(view.data))
-        for entry in data["chains"].values():
-            if entry.get("state") != STATE_RETIRED and (entry.get("fence") or {}).get("reason") != RESTORED_REASON:
-                entry.update(state="fenced", fence={"reason": RESTORED_REASON, "epoch": entry["epoch"]})
-        data["ops"] = {}
-        if data != view.data:
-            write_registry(data)
-        if ops_dir().is_dir():
-            for payload in sorted(ops_dir().glob("*.json")):
-                _archive_payload(payload, "restored")
-        with store_locks(paths):
-            view = read_registry()
-            payload = plan_registration(view, load_snapshots(paths), only_unregistered=True,
-                                        fence_all=RESTORED_REASON, kind="restore")
-            if payload.chains:
-                run_op(payload, view)
+def write_restored_store(dest: Path, data: bytes) -> Optional[str]:
+    """Write a restored auth.json at *dest*: ONE read-merge-write under that store's lock (the caller
+    holds the migration lock, :func:`restore_guard`) with the strict writer — the restored content
+    without Codex material plus the destination's current Codex material, so the destination never
+    lacks its Codex section. Returns None when written, else why it was not (the destination keeps
+    its current file)."""
+    from hermes_cli.auth import _auth_store_lock
+    from hermes_cli.auth_credential_io import (
+        encode_json, read_witnessed_bytes, require_committed, write_credential_file)
     try:
-        unlink_retrying(restore_barrier_path())
-    except FileNotFoundError:
-        pass
+        restored = json.loads(data.decode("utf-8-sig"))
+    except Exception:
+        return "the backup's copy is not valid JSON, so its Codex material cannot be removed"
+    if not isinstance(restored, dict):
+        return "the backup's copy is not a Hermes credential store"
+    Path(dest).parent.mkdir(parents=True, exist_ok=True)
+    with _auth_store_lock(target_path=Path(dest)):
+        raw, _sha = read_witnessed_bytes(dest)
+        current = None
+        if raw is not None:
+            try:
+                current = json.loads(raw.decode("utf-8-sig"))
+            except Exception:
+                return "this machine's copy does not parse, so its Codex login could not be kept"
+        require_committed(write_credential_file(dest, encode_json(merge_without_codex(restored, current))),
+                          f"restored credential store {dest}")
+    return None

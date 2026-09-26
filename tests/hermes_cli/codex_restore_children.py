@@ -21,8 +21,7 @@ import os, sys, time
 from pathlib import Path
 from types import SimpleNamespace
 archive, log, point, mode, ready, gate = sys.argv[1:7]
-from hermes_cli import backup, auth_codex_ops, auth_codex_registry, auth_codex_restore
-import hermes_cli.auth_credential_io as io
+from hermes_cli import backup
 backup._revive_gateway_after_import = lambda root: None
 backup._restore_profile_wrappers = lambda root: []
 
@@ -41,14 +40,16 @@ def extract(zf, member, target, *a, **k):
     if point == "after-auth-json" and member == "auth.json":
         stop()
 backup._extract_member_atomically = extract
-if point == "before-fence":
-    auth_codex_restore.fence_restored = lambda: stop()
-if point == "mid-fence":
-    for module in (auth_codex_registry, auth_codex_ops):
-        module.write_registry = lambda data: stop()
-if point == "before-barrier-clear":
-    real_unlink = io.unlink_retrying
-    io.unlink_retrying = lambda p: stop() if str(p).endswith("auth.restore-barrier.json") else real_unlink(p)
+if point == "after-auth-json":  # an auth.json is written by the Codex-stripping store merge
+    from hermes_cli import auth_codex_restore
+    real_store = auth_codex_restore.write_restored_store
+    def store(target, data):
+        why = real_store(target, data)
+        with open(log, "a", encoding="utf-8") as f:
+            f.write(str(target) + "\n")
+        stop()
+        return why
+    auth_codex_restore.write_restored_store = store
 backup.run_import(SimpleNamespace(zipfile=archive, force=True))
 print("RESTORED")
 '''
@@ -185,26 +186,3 @@ def runtime_startup(tmp: Path, userhome: Path, hermes_home: Path) -> dict:
         raise AssertionError(f"runtime startup failed: {err[-2000:]}") from exc
     result["presented"] = presented.read_text(encoding="utf-8").split() if presented.exists() else []
     return result
-
-
-# A quick-snapshot restore into an explicit home that DIES (os._exit) right after its files were
-# written, before the fence ran.
-SNAPSHOT_DIER = r'''
-import os, sys
-from pathlib import Path
-snapshot_id, home = sys.argv[1:3]
-from hermes_cli import backup
-real = backup._restore_quick_snapshot_files
-def extract_then_die(*a, **k):
-    real(*a, **k)
-    os._exit(137)
-backup._restore_quick_snapshot_files = extract_then_die
-backup.restore_quick_snapshot(snapshot_id, hermes_home=Path(home))
-print("SURVIVED")
-'''
-
-
-def run_in(code: str, args, userhome: Path, hermes_home: Path, timeout: float = 180):
-    proc = spawn_in(code, args, userhome, hermes_home)
-    out, err = proc.communicate(timeout=timeout)
-    return proc.returncode, out, err
