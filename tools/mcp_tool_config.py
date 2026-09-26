@@ -45,7 +45,10 @@ def _get_mcp_stderr_log() -> Any:
 
 
 def _close_mcp_stderr_logs(*, scope: Optional[str] = None) -> None:
-    """Release cached parent handles after the selected MCP transports have stopped."""
+    """Release cached parent handles after the selected MCP transports have stopped, and close the
+    stdio stderr sinks (waiting for an in-flight append) so the profile directory is free."""
+    from tools.mcp_tool_stderr import close_sinks
+    close_sinks(scope)
     with _mcp_stderr_log_lock:
         keys = list(_mcp_stderr_log_fh) if scope is None else [scope]
         for key in keys:

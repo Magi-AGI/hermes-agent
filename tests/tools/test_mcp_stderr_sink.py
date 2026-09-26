@@ -51,3 +51,60 @@ def test_the_log_rotates_by_size_while_a_server_is_running(tmp_path, monkeypatch
     assert (logs / "mcp-stderr.log.1").exists()
     assert (logs / "mcp-stderr.log").stat().st_size <= 4096 + 2048
     assert not (logs / f"mcp-stderr.log.{mcp_tool_stderr._BACKUPS + 1}").exists()
+
+
+_MEGABYTE = """
+import sys
+sys.stderr.write("x" * (1024 * 1024))
+sys.stderr.flush()
+"""
+
+
+def test_a_stalled_log_write_never_backs_the_pipe_up_into_the_server(tmp_path):
+    """The drain only reads; disk I/O happens elsewhere. Holding the log (another sink's append, a
+    slow filesystem) used to stop the reads, fill the pipe and block the server's stderr write."""
+    sink = mcp_tool_stderr.open_stderr_sink("stalled", home=tmp_path)
+    script = tmp_path / "megabyte.py"
+    script.write_text(textwrap.dedent(_MEGABYTE), encoding="utf-8")
+    with mcp_tool_stderr._append_lock:
+        proc = subprocess.Popen([sys.executable, str(script)], stderr=sink.writer, stdin=subprocess.DEVNULL)
+        sink.release_writer()
+        try:
+            proc.wait(timeout=20)
+        finally:
+            proc.kill()
+    sink.thread.join(timeout=30)
+    sink.close()
+
+
+def test_profile_shutdown_waits_for_an_in_flight_append_before_the_directory_moves(tmp_path, monkeypatch):
+    """Profile rename runs shutdown and renames at once; a sink still inside its final append held
+    the log open and the rename failed on Windows."""
+    import os
+    import threading
+
+    from hermes_constants import hermes_home_key
+    from tools.mcp_tool_lifecycle import shutdown_mcp_servers
+
+    home = tmp_path / "profiles" / "moving"
+    (home / "logs").mkdir(parents=True)
+    in_append, release = threading.Event(), threading.Event()
+    real_append = mcp_tool_stderr.append_to_log
+
+    def slow_append(path, text):
+        if "last words" not in text:
+            return real_append(path, text)
+        with open(path, "a", encoding="utf-8") as fh:  # the handle a rename trips over
+            in_append.set()
+            release.wait(10)
+            fh.write(text)
+
+    monkeypatch.setattr(mcp_tool_stderr, "append_to_log", slow_append)
+    sink = mcp_tool_stderr.open_stderr_sink("closing", home=home)
+    sink.writer.write("last words\n")
+    sink.release_writer()
+    assert in_append.wait(10)
+    threading.Timer(0.5, release.set).start()
+    shutdown_mcp_servers(scope=hermes_home_key(home))
+    os.rename(home, tmp_path / "profiles" / "moved")  # raised PermissionError while the append was open
+    assert "last words" in (tmp_path / "profiles" / "moved" / "logs" / "mcp-stderr.log").read_text(encoding="utf-8")
