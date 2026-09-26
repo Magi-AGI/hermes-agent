@@ -13,6 +13,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import yaml
 from websockets.sync.client import connect
 
+from sealed_home import seal_user_dirs
+
 p = argparse.ArgumentParser()
 p.add_argument('--output', required=True)
 p.add_argument('--port', type=int, default=18000)
@@ -74,7 +76,8 @@ for label in ['default', 'alpha', 'beta', 'unapproved']:
     (h / 'config.yaml').write_text(yaml.safe_dump(cfg))
     (h / '.env').write_text('OPENAI_API_KEY=fixture-key\nOPENAI_BASE_URL=http://127.0.0.1:' + str(a.port+1) + '/v1\n')
 env = {k: v for k, v in os.environ.items() if not (k.startswith('HERMES_') or k.endswith(('_API_KEY', '_TOKEN')))}
-env.update(HOME=str(out / 'os-home'), HERMES_HOME=str(home), HERMES_DASHBOARD_SESSION_TOKEN='hooks-fixture-token', HERMES_IGNORE_RULES='1', PYTHONPATH=str(a.repo))
+seal_user_dirs(env, out / 'os-home')
+env.update(HERMES_HOME=str(home), HERMES_DASHBOARD_SESSION_TOKEN='hooks-fixture-token', HERMES_IGNORE_RULES='1', PYTHONPATH=str(a.repo))
 cmd = [sys.executable, '-m', 'hermes_cli.main', 'serve', '--host', '127.0.0.1', '--port', str(a.port), '--skip-build']
 log = (out / 'serve.log').open('w')
 proc = subprocess.Popen(cmd, cwd=a.repo, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
