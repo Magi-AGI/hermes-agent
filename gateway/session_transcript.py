@@ -36,6 +36,18 @@ def _spool_dropped(session_id: str, message: Dict[str, Any]):
         return None
 
 
+def _message_platform_id(message: Dict[str, Any]) -> Optional[str]:
+    return message.get("platform_message_id") or message.get("message_id") or None
+
+
+def _timestamp_key(value: Any):
+    """A message timestamp as the store keeps it (epoch float); a missing or unreadable one is its own
+    identity, never equal to another message's."""
+    from hermes_cli.timefmt import coerce_epoch
+    epoch = coerce_epoch(value, field="message timestamp") if value is not None else None
+    return object() if epoch is None else (0.0 if epoch == 0.0 else float(epoch))
+
+
 # Message keys persisted only for assistant rows (None otherwise).
 _ASSISTANT_ONLY_KEYS = (
     "reasoning", "reasoning_content", "reasoning_details", "codex_reasoning_items",
@@ -354,7 +366,8 @@ class SessionTranscriptMixin:
             with self._transcript_retry_lock:
                 known_failing = bool(self._transcript_append_failures.get(session_id))
             _replayed, remaining = drain_transcript_spool(
-                session_id, lambda message: self._append_transcript_message(session_id, message),
+                session_id, lambda message: self._append_transcript_message(
+                    session_id, self._apply_pending_recalls(session_id, message)),
                 db_known_failing=known_failing,
             )
             if not remaining:
@@ -519,48 +532,97 @@ class SessionTranscriptMixin:
 
     def redact_user_message(self, session_id: str, *, platform_message_id: Optional[str] = None,
                             content: Any = None, replacement: str) -> int:
-        """Overwrite one withdrawn user message wherever this conversation stores it: the durable rows
-        of its compression lineage (``SessionDB.redact_user_message``), a copy queued here for a retried
-        write, and a copy spooled to disk for replay; either would write it back later. One identity
-        rule for all three: the platform message id, else the exact text on id-less messages only.
-        Raises the SessionDB fence errors while a live turn or a compression holds the conversation
-        (and ``RecallTargetAmbiguousError``); the caller retries. Returns messages overwritten."""
-        from hermes_state_errors import CompressionSessionClosedError
+        """Overwrite one withdrawn user message wherever this conversation stores it: durable rows of its
+        compression lineage, a copy queued here for a retried write, and a copy spooled to disk for
+        replay (either would write it back later).
+
+        The identity is resolved over all three before anything changes: the platform message id if
+        any copy carries it; otherwise the exact text on id-less messages, and only if every such copy
+        is one logical message (one timestamp; protected-tail clones share it), else
+        ``RecallTargetAmbiguousError`` and nothing is touched. Raises the SessionDB fence errors while a
+        live turn or a compression holds the conversation, and ``TranscriptSpoolIncompleteError`` when a
+        spool file cannot be read; the caller retries. Until an id recall completes, spool replay
+        overwrites a matching message itself. Returns messages overwritten."""
+        from gateway.shutdown_flush import rewrite_spooled_message, spooled_transcript_messages
+        from hermes_state_errors import CompressionSessionClosedError, RecallTargetAmbiguousError
         db = self._db_for_session_id(session_id)
         if not db:
             return 0
+        pending = self._lazy("_pending_recalls", dict)
+        changed = 0
+        sessions = {session_id}
         with self._get_transcript_drain_lock():
             for attempt in range(self._REDACT_ROTATION_ATTEMPTS):
                 tip = db.get_compression_tip(self._follow_reroutes(session_id)) or session_id
                 lineage = list(reversed(db.get_compression_lineage(tip))) or [tip]
+                sessions = {session_id, *lineage}
+                if platform_message_id:
+                    for sid in sessions:
+                        pending.setdefault(sid, {})[platform_message_id] = replacement
+                durable = db.recall_candidates(lineage, platform_message_id=platform_message_id, content=content)
+                with self._transcript_retry_lock:
+                    queued = [m for sid in sessions for m in self._dirty_transcripts.get(sid, [])
+                              if m.get("role") == "user"]
+                spooled = [(path, payload, m) for path, payload, m in spooled_transcript_messages(sessions)
+                           if m.get("role") == "user"]
+                retry_copies = queued + [m for _path, _payload, m in spooled]
+                by_id = bool(platform_message_id) and (
+                    any(pid == platform_message_id for pid, _ts in durable)
+                    or any(_message_platform_id(m) == platform_message_id for m in retry_copies))
+                timestamp, text_targets = None, set()
+                if not by_id:
+                    if not content:
+                        break
+                    # Keys computed once: a copy without a timestamp is its own identity (a fresh sentinel).
+                    keyed = [(m, _timestamp_key(m.get("timestamp"))) for m in retry_copies
+                             if not _message_platform_id(m) and m.get("content") == content]
+                    stamps = {_timestamp_key(ts) for pid, ts in durable if not pid} | {k for _m, k in keyed}
+                    if not stamps:
+                        break
+                    if len(stamps) > 1:
+                        raise RecallTargetAmbiguousError(
+                            f"the recalled text matches {len(stamps)} different messages")
+                    (timestamp,) = stamps
+                    text_targets = {id(m) for m, k in keyed if k == timestamp}
+
+                def matches(message: Dict[str, Any]) -> bool:
+                    if by_id:
+                        return _message_platform_id(message) == platform_message_id
+                    return id(message) in text_targets
+
                 try:
-                    changed, matched_by = db.redact_user_message(
-                        lineage, platform_message_id=platform_message_id, content=content, replacement=replacement)
-                    break
+                    changed = db.redact_user_message(
+                        lineage, platform_message_id=platform_message_id if by_id else None,
+                        content=None if by_id else content,
+                        timestamp=timestamp if isinstance(timestamp, float) else None,
+                        replacement=replacement)
                 except CompressionSessionClosedError:
                     if attempt + 1 == self._REDACT_ROTATION_ATTEMPTS:
                         raise
-            by_content = bool(content) and matched_by != "id"
-
-            def matches(message: Dict[str, Any]) -> bool:
-                if message.get("role") != "user":
-                    return False
-                message_id = message.get("platform_message_id") or message.get("message_id")
-                if message_id:
-                    return bool(platform_message_id) and message_id == platform_message_id
-                return by_content and message.get("content") == content
-
-            sessions = {session_id, *lineage}
-            with self._transcript_retry_lock:
-                for sid in sessions:
-                    for queued in self._dirty_transcripts.get(sid, []):
-                        if matches(queued):
-                            queued["content"] = replacement
-                            queued.pop("api_content", None)
+                    continue
+                with self._transcript_retry_lock:
+                    for message in queued:
+                        if matches(message):
+                            message["content"] = replacement
+                            message.pop("api_content", None)
                             changed += 1
-            from gateway.shutdown_flush import redact_spooled_transcript_messages
-            changed += redact_spooled_transcript_messages(sessions, matches, replacement)
+                for path, payload, message in spooled:
+                    if matches(message):
+                        rewrite_spooled_message(path, payload, message, replacement)
+                        changed += 1
+                break
+            if platform_message_id:
+                for sid in sessions:
+                    pending.get(sid, {}).pop(platform_message_id, None)
             return changed
+
+    def _apply_pending_recalls(self, session_id: str, message: Dict[str, Any]) -> Dict[str, Any]:
+        """Replay guard: a message whose id is being recalled right now is written as its redaction."""
+        replacement = (getattr(self, "_pending_recalls", None) or {}).get(session_id, {}).get(
+            _message_platform_id(message) or "")
+        if replacement is None or message.get("role") != "user":
+            return message
+        return {**{k: v for k, v in message.items() if k != "api_content"}, "content": replacement}
 
     def has_input_owner(self, session_id: str, owner: str) -> bool:
         """Find this accepted input on the canonical live continuation and its ancestors.

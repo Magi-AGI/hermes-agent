@@ -132,33 +132,46 @@ def spool_dropped_transcript_message(session_id: str, message: Dict[str, Any]) -
         return None
 
 
-def redact_spooled_transcript_messages(session_ids, matches, replacement: str) -> int:
-    """Overwrite, in place, the content of spooled transcript messages of *session_ids* for which
-    ``matches(message)`` is true: a withdrawn message waiting in the spool would otherwise be written
-    back by the next replay after its durable copy was redacted. Returns messages rewritten."""
+class TranscriptSpoolIncompleteError(OSError):
+    """Some spooled transcript files could not be read, so a search of the spool is incomplete."""
+
+
+def spooled_transcript_messages(session_ids) -> list:
+    """``(path, payload, message)`` for every spooled transcript message of *session_ids*. Raises
+    ``TranscriptSpoolIncompleteError`` when the directory or any file cannot be read (a sharing lock,
+    a transient I/O error): a recall must not report success over a copy it could not inspect.
+    Unparseable files are skipped, as replay skips them."""
     try:
         candidates = list(_get_flush_dir().glob("pending-*.json"))
-    except Exception as exc:
-        logger.debug("Cannot scan transcript spool: %s", exc)
-        return 0
-    wanted, rewritten = set(session_ids), 0
+    except OSError as exc:
+        raise TranscriptSpoolIncompleteError(f"cannot scan the transcript spool: {exc}") from exc
+    wanted, found = set(session_ids), []
     for path in candidates:
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            continue  # replayed meanwhile
+        except OSError as exc:
+            raise TranscriptSpoolIncompleteError(f"cannot read {path.name}: {exc}") from exc
+        try:
+            payload = json.loads(raw)
+        except ValueError:
             continue
         if (not isinstance(payload, dict) or payload.get("reason") != TRANSCRIPT_CAP_DROP_REASON
                 or payload.get("session_key") not in wanted):
             continue
         message = (payload.get("data") or {}).get("message")
-        if not isinstance(message, dict) or not matches(message):
-            continue
-        message["content"] = replacement
-        message.pop("api_content", None)
-        from utils import atomic_json_write
-        atomic_json_write(path, payload, mode=0o600, default=str)
-        rewritten += 1
-    return rewritten
+        if isinstance(message, dict):
+            found.append((path, payload, message))
+    return found
+
+
+def rewrite_spooled_message(path, payload, message, replacement: str) -> None:
+    """Overwrite one spooled message's content in place (atomic replace of its file)."""
+    from utils import atomic_json_write
+    message["content"] = replacement
+    message.pop("api_content", None)
+    atomic_json_write(path, payload, mode=0o600, default=str)
 
 
 def drain_transcript_spool(session_id: str, replay, *, db_known_failing: bool = False) -> tuple[int, int]:

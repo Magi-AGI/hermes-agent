@@ -808,26 +808,49 @@ class SessionMessagesMixin:
             "UPDATE messages SET content = ? WHERE id = ? AND session_id = ? AND role = 'user' AND active = 1",
             (self._encode_content(content), row_id, session_id))
 
-    def redact_user_message(self, session_ids: Sequence[str], *, platform_message_id: Optional[str] = None,
-                            content: Any = None, replacement: str) -> Tuple[int, Optional[str]]:
-        """Overwrite ONE withdrawn user message in place, in every row that holds it: live and
-        compaction-archived copies across *session_ids* (a compression lineage, tip first). The
-        sidecar ``api_content`` goes too; FTS follows through its update triggers; every other row is
-        left alone, so concurrent messages survive.
+    def recall_candidates(self, session_ids: Sequence[str], *, platform_message_id: Optional[str] = None,
+                          content: Any = None) -> List[Tuple[Optional[str], float]]:
+        """``(platform id, timestamp)`` of the user rows across *session_ids* that could be a withdrawn
+        message: those carrying *platform_message_id*, and id-less rows with exactly *content*. Read-only;
+        the caller resolves one identity (see ``SessionStore.redact_user_message``)."""
+        ids = [sid for sid in dict.fromkeys(session_ids) if sid]
+        if not ids or not (platform_message_id or content):
+            return []
+        marks = ",".join("?" * len(ids))
+        clauses, params = [], list(ids)
+        if platform_message_id:
+            clauses.append("platform_message_id = ?")
+            params.append(platform_message_id)
+        if content:
+            variants = self._recall_content_variants(content)
+            clauses.append("((platform_message_id IS NULL OR platform_message_id = '') "
+                           f"AND content IN ({','.join('?' * len(variants))}))")
+            params.extend(variants)
+        with self._read_ctx() as conn:
+            return [(row[0] or None, row[1]) for row in conn.execute(
+                f"SELECT platform_message_id, timestamp FROM messages WHERE session_id IN ({marks}) "
+                f"AND role = 'user' AND ({' OR '.join(clauses)})", params)]
 
-        Identity: the platform message id. Only when no row carries it is the exact *content* used,
-        and then only on rows with NO platform id (a different id is a different message) that are
-        one logical message: its protected-tail clones share its timestamp. Several distinct
-        timestamps raise ``RecallTargetAmbiguousError`` and rewrite nothing.
+    def _recall_content_variants(self, content: Any) -> list:
+        # Stored bytes may carry whitespace the loaded view strips: match either form.
+        return sorted({self._encode_content(content),
+                       self._encode_content(self._loaded_view_content("user", content))}, key=str)
+
+    def redact_user_message(self, session_ids: Sequence[str], *, platform_message_id: Optional[str] = None,
+                            content: Any = None, timestamp: Optional[float] = None, replacement: str) -> int:
+        """Overwrite ONE resolved withdrawn user message in place, in every row that holds it: live and
+        compaction-archived copies across *session_ids* (a compression lineage, tip first). The identity
+        is either *platform_message_id*, or the id-less *content* at *timestamp* (protected-tail clones
+        share it); the caller resolves it first (``SessionStore.redact_user_message``). The sidecar
+        ``api_content`` goes too; FTS follows through its update triggers; every other row is untouched.
 
         Fenced like a user rewrite, in the same transaction: refused (``SessionTurnLeaseLostError`` /
         ``SessionCompressionInProgressError`` / ``CompressionSessionClosedError`` for a tip that just
         rotated) so the caller retries; a stale lease is reclaimed, which fences that holder's late
-        flush. Returns ``(rows overwritten, "id" | "content" | None)``."""
-        from hermes_state_errors import RecallTargetAmbiguousError
+        flush. Returns rows overwritten."""
         ids = [sid for sid in dict.fromkeys(session_ids) if sid]
-        if not ids or not (platform_message_id or content):
-            return 0, None
+        if not ids or not (platform_message_id or (content and timestamp is not None)):
+            return 0
         marks = ",".join("?" * len(ids))
         redacted = self._encode_content(replacement)
 
@@ -835,26 +858,15 @@ class SessionMessagesMixin:
             self._check_transcript_write_guards(
                 conn, ids[0], None, reject_active_turn_lease=True, reject_active_compression_lock=True)
             if platform_message_id:
-                changed = conn.execute(
+                return conn.execute(
                     f"UPDATE messages SET content = ?, api_content = NULL WHERE session_id IN ({marks}) "
                     "AND role = 'user' AND platform_message_id = ?", (redacted, *ids, platform_message_id)).rowcount
-                if changed:
-                    return changed, "id"
-            if not content:
-                return 0, None
-            # Stored bytes may carry whitespace the loaded view strips: match either form.
-            variants = sorted({self._encode_content(content),
-                               self._encode_content(self._loaded_view_content("user", content))}, key=str)
-            rows = conn.execute(
-                f"SELECT id, timestamp FROM messages WHERE session_id IN ({marks}) AND role = 'user' "
-                "AND (platform_message_id IS NULL OR platform_message_id = '') "
-                f"AND content IN ({','.join('?' * len(variants))})", (*ids, *variants)).fetchall()
-            if len({row[1] for row in rows}) > 1:
-                raise RecallTargetAmbiguousError(
-                    f"{len(rows)} rows in {len({row[1] for row in rows})} messages carry the recalled text")
-            for row in rows:
-                conn.execute("UPDATE messages SET content = ?, api_content = NULL WHERE id = ?", (redacted, row[0]))
-            return len(rows), ("content" if rows else None)
+            variants = self._recall_content_variants(content)
+            return conn.execute(
+                f"UPDATE messages SET content = ?, api_content = NULL WHERE session_id IN ({marks}) "
+                "AND role = 'user' AND (platform_message_id IS NULL OR platform_message_id = '') "
+                f"AND timestamp = ? AND content IN ({','.join('?' * len(variants))})",
+                (redacted, *ids, timestamp, *variants)).rowcount
         return self._execute_write(_do)
 
     def _display_dedupe_key(self, row) -> Tuple[Any, ...]:

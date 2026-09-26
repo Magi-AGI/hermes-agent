@@ -173,3 +173,73 @@ def test_a_spooled_copy_is_not_replayed_after_the_recall(store):
     _recall(adapter, tasks, "p1", SECRET)
     store.append_to_transcript(sid, {"role": "assistant", "content": "next"})  # drains the spool first
     assert not [r for r in _rows(db, sid) if SECRET in (r[1] or "")]
+
+
+def test_identity_is_resolved_across_the_retry_queue_and_spool_before_anything_changes(store):
+    """Round 2 (Codex): the retry copies bypassed the one-message rule. Three id-less 'repeat'
+    messages at different times (two queued, one spooled) are ambiguous: none is rewritten. An exact
+    id that only a queued copy carries wins over an unrelated equal-text row in SQLite."""
+    from gateway.shutdown_flush import spool_dropped_transcript_message, spooled_transcript_messages
+
+    tasks: list = []
+    adapter = _adapter(store, tasks)
+    sid = _session(store, adapter)
+    db = store._db
+    with store._transcript_retry_lock:
+        store._dirty_transcripts[sid] = [
+            {"role": "user", "content": "repeat", "timestamp": 1_700_000_000.0},
+            {"role": "user", "content": "repeat", "timestamp": 1_700_000_100.0}]
+    assert spool_dropped_transcript_message(sid, {"role": "user", "content": "repeat", "timestamp": 1_700_000_200.0})
+    _recall(adapter, tasks, "missing", "repeat")
+    everywhere = ([r[1] for r in _rows(db, sid) if r[0] == "user"]  # the note's append flushes the queue
+                  + [m["content"] for m in store._dirty_transcripts.get(sid, [])]
+                  + [m["content"] for _p, _pl, m in spooled_transcript_messages({sid})])
+    assert everywhere.count("repeat") == 3 and RecallGuardMiddleware._REDACTED not in everywhere
+    assert any(r[0] == "system" and "missing" in r[1] for r in _rows(db, sid))
+
+    tasks.clear()
+    db.append_message(session_id=sid, role="user", content="same words")  # an unrelated, older message
+    with store._transcript_retry_lock:
+        store._dirty_transcripts[sid] = [{"role": "user", "content": "same words", "message_id": "p9"}]
+    _recall(adapter, tasks, "p9", "same words")
+    assert store._dirty_transcripts[sid][0]["content"] == RecallGuardMiddleware._REDACTED
+    assert ("user", "same words", 1) in _rows(db, sid)
+
+
+@pytest.mark.windows_only
+def test_an_unreadable_spool_file_keeps_the_recall_pending_and_replay_cannot_restore_it(store, monkeypatch):
+    """Round 2 (Codex): a spool file held with a non-sharing handle was skipped, the recall reported
+    success, and the next replay wrote the original text back."""
+    import ctypes
+    from ctypes import wintypes
+
+    from gateway.shutdown_flush import spool_dropped_transcript_message
+
+    monkeypatch.setattr(RecallGuardMiddleware, "_REDACT_RETRY_INTERVAL_S", 0.05)
+    tasks: list = []
+    adapter = _adapter(store, tasks)
+    sid = _session(store, adapter)
+    db = store._db
+    db.append_message(session_id=sid, role="user", content=SECRET, platform_message_id="p1")
+    path = spool_dropped_transcript_message(sid, {"role": "user", "content": SECRET, "message_id": "p1"})
+    store._spooled_drop_sessions = {sid}
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    handle = kernel32.CreateFileW(str(path), 0x80000000, 0, None, 3, 0x80, None)  # GENERIC_READ, no sharing
+    assert handle not in (None, wintypes.HANDLE(-1).value)
+
+    async def recall():
+        RecallGuardMiddleware._patch_transcript(adapter, "p1", "", "u1", SECRET)
+        await asyncio.sleep(0.5)
+        pending = not all(t.done() for t in tasks)
+        kernel32.CloseHandle(handle)
+        store.append_to_transcript(sid, {"role": "assistant", "content": "next"})  # replays the spool
+        await asyncio.wait_for(asyncio.gather(*tasks), 30)
+        return pending
+
+    try:
+        still_pending = asyncio.run(recall())
+    finally:
+        kernel32.CloseHandle(handle)
+    assert still_pending, "reported success over a spool file it could not read"
+    assert not [r for r in _rows(db, sid) if SECRET in (r[1] or "")]

@@ -537,6 +537,7 @@ class RecallGuardMiddleware(InboundMiddleware):
         that long for a row the interrupted turn has not written yet; ``note_if_missing`` appends the
         do-not-reference note when nothing was stored (branch B)."""
         from hermes_state import SessionCompressionInProgressError
+        from gateway.shutdown_flush import TranscriptSpoolIncompleteError
         from hermes_state_errors import (
             CompressionSessionClosedError, RecallTargetAmbiguousError, SessionTurnLeaseLostError)
 
@@ -555,8 +556,11 @@ class RecallGuardMiddleware(InboundMiddleware):
                     changed = await asyncio.to_thread(
                         store.redact_user_message, sid, platform_message_id=recalled_id or None,
                         content=content or None, replacement=cls._REDACTED)
-                except (SessionTurnLeaseLostError, SessionCompressionInProgressError, CompressionSessionClosedError):
-                    changed = None  # a live turn or compression owns (or just rotated) the conversation
+                except (SessionTurnLeaseLostError, SessionCompressionInProgressError, CompressionSessionClosedError,
+                        TranscriptSpoolIncompleteError):
+                    # A live turn or compression owns (or just rotated) the conversation, or a spooled copy
+                    # could not be inspected yet: success must mean every copy was covered, so try again.
+                    changed = None
                 except RecallTargetAmbiguousError as exc:
                     # Equal text is not identity: rewrite nothing, and tell the model not to use it.
                     logger.warning("[%s] Recall redact: msg_id=%s not redacted: %s", adapter.name, recalled_id, exc)
