@@ -205,13 +205,18 @@ def test_powershell_under_the_sandbox_env_writes_nothing_into_its_cwd(tmp_path):
     (("pkg/__pycache__/stray.cpython-311.pyc",), False),  # the runner's own kind of output
     # A new ignored directory holding a cache AND a real write: judged per file, not as one entry.
     (("output/__pycache__/stray.cpython-311.pyc", "output/state.db"), True),
-], ids=["clean", "untracked", "ignored", "agent-tooling", "bytecode-cache", "ignored-dir-mixed"])
+    # A new nested repository: git lists it collapsed (new-checkout/) among the NON-ignored paths.
+    (("new-checkout/.git/", "new-checkout/payload.txt"), True),
+], ids=["clean", "untracked", "ignored", "agent-tooling", "bytecode-cache", "ignored-dir-mixed", "nested-repo"])
 def test_a_run_that_writes_into_the_checkout_fails_and_names_the_path(tmp_path, monkeypatch, capsys, strays, counts):
     """T5/A7: tests run with the checkout as CWD, so a relative or mangled path lands in the tree."""
     repo = tmp_path / "repo"
     (repo / "scripts").mkdir(parents=True)
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
-    body = (f"import os\nfor p in {list(strays)!r}:\n"
+    # "<dir>/.git/" makes <dir> a real repository (git init); every other entry is a file.
+    body = (f"import os, subprocess\nfor p in {list(strays)!r}:\n"
+            "    if p.endswith('/.git/'):\n"
+            "        subprocess.run(['git', 'init', '-q', p[:-len('/.git/')]], check=True)\n        continue\n"
             "    os.makedirs(os.path.dirname(p) or '.', exist_ok=True)\n    open(p, 'w').close()\n")
     (repo / "scripts" / "run_tests_parallel.py").write_text(body, encoding="utf-8")
     (repo / ".gitignore").write_text("scripts/\n*.db\n__pycache__/\noutput/\n", encoding="utf-8")

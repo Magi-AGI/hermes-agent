@@ -174,8 +174,13 @@ def _untracked(problems: list[str]) -> set[str] | None:
 def _checkout_writes(before: set[str], after: set[str], problems: list[str]) -> list[str]:
     written = []
     for path in sorted(after - before):
-        # A new collapsed directory is judged by what is in it (pkg/ holding only __pycache__/).
-        inside = _ls_others(problems, "--ignored", "--", path) if path.endswith("/") else {path}
+        inside = {path}
+        if path.endswith("/"):
+            # A new collapsed directory is judged by what is in it (pkg/ holding only __pycache__/).
+            # git also collapses an untracked nested repository; that one lists as itself, and a
+            # directory whose contents cannot be listed at all counts as written.
+            plain, ignored = _ls_others(problems, "--", path), _ls_others(problems, "--ignored", "--", path)
+            inside = None if plain is None or ignored is None else (plain | ignored) or {path}
         if inside is None or any(not _NOT_A_CHECKOUT_WRITE.search(p) for p in inside):
             written.append(path)
     return written
