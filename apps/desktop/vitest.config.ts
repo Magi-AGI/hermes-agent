@@ -27,7 +27,11 @@ const electronNative: TestProjectConfiguration = {
     // ignores the same pattern so they run in exactly one runner.
     include: ['electron/**/*.test.ts', 'scripts/**.test.{ts,mjs}', 'e2e/**/*.unit.test.ts'],
     // These use node:test and have dedicated npm scripts, not Vitest suites.
-    exclude: ['scripts/run-short-session-hang-repro.test.mjs', 'scripts/tasks-scroll.test.mjs']
+    exclude: ['scripts/run-short-session-hang-repro.test.mjs', 'scripts/tasks-scroll.test.mjs'],
+    // Many of these start real git / node / shell processes. Under CPU load, vitest's 5 s default
+    // failed eleven of them that were still working (one took 16.6 s), so this is a hang guard,
+    // not a latency bound.
+    testTimeout: 30_000
   }
 }
 
