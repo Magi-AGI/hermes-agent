@@ -679,6 +679,53 @@ CREATE INDEX IF NOT EXISTS idx_sessions_system_prompt_hash
 -- a small candidate set before compression-chain and preview hydration.
 CREATE INDEX IF NOT EXISTS idx_sessions_effective_activity
     ON sessions(COALESCE(last_activity_at, started_at) DESC, started_at DESC);
+-- A withdrawn (recalled) user message, per session of its conversation: by platform id, or for an
+-- id-less message by exact stored content at its timestamp. Every later insert or content rewrite
+-- of a matching user row gets the replacement (a turn's late flush, retry-queue and spool replay,
+-- boot recovery, another process), so a recall survives restarts and cannot be written back.
+CREATE TABLE IF NOT EXISTS recalled_messages (
+    session_id TEXT NOT NULL,
+    platform_message_id TEXT,
+    content TEXT,
+    timestamp REAL,
+    replacement TEXT NOT NULL,
+    recalled_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_recalled_messages_session ON recalled_messages(session_id);
+DROP TRIGGER IF EXISTS messages_recall_insert;
+CREATE TRIGGER IF NOT EXISTS messages_recall_insert
+AFTER INSERT ON messages
+WHEN new.role = 'user' AND EXISTS (SELECT 1 FROM recalled_messages WHERE session_id = new.session_id)
+BEGIN
+    UPDATE messages SET api_content = NULL, content = (
+        SELECT r.replacement FROM recalled_messages r WHERE r.session_id = new.session_id
+          AND ((r.platform_message_id IS NOT NULL AND r.platform_message_id = new.platform_message_id)
+            OR (r.platform_message_id IS NULL AND COALESCE(new.platform_message_id, '') = ''
+                AND r.content = new.content AND r.timestamp = new.timestamp))
+        LIMIT 1)
+    WHERE id = new.id AND EXISTS (
+        SELECT 1 FROM recalled_messages r WHERE r.session_id = new.session_id
+          AND ((r.platform_message_id IS NOT NULL AND r.platform_message_id = new.platform_message_id)
+            OR (r.platform_message_id IS NULL AND COALESCE(new.platform_message_id, '') = ''
+                AND r.content = new.content AND r.timestamp = new.timestamp)));
+END;
+DROP TRIGGER IF EXISTS messages_recall_update;
+CREATE TRIGGER IF NOT EXISTS messages_recall_update
+AFTER UPDATE OF content, platform_message_id ON messages
+WHEN new.role = 'user' AND EXISTS (SELECT 1 FROM recalled_messages WHERE session_id = new.session_id)
+BEGIN
+    UPDATE messages SET api_content = NULL, content = (
+        SELECT r.replacement FROM recalled_messages r WHERE r.session_id = new.session_id
+          AND ((r.platform_message_id IS NOT NULL AND r.platform_message_id = new.platform_message_id)
+            OR (r.platform_message_id IS NULL AND COALESCE(new.platform_message_id, '') = ''
+                AND r.content = new.content AND r.timestamp = new.timestamp))
+        LIMIT 1)
+    WHERE id = new.id AND EXISTS (
+        SELECT 1 FROM recalled_messages r WHERE r.session_id = new.session_id AND r.replacement IS NOT new.content
+          AND ((r.platform_message_id IS NOT NULL AND r.platform_message_id = new.platform_message_id)
+            OR (r.platform_message_id IS NULL AND COALESCE(new.platform_message_id, '') = ''
+                AND r.content = new.content AND r.timestamp = new.timestamp)));
+END;
 """
 
 

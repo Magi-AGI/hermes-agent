@@ -528,14 +528,13 @@ class RecallGuardMiddleware(InboundMiddleware):
 
     @classmethod
     def _schedule_redact(cls, adapter, session_key: str, group_code: str, from_account: str, *,
-                         recalled_id: str, content: Optional[str], wait_for_row_s: float = 0.0,
-                         note_if_missing: bool = False) -> None:
-        """Overwrite the recalled message in place (targeted and fenced: see
+                         recalled_id: str, content: Optional[str], note_if_missing: bool = False) -> None:
+        """Withdraw the recalled message (targeted, fenced and recorded: see
         ``SessionStore.redact_user_message``) on a tracked task. While a turn or compression holds the
-        conversation the store refuses, so this retries until it ends: the interrupted turn's own late
-        write of the recalled message then lands first and is caught. ``wait_for_row_s`` keeps looking
-        that long for a row the interrupted turn has not written yet; ``note_if_missing`` appends the
-        do-not-reference note when nothing was stored (branch B)."""
+        conversation, or a spooled copy cannot be read or rewritten, the store refuses and this retries.
+        The withdrawal is recorded by id before the row need exist, so the interrupted turn's own late
+        write of it is overwritten by the database. ``note_if_missing`` appends the do-not-reference
+        note when nothing was stored (branch B), as does text that names several messages."""
         from hermes_state import SessionCompressionInProgressError
         from gateway.shutdown_flush import TranscriptSpoolIncompleteError
         from hermes_state_errors import (
@@ -574,7 +573,7 @@ class RecallGuardMiddleware(InboundMiddleware):
                     logger.info("[%s] Recall: redacted msg_id=%s (%d row(s)), session %s",
                                 adapter.name, recalled_id, changed, session_key[:30])
                     return
-                if changed == 0 and elapsed >= wait_for_row_s:
+                if changed == 0:
                     break
                 if elapsed >= cls._REDACT_RETRY_WINDOW_S:
                     logger.warning("[%s] Recall redact gave up on msg_id=%s: the conversation stayed busy "
@@ -644,7 +643,7 @@ class RecallGuardMiddleware(InboundMiddleware):
         # The interrupted turn may persist the recalled content after our interrupt: the fenced redaction
         # waits for that turn to release the conversation, then looks a little longer for the row.
         cls._schedule_redact(adapter, session_key, group_code, from_account, recalled_id=recalled_id,
-                             content=adapter._processing_msg_texts.get(session_key, ""), wait_for_row_s=15.0)
+                             content=adapter._processing_msg_texts.get(session_key, ""))
 
     # -- Branch A/B: patch transcript (session idle) --------------------
 

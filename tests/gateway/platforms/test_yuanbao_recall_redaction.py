@@ -243,3 +243,139 @@ def test_an_unreadable_spool_file_keeps_the_recall_pending_and_replay_cannot_res
         kernel32.CloseHandle(handle)
     assert still_pending, "reported success over a spool file it could not read"
     assert not [r for r in _rows(db, sid) if SECRET in (r[1] or "")]
+
+
+def _hold_windows_file(path, share_mode):
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    handle = kernel32.CreateFileW(str(path), 0x80000000, share_mode, None, 3, 0x80, None)  # GENERIC_READ
+    assert handle not in (None, wintypes.HANDLE(-1).value)
+    return lambda: kernel32.CloseHandle(handle)
+
+
+def test_identity_is_decided_inside_the_fenced_transaction(store, tmp_path, monkeypatch):
+    """Round 3 (Codex): candidates were read before the transaction. A live turn that wrote the real
+    target id and released its lease in that gap left the target untouched and blanked an older,
+    unrelated message with the same text."""
+    import time as _time
+
+    import gateway.shutdown_flush as shutdown_flush
+
+    tasks: list = []
+    adapter = _adapter(store, tasks)
+    sid = _session(store, adapter)
+    db = store._db
+    stamp = _time.time() - 100
+    db.append_message(session_id=sid, role="user", content="repeat", timestamp=stamp)
+    sibling = SessionDB(db_path=tmp_path / "state.db")
+    assert sibling.acquire_session_turn_lease(sid, "live-turn", wait_seconds=0)
+    real_scan = shutdown_flush.spooled_transcript_messages
+
+    def turn_finishes_in_the_gap(sessions):
+        if not getattr(turn_finishes_in_the_gap, "done", False):
+            turn_finishes_in_the_gap.done = True
+            sibling.append_message(session_id=sid, role="user", content="repeat", platform_message_id="target",
+                                   timestamp=stamp + 10, turn_lease_holder="live-turn")
+            sibling.release_session_turn_lease(sid, "live-turn")
+        return real_scan(sessions)
+
+    monkeypatch.setattr(shutdown_flush, "spooled_transcript_messages", turn_finishes_in_the_gap)
+    try:
+        store.redact_user_message(sid, platform_message_id="target", content="repeat",
+                                  replacement=RecallGuardMiddleware._REDACTED)
+    finally:
+        sibling.close()
+    rows = _rows(db, sid)
+    assert rows[0] == ("user", "repeat", 1)  # the older, unrelated message
+    assert rows[1] == ("user", RecallGuardMiddleware._REDACTED, 1)
+
+
+def test_the_fence_applies_when_nothing_is_stored_yet_or_only_an_undated_retry_copy_exists(store):
+    """Round 3 (Codex): with no candidate, or only an undated queued copy, the transaction returned
+    before the lease check: recall "succeeded" under a live turn that then flushed the text back."""
+    from hermes_state_errors import SessionTurnLeaseLostError
+
+    tasks: list = []
+    adapter = _adapter(store, tasks)
+    sid = _session(store, adapter)
+    db = store._db
+    assert db.acquire_session_turn_lease(sid, "live-turn", wait_seconds=0)
+    with pytest.raises(SessionTurnLeaseLostError):
+        store.redact_user_message(sid, platform_message_id="target", content=SECRET, replacement="x")
+    with store._transcript_retry_lock:
+        store._dirty_transcripts[sid] = [{"role": "user", "content": SECRET}]
+    with pytest.raises(SessionTurnLeaseLostError):
+        store.redact_user_message(sid, content=SECRET, replacement="x")
+    assert store._dirty_transcripts[sid][0]["content"] == SECRET  # untouched while fenced
+
+
+@pytest.mark.windows_only
+def test_a_failed_spool_rewrite_is_retried_and_replay_still_writes_the_redaction(store):
+    """Round 3 (Codex): the spool was readable but its replacement failed; the recall task ended and
+    the next replay restored an id-less original beside its redacted copy."""
+    import time as _time
+
+    from gateway.shutdown_flush import TranscriptSpoolIncompleteError, spool_dropped_transcript_message
+
+    tasks: list = []
+    adapter = _adapter(store, tasks)
+    sid = _session(store, adapter)
+    db = store._db
+    stamp = _time.time() - 5
+    path = spool_dropped_transcript_message(sid, {"role": "user", "content": SECRET, "timestamp": stamp})
+    store._spooled_drop_sessions = {sid}
+    release = _hold_windows_file(path, 0x1)  # FILE_SHARE_READ only: readable, not replaceable
+    try:
+        with pytest.raises(TranscriptSpoolIncompleteError):
+            store.redact_user_message(sid, content=SECRET, replacement=RecallGuardMiddleware._REDACTED)
+    finally:
+        release()
+    store.append_to_transcript(sid, {"role": "assistant", "content": "next"})  # replays the spool
+    assert not [r for r in _rows(db, sid) if SECRET in (r[1] or "")]
+    assert ("user", RecallGuardMiddleware._REDACTED, 1) in _rows(db, sid)
+
+
+@pytest.mark.windows_only
+def test_a_pending_recall_survives_a_restart_and_boot_recovery_honours_it(store, tmp_path):
+    """Round 3 (Codex): the pending recall lived only in memory; a new process's boot recovery replayed
+    the unread spool file and inserted the original text."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    from gateway.shutdown_flush import TranscriptSpoolIncompleteError, spool_dropped_transcript_message
+    from hermes_constants import get_hermes_home
+
+    tasks: list = []
+    adapter = _adapter(store, tasks)
+    sid = _session(store, adapter)
+    path = spool_dropped_transcript_message(sid, {"role": "user", "content": SECRET, "message_id": "p1"})
+    release = _hold_windows_file(path, 0)  # no sharing: unreadable
+    try:
+        with pytest.raises(TranscriptSpoolIncompleteError):
+            store.redact_user_message(sid, platform_message_id="p1", content=SECRET,
+                                      replacement=RecallGuardMiddleware._REDACTED)
+    finally:
+        release()
+    store._db.close()
+    repo = str(Path(__file__).resolve().parents[3])
+    boot = (
+        "import sys; sys.path.insert(0, sys.argv[1])\n"
+        "from pathlib import Path\n"
+        "from hermes_state import SessionDB\n"
+        "from gateway.shutdown_flush import recover_pending_to_db\n"
+        "db = SessionDB(db_path=Path(sys.argv[2]))\n"
+        "print('recovered', recover_pending_to_db(db))\n"
+        "db.close()\n")
+    proc = subprocess.run([sys.executable, "-c", boot, repo, str(tmp_path / "state.db")],
+                          capture_output=True, text=True, timeout=120,
+                          env={**__import__("os").environ, "HERMES_HOME": str(get_hermes_home())})
+    assert "recovered 1" in proc.stdout, proc.stderr[-2000:]
+    reopened = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        rows = _rows(reopened, sid)
+    finally:
+        reopened.close()
+    assert rows and not [r for r in rows if SECRET in (r[1] or "")]

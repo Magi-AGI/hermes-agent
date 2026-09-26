@@ -305,9 +305,12 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
             logger.warning("Cannot recover structurally invalid transcript spool "
                            "file %s; preserved for manual inspection", path)
             return False
+        # The platform id too, as live replay writes it: a recall recorded by id must still match.
         session_db.append_message(session_id=spooled_sid, role=message.get("role", "unknown"),
                                   content=message.get("content") or "",
-                                  timestamp=message.get("timestamp") or payload.get("ts"))
+                                  timestamp=message.get("timestamp") or payload.get("ts"),
+                                  platform_message_id=(message.get("platform_message_id")
+                                                       or message.get("message_id")))
         return True
     session_key, data = payload.get("session_key", ""), payload.get("data", {})
     text = data.get("text", "")
