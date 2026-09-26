@@ -110,7 +110,8 @@ def test_twenty_windows_share_one_build_and_leave_the_lane_free(options_handler,
 
     _handler, builds, gate, _home = options_handler
     monkeypatch.setattr(server, "_lanes", LaneSet())
-    monkeypatch.setattr(rpc_coalesce, "MODEL_OPTIONS", SingleFlight())
+    flight = SingleFlight()
+    monkeypatch.setattr(rpc_coalesce, "MODEL_OPTIONS", flight)
     for name in ("model.options", "complete.path"):
         monkeypatch.delitem(server._contracts.METHODS, name, raising=False)
     monkeypatch.setitem(server._methods, "complete.path",
@@ -122,6 +123,9 @@ def test_twenty_windows_share_one_build_and_leave_the_lane_free(options_handler,
     assert _wait(lambda: builds["n"] >= 1)
     server.dispatch({"id": "typing", "method": "complete.path", "params": {}}, transport)
     assert _wait(lambda: "typing" in transport.frames), "a catalog read starved behind parked joiners"
+    # Release the build only once every other window has joined it (event-based, no timing guess): a
+    # request still queued when the build finishes rightly starts a fresh one.
+    assert _wait(lambda: flight.joined == 19, timeout=10), f"only {flight.joined} of 19 joined the build"
 
     gate.set()
     assert _wait(lambda: all(f"w{i}" in transport.frames for i in range(20)), timeout=10)
@@ -192,3 +196,37 @@ def test_one_slow_window_never_delays_the_others_or_keeps_the_finished_build_joi
     gate.set()
     assert _wait(lambda: "slow" in slow.frames and "later" in healthy.frames, timeout=10)
     server._lanes.shutdown()
+
+
+def test_a_queued_delivery_cancelled_at_shutdown_still_releases_its_admission(monkeypatch):
+    """Codex, T1 r3: a joiner's delivery still queued when the pool shuts down (cancel_futures=True)
+    never ran deliver(), so its retirement admission leaked and retirement could never prove idle."""
+    import concurrent.futures
+
+    from hermes_cli import backend_retirement
+    from tui_gateway import rpc_coalesce
+    from tui_gateway.rpc_lanes import SingleFlight
+    from tui_gateway.transport import bind_transport, reset_transport
+
+    fence = backend_retirement.RetirementFence()
+    monkeypatch.setattr(backend_retirement, "retirement", fence)
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    monkeypatch.setattr(rpc_coalesce, "_DELIVERY", pool)
+    flight, blocker = SingleFlight(), threading.Event()
+    shared, leader = flight.claim("k")
+    assert leader
+
+    token = bind_transport(_Capture())
+    try:
+        assert rpc_coalesce.respond(flight, "k", "joiner", lambda: {}, error_code=5033) is None
+    finally:
+        reset_transport(token)
+    assert fence.active_count() == 1  # the joiner's pending response holds admission
+
+    busy = pool.submit(blocker.wait, 10)  # the only delivery worker is busy
+    flight.lead("k", shared, lambda: {"providers": []})  # the joiner's delivery is now QUEUED
+    pool.shutdown(wait=False, cancel_futures=True)
+    blocker.set()
+    busy.result(timeout=10)
+
+    assert _wait(lambda: fence.active_count() == 0, timeout=5), "a cancelled delivery kept its admission"

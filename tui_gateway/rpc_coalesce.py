@@ -114,9 +114,13 @@ def respond(flight: SingleFlight, key: Hashable | None, rid: Any, compute: Calla
 
     def schedule(done) -> None:
         try:
-            _DELIVERY.submit(deliver, done)
+            delivery = _DELIVERY.submit(deliver, done)
         except RuntimeError:  # delivery pool shut down (process exit): nothing will write it
             retirement.release()
+            return
+        # A queued delivery cancelled by the pool's shutdown never runs deliver(): release its
+        # admission here instead (exactly once: deliver() releases whenever it runs).
+        delivery.add_done_callback(lambda f: retirement.release() if f.cancelled() else None)
 
     shared.add_done_callback(schedule)
     return None
