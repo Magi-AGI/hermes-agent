@@ -1,5 +1,6 @@
 """Backup and import commands for hermes CLI."""
 
+import errno
 import json
 import logging
 import os
@@ -564,55 +565,142 @@ def _publish_file_atomically(src: Path, dst: Path) -> None:
 
 
 _DB_SIDECARS = ("-wal", "-shm", "-journal")
+# SQLite primary result codes meaning "this file is not a usable database" (NOTADB, CORRUPT).
+_SQLITE_UNREADABLE_CODES = {11, 26}
+
+
+class DatabaseReplacementRefused(OSError):
+    """The destination database could not be proven self-contained (busy, held, unreadable sidecar
+    state): nothing was touched."""
+
+
+def _sidecar(dst: Path, suffix: str) -> Path:
+    return dst.with_name(dst.name + suffix)
+
+
+def _sidecar_holds_data(path: Path) -> bool:
+    """A WAL / rollback journal that still has bytes may hold recovery data (an absent or empty one
+    cannot). An uninspectable one is assumed to hold data."""
+    try:
+        return os.stat(path).st_size > 0
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def _settle_db_for_replacement(dst: Path) -> str:
+    """Make *dst* self-contained through SQLite before anything replaces it; the caller has excluded
+    live holders. Returns ``clean`` (every committed transaction is in the main file: the WAL is
+    checkpointed and truncated, a hot rollback journal was resolved by SQLite's own open, no
+    sidecar holds data) or ``unreadable`` (SQLite reports the file is not a database / corrupt:
+    nothing of it can be recovered by opening it). Raises :class:`DatabaseReplacementRefused` for
+    anything else — a busy or held checkpoint, an error, a sidecar that still holds bytes.
+
+    A file without the SQLite header is ``unreadable`` WITHOUT being opened: SQLite, closing a
+    connection to it, deletes its WAL — the sidecars must be preserved first."""
+    from hermes_cli.sqlite_safe_read import read_header_bytes_preopen
+    head = read_header_bytes_preopen(dst, length=len(_SQLITE_HEADER))
+    if head is None:
+        raise DatabaseReplacementRefused(errno.EIO, f"{dst} could not be read; nothing was changed")
+    if head and head != _SQLITE_HEADER:
+        return "unreadable"
+    uri = f"{dst.absolute().as_uri()}?mode=rw"
+    try:
+        with closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as conn:
+            # Reading the schema makes SQLite roll back a hot journal (it is a crashed writer's).
+            conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            busy, log, checkpointed = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    except sqlite3.DatabaseError as exc:
+        if (getattr(exc, "sqlite_errorcode", 0) & 0xFF) in _SQLITE_UNREADABLE_CODES:
+            return "unreadable"
+        raise DatabaseReplacementRefused(
+            errno.EBUSY, f"{dst} could not be checkpointed before the restore ({exc}); nothing was changed") from exc
+    if busy or log != checkpointed:
+        raise DatabaseReplacementRefused(
+            errno.EBUSY, f"{dst} is in use (its write-ahead log could not be fully checkpointed: "
+                         f"busy={busy}, log={log}, checkpointed={checkpointed}); nothing was changed")
+    held = [s for s in ("-wal", "-journal") if _sidecar_holds_data(_sidecar(dst, s))]
+    if held:
+        raise DatabaseReplacementRefused(
+            errno.EBUSY, f"{dst}: {', '.join(held)} still holds data after SQLite's checkpoint; nothing was changed")
+    return "clean"
+
+
+def _preserve_sidecars(dst: Path) -> list[tuple[Path, str]]:
+    """Move the sidecars of an UNREADABLE database to unique ``.preserved`` names (kept, never
+    deleted: SQLite could not open the database to prove them empty)."""
+    preserved: list[tuple[Path, str]] = []
+    for suffix in _DB_SIDECARS:
+        sidecar = _sidecar(dst, suffix)
+        if not os.path.lexists(sidecar):
+            continue
+        fd, keep = tempfile.mkstemp(dir=str(dst.parent), prefix=f".{sidecar.name[:80]}.unreadable-db.",
+                                    suffix=".preserved")
+        os.close(fd)
+        try:
+            os.replace(sidecar, keep)
+        except BaseException:
+            with suppress(OSError):
+                os.unlink(keep)
+            raise
+        preserved.append((sidecar, keep))
+    return preserved
 
 
 def _publish_db_replacing(src: Path, dst: Path) -> None:
-    """Replace database *dst* with the image *src* WITHOUT ever deleting or writing into the current
-    file; the caller has already excluded live holders.
+    """Replace database *dst* with the image *src* without ever deleting or writing into the current
+    file, and without ever discarding recovery data; the caller has already excluded live holders.
 
-    1. stage *src* into an exclusively created temp file beside *dst* (fsynced);
-    2. move each existing sidecar (-wal / -shm / -journal: they belong to the OLD database) aside to
-       an exclusively reserved unique name;
-    3. ``os.replace`` the staged file over *dst* (one rename: no window without a database);
-    4. only then delete the set-aside sidecars.
+    Sidecars are only discarded after SQLite has proven they hold no recovery data:
+    1. SQLite opens *dst* (resolving a hot rollback journal) and checkpoints its WAL with TRUNCATE;
+       unless that fully succeeds and no WAL / journal is left holding bytes, the restore is
+       REFUSED before anything is touched (:class:`DatabaseReplacementRefused`);
+    2. the image is staged in an exclusively created unique temp file beside *dst* (fsynced);
+    3. the sidecars are re-checked, then ``os.replace`` publishes the image in one rename;
+    4. the now-empty sidecars are deleted (a failure is logged: they carry no data).
 
-    Order: at every point the path holds either the OLD database (with its own sidecars, or with
-    them set aside intact) or the NEW one with no sidecars — never a new image beside an old WAL,
-    which SQLite would replay over it. Any failure before step 3 moves the sidecars back and leaves
-    *dst* untouched (raised); a crash there leaves the old database consistent as of its last
-    checkpoint with its WAL / journal preserved under the ``.aside`` names. A failure in step 4
-    only leaves those aside files behind. A symlinked *dst* is published at its target, like every
-    other restored file."""
+    A crash or failure anywhere leaves either the old, self-contained database (every committed row
+    in its main file) or the new image — never a database missing committed data, never none.
+    A database SQLite cannot open at all (not a database / corrupt: what the post-update auto-restore
+    replaces) is replaced too, and its sidecars are PRESERVED under ``.preserved`` names before the
+    rename, never deleted and never left beside the new image. A symlinked *dst* is published at its
+    target, like every other restored file."""
     if os.path.islink(dst):
         dst = Path(os.path.realpath(dst))
+    state = _settle_db_for_replacement(dst)
     tmp_name = _stage_copy(src, dst, ".dbrestore")
-    reserved: list[str] = []
-    moved: list[tuple[str, Path]] = []
+    preserved: list[tuple[Path, str]] = []
     try:
-        for suffix in _DB_SIDECARS:
-            sidecar = dst.with_name(dst.name + suffix)
-            if not os.path.lexists(sidecar):
-                continue
-            fd, aside = tempfile.mkstemp(dir=str(dst.parent), prefix=f".{sidecar.name[:80]}.", suffix=".aside")
-            os.close(fd)
-            reserved.append(aside)
-            os.replace(sidecar, aside)
-            moved.append((aside, sidecar))
+        if state == "clean":
+            held = [s for s in ("-wal", "-journal") if _sidecar_holds_data(_sidecar(dst, s))]
+            if held:  # a writer appeared after the checkpoint
+                raise DatabaseReplacementRefused(
+                    errno.EBUSY, f"{dst}: {', '.join(held)} gained data after the checkpoint; nothing was changed")
+        else:
+            preserved = _preserve_sidecars(dst)
+            logger.error("Replacing unreadable database %s; its sidecars are kept at %s", dst,
+                         ", ".join(keep for _s, keep in preserved) or "(none)")
         os.replace(tmp_name, dst)
     except BaseException:
-        for aside, sidecar in reversed(moved):
-            with suppress(OSError):
-                os.replace(aside, sidecar)
-        for aside in reserved:
-            if all(aside != a for a, _ in moved):
-                with suppress(OSError):
-                    os.unlink(aside)
-        with suppress(OSError):
+        for sidecar, keep in reversed(preserved):
+            try:
+                os.replace(keep, sidecar)
+            except OSError as exc:
+                logger.error("Restore of %s failed and the unreadable database's %s could not be put back: "
+                             "it is kept at %s (%s)", dst, sidecar.name, keep, exc)
+        try:
             os.unlink(tmp_name)
+        except OSError as exc:
+            logger.error("Restore of %s failed; its staged image %s could not be removed (%s)", dst, tmp_name, exc)
         raise
-    for aside, _sidecar in moved:
-        with suppress(OSError):
-            os.unlink(aside)
+    if state == "clean":
+        for suffix in _DB_SIDECARS:
+            sidecar = _sidecar(dst, suffix)
+            try:
+                sidecar.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.error("Restored %s, but its old (empty) %s could not be removed (%s)", dst, sidecar.name, exc)
 
 
 def _safe_restore_db(src: Path, dst: Path) -> bool:
@@ -648,7 +736,8 @@ def _safe_restore_db(src: Path, dst: Path) -> bool:
 
 def _replace_restore_db(src: Path, dst: Path) -> bool:
     """Fallback restore: replace the file (:func:`_publish_db_replacing`). Only safe when no process
-    holds the DB open; on any failure the current database and its sidecars are kept.
+    holds the DB open; refused (the database untouched) unless SQLite first proves its sidecars hold
+    no recovery data, and on any failure the current database keeps every committed row.
 
     Replacing the inode under a live holder is the #90950 corruption class (the holder keeps
     writing through a deleted-inode fd and loses its WAL index), so fail closed. The foreign-pid
@@ -665,10 +754,13 @@ def _replace_restore_db(src: Path, dst: Path) -> bool:
         with offline_file_access(dst, what="replacement restore of"):
             # The snapshot owns no WAL, so any -wal/-shm here belongs to the DB being replaced (a
             # killed gateway leaves them — exactly when a restore runs); SQLite would replay that
-            # foreign WAL over the restored file: "malformed" or resurrected post-snapshot rows.
-            # _publish_db_replacing retires them with no window where the two are mismatched.
+            # foreign WAL over the restored file. _publish_db_replacing has SQLite checkpoint them
+            # into the old database first, so discarding them never discards committed data.
             _publish_db_replacing(src, dst)
         return True
+    except DatabaseReplacementRefused as exc2:
+        logger.error("Refusing replacement restore of %s: %s", dst, exc2)
+        return False
     except LiveConnectionError as exc2:
         logger.error("Refusing replacement restore of %s: %s Close the in-process "
                      "database handles (or restart Hermes) and retry.", dst, exc2)

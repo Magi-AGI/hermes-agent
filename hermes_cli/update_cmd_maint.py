@@ -422,8 +422,9 @@ def _restore_state_db_from_snapshot(state_path: Path, snap_state: Path) -> bool:
     # CLOSED on any tracked connection and holds the lock across clear + copy.
     try:
         with offline_file_access(state_path, what="restore a snapshot over"):
-            # Replaced, never copied into: its stale sidecars are retired with it, a failure keeps
-            # the current file, and nothing writes through a hard link to it.
+            # Replaced, never copied into: sidecars are discarded only after SQLite proves they hold
+            # no recovery data (an unreadable database's are preserved), a failure keeps the current
+            # file, and nothing writes through a hard link to it.
             _publish_db_replacing(snap_state, state_path)
     except LiveConnectionError as exc:
         print(
