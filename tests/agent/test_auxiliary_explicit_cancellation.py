@@ -30,6 +30,10 @@ def _release_silent_fakes():
     yield
     while _SILENT_FAKES:
         _SILENT_FAKES.pop().release()
+    # Released provider workers unwind on their own; settle them within a bound.
+    for worker in threading.enumerate():
+        if worker.name == "hermes-protected-aux-provider":
+            worker.join(timeout=_HANG_GUARD)
 
 
 class _Silent:
@@ -76,11 +80,15 @@ class _CodexWatchdog:
         monkeypatch.setattr(aux._CodexStreamGuard, "_watchdog_fire", fire)
 
     def expire(self, index: int = 0) -> None:
+        """Only brings forward a watchdog production armed and has not fired: it never supplies a
+        missing one (Codex r2: expiry that armed its own timer passed with arming removed)."""
         guard = self.guards[index]
+        timer = guard._timer
+        assert timer is not None and timer.is_alive() and not timer.finished.is_set(), (
+            "production armed no pending watchdog for this stream")
         with guard._deadline_lock:
             guard._progress_deadline = guard.hard_deadline = time.monotonic()
-        if guard._timer is not None:
-            guard._timer.cancel()
+        timer.cancel()
         guard._arm_timer(0.0)
 
 
@@ -536,15 +544,16 @@ def test_cancelled_attempt_does_not_close_or_fail_concurrent_shared_client_call(
         except BaseException as exc:  # pragma: no cover - asserted below
             outcomes["b"] = exc
 
+    _SILENT_FAKES.extend(SimpleNamespace(release=event.set) for event in (a_release, b_release))
     a_thread = threading.Thread(target=_session_a, daemon=True)
     b_thread = threading.Thread(target=_session_b, daemon=True)
-    a_thread.start()
-    b_thread.start()
-    assert a_started.wait(timeout=_HANG_GUARD)
-    assert b_started.wait(timeout=_HANG_GUARD)
-    cancel_event.set()
-    a_thread.join(timeout=_HANG_GUARD)
     try:
+        a_thread.start()
+        b_thread.start()
+        assert a_started.wait(timeout=_HANG_GUARD)
+        assert b_started.wait(timeout=_HANG_GUARD)
+        cancel_event.set()
+        a_thread.join(timeout=_HANG_GUARD)
         assert not a_thread.is_alive()
         assert isinstance(outcomes["a"], aux.AuxiliaryExplicitCancellation)
         assert not closed.is_set()
@@ -557,6 +566,9 @@ def test_cancelled_attempt_does_not_close_or_fail_concurrent_shared_client_call(
     finally:
         a_release.set()
         b_release.set()
+        for session in (a_thread, b_thread):
+            if session.ident is not None:
+                session.join(timeout=_HANG_GUARD)
 
 
 def test_bedrock_silent_nonstream_request_is_isolated_without_close_wakeup() -> None:
