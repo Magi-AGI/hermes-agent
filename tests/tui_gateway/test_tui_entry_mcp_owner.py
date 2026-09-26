@@ -30,18 +30,34 @@ def test_wait_falls_through_to_shared_owner(monkeypatch):
     monkeypatch.setattr(
         mcp_startup, "start_background_mcp_discovery", lambda **kw: None
     )
-    # Ordered by events, not elapsed time: discovery finishes only after `release`, and the wait
-    # must not return before it has. (A 50 ms sleep measured against a 40 ms bound read short on a
-    # descheduled main thread.) The 10 s bounds are hang guards.
-    release, finished = threading.Event(), threading.Event()
-    thread = threading.Thread(target=lambda: (release.wait(10.0), finished.set()), daemon=True)
+    thread = _DiscoveryFinishedByJoin()
     thread.start()
     monkeypatch.setattr(mcp_startup, "_mcp_discovery_thread", {hermes_home_key(): thread})
-    threading.Timer(0.2, release.set).start()
+    try:
+        entry.wait_for_mcp_discovery(timeout=10.0)
+        assert thread.finished.is_set()
+    finally:
+        thread.release.set()
+        threading.Thread.join(thread, 10.0)
 
-    entry.wait_for_mcp_discovery(timeout=10.0)
 
-    assert finished.is_set()
+class _DiscoveryFinishedByJoin(threading.Thread):
+    """A discovery run that completes only once something joins it: a waiter that really waits
+    always sees it finished, one that does not never does. No timers, so no scheduling race (a
+    50 ms sleep against a 40 ms bound read short on a descheduled main thread). The 10 s wait is
+    a hang guard; running out of it leaves ``finished`` unset, i.e. a failure."""
+
+    def __init__(self):
+        super().__init__(target=self._discover, daemon=True)
+        self.release, self.finished = threading.Event(), threading.Event()
+
+    def _discover(self):
+        if self.release.wait(10.0):
+            self.finished.set()
+
+    def join(self, timeout=None):
+        self.release.set()
+        super().join(timeout)
 
 
 def test_wait_noop_when_no_owner_has_a_thread(monkeypatch):
