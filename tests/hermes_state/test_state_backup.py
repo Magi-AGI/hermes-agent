@@ -14,7 +14,7 @@ import yaml
 
 from hermes_constants import get_hermes_home
 from hermes_state import SessionDB
-from hermes_state_backup import rotate_state_backup
+from hermes_state_backup import rotate_state_backup, store_backup_dir
 
 
 def _seed(db_path: Path, sessions: int = 3) -> SessionDB:
@@ -55,7 +55,7 @@ def test_backups_are_consistent_under_writes_and_rotate_to_keep(tmp_path):
         writer.join(timeout=10)
         db.close()
     assert [r["skipped"] for r in results] == [False, False, False]
-    images = sorted(dest.glob("state-*.db"))
+    images = sorted(store_backup_dir(tmp_path / "state.db", dest).glob("state-*.db"))
     assert len(images) == 2 and [str(p) for p in images] == [r["path"] for r in results[1:]]
     for image in images:
         conn = sqlite3.connect(str(image))
@@ -82,7 +82,7 @@ def test_a_backup_is_not_repeated_before_the_interval_nor_run_twice_at_once(tmp_
     finally:
         _release_lock_handle(held)
     assert busy["skipped"] and busy["reason"] == "another process is backing up"
-    assert len(list(dest.glob("state-*.db"))) == 1
+    assert len(list(store_backup_dir(tmp_path / "state.db", dest).glob("state-*.db"))) == 1
 
 
 def test_enabling_sessions_backup_makes_the_housekeeping_tick_write_one(tmp_path):
@@ -95,8 +95,51 @@ def test_enabling_sessions_backup_makes_the_housekeeping_tick_write_one(tmp_path
     from gateway.run import _housekeeping_state_db_maintenance
     _housekeeping_state_db_maintenance()
     deadline = time.monotonic() + 60
-    backups = home / "state-backups"
+    backups = store_backup_dir(home / "state.db", home / "state-backups")
     while time.monotonic() < deadline and not list(backups.glob("state-*.db")):
         time.sleep(0.1)
     images = list(backups.glob("state-*.db"))
     assert len(images) == 1 and _count(images[0], "sessions") == 3
+
+
+def test_stores_sharing_one_backup_dir_keep_separate_histories(tmp_path):
+    """Round 1 (Codex): alpha's image made beta report "not due" in a shared ``dir``."""
+    shared = tmp_path / "shared-backups"
+    now = time.time()
+    for name in ("alpha", "beta"):
+        (tmp_path / name).mkdir()
+        _seed(tmp_path / name / "state.db", sessions=2 if name == "alpha" else 4).close()
+    results = {name: rotate_state_backup(tmp_path / name / "state.db", shared, interval_hours=24, keep=1, now=now)
+               for name in ("alpha", "beta")}
+    assert all(not r["skipped"] for r in results.values()), results
+    counts = {name: _count(Path(r["path"]), "sessions") for name, r in results.items()}
+    assert counts == {"alpha": 2, "beta": 4}
+
+
+def test_a_file_without_a_stamp_neither_counts_nor_rotates(tmp_path):
+    """Round 1 (Antigravity): an unparseable newest name disabled the throttle on every tick."""
+    _seed(tmp_path / "state.db").close()
+    dest = tmp_path / "state-backups"
+    store = store_backup_dir(tmp_path / "state.db", dest)
+    store.mkdir(parents=True)
+    (store / "state-manual.db").write_bytes(b"kept by the user")
+    now = time.time()
+    assert rotate_state_backup(tmp_path / "state.db", dest, interval_hours=24, keep=1, now=now)["skipped"] is False
+    later = rotate_state_backup(tmp_path / "state.db", dest, interval_hours=24, keep=1, now=now + 60)
+    assert later["reason"] == "not due"
+    assert (store / "state-manual.db").exists()
+
+
+def test_a_relative_backup_dir_lives_under_the_profile_home(tmp_path, monkeypatch):
+    from hermes_state_backup import start_state_backup_if_enabled
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    _seed(home / "state.db").close()
+    monkeypatch.chdir(tmp_path)
+    assert start_state_backup_if_enabled({"sessions": {"backup": {"enabled": True, "dir": "mine"}}}, home=home)
+    target = store_backup_dir(home / "state.db", home / "mine")
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline and not list(target.glob("state-*.db")):
+        time.sleep(0.1)
+    assert list(target.glob("state-*.db")) and not (tmp_path / "mine").exists()

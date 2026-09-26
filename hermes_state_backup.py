@@ -7,13 +7,15 @@ backup's timestamp is the throttle, so the job keeps no state of its own and nev
 store. The pre-update snapshot skips a state.db over 1 GiB, so on a large install this is the only
 copy of the session history.
 
-Restore: stop Hermes, move the live ``state.db`` and any ``state.db-wal`` / ``state.db-shm`` aside,
-and copy the chosen ``state-<UTC time>.db`` to ``state.db``.
+Images live in a per-store directory, ``<dir>/<profile dir name>-<hash>/state-<UTC time>.db``, so
+profiles sharing one ``dir`` never mix histories. Restore: stop Hermes, move the live ``state.db`` and
+any ``state.db-wal`` / ``state.db-shm`` aside, and copy the chosen image to ``state.db``.
 """
 
 from __future__ import annotations
 
 import calendar
+import hashlib
 import logging
 import os
 import shutil
@@ -35,9 +37,20 @@ _running: set = set()
 _running_lock = threading.Lock()
 
 
-def _backups(dest_dir: Path) -> list:
-    """Finished backups, oldest first (the UTC stamp in the name sorts chronologically)."""
-    return sorted(p for p in dest_dir.glob(f"{_NAME_PREFIX}*.db") if p.is_file())
+def _backups(store_dir: Path) -> list:
+    """Finished backups, oldest first (the UTC stamp in the name sorts chronologically). A file
+    whose name carries no stamp is not ours: it neither satisfies the throttle nor is rotated."""
+    return sorted(p for p in store_dir.glob(f"{_NAME_PREFIX}*.db")
+                  if p.is_file() and _stamp_time(p) is not None)
+
+
+def store_backup_dir(db_path: Path, dest_dir: Path) -> Path:
+    """This store's own directory under *dest_dir*. Profiles may share one ``dir``: without a
+    per-store namespace one store's image made another's look recent, and retention or stale-partial
+    cleanup could delete the other's files."""
+    resolved = db_path.resolve()
+    digest = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:12]
+    return dest_dir / f"{resolved.parent.name or 'store'}-{digest}"
 
 
 def _stamp_time(path: Path) -> Optional[float]:
@@ -83,13 +96,16 @@ def _rotate_locked(db_path: Path, dest_dir: Path, interval_hours: float, keep: i
                    result: Dict[str, Any]) -> Dict[str, Any]:
     try:
         from hermes_constants import mkdir_under_hermes_home
+        dest_dir = store_backup_dir(db_path, dest_dir)
         mkdir_under_hermes_home(dest_dir)
         existing = _backups(dest_dir)
         newest = _stamp_time(existing[-1]) if existing else None
         if newest is not None and now - newest < interval_hours * 3600:
             result["reason"] = "not due"
             return result
-        needed = db_path.stat().st_size * _FREE_SPACE_MARGIN
+        wal = db_path.with_name(db_path.name + "-wal")
+        # The image holds the WAL's committed pages too.
+        needed = (db_path.stat().st_size + (wal.stat().st_size if wal.is_file() else 0)) * _FREE_SPACE_MARGIN
         free = shutil.disk_usage(dest_dir).free
         if free < needed:
             result["reason"] = f"only {free} bytes free, need about {int(needed)}"
@@ -146,8 +162,8 @@ def start_state_backup_if_enabled(config: Optional[dict] = None, home: Optional[
         from hermes_constants import get_hermes_home
         home = get_hermes_home()
     db_path = Path(home) / "state.db"
-    custom_dir = str(settings.get("dir") or "").strip()
-    dest_dir = Path(os.path.expanduser(custom_dir)) if custom_dir else Path(home) / BACKUP_DIR_NAME
+    custom_dir = Path(os.path.expanduser(str(settings.get("dir") or "").strip() or BACKUP_DIR_NAME))
+    dest_dir = custom_dir if custom_dir.is_absolute() else Path(home) / custom_dir  # relative: under the home
     key = str(db_path.resolve())
     with _running_lock:
         if key in _running:
