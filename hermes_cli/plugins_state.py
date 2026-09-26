@@ -11,7 +11,7 @@ from typing import Any, Dict, Mapping
 
 from hermes_constants import get_hermes_home
 from hermes_cli.plugins_manifest import _portable_skill_namespace
-from utils import lock_file_polled, unlock_file
+from utils import lock_file_polled, pad_lock_sentinel, unlock_file
 
 _PLUGIN_SETTING_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _PLUGIN_SETTING_RESERVED_ROOTS = frozenset({"model", "plugins", "security", "settings"})
@@ -78,14 +78,14 @@ def _plugin_data_namespace(plugin_id: str, skill_namespace: str) -> str:
 def _locked_plugin_state(path: Path):
     """Serialize state read-modify-write across threads/processes (fcntl / msvcrt). The lock lives in a
     sibling file because atomic replacement changes the target's inode. A sibling process holding it
-    is waited out up to ``utils.BOUNDED_LOCK_WAIT_S`` (msvcrt LK_LOCK gave up after ~10 s); the lock
-    file stays empty (Windows locks a byte past EOF)."""
+    is waited out up to ``utils.BOUNDED_LOCK_WAIT_S`` (msvcrt LK_LOCK gave up after ~10 s)."""
     lock_path = path.with_name(f".{path.name}.lock")
     with _PLUGIN_STATE_LOCKS_GUARD:
         thread_lock = _PLUGIN_STATE_LOCKS.setdefault(str(lock_path.resolve(strict=False)), threading.RLock())
     with thread_lock:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         with open(lock_path, "a+b") as handle:
+            pad_lock_sentinel(handle)
             lock_file_polled(handle)
             try:
                 yield

@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 from hermes_time import now as _hermes_now
 from hermes_time import get_timezone
-from utils import atomic_replace, atomic_write_text
+from utils import atomic_replace, atomic_write_text, lock_file_polled, unlock_file
 
 # croniter is imported lazily (slow import, only needed for cron exprs). HAS_CRONITER stays a
 # module attribute: a monkeypatched value wins because _ensure_croniter only probes while None.
@@ -239,32 +239,23 @@ def _jobs_lock_file() -> Path:
 def _acquire_flock(lock_fd, timeout: float) -> Optional[bool]:
     """Bounded exclusive lock: True when acquired, False on timeout, None when no backend exists. A
     blocking flock(LOCK_EX) taken under the in-process lock would let a wedged sibling freeze
-    EVERY cron function forever, so poll LOCK_NB against a deadline; the caller picks the
+    EVERY cron function forever, so poll non-blocking against a deadline on both backends (msvcrt's
+    LK_LOCK ignored *timeout* and raised after ten one-second tries); the caller picks the
     degraded mode."""
-    if fcntl is not None:
-        deadline = time.monotonic() + timeout
-        while True:
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return True
-            except (OSError, IOError):
-                if time.monotonic() >= deadline:
-                    return False
-                time.sleep(0.1)
-    if msvcrt is not None:
-        getattr(msvcrt, "locking")(lock_fd.fileno(), getattr(msvcrt, "LK_LOCK"), 1)
-        return True
-    return None
+    if fcntl is None and msvcrt is None:
+        return None
+    try:
+        lock_file_polled(lock_fd, time.monotonic() + timeout)
+    except TimeoutError:
+        return False
+    return True
 
 
 def _release_flock(lock_fd) -> None:
     """Unlock (best effort) and close a lock file opened for ``_acquire_flock``."""
     try:
-        if fcntl is not None:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        elif msvcrt is not None:
-            getattr(msvcrt, "locking")(lock_fd.fileno(), getattr(msvcrt, "LK_UNLCK"), 1)
-    except (OSError, IOError):
+        unlock_file(lock_fd)
+    except OSError:
         pass
     finally:
         lock_fd.close()

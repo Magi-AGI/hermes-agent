@@ -88,6 +88,18 @@ def lock_file_polled(fh_or_fd, deadline: "float | None" = None) -> None:
             time.sleep(_BOUNDED_LOCK_POLL_S)
 
 
+def pad_lock_sentinel(fh_or_fd) -> None:
+    """Give an empty lock file its one-byte sentinel, before locking it. Earlier versions of the vault,
+    plugin-state and install-id locks pad an empty lock file before THEIR lock attempt and fail outright
+    when that write hits a byte a holder has locked, so such a lock file must never be empty while held.
+    *fh_or_fd* must be open for append: the byte lands at EOF, never on a byte a sibling holds, and a
+    failed write means a sibling padded (and locked) it first."""
+    fd = fh_or_fd if isinstance(fh_or_fd, int) else fh_or_fd.fileno()
+    if os.fstat(fd).st_size == 0:
+        with suppress(OSError):
+            os.write(fd, b"\0")
+
+
 def unlock_file(fh_or_fd) -> None:
     """Release a lock taken with :func:`lock_file_polled`."""
     if os.name == "nt":

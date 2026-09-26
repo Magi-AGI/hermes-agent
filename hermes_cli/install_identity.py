@@ -11,7 +11,7 @@ from typing import Optional
 import uuid
 
 from hermes_constants import get_default_hermes_root
-from utils import atomic_write_text, lock_file_polled, unlock_file
+from utils import atomic_write_text, lock_file_polled, pad_lock_sentinel, unlock_file
 
 _INSTALL_ID_FILENAME = "install_id"
 _INSTALL_ID_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -23,8 +23,9 @@ _INSTALL_ID_LOCK, _INSTALL_ID_PUBLICATION_LOCK = threading.Lock(), threading.Loc
 def _install_id_file_lock(root: Path):
     """Serialize identity publication across processes on POSIX and Windows; a sibling holding the
     lock is waited out up to ``utils.BOUNDED_LOCK_WAIT_S`` (msvcrt LK_LOCK gave up after ~10 s)."""
-    fd = os.open(root / ".install_id.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fd = os.open(root / ".install_id.lock", os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
     try:
+        pad_lock_sentinel(fd)
         lock_file_polled(fd)
         try:
             yield

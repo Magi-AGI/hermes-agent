@@ -33,6 +33,7 @@ else:
     fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 print("locked", flush=True)
 time.sleep(float(sys.argv[2]))
+open(sys.argv[1] + ".released", "w").close()
 """
 
 
@@ -96,8 +97,21 @@ def _install_identity(tmp_path):
     return root / ".install_id.lock", op
 
 
-@pytest.mark.parametrize("site", [_curator, _trajectory, _vault, _plugin_state, _install_identity],
-                         ids=["curator", "trajectory", "vault", "plugin_state", "install_identity"])
+def _cron_jobs(tmp_path):
+    from cron import jobs
+
+    lock = jobs._jobs_lock_file()
+
+    def op():
+        # Degrading to in-process-only locking would run the section while the holder still has it.
+        with jobs._jobs_lock():
+            return (lock.parent / (lock.name + ".released")).exists()
+
+    return lock, op
+
+
+@pytest.mark.parametrize("site", [_curator, _trajectory, _vault, _plugin_state, _install_identity, _cron_jobs],
+                         ids=["curator", "trajectory", "vault", "plugin_state", "install_identity", "cron_jobs"])
 def test_state_lock_outwaits_a_sibling_process_holding_it_past_ten_seconds(site, tmp_path):
     lock_path, op = site(tmp_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -112,3 +126,81 @@ def test_state_lock_outwaits_a_sibling_process_holding_it_past_ten_seconds(site,
         holder.kill()
         holder.wait()
     assert waited >= HOLD_S - 1.0, f"the operation did not wait for the holder ({waited:.1f} s)"
+
+
+# The previous release's lock recipes, verbatim in effect: pad an EMPTY lock file (on Windows), THEN lock.
+_OLDER_PEER = r"""
+import os, sys
+from pathlib import Path
+kind, path = sys.argv[1], Path(sys.argv[2])
+nt = os.name == "nt"
+try:
+    if kind == "vault":
+        if nt and (not path.exists() or path.stat().st_size == 0):
+            path.write_text(" ", encoding="utf-8")
+        fh = open(path, "r+" if nt else "a+", encoding="utf-8")
+        fd = fh.fileno()
+    elif kind == "plugin_state":
+        fh = open(path, "a+b")
+        if nt and fh.seek(0, os.SEEK_END) == 0:
+            fh.write(b"\0")
+            fh.flush()
+        fd = fh.fileno()
+    else:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        if nt and os.fstat(fd).st_size == 0:
+            os.write(fd, b"\0")
+except OSError as exc:
+    print("pad-failed", exc, flush=True)
+    raise SystemExit(0)
+print("padded", flush=True)
+os.lseek(fd, 0, os.SEEK_SET)
+if nt:
+    import msvcrt
+    msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+else:
+    import fcntl
+    fcntl.flock(fd, fcntl.LOCK_EX)
+print("locked", flush=True)
+"""
+
+
+def _vault_lock(tmp_path):
+    from agent.vault_store import VaultStore
+
+    store = VaultStore(tmp_path / "vault")
+    return tmp_path / "vault" / ".vault.lock", store._locked
+
+
+def _plugin_state_lock(tmp_path):
+    from hermes_cli.plugins_state import PluginState, _locked_plugin_state
+
+    state = PluginState("lock-probe")
+    return state.path.with_name(f".{state.path.name}.lock"), lambda: _locked_plugin_state(state.path)
+
+
+def _install_identity_lock(tmp_path):
+    from hermes_cli.install_identity import _install_id_file_lock
+
+    root = tmp_path / "root"
+    root.mkdir()
+    return root / ".install_id.lock", lambda: _install_id_file_lock(root)
+
+
+@pytest.mark.parametrize("kind,site", [("vault", _vault_lock), ("plugin_state", _plugin_state_lock),
+                                       ("install_identity", _install_identity_lock)])
+def test_a_lock_created_and_held_by_this_version_never_breaks_an_older_peer(kind, site, tmp_path):
+    """Mixed versions during an update (A18 r1, Codex): an older peer pads an empty lock file before its lock
+    attempt, and that write fails outright on a byte a holder has locked. A lock file this version creates
+    must therefore carry its sentinel byte while held, so the older peer simply waits its turn."""
+    lock_path, hold = site(tmp_path)
+    with hold():
+        peer = subprocess.Popen([sys.executable, "-c", _OLDER_PEER, kind, str(lock_path)],
+                                stdout=subprocess.PIPE, text=True)
+        first = peer.stdout.readline().strip()
+    try:
+        rest = peer.communicate(timeout=30)[0].split()
+    finally:
+        peer.kill()
+    assert first == "padded", first
+    assert rest == ["locked"]

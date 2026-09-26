@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
-from utils import lock_file_polled, unlock_file
+from utils import lock_file_polled, pad_lock_sentinel, unlock_file
 
 from hermes_constants import get_hermes_home
 from utils import atomic_write_bytes
@@ -216,11 +216,12 @@ class VaultStore:
         """Serialize read-modify-write cycles across threads AND processes: the Desktop gateway, a CLI
         `hermes vault add` and a TUI slash worker all write the same ``vault.json.enc``; two unlocked
         writers would drop each other's items. A sibling holding it is waited out up to
-        ``utils.BOUNDED_LOCK_WAIT_S``. The lock file is never written: Windows locks a byte past EOF,
-        and the old truncating pad raced a sibling that held the lock."""
+        ``utils.BOUNDED_LOCK_WAIT_S``. The sentinel byte is appended, never truncated in: the old
+        truncating pad raced a sibling that held the lock."""
         with _LOCK:
             self._ensure_dir()
             with open(self._base / ".vault.lock", "a+", encoding="utf-8") as fd:
+                pad_lock_sentinel(fd)
                 lock_file_polled(fd)
                 try:
                     yield
