@@ -1,16 +1,21 @@
-"""A database restore never discards a sidecar that still holds recovery data (stage 1, round 12).
+"""A database restore never writes into an alias: a pre-open guard, then upstream's own path (stage 1).
 
-The replacement path moved the old WAL aside before publishing the new image and kept that fact only
-in memory (rollback errors were suppressed). Codex reproduced, with a real WAL: a restorer killed
-right after the WAL moved, or a failed publication whose WAL rollback also failed, and normal Hermes
-startup (``SessionDB``) opened the old database WITHOUT a committed row.
+Rounds 10-12 built a custom database replacement (staging, sidecar set-aside, checkpoint-first
+publication) and each review found new edge cases in it: SQLite's checkpoint wrote through a
+sidecar hard-linked to a chain record (truncating it), probing a corrupt database deleted its WAL,
+cleanup deleted a newer generation's WAL (Codex, rounds 11-12). That machinery is gone. A database
+member (sessions.db, state.db, any ``.db``; also the post-update state.db auto-restore) is now
+checked by ``backup._db_restore_refusal`` BEFORE anything opens it — ``lstat`` / ``stat`` and the
+restore classification only: the database, each of its ``-wal`` / ``-shm`` / ``-journal`` sidecars
+and upstream's staging name must not be a link, a hard link, credential state, outside the
+database's directory or uninspectable (and the staging name must not exist) — and otherwise
+upstream's database restore runs unchanged (SQLite backup-API page copy, its unlink+move fallback).
+A refused database is not restored; the rest of the restore proceeds.
 
-Now SQLite proves the old database self-contained first — it opens it (resolving a hot rollback
-journal) and checkpoints the WAL with TRUNCATE; unless that fully succeeds, the restore is refused
-with nothing touched — and only then is the image published in one rename and the now-empty
-sidecars removed. Real SQLite; the crash cases die for real in child processes and a separate child
-performs the normal ``SessionDB`` startup. Crash and failed-publication cases are adapted from
-Codex's review reproductions. Fake data only.
+Codex's round-12 reproductions are adapted here (its fixture gives sessions.db a second hard link,
+so every one of them is now refused by the guard); ``_prepare`` / ``_read`` / ``_run`` /
+``_backup_image`` keep the names Codex's external file imports. Real SQLite and real child
+processes; fake data only.
 """
 
 import errno
@@ -19,13 +24,14 @@ import os
 import sqlite3
 import subprocess
 import sys
-import time
+import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from tests.hermes_cli.codex_authority_env import codex_home  # noqa: F401
-from tests.hermes_cli.test_codex_restore_aliases import _snapshot
+from tests.hermes_cli.test_codex_restore_aliases import _snapshot, live_root  # noqa: F401
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -42,39 +48,6 @@ c.commit()
 os._exit(71)  # no close-time checkpoint: the committed row lives only in the WAL
 '''
 
-# A writer that dies mid-transaction after spilling pages into the database file: a HOT journal.
-SEED_HOT_JOURNAL = r'''
-import os, sqlite3, sys
-c = sqlite3.connect(sys.argv[1], isolation_level=None)
-c.execute("PRAGMA journal_mode=DELETE")
-c.execute("CREATE TABLE review_rows(v TEXT)")
-c.execute("INSERT INTO review_rows VALUES ('committed-live')")
-c.execute("PRAGMA cache_size=2")
-c.execute("BEGIN")
-for i in range(3000):
-    c.execute("INSERT INTO review_rows VALUES (?)", ("uncommitted-" + "x" * 200,))
-os._exit(72)
-'''
-
-CRASH_RESTORE = r'''
-import os, sys
-from pathlib import Path
-from hermes_cli import backup
-root, snapshot_id, boundary = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
-live = root / "sessions.db"
-real_replace = os.replace
-def replace(src, dst, *args, **kwargs):
-    if Path(dst) == live and boundary == "before-publication":
-        os._exit(81)
-    result = real_replace(src, dst, *args, **kwargs)
-    if Path(dst) == live and boundary == "after-publication":
-        os._exit(82)
-    return result
-os.replace = replace
-backup.restore_quick_snapshot(snapshot_id, hermes_home=root)
-raise SystemExit(99)
-'''
-
 READ_WITH_HERMES = r'''
 import json, sys
 from pathlib import Path
@@ -86,24 +59,16 @@ db.close()
 print(json.dumps({"rows": rows, "integrity": ok}))
 '''
 
-# Holds the database open until a gate file appears: a reader inside a snapshot, or a writer
-# holding the write lock with an uncommitted row.
-HOLDER = r'''
-import sqlite3, sys, time
+POST_PUBLISH_WRITER = r'''
+import os, sys
 from pathlib import Path
-path, mode, ready, gate = sys.argv[1:5]
-c = sqlite3.connect(path, isolation_level=None)
-if mode == "reader":
-    c.execute("BEGIN")
-    c.execute("SELECT count(*) FROM review_rows").fetchone()
-else:
-    c.execute("BEGIN IMMEDIATE")
-    c.execute("INSERT INTO review_rows VALUES ('uncommitted-writer')")
-Path(ready).write_text("ready")
-while not Path(gate).exists():
-    time.sleep(0.05)
-c.execute("ROLLBACK")
-c.close()
+from hermes_state import SessionDB
+db = SessionDB(db_path=Path(sys.argv[1]))
+c = db._conn
+c.execute("PRAGMA wal_autocheckpoint=0")
+c.execute("INSERT INTO review_rows VALUES ('arrived-after-publication')")
+c.commit()
+os._exit(73)
 '''
 
 
@@ -120,107 +85,47 @@ def _read(live):
 
 def _backup_image(tmp_path):
     source = tmp_path / "source.db"
-    with closing_db(source) as c:
-        c.execute("CREATE TABLE review_rows(v TEXT)")
-        c.execute("INSERT INTO review_rows VALUES ('backup-image')")
-        c.commit()
+    source.unlink(missing_ok=True)
+    conn = sqlite3.connect(str(source))
+    conn.execute("CREATE TABLE review_rows(v TEXT)")
+    conn.execute("INSERT INTO review_rows VALUES ('backup-image')")
+    conn.commit()
+    conn.close()
     return source
 
 
-class closing_db:
-    def __init__(self, path):
-        self.conn = sqlite3.connect(str(path))
-
-    def __enter__(self):
-        return self.conn
-
-    def __exit__(self, *exc):
-        self.conn.close()
-
-
-def _prepare(root, tmp_path, seed=SEED_WAL, code=71):
-    """A live multi-link database (the replacement branch) whose committed row is only in its
-    sidecar state, and a snapshot holding a different image."""
+def _prepare(root, tmp_path, link=True):
+    """A live database whose committed row is only in its WAL (with a second hard link, as in
+    Codex's fixture, unless *link* is False), and a snapshot holding a different image."""
     live = root / "sessions.db"
-    seeded = _run(seed, live)
-    assert seeded.returncode == code, seeded.stderr[-2000:]
-    os.link(live, tmp_path / "other-name.db")
+    seeded = _run(SEED_WAL, live)
+    assert seeded.returncode == 71, seeded.stderr[-2000:]
+    if link:
+        os.link(live, tmp_path / "other-name.db")
     return live, _snapshot(root, {"sessions.db": _backup_image(tmp_path).read_bytes()})
 
 
-@pytest.mark.parametrize("boundary", ["before-publication", "after-publication"])
-def test_a_restorer_killed_mid_publication_never_loses_a_committed_row(codex_home, tmp_path, boundary):
-    root, _endpoint = codex_home
-    live, snapshot_id = _prepare(root, tmp_path)
-    wal = live.with_name(live.name + "-wal")
-    assert wal.exists() and wal.stat().st_size > 32, "the committed row is not in the WAL"
-
-    killed = _run(CRASH_RESTORE, root, snapshot_id, boundary)
-    assert killed.returncode == (81 if boundary == "before-publication" else 82), killed.stderr[-2000:]
-
-    state = _read(live)  # a SEPARATE process: normal Hermes startup
-    expected = ["committed-live"] if boundary == "before-publication" else ["backup-image"]
-    assert state == {"rows": expected, "integrity": "ok"}, f"startup after a kill {boundary}: {state}"
-
-
-def test_a_failed_publication_keeps_every_committed_row(codex_home, tmp_path, monkeypatch):
+def _restore(tmp_path, root, how, image):
     from hermes_cli import backup
-
-    root, _endpoint = codex_home
-    live, snapshot_id = _prepare(root, tmp_path)
-    real_replace, failures = os.replace, []
-
-    def replace(src, dst, *args, **kwargs):
-        if Path(dst) == live or str(dst).endswith(("-wal", "-journal")):
-            failures.append(Path(dst))
-            raise PermissionError(errno.EACCES, "injected publication / rollback failure", str(dst))
-        return real_replace(src, dst, *args, **kwargs)
-
-    monkeypatch.setattr(os, "replace", replace)
-    assert backup.restore_quick_snapshot(snapshot_id, hermes_home=root) is False
-    monkeypatch.undo()
-    assert live in failures, "the failure injection did not reach the publication"
-    assert _read(live) == {"rows": ["committed-live"], "integrity": "ok"}
+    if how == "snapshot":
+        return backup.restore_quick_snapshot(_snapshot(root, {"sessions.db": image}), hermes_home=root)
+    archive = tmp_path / "old.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("config.yaml", "model: {}\n")
+        zf.writestr("sessions.db", image)
+    backup.run_import(SimpleNamespace(zipfile=str(archive), force=True))
+    return None
 
 
-@pytest.mark.parametrize("holder", ["reader", "writer"])
-def test_a_checkpoint_that_cannot_complete_refuses_the_restore_untouched(codex_home, tmp_path, holder):
-    from hermes_cli import backup
-
-    root, _endpoint = codex_home
-    live, snapshot_id = _prepare(root, tmp_path)
-    wal = live.with_name(live.name + "-wal")
-    ready, gate = tmp_path / "ready", tmp_path / "gate"
-    proc = subprocess.Popen([sys.executable, "-B", "-c", HOLDER, str(live), holder, str(ready), str(gate)],
-                            cwd=str(REPO), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    try:
-        deadline = time.monotonic() + 60
-        while not ready.exists():
-            assert proc.poll() is None and time.monotonic() < deadline, proc.communicate()
-            time.sleep(0.05)
-        wal_before = wal.read_bytes()
-
-        assert backup.restore_quick_snapshot(snapshot_id, hermes_home=root) is False
-
-        # SQLite's own (partial) checkpoint may copy committed frames into the main file; the WAL
-        # itself, and the database file's identity, are untouched.
-        assert wal.read_bytes() == wal_before, "a refused restore touched the WAL"
-        assert os.path.samefile(live, tmp_path / "other-name.db"), "a refused restore replaced the database"
-    finally:
-        gate.write_text("go")
-        proc.communicate(timeout=60)
-    assert _read(live) == {"rows": ["committed-live"], "integrity": "ok"}
-
+# ── Codex's round-12 reproductions: every one is refused by the guard ─────────────────────────
 
 @pytest.mark.parametrize("publication", ["succeeds", "fails"])
-def test_a_hot_rollback_journal_is_resolved_by_sqlite_before_anything_is_replaced(
-        codex_home, tmp_path, monkeypatch, publication):
+def test_a_restore_never_writes_into_another_name_of_the_database(codex_home, tmp_path, monkeypatch, publication):
     from hermes_cli import backup
-
     root, _endpoint = codex_home
-    live, snapshot_id = _prepare(root, tmp_path, seed=SEED_HOT_JOURNAL, code=72)
-    journal = live.with_name(live.name + "-journal")
-    assert journal.exists() and journal.stat().st_size > 0, "no hot journal was left"
+    live, snapshot_id = _prepare(root, tmp_path)
+    other = tmp_path / "other-name.db"
+    before, wal_before = other.read_bytes(), live.with_name(live.name + "-wal").read_bytes()
     if publication == "fails":
         real_replace = os.replace
 
@@ -230,28 +135,106 @@ def test_a_hot_rollback_journal_is_resolved_by_sqlite_before_anything_is_replace
             return real_replace(src, dst, *args, **kwargs)
         monkeypatch.setattr(os, "replace", replace)
 
-    restored = backup.restore_quick_snapshot(snapshot_id, hermes_home=root)
-    monkeypatch.undo()
+    assert backup.restore_quick_snapshot(snapshot_id, hermes_home=root) is False  # refused
 
-    assert restored is (publication == "succeeds")
-    assert not (journal.exists() and journal.stat().st_size > 0), "a journal was left beside the database"
-    expected = ["backup-image"] if publication == "succeeds" else ["committed-live"]
-    assert _read(live) == {"rows": expected, "integrity": "ok"}
+    assert other.read_bytes() == before, "the restore wrote into a different hard-link name"
+    assert live.with_name(live.name + "-wal").read_bytes() == wal_before
 
 
-def test_an_unreadable_database_is_replaced_and_its_sidecars_are_preserved(codex_home, tmp_path):
+@pytest.mark.parametrize("damage", ["empty", "schema", "page-size"])
+def test_a_refused_unreadable_database_keeps_its_wal(codex_home, tmp_path, damage):
     from hermes_cli import backup
-
     root, _endpoint = codex_home
-    live, snapshot_id = _prepare(root, tmp_path)  # a committed row in the WAL ...
+    live, snapshot_id = _prepare(root, tmp_path)
     wal = live.with_name(live.name + "-wal")
-    old_wal = wal.read_bytes()
-    with open(live, "r+b") as handle:  # ... beside a main file whose header is destroyed
-        handle.write(b"\x00" * 100)
+    evidence = wal.read_bytes()
+    if damage == "empty":
+        live.write_bytes(b"")
+    else:
+        with live.open("r+b") as handle:
+            handle.seek(100 if damage == "schema" else 16)
+            handle.write(b"\xff" if damage == "schema" else b"\x00\x03")
 
-    assert backup.restore_quick_snapshot(snapshot_id, hermes_home=root) is True
+    backup.restore_quick_snapshot(snapshot_id, hermes_home=root)
 
-    assert not wal.exists(), "the old WAL was left beside the new image"
-    kept = list(root.glob(".sessions.db-wal.*.preserved"))
-    assert [p.read_bytes() for p in kept] == [old_wal], "the unreadable database's WAL was not preserved"
+    assert wal.read_bytes() == evidence, f"the WAL of a {damage} database was lost"
+
+
+def test_a_sidecar_hard_linked_to_a_credential_record_is_never_touched(live_root, tmp_path):
+    from hermes_cli import backup
+    root, _endpoint, chain_id = live_root
+    record = root / "auth.recovery" / f"{chain_id}.json"
+    before = record.read_bytes()
+    live = root / "sessions.db"
+    live.write_bytes(_backup_image(tmp_path).read_bytes())
+    os.link(record, live.with_name(live.name + "-wal"))
+    snapshot_id = _snapshot(root, {"sessions.db": live.read_bytes()})
+
+    assert backup.restore_quick_snapshot(snapshot_id, hermes_home=root) is False
+
+    assert record.read_bytes() == before, "SQLite wrote through a sidecar alias into credential state"
+
+
+def test_a_refused_restore_leaves_the_live_database_and_later_commits_intact(codex_home, tmp_path):
+    """Codex's post-publication writer, against a restore the guard refuses: nothing is published
+    or cleaned up, and a separate SessionDB writer's commit survives the next startup."""
+    from hermes_cli import backup
+    root, _endpoint = codex_home
+    live, snapshot_id = _prepare(root, tmp_path)
+    assert backup.restore_quick_snapshot(snapshot_id, hermes_home=root) is False
+    out = _run(POST_PUBLISH_WRITER, live)
+    assert out.returncode == 73, out.stderr[-2000:]
+    assert _read(live) == {"rows": ["committed-live", "arrived-after-publication"], "integrity": "ok"}
+
+
+# ── The guard, name by name ────────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("how", ["snapshot", "import"])
+@pytest.mark.parametrize("name", ["sessions.db", "sessions.db-wal", "sessions.db-shm", "sessions.db-journal",
+                                  ".sessions.db.snap_restore"])
+def test_no_file_a_database_restore_may_write_can_be_a_credential_alias(live_root, tmp_path, how, name):
+    root, _endpoint, chain_id = live_root
+    record = root / "auth.recovery" / f"{chain_id}.json"
+    before = record.read_bytes()
+    live = root / "sessions.db"
+    if name != "sessions.db":
+        live.write_bytes(_backup_image(tmp_path).read_bytes())
+    os.link(record, root / name)
+
+    _restore(tmp_path, root, how, _backup_image(tmp_path).read_bytes())
+
+    assert record.read_bytes() == before, f"a database restore wrote through {name} into a chain record"
+
+
+def test_a_planted_staging_name_refuses_the_database(codex_home, tmp_path):
+    from hermes_cli import backup
+    root, _endpoint = codex_home
+    live, snapshot_id = _prepare(root, tmp_path, link=False)
+    staging = root / ".sessions.db.snap_restore"
+    staging.write_bytes(b"planted")
+    assert backup.restore_quick_snapshot(snapshot_id, hermes_home=root) is False
+    assert staging.read_bytes() == b"planted"
+    assert _read(live) == {"rows": ["committed-live"], "integrity": "ok"}
+
+
+def test_the_post_update_auto_restore_is_guarded_too(live_root, tmp_path):
+    from hermes_cli.update_cmd_maint import _restore_state_db_from_snapshot
+    root, _endpoint, chain_id = live_root
+    record = root / "auth.recovery" / f"{chain_id}.json"
+    before = record.read_bytes()
+    state = root / "state.db"
+    state.write_bytes(b"\x00" * 4096)  # the corrupt database the auto-restore replaces
+    os.link(record, state.with_name(state.name + "-wal"))
+
+    assert _restore_state_db_from_snapshot(state, _backup_image(tmp_path)) is False
+
+    assert record.read_bytes() == before, "the auto-restore deleted or wrote a credential alias"
+
+
+@pytest.mark.parametrize("how", ["snapshot", "import"])
+def test_an_ordinary_database_is_restored_by_upstreams_path(codex_home, tmp_path, how):
+    """Control: no alias anywhere, so the guard lets upstream's page copy restore it."""
+    root, _endpoint = codex_home
+    live, _snapshot_id = _prepare(root, tmp_path, link=False)
+    _restore(tmp_path, root, how, _backup_image(tmp_path).read_bytes())
     assert _read(live) == {"rows": ["backup-image"], "integrity": "ok"}

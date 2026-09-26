@@ -407,8 +407,12 @@ def _restore_state_db_from_snapshot(state_path: Path, snap_state: Path) -> bool:
     clobbers pages. Holder scan ``None`` proceeds (gateways drained; refusing on unknown would
     disable auto-restore on non-Linux). Raises OSError if the copy fails.
     """
-    from hermes_cli.backup import _foreign_db_holder_pids, _publish_db_replacing, verify_sqlite_integrity
+    from hermes_cli.backup import _db_restore_refusal, _foreign_db_holder_pids, verify_sqlite_integrity
     from hermes_cli.sqlite_safe_read import LiveConnectionError, offline_file_access
+    refusal = _db_restore_refusal(state_path)  # the copy below writes into state.db: never an alias
+    if refusal is not None:
+        print(f"  ✗ Auto-restore refused: {refusal}. Restore manually with /snapshot restore once fixed.")
+        return False
     holders = _foreign_db_holder_pids(state_path)
     if holders:
         print(
@@ -422,10 +426,8 @@ def _restore_state_db_from_snapshot(state_path: Path, snap_state: Path) -> bool:
     # CLOSED on any tracked connection and holds the lock across clear + copy.
     try:
         with offline_file_access(state_path, what="restore a snapshot over"):
-            # Replaced, never copied into: sidecars are discarded only after SQLite proves they hold
-            # no recovery data (an unreadable database's are preserved), a failure keeps the current
-            # file, and nothing writes through a hard link to it.
-            _publish_db_replacing(snap_state, state_path)
+            _clear_stale_sqlite_sidecars(state_path)
+            shutil.copy2(snap_state, state_path)
     except LiveConnectionError as exc:
         print(
             f"  ✗ Auto-restore refused: {exc} Close the in-process database "

@@ -132,8 +132,9 @@ def _sqlite(path, value):
 @pytest.mark.parametrize("how", ["snapshot", "import"])
 @pytest.mark.parametrize("kind", ["file", "database"])
 def test_a_restored_file_never_changes_another_hard_link_to_the_old_file(live_root, tmp_path, how, kind):
-    """Structural: every restore publishes by replacing the directory entry, so an ordinary file's
-    other hard link keeps the old content — for plain files and for session databases alike."""
+    """Structural: an ordinary file is published by replacing the directory entry, so its other hard
+    link keeps the old content; a database with another hard link is not restored at all (the
+    pre-open guard: upstream's page copy would write into the shared file)."""
     from hermes_cli import backup
     root, _endpoint, _chain_id = live_root
     name = "notes.txt" if kind == "file" else "sessions.db"
@@ -158,4 +159,7 @@ def test_a_restored_file_never_changes_another_hard_link_to_the_old_file(live_ro
         backup.run_import(SimpleNamespace(zipfile=str(archive), force=True))
 
     assert other.read_bytes() == before, f"restoring {name} wrote through its other hard link"
-    assert live.read_bytes() == source.read_bytes(), f"{name} was not restored"
+    if kind == "file":
+        assert live.read_bytes() == source.read_bytes(), f"{name} was not restored"
+    else:
+        assert live.read_bytes() == before, "a hard-linked database was restored instead of refused"
