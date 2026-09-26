@@ -100,12 +100,13 @@ def _skill_mutation_lock(name: str):
 
 
 def _skill_mutation_locks(names):
-    """Every lock of an atomic batch, acquired in one stable path order (deadlock-free across batches)."""
+    """Every lock of an atomic batch, acquired in one stable path order (deadlock-free across batches).
+    If a later lock cannot be taken, the ones already held are released before the error propagates."""
     from tools.skill_usage import skill_file_lock
-    stack = ExitStack()
-    for lock_path in sorted({_skill_lock_path(n) for n in names}):
-        stack.enter_context(skill_file_lock(lock_path))
-    return stack
+    with ExitStack() as stack:
+        for lock_path in sorted({_skill_lock_path(n) for n in names}):
+            stack.enter_context(skill_file_lock(lock_path))
+        return stack.pop_all()
 
 
 MAX_NAME_LENGTH = 64

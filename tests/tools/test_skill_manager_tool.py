@@ -381,6 +381,50 @@ class TestSkillMutationLock:
             assert lock.parent == tmp_path / ".locks"
             assert lock.name == hashlib.sha256(b"foo").hexdigest() + ".lock"
 
+    def test_batch_that_cannot_take_a_later_lock_releases_the_earlier_ones(self, tmp_path, monkeypatch):
+        """A batch takes its locks in path order; when a later one times out, the ones already
+        taken must be released, not left held by this thread for the life of the process (A18)."""
+        import utils
+        from tools.skill_manager_tool import _skill_mutation_locks
+        from tools.skill_usage import skill_file_lock
+
+        monkeypatch.setattr(utils, "BOUNDED_LOCK_WAIT_S", 0.3)
+        with _skill_dir(tmp_path):
+            first, second = sorted({_skill_lock_path("aaa"), _skill_lock_path("bbb")})
+            holding, release = threading.Event(), threading.Event()
+
+            def hold_second():
+                with skill_file_lock(second):
+                    holding.set()
+                    release.wait(10)
+
+            holder = threading.Thread(target=hold_second)
+            holder.start()
+            assert holding.wait(5)
+            try:
+                # Kept alive like a caller that stores or reports the error: release must not wait
+                # for the garbage collector to finalize the half-built stack.
+                with pytest.raises(TimeoutError) as failure:
+                    _skill_mutation_locks(["aaa", "bbb"])
+            finally:
+                release.set()
+                holder.join(5)
+
+            taken = []
+
+            def take_first():
+                try:
+                    with skill_file_lock(first):
+                        taken.append(True)
+                except TimeoutError:
+                    taken.append(False)
+
+            other = threading.Thread(target=take_first)
+            other.start()
+            other.join(5)
+            assert taken == [True], "the first lock of the failed batch is still held"
+            assert failure.type is TimeoutError
+
 
 class TestDeleteSkill:
     def test_delete_cleans_empty_category_dir(self, tmp_path):
