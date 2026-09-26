@@ -190,93 +190,34 @@ def _lease_paths(
     return home / "runtime" / "active_sessions.json", home / "runtime" / "active_sessions.lock"
 
 
-# How long a claim/release waits for the registry lock before failing CLOSED. Windows'
-# msvcrt.LK_LOCK gives up after 10 one-second retries: with a dozen windows starting turns at once
-# the holder (starved of the GIL by agent builds) kept the lock past that, and every waiter was
-# refused "could not safely reserve this session" (4090) at the same instant. Threads of one
-# process now queue on a per-file thread lock (no polling among themselves), and the cross-process
-# file lock (msvcrt on Windows, fcntl on POSIX, both non-blocking) is polled every 50 ms up to this
-# budget; a holder that never lets go makes waiters fail CLOSED here instead of hanging forever.
+# How long a claim/release waits for the registry lock before failing CLOSED (utils.bounded_file_lock:
+# threads of this process queue on a thread lock, the cross-process lock is polled non-blocking). The
+# old msvcrt.LK_LOCK gave up after ten one-second retries: with a dozen windows starting turns at once
+# every waiter was refused "could not safely reserve this session" (4090) at the same instant.
 _LOCK_WAIT_S = 30.0
-_LOCK_POLL_S = 0.05
-_THREAD_LOCKS: dict[str, threading.Lock] = {}
-_THREAD_LOCKS_GUARD = threading.Lock()
-
-
-def _thread_lock_for(path: Path) -> threading.Lock:
-    key = os.path.normcase(os.path.abspath(path))
-    with _THREAD_LOCKS_GUARD:
-        return _THREAD_LOCKS.setdefault(key, threading.Lock())
-
-
-def _flock(fh, *, lock: bool, deadline: float | None = None) -> None:
-    """Exclusive whole-file lock/unlock on ``fh`` (fcntl on POSIX, msvcrt on Windows)."""
-    if os.name == "nt":
-        import msvcrt
-        fh.seek(0)
-        if not lock:
-            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
-            return
-        while True:
-            try:
-                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
-                return
-            except OSError:
-                if deadline is None or time.monotonic() >= deadline:
-                    raise
-                time.sleep(_LOCK_POLL_S)
-    else:
-        import fcntl
-        if not lock:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-            return
-        while True:
-            try:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return
-            except BlockingIOError:
-                if deadline is None or time.monotonic() >= deadline:
-                    raise
-                time.sleep(_LOCK_POLL_S)
 
 
 class _FileLock:
     def __init__(self, path: Path):
         self.path = path
-        self._fh = None
-        self._thread_lock: threading.Lock | None = None
+        self._held = None
 
     def __enter__(self):
-        deadline = time.monotonic() + _LOCK_WAIT_S
-        thread_lock = _thread_lock_for(self.path)
-        if not thread_lock.acquire(timeout=_LOCK_WAIT_S):
-            raise RuntimeError("active session file lock unavailable")
+        from utils import bounded_file_lock
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        held = bounded_file_lock(self.path, lambda: open(self.path, "a+b"), wait_s=_LOCK_WAIT_S)
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self._fh = open(self.path, "a+b")
-            try:
-                _flock(self._fh, lock=True, deadline=deadline)
-            except Exception as exc:
-                self._fh.close()
-                self._fh = None
-                raise RuntimeError("active session file lock unavailable") from exc
-        except BaseException:
-            thread_lock.release()
-            raise
-        self._thread_lock = thread_lock
+            held.__enter__()
+        except (TimeoutError, OSError) as exc:
+            raise RuntimeError("active session file lock unavailable") from exc
+        self._held = held
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        fh, self._fh = self._fh, None
-        thread_lock, self._thread_lock = self._thread_lock, None
-        try:
-            if fh is not None:
-                with suppress(Exception):
-                    _flock(fh, lock=False)
-                fh.close()
-        finally:
-            if thread_lock is not None:
-                thread_lock.release()
+        held, self._held = self._held, None
+        if held is not None:
+            held.__exit__(exc_type, exc, tb)
 
 
 def _read_entries(path: Path, *, strict: bool = False) -> list[dict[str, Any]]:

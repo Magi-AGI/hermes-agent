@@ -7,10 +7,11 @@ import os
 import shutil
 import stat
 import tempfile
+import threading
 import time
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from pathlib import Path
-from typing import Any, Union
+from typing import Any, Iterator, Union
 from urllib.parse import urlparse
 
 import yaml
@@ -33,6 +34,77 @@ def is_truthy_value(value: Any, default: bool = False) -> bool:
 def env_var_enabled(name: str, default: str = "") -> bool:
     """Return True when an environment variable is set to a truthy value."""
     return is_truthy_value(os.getenv(name, default), default=False)
+
+
+# ── Bounded exclusive file locks ─────────────────────────────────────────────────────────────
+# msvcrt.LK_LOCK retries once a second and raises after ten tries, and a blocking POSIX flock never
+# gives up. Threads of ONE process contending through separate handles therefore serialized at one
+# acquisition per second on Windows (a dozen concurrent turns: the last waiter past the ten-try cliff,
+# its write lost or refused), and a holder that never lets go hung every POSIX waiter. Threads now
+# queue on a per-path thread lock (no polling among themselves) and the cross-process lock is polled
+# non-blocking every 50 ms up to a budget; past it the caller gets TimeoutError and applies its own
+# policy (fail closed, degrade, skip).
+BOUNDED_LOCK_WAIT_S = 30.0
+_BOUNDED_LOCK_POLL_S = 0.05
+_path_thread_locks: "dict[str, threading.Lock]" = {}
+_path_thread_locks_guard = threading.Lock()
+
+
+def _path_thread_lock(key: Union[str, Path]) -> threading.Lock:
+    norm = os.path.normcase(os.path.abspath(key))
+    with _path_thread_locks_guard:
+        return _path_thread_locks.setdefault(norm, threading.Lock())
+
+
+def _os_lock_polled(fh, deadline: float) -> None:
+    """Exclusive OS lock on byte 0 of *fh* (msvcrt / fcntl), polled non-blocking until *deadline*."""
+    while True:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"file lock not acquired within the budget: {getattr(fh, 'name', fh)}") from None
+            time.sleep(_BOUNDED_LOCK_POLL_S)
+
+
+def _os_unlock(fh) -> None:
+    if os.name == "nt":
+        import msvcrt
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def bounded_file_lock(key: Union[str, Path], open_fh, *, wait_s: "float | None" = None) -> Iterator[Any]:
+    """Hold an exclusive lock for the block: this process's per-*key* thread lock, then the OS lock on
+    byte 0 of the handle ``open_fh()`` returns (opened only once the thread lock is held, so creating
+    or padding the lock file never races a sibling thread). Yields the handle. Raises TimeoutError when
+    either lock is not had within *wait_s* (default :data:`BOUNDED_LOCK_WAIT_S`). Not re-entrant."""
+    budget = BOUNDED_LOCK_WAIT_S if wait_s is None else wait_s
+    deadline = time.monotonic() + budget
+    thread_lock = _path_thread_lock(key)
+    if not thread_lock.acquire(timeout=budget):
+        raise TimeoutError(f"file lock not acquired within the budget (another thread): {key}")
+    try:
+        with open_fh() as fh:
+            _os_lock_polled(fh, deadline)
+            try:
+                yield fh
+            finally:
+                with suppress(OSError):
+                    _os_unlock(fh)
+    finally:
+        thread_lock.release()
 
 
 def file_signature(st: os.stat_result) -> "tuple[int, int, int, int]":

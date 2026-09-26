@@ -166,34 +166,29 @@ class MemoryStore:
         if fcntl is None and msvcrt is None:
             yield
             return
-        flags = os.O_RDWR | os.O_CREAT
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        raw_fd = os.open(lock_path, flags, 0o600)
-        try:
-            # The creation mode is filtered through the process umask and does
-            # not repair a lock left loose by an older Hermes process. Tighten
-            # the opened inode before acquiring the lock so both cases are
-            # owner-only. Operating on the fd avoids a path-swap window.
-            if hasattr(os, "fchmod"):
-                os.fchmod(raw_fd, 0o600)
-            fd = os.fdopen(raw_fd, "r+", encoding="utf-8")
-        except Exception:
-            os.close(raw_fd)
-            raise
-        with fd:
-            def _flock(unlock: bool):
-                if fcntl:
-                    fcntl.flock(fd, fcntl.LOCK_UN if unlock else fcntl.LOCK_EX)
-                else:
-                    fd.seek(0)
-                    msvcrt.locking(fd.fileno(), msvcrt.LK_UNLCK if unlock else msvcrt.LK_LOCK, 1)
-            _flock(False)
+
+        def open_lock_file():
+            flags = os.O_RDWR | os.O_CREAT
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            raw_fd = os.open(lock_path, flags, 0o600)
             try:
-                yield
-            finally:
-                with suppress(OSError):
-                    _flock(True)
+                # The creation mode is filtered through the process umask and does
+                # not repair a lock left loose by an older Hermes process. Tighten
+                # the opened inode before acquiring the lock so both cases are
+                # owner-only. Operating on the fd avoids a path-swap window.
+                if hasattr(os, "fchmod"):
+                    os.fchmod(raw_fd, 0o600)
+                return os.fdopen(raw_fd, "r+", encoding="utf-8")
+            except Exception:
+                os.close(raw_fd)
+                raise
+
+        # Bounded (utils.bounded_file_lock): concurrent turns writing memory queue on a thread lock
+        # instead of msvcrt.LK_LOCK's one-per-second retries and ten-try cliff.
+        from utils import bounded_file_lock
+        with bounded_file_lock(lock_path, open_lock_file):
+            yield
 
     @staticmethod
     def _path_for(target: str) -> Path:

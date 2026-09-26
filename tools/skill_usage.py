@@ -55,21 +55,29 @@ def _archive_dir() -> Path:
     return _skills_dir() / ".archive"
 
 
-def _flock(fd, lock: bool) -> None:
-    if fcntl:
-        return fcntl.flock(fd, fcntl.LOCK_EX if lock else fcntl.LOCK_UN)
-    fd.seek(0)
-    msvcrt.locking(fd.fileno(), msvcrt.LK_LOCK if lock else msvcrt.LK_UNLCK, 1)
+_held_locks = threading.local()  # per thread: an OS lock is NOT re-entrant across separate fds
 
 
-_held_locks = threading.local()  # per thread: flock is NOT re-entrant across separate fds
+def _open_lock_file(lock_path: Path):
+    # Opened under the per-path thread lock (utils.bounded_file_lock), so padding a new lock file never
+    # races a sibling thread: truncating + rewriting it while another thread held byte 0 raised
+    # PermissionError and silently dropped that usage update. Append mode never truncates.
+    fh = open(lock_path, "a+", encoding="utf-8")
+    if fh.tell() == 0:
+        fh.write(" ")
+        fh.flush()
+    return fh
 
 
 @contextmanager
 def skill_file_lock(lock_path: Path):
     """Exclusive cross-process lock on ``lock_path`` held across a read-modify-write cycle.
     Re-entrant within one thread (a nested acquire of the same path just runs); a no-op
-    where neither fcntl nor msvcrt exists."""
+    where neither fcntl nor msvcrt exists. Bounded: threads of this process queue instead of
+    polling once a second (msvcrt.LK_LOCK serialized a dozen concurrent turns at 1/s and dropped
+    updates past its ten-try cliff); TimeoutError past utils.BOUNDED_LOCK_WAIT_S."""
+    from utils import bounded_file_lock
+
     lock_path = Path(lock_path)
     held = getattr(_held_locks, "paths", None)
     if held is None:
@@ -78,17 +86,12 @@ def skill_file_lock(lock_path: Path):
         yield
         return
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    if msvcrt and (not lock_path.exists() or lock_path.stat().st_size == 0):
-        lock_path.write_text(" ", encoding="utf-8")  # msvcrt needs a non-empty byte range to lock
-    with open(lock_path, "r+" if msvcrt else "a+", encoding="utf-8") as fd:
-        _flock(fd, True)
+    with bounded_file_lock(lock_path, lambda: _open_lock_file(lock_path)):
         held.add(lock_path)
         try:
             yield
         finally:
             held.discard(lock_path)
-            with suppress(OSError, IOError):
-                _flock(fd, False)
 
 
 def _usage_file_lock():
