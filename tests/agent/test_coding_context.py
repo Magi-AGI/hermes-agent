@@ -11,6 +11,14 @@ import pytest
 from agent import coding_context as cc
 
 
+@pytest.fixture(autouse=True)
+def _git_probe_bound_is_a_hang_guard(monkeypatch):
+    # These tests check what the workspace probe reports, not how fast git answers: at the 2.5 s
+    # production bound a loaded runner dropped `rev-parse --git-common-dir` and with it the
+    # "Worktree: linked" line. The bound itself is covered by tests/hermes_cli/test_bounded_probe_run.py.
+    monkeypatch.setattr(cc, "_GIT_TIMEOUT", 60.0)
+
+
 def test_coding_guidance_advertises_persistent_terminal_state():
     assert "Terminal state persists across calls" in cc.CODING_AGENT_GUIDANCE
     assert "Activate a virtualenv" in cc.CODING_AGENT_GUIDANCE
@@ -29,6 +37,9 @@ def _git_init(path):
     (Path(path) / "main.py").write_text("print('hi')\n")
     for args in (
         ["init", "-q", "-b", "main"],
+        # Git for Windows' system config sets core.autocrlf=true; the LF-committed file then
+        # reads as modified and the workspace is never "clean".
+        ["config", "core.autocrlf", "false"],
         ["add", "-A"],
         ["commit", "-q", "-m", "init commit"],
     ):
