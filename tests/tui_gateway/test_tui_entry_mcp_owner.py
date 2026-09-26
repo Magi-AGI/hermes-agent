@@ -30,28 +30,30 @@ def test_wait_falls_through_to_shared_owner(monkeypatch):
     monkeypatch.setattr(
         mcp_startup, "start_background_mcp_discovery", lambda **kw: None
     )
-    thread = threading.Thread(target=lambda: time.sleep(0.05), daemon=True)
-    # Clock starts before the thread does: a main thread descheduled after start() used to see
-    # most of the 50 ms already gone and measure under the bound.
-    start = time.monotonic()
+    # Ordered by events, not elapsed time: discovery finishes only after `release`, and the wait
+    # must not return before it has. (A 50 ms sleep measured against a 40 ms bound read short on a
+    # descheduled main thread.) The 10 s bounds are hang guards.
+    release, finished = threading.Event(), threading.Event()
+    thread = threading.Thread(target=lambda: (release.wait(10.0), finished.set()), daemon=True)
     thread.start()
     monkeypatch.setattr(mcp_startup, "_mcp_discovery_thread", {hermes_home_key(): thread})
+    threading.Timer(0.2, release.set).start()
 
-    entry.wait_for_mcp_discovery(timeout=2.0)
-    elapsed = time.monotonic() - start
+    entry.wait_for_mcp_discovery(timeout=10.0)
 
-    assert not thread.is_alive()
-    assert elapsed >= 0.04
+    assert finished.is_set()
 
 
 def test_wait_noop_when_no_owner_has_a_thread(monkeypatch):
     monkeypatch.setattr(entry, "_mcp_discovery_thread", None)
     monkeypatch.setattr(mcp_startup, "_mcp_discovery_thread", {})
 
+    # Not waiting is told apart from waiting out the 60 s timeout with a 30 s bound, far above any
+    # scheduling delay on a loaded runner.
     start = time.monotonic()
-    entry.wait_for_mcp_discovery(timeout=2.0)
+    entry.wait_for_mcp_discovery(timeout=60.0)
 
-    assert time.monotonic() - start < 0.5
+    assert time.monotonic() - start < 30.0
 
 
 def test_wait_still_joins_entry_local_thread(monkeypatch):
