@@ -13,6 +13,7 @@ from typing import Any, Callable
 from gateway import hosted_room_driver as state
 
 _LockType = type(threading.Lock())
+_RECEIPT_HISTORY_TAIL = 200
 
 
 class HostedRoomSessionError(RuntimeError):
@@ -84,8 +85,12 @@ class HostedRoomServerRPC:
             raise
 
     def history(self, *, profile: str, session_id: str, source: str) -> Sequence[Mapping[str, Any]]:
+        """The newest turns only: the driver looks for the ACTIVE task's terminal receipt, which a stop or a
+        poll finds at the tail, and a bounded read is never refused for a long session (a full-lineage
+        read past sessions.max_resume_messages is, which left Stop unable to reach its interrupt)."""
         del source
-        result = self._call("session.history", {"profile": profile, "session_id": session_id})
+        result = self._call("session.history", {"profile": profile, "session_id": session_id,
+                                                "tail": _RECEIPT_HISTORY_TAIL})
         rows = result.get("messages")
         return tuple(row for row in rows if isinstance(row, dict)) if isinstance(rows, list) else ()
 

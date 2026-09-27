@@ -2790,6 +2790,7 @@ export interface SessionStatusResult {
 export interface SessionHistoryParams {
   session_id: string
   profile?: string | null
+  tail?: number | null
 }
 export interface SessionHistoryResult {
   count: number
@@ -4539,7 +4540,7 @@ export interface RpcMethods {
   'session.foreign.list': { params: SessionForeignListParams; result: SessionForeignListResult }
   /** Preview a foreign session's tail before importing it. */
   'session.foreign.preview': { params: SessionForeignIdParams; result: SessionForeignPreviewResult }
-  /** The durable display transcript (ancestors included, row ids attached). */
+  /** The durable display transcript (ancestors included, row ids attached); 4130 past sessions.max_resume_messages, never truncated. ``tail`` reads only the newest messages. */
   'session.history': { params: SessionHistoryParams; result: SessionHistoryResult }
   /** Stop the running turn (and streaming TTS); retires the crash-recovery marker. */
   'session.interrupt': { params: SessionInterruptParams; result: SessionInterruptResult }

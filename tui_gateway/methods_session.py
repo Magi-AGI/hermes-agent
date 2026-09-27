@@ -1775,9 +1775,25 @@ def _(rid, params: dict, session: dict) -> dict:
     return _ok(rid, {"output": "\n".join(lines)})
 
 
+_HISTORY_TAIL_MAX = 500
+
+
 @_session_method("session.history")
 def _(rid, params: dict, session: dict) -> dict:
     history = list(session.get("history", []))
+    # ``tail``: only the newest N messages of the current segment, a bounded read that is never refused
+    # (a hosted-room Stop looks up the active task's receipt this way on any session length).
+    tail = params.get("tail")
+    if tail is not None:
+        if isinstance(tail, bool) or not isinstance(tail, int) or not 1 <= tail <= _HISTORY_TAIL_MAX:
+            return _err(rid, 4002, f"tail must be an integer from 1 to {_HISTORY_TAIL_MAX}")
+        history = history[-tail:]
+        if session.get("session_key"):
+            with _session_db(session) as db:
+                if db is not None:
+                    with contextlib.suppress(Exception):
+                        history = db.get_conversation_tail(session["session_key"], tail)
+        return _ok(rid, {"count": len(history), "messages": _history_to_messages(history)})
     if session.get("session_key"):
         with _session_db(session) as db:
             if db is not None:

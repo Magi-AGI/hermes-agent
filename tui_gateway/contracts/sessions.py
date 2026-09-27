@@ -399,7 +399,8 @@ method("session.status", params=SessionStatusParams, result=SessionStatusResult,
 
 
 class SessionHistoryParams(SessionParams):
-    pass
+    # Only the newest N messages of the current segment (1-500): a bounded read, never refused for size.
+    tail: int | None = None
 
 
 class SessionHistoryResult(Result):
@@ -408,7 +409,8 @@ class SessionHistoryResult(Result):
 
 
 method("session.history", params=SessionHistoryParams, result=SessionHistoryResult,
-       doc="The durable display transcript (ancestors included, row ids attached).")
+       doc="The durable display transcript (ancestors included, row ids attached); 4130 past "
+           "sessions.max_resume_messages, never truncated. ``tail`` reads only the newest messages.")
 
 
 class SessionUsageParams(SessionParams):

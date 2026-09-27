@@ -225,8 +225,9 @@ class HostedRoomRuntime:
                     if binding is not None:
                         lease = self._ensure_lease(binding)
                         if self._peer_stop_acknowledged(binding, result) or (
-                            not self._settle_stopping_completion(binding, result, lease)
-                            and self._interrupt_stopping_task(binding, result)):
+                            not (settled := self._settle_stopping_completion(binding, result, lease))
+                            and self._interrupt_stopping_task(
+                                binding, result, history_checked=settled is not None)):
                             self._complete_cancel(result, cancel_id=cancel_id)
                 except Exception as exc:
                     self._record_error(f"stop remains pending: {exc}")
@@ -310,9 +311,9 @@ class HostedRoomRuntime:
         self, binding: HostedRoomBinding, task: Mapping[str, Any], lease: state.DriverLease
     ) -> bool:
         """Terminalize a stopping task from its receipt or an acknowledged interrupt."""
-        if self._settle_stopping_completion(binding, task, lease):
+        if settled := self._settle_stopping_completion(binding, task, lease):
             return True
-        if self._interrupt_stopping_task(binding, task):
+        if self._interrupt_stopping_task(binding, task, history_checked=settled is not None):
             self._complete_acknowledged_stop(binding, task, lease)
             return True
         return False
@@ -357,7 +358,11 @@ class HostedRoomRuntime:
             and str(info.get("task_id") or "") == task["identity"].task_id
             and int(info.get("execution_generation") or 0) == int(task["execution_generation"]))
 
-    def _interrupt_stopping_task(self, binding: HostedRoomBinding, task: Mapping[str, Any]) -> bool:
+    def _interrupt_stopping_task(
+        self, binding: HostedRoomBinding, task: Mapping[str, Any], *, history_checked: bool = True
+    ) -> bool:
+        """Interrupt the exactly identified active task. ``history_checked=False`` (its receipt could not be
+        looked up): an inactive session is NOT a Stop acknowledgement, since the task may have settled."""
         transport, profile, session_id = self._open_session(binding, task)
         if session_id is None:
             # A local turn cannot survive without its canonical session, so an authoritative
@@ -367,7 +372,7 @@ class HostedRoomRuntime:
         if not _info_active(info):
             # History was checked just before this probe: an inactive exact session cannot
             # keep executing, and after a restart its process-local task marker is absent.
-            return True
+            return history_checked
         if not _info_is_active_for(info, task["identity"], require_exact=True):
             return False
         result = transport.interrupt(
@@ -378,12 +383,18 @@ class HostedRoomRuntime:
 
     def _settle_stopping_completion(
         self, binding: HostedRoomBinding, task: Mapping[str, Any], lease: state.DriverLease
-    ) -> bool:
-        """Publish a terminal receipt that arrived before Stop was acknowledged."""
+    ) -> bool | None:
+        """Publish a terminal receipt that arrived before Stop was acknowledged: True settled, False no
+        receipt, None when history could not be read (the receipt is unknown; an exactly active task can
+        still be interrupted, so a failed lookup never blocks Stop)."""
         transport, profile, session_id = self._open_session(binding, task)
         if session_id is None:
             return False
-        receipt = self._terminal_from_history(transport, profile, session_id, task)
+        try:
+            receipt = self._terminal_from_history(transport, profile, session_id, task)
+        except Exception as exc:
+            self._record_error(f"stop: task receipt lookup failed: {exc}")
+            return None
         if receipt is None:
             return False
         self._fenced(state.settle_stopping_task, binding, task, lease, **asdict(receipt))

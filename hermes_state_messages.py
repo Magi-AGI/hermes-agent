@@ -1100,6 +1100,15 @@ class SessionMessagesMixin:
             repair_alternation=repair_alternation, include_row_ids=include_row_ids,
             include_summary_markers=repair_alternation)
 
+    def get_conversation_tail(self, session_id: str, limit: int) -> List[Dict[str, Any]]:
+        """The newest *limit* active rows of one session (no ancestors), oldest first, in OpenAI format with row
+        ids: a bounded read for consumers that only need the latest turns (a hosted-room task receipt)."""
+        rows = self._read_all(
+            f"SELECT {self._CONVERSATION_ROW_COLUMNS} FROM messages WHERE session_id = ? AND active = 1 "
+            "ORDER BY id DESC LIMIT ?", (session_id, limit))
+        return self._rows_to_conversation(rows[::-1], session_id=session_id, include_ancestors=False,
+                                          repair_alternation=False, include_row_ids=True)
+
     def _dedupe_replayed_user(self, messages, msg, exact_user_clones) -> Tuple[bool, Any]:
         """Ancestor-lineage dedupe of one decoded user *msg* -> ``(skip, exact_clone_key)``. Rotation
         column-clones the concurrent tail into the child, so copies need not be adjacent: the exact
