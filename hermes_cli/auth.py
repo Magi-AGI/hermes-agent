@@ -741,6 +741,12 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
             auth_file, exc_info=True)
         raise
     if raw_bytes is None:
+        # A named profile whose DIRECTORY is gone (renamed / deleted by another process) is not an
+        # empty profile: reading it as empty would fall back to root's (another account's)
+        # credentials. Every provider's resolution fails closed here (stage-2 review r1-1).
+        profile_dir = named_profile_home(auth_file.parent)
+        if profile_dir is not None and Path(profile_dir) == auth_file.parent and not auth_file.parent.is_dir():
+            raise ProfileStoreMissing(auth_file.parent)
         return attach_witness(WitnessedStore(_empty_auth_store()), Witness(key, None, True))
     try:
         raw = json.loads(raw_bytes.decode("utf-8-sig"))

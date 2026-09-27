@@ -523,6 +523,8 @@ def resolve_codex_runtime_credentials(
                 observed = raw.get("access_token") if isinstance(raw, dict) else None
                 data = _read_codex_tokens(_lock=False)
     except AuthError as exc:
+        if exc.code in ("profile_store_missing", "profile_being_moved"):
+            raise  # this profile moved away: never fall back to another store's (account's) credential
         read_error = exc
         if not read_only and exc.relogin_required and exc.code in {
             "codex_auth_missing_access_token", "codex_auth_missing_refresh_token",
