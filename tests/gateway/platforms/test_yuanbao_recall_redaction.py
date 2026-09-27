@@ -1060,3 +1060,38 @@ def test_a_child_detached_before_the_decision_leaves_the_parent_to_its_own_fence
         assert _rows(db, "parent")[0][1] == RecallGuardMiddleware._REDACTED
     finally:
         db.close()
+
+
+def test_a_recalled_copy_timestamp_is_not_given_to_a_later_unrelated_copy(store):
+    """Round 9 (Codex, guarded_stamp_reuse): once a recalled copy's row held its replacement, its
+    timestamp looked free to the next undated copy with the same text, which then matched the earlier
+    withdrawal and was redacted too."""
+    from gateway.shutdown_flush import recover_pending_to_db
+
+    tasks: list = []
+    adapter = _adapter(store, tasks)
+    sid = _session(store, adapter)
+    db = store._db
+    _spool_undated(sid, 1)
+    assert _db_recall(db, sid, "r1", content=SECRET,
+                      replacement=RecallGuardMiddleware._REDACTED)[1] == "resolved"
+    recover_pending_to_db(db)  # boot replays it at its envelope second
+    _spool_undated(sid, 2)  # a different message, spooled in the same second
+    recover_pending_to_db(db)
+    assert [r[1] for r in _rows(db, sid) if r[0] == "user"] == [RecallGuardMiddleware._REDACTED, SECRET]
+
+
+def test_two_undated_copies_written_in_one_second_are_both_displayed(store):
+    """Round 9 (Codex, display_bump): the second copy's timestamp was moved after its display identity
+    was computed, so the two messages shared one display position and history showed only one."""
+    from gateway.shutdown_flush import recover_pending_to_db
+
+    tasks: list = []
+    adapter = _adapter(store, tasks)
+    sid = _session(store, adapter)
+    db = store._db
+    _spool_undated(sid, 1)
+    _spool_undated(sid, 2)
+    assert recover_pending_to_db(db) == 2
+    shown = [m for m in db.get_messages(sid, include_compacted=True) if m.get("role") == "user"]
+    assert [m.get("content") for m in shown] == [SECRET, SECRET]
