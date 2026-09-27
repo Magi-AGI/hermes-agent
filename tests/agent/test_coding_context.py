@@ -225,57 +225,44 @@ class TestWorkspaceSnapshotProbeFailures:
         assert f"- Status: {_UNKNOWN}" in block and "Status: clean" not in block
 
     @staticmethod
-    def _starve_status_lane(monkeypatch, failure, stuck=None):
-        """Make the status lane fail where the launch path can: the raw starter refused, the
-        worker's start() refused, or start() stuck as it is when the bootstrap dies."""
-        import threading
+    def _starve_status_lane(monkeypatch, failure):
+        """Make the status lane fail where a raw lane thread can: its start refused, or the new
+        thread dying before it runs the lane (a bootstrap MemoryError under commit exhaustion)."""
+        real_start = cc._thread.start_new_thread
 
-        real_starter, real_start = cc._thread.start_new_thread, threading.Thread.start
-
-        def starter(fn, args):
-            if failure == "starter-refused" and args[1] == ("status",):
+        def start(fn, args):
+            if args != (("status",),):
+                return real_start(fn, args)
+            if failure == "refused":
                 raise RuntimeError("can't start new thread")
-            return real_starter(fn, args)
 
-        def start(thread):
-            if thread.name == "workspace-snapshot-git-status":
-                if failure == "start-refused":
-                    raise RuntimeError("can't start new thread")
-                if failure == "start-stuck":
-                    stuck.wait(60)
-                    return None
-            return real_start(thread)
+            def dies():
+                raise MemoryError
 
-        monkeypatch.setattr(cc._thread, "start_new_thread", starter)
-        monkeypatch.setattr(threading.Thread, "start", start)
+            return real_start(dies, ())
 
-    @pytest.mark.parametrize("failure", ["starter-refused", "start-refused"])
-    def test_a_refused_lane_is_unknown_and_the_other_lane_is_kept(self, tmp_path, monkeypatch, failure):
+        monkeypatch.setattr(cc._thread, "start_new_thread", start)
+
+    def test_a_refused_lane_is_unknown_and_the_other_lane_is_kept(self, tmp_path, monkeypatch):
         _git_init(tmp_path)
         _canned_git(monkeypatch)
         monkeypatch.setattr(cc, "_GIT_TIMEOUT", 30.0)  # returns once the quick lane answers
-        self._starve_status_lane(monkeypatch, failure)
+        self._starve_status_lane(monkeypatch, "refused")
         block = cc.build_coding_workspace_block(tmp_path)
         assert f"- Status: {_UNKNOWN}" in block
         assert "- Branch: main" in block and "abc1234 init commit" in block
 
-    def test_a_lane_whose_start_never_returns_is_unknown_and_bounded(self, tmp_path, monkeypatch):
-        import threading
+    def test_a_lane_whose_bootstrap_dies_is_unknown_and_bounded(self, tmp_path, monkeypatch):
         import time
 
         _git_init(tmp_path)
         _canned_git(monkeypatch)
         monkeypatch.setattr(cc, "_GIT_TIMEOUT", 1.0)
-        stuck = threading.Event()
-        self._starve_status_lane(monkeypatch, "start-stuck", stuck)
-        try:
-            started = time.monotonic()
-            block = cc.build_coding_workspace_block(tmp_path)
-            elapsed = time.monotonic() - started
-        finally:
-            stuck.set()
+        self._starve_status_lane(monkeypatch, "bootstrap-dies")
+        started = time.monotonic()
+        block = cc.build_coding_workspace_block(tmp_path)
         assert f"- Status: {_UNKNOWN}" in block and "Status: clean" not in block
-        assert elapsed < 10.0  # the 1 s deadline, not the stuck start()
+        assert time.monotonic() - started < 10.0  # the 1 s deadline, not a wait on the dead lane
 
     def test_a_refused_lane_still_pins_the_snapshot(self, tmp_path, monkeypatch):
         from types import SimpleNamespace
@@ -287,10 +274,27 @@ class TestWorkspaceSnapshotProbeFailures:
         agent = SimpleNamespace(valid_tool_names={"terminal"}, platform="cli", model="gpt-4o",
                                 _frozen_workspace_snapshot=None)
         with monkeypatch.context() as starved:
-            self._starve_status_lane(starved, "start-refused")
+            self._starve_status_lane(starved, "refused")
             first = system_prompt._coding_parts(agent)
         assert first[1] and f"- Status: {_UNKNOWN}" in first[1][0]
         assert system_prompt._coding_parts(agent) == first  # threads available again: same bytes
+
+    @pytest.mark.parametrize("failure", ["refused", "bootstrap-dies"])
+    def test_a_failed_lane_leaves_no_thread_records_behind(self, tmp_path, monkeypatch, failure):
+        """Real git in the lane that runs, so the subprocess layer registers what it registers;
+        after the lanes finish nothing the snapshot started is left registered or waiting."""
+        import threading
+        import time
+
+        _git_init(tmp_path)
+        monkeypatch.setattr(cc, "_GIT_TIMEOUT", 2.0)
+        self._starve_status_lane(monkeypatch, failure)
+        before = set(threading.enumerate())
+        assert f"- Status: {_UNKNOWN}" in cc.build_coding_workspace_block(tmp_path)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and set(threading.enumerate()) - before:
+            time.sleep(0.05)
+        assert not [t.name for t in set(threading.enumerate()) - before]
 
     def test_snapshots_leave_no_thread_records_behind(self, tmp_path):
         """Lane threads (and anything the subprocess layer registers inside them) are gone once

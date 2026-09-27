@@ -449,6 +449,17 @@ _SNAPSHOT_PROBES = {
 _SNAPSHOT_LANES = (("status",), ("head", "dirs", "log"))
 
 
+def _forget_dummy_thread_record() -> None:
+    """Called as a raw ``_thread`` lane exits. The first time anything inside the lane asks
+    ``threading`` which thread it is (Windows subprocess handling does), ``threading`` registers
+    a ``_DummyThread`` for it that is never removed; drop this lane's own record so snapshots
+    leave no stale threads behind. Private ``threading`` state, covered by the snapshot leak tests."""
+    ident = _thread.get_ident()
+    with threading._active_limbo_lock:
+        if isinstance(threading._active.get(ident), threading._DummyThread):
+            del threading._active[ident]
+
+
 def _collect_snapshot_git(root: Path) -> dict[str, Optional[str]]:
     """Probe name -> stdout, or ``None`` for a probe not answered by the shared deadline (a probe
     still running then finishes its own bounded cleanup in the background). Each probe gets the
@@ -474,25 +485,15 @@ def _collect_snapshot_git(root: Path) -> dict[str, Optional[str]]:
         finally:
             for name in names:
                 publish(name, None)  # no-op for names already published
-
-    def start(worker: threading.Thread, names: tuple[str, ...]) -> None:
-        try:
-            worker.start()
-        except (RuntimeError, MemoryError):
-            for name in names:
-                publish(name, None)
+            _forget_dummy_thread_record()
 
     for names in _SNAPSHOT_LANES:
-        # Lanes are real threading.Thread objects: a raw _thread worker gets a permanent
-        # _DummyThread record the first time anything inside it asks threading who it is (Windows
-        # subprocess handling does). Only start() runs on a throwaway raw thread, because it waits
-        # without a bound for a bootstrap that can die under commit exhaustion; the collector
-        # never waits on it. A refused start makes that lane's facts unavailable, and the snapshot
-        # is still built and pinned.
+        # Raw lane threads: threading.Thread.start() waits without a bound for a bootstrap that
+        # can die under commit exhaustion, and then strands both the waiter and the half-started
+        # thread's registration. A raw thread whose bootstrap dies leaves nothing behind. A
+        # refused start makes that lane's facts unavailable; the snapshot is still built and pinned.
         try:
-            worker = threading.Thread(target=ctx_bound(lane), args=(names,), daemon=True,
-                                      name=f"workspace-snapshot-git-{names[0]}")
-            _thread.start_new_thread(start, (worker, names))
+            _thread.start_new_thread(ctx_bound(lane), (names,))
         except (RuntimeError, MemoryError):
             for name in names:
                 publish(name, None)
