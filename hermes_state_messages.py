@@ -879,8 +879,11 @@ class SessionMessagesMixin:
         session_id, stamp = params[self._P_SESSION], float(params[self._P_TIMESTAMP])
         variants = self._recall_content_variants(params[self._P_CONTENT])
         marks = ",".join("?" * len(variants))
-        written = conn.execute("SELECT timestamp FROM recall_copy_stamps WHERE copy_key = ?", (copy_key,)).fetchone()
+        written = conn.execute("SELECT timestamp FROM recall_copy_stamps WHERE copy_key = ? LIMIT 1",
+                               (copy_key,)).fetchone()
         if written is not None:  # the same copy again (its spool file outlived the first write): same identity
+            conn.execute("INSERT OR IGNORE INTO recall_copy_stamps (copy_key, session_id, timestamp) VALUES (?, ?, ?)",
+                         (copy_key, session_id, written[0]))
             self._guard_keyed_copy(conn, session_id, copy_key, variants, written[0])
             return written[0]
         taken = self._CONVERSATION_UP_SQL + (
@@ -1096,7 +1099,7 @@ class SessionMessagesMixin:
                 for copy_pid, text_matches, ts, copy_key in retry_copies:
                     if not copy_pid and text_matches:
                         written = copy_key and conn.execute(
-                            "SELECT timestamp FROM recall_copy_stamps WHERE copy_key = ?", (copy_key,)).fetchone()
+                            "SELECT timestamp FROM recall_copy_stamps WHERE copy_key = ? LIMIT 1", (copy_key,)).fetchone()
                         if written:  # already stored (its spool file outlived the write): that row's identity
                             stamps.add(written[0])
                         elif copy_key:

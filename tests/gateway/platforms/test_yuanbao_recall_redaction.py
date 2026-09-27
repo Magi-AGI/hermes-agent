@@ -1174,3 +1174,64 @@ def test_a_moved_session_keeps_its_written_copies_identity(store, tmp_path):
         assert rows and not [r for r in rows if SECRET in (r[1] or "")]
     finally:
         target.close()
+
+
+@pytest.mark.windows_only
+@pytest.mark.parametrize("recalled_first", [False, True])
+@pytest.mark.parametrize("moved", ["child", "parent"])
+def test_a_written_copy_keeps_its_identity_on_both_sides_of_a_partial_move(tmp_path, moved, recalled_first):
+    """Round 12 (Codex, child_move/parent_move and their recalled variants): the copy-timestamp mapping
+    had one owner, the session first written; moving the continuation alone left it behind, moving the
+    parent took it away from the continuation, and a replay of the same copy there became a second
+    message (text recall ambiguous) or bypassed the withdrawal and restored the text."""
+    from gateway.shutdown_flush import recover_pending_to_db
+
+    redacted = RecallGuardMiddleware._REDACTED
+    source, target = SessionDB(db_path=tmp_path / "source.db"), SessionDB(db_path=tmp_path / "target.db")
+    try:
+        source.create_session("parent", "yuanbao")
+        path = _spool_undated("parent", 1)
+        release = _hold_windows_file(path, 0x1)  # written, but its spool file cannot be deleted
+        try:
+            recover_pending_to_db(source)
+        finally:
+            release()
+        if recalled_first:  # withdrawn as the stored row: a text guard at its timestamp
+            assert _db_recall(source, "parent", "r1", content=SECRET, replacement=redacted)[1] == "resolved"
+        ((content, stamp),) = [(r["content"], r["timestamp"]) for r in source.get_messages("parent")]
+        _compress(source, "parent", "child", messages=[{"role": "user", "content": content, "timestamp": stamp}])
+        target.import_moved_session(source.export_session_for_move(moved), profile_name="elsewhere")
+        source.delete_moved_session(moved)
+        holder = target if moved == "child" else source
+        holder.append_message(session_id="child", role="user", content=SECRET, recall_copy_key=path.name)  # it again
+        if not recalled_first:
+            assert _db_recall(holder, "child", "r1", content=SECRET, replacement=redacted)[1] == "resolved"
+        rows = _rows(holder, "child")
+        assert rows and not [r for r in rows if SECRET in (r[1] or "")]
+    finally:
+        source.close()
+        target.close()
+
+
+def test_a_copy_mapping_recorded_before_ownership_still_follows_a_move(tmp_path):
+    """Round 12 (Codex, upgrade_r11): mappings written by the previous review build had no owning
+    session after the upgrade, so a session move left them behind and a replay of the copy at the
+    destination became a second message."""
+    source, target = SessionDB(db_path=tmp_path / "source.db"), SessionDB(db_path=tmp_path / "target.db")
+    try:
+        source.create_session("s", "yuanbao")
+        source.append_message(session_id="s", role="user", content=SECRET, timestamp=1_700_000_000.0)
+        source._execute_write(lambda conn: conn.executescript(
+            "DROP TABLE recall_copy_stamps; "
+            "CREATE TABLE recall_copy_stamps (copy_key TEXT PRIMARY KEY, timestamp REAL NOT NULL); "
+            "INSERT INTO recall_copy_stamps VALUES ('pending-copy.json', 1700000000.0);"))
+        source.close()
+        source = SessionDB(db_path=tmp_path / "source.db")
+        target.import_moved_session(source.export_session_for_move("s"), profile_name="elsewhere")
+        source.delete_moved_session("s")
+        target.append_message(session_id="s", role="user", content=SECRET, recall_copy_key="pending-copy.json")
+        assert _db_recall(target, "s", "r1", content=SECRET,
+                          replacement=RecallGuardMiddleware._REDACTED)[1] == "resolved"
+    finally:
+        source.close()
+        target.close()

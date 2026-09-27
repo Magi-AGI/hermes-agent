@@ -199,7 +199,7 @@ class SessionProfileRepairMixin:
             recall_requests = [dict(r) for r in conn.execute(
                 "SELECT * FROM recall_requests WHERE session_id = ?", (session_id,))]
             copy_stamps = [dict(r) for r in conn.execute(
-                "SELECT * FROM recall_copy_stamps WHERE session_id = ?", (session_id,))]
+                "SELECT * FROM recall_copy_stamps WHERE session_id = ? OR session_id IS NULL", (session_id,))]
             return {"session": dict(session), "system_prompt": prompt, "messages": messages, "usage": usage,
                     "recalls": recalls, "recall_requests": recall_requests, "copy_stamps": copy_stamps}
         return self._read_retrying_ioerr(_read)
@@ -226,7 +226,8 @@ class SessionProfileRepairMixin:
             for request in payload.get("recall_requests") or []:
                 self._insert_row(conn, "recall_requests", {**request, "session_id": session_id}, skip=frozenset())
             for stamp in payload.get("copy_stamps") or []:  # a retry copy written here keeps its identity there
-                self._insert_row(conn, "recall_copy_stamps", {**stamp, "session_id": session_id}, skip=frozenset())
+                conn.execute("INSERT OR IGNORE INTO recall_copy_stamps (copy_key, session_id, timestamp) "
+                             "VALUES (?, ?, ?)", (stamp["copy_key"], session_id, stamp["timestamp"]))
             for message in payload.get("messages") or []:
                 self._insert_row(conn, "messages", {**message, "session_id": session_id}, skip=_MESSAGE_MOVE_SKIP)
             for usage in payload.get("usage") or []:

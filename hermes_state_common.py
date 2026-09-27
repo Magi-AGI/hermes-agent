@@ -617,11 +617,15 @@ CREATE TABLE IF NOT EXISTS recalled_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_recalled_messages_session ON recalled_messages(session_id);
 -- The timestamp a retry copy without one of its own (keyed, see recalled_messages.copy_key) was first
--- written with: a replay of the same copy (its spool file outlived the write) keeps that identity.
+-- written with, per session holding it (the one it was written to, and compression continuations,
+-- which carry the row): a replay of the same copy (its spool file outlived the write) keeps that
+-- identity wherever either part of the conversation lives. A NULL session: recorded before ownership
+-- was (a review build); it goes with every moved session (keys are unique, so a spare copy is inert).
 CREATE TABLE IF NOT EXISTS recall_copy_stamps (
-    copy_key TEXT PRIMARY KEY,
+    copy_key TEXT NOT NULL,
     session_id TEXT,
-    timestamp REAL NOT NULL
+    timestamp REAL NOT NULL,
+    PRIMARY KEY (copy_key, session_id)
 );
 """
 

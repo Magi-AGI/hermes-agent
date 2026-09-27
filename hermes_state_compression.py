@@ -297,6 +297,10 @@ class SessionCompressionMixin:
                 "copy_key, replacement, recalled_at) SELECT ?, request_id, platform_message_id, content, timestamp, "
                 "copy_key, replacement, recalled_at FROM recalled_messages WHERE session_id = ?",
                 (child_session_id, parent_session_id))
+            conn.execute(  # a written retry copy keeps its identity in the continuation
+                "INSERT OR IGNORE INTO recall_copy_stamps (copy_key, session_id, timestamp) "
+                "SELECT copy_key, ?, timestamp FROM recall_copy_stamps WHERE session_id = ?",
+                (child_session_id, parent_session_id))
             conn.execute(  # and its requests stay anchored in the continuation, open or with their outcome
                 "INSERT OR IGNORE INTO recall_requests (request_id, session_id, platform_message_id, content, "
                 "replacement, note, status, created_at, settled_at) SELECT request_id, ?, platform_message_id, "

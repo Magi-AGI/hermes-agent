@@ -749,12 +749,24 @@ class SessionSchemaMixin:
     def _migrate_review_build_recalls(cursor: sqlite3.Cursor) -> None:
         """Stores opened by the unreleased review builds of recall redaction: drop the triggers one
         enforced recalls with, and turn another's ``pending`` text notes (an unresolved recall) into open
-        requests, with the platform id its id record kept. Probes first: a DROP or DELETE takes the
-        write lock even as a no-op."""
+        requests, with the platform id its id record kept, and rekey the copy-timestamp map per session.
+        Probes first: a DROP or DELETE takes the write lock even as a no-op."""
         for obsolete in ("messages_recall_insert", "messages_recall_update"):
             if cursor.execute("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?",
                               (obsolete,)).fetchone():
                 cursor.execute(f"DROP TRIGGER {obsolete}")
+        stamp_pk = {row[1]: row[5] for row in cursor.execute('PRAGMA table_info("recall_copy_stamps")')}
+        if stamp_pk and not stamp_pk.get("session_id"):
+            # Keyed by copy alone (review builds): rekey per session, keeping each row's recorded owner or
+            # none (an unowned row travels with every moved session, see SCHEMA_SQL).
+            cursor.execute("ALTER TABLE recall_copy_stamps RENAME TO recall_copy_stamps_review")
+            cursor.execute(
+                "CREATE TABLE recall_copy_stamps (copy_key TEXT NOT NULL, session_id TEXT, "
+                "timestamp REAL NOT NULL, PRIMARY KEY (copy_key, session_id))")
+            owner = "session_id" if "session_id" in stamp_pk else "NULL"
+            cursor.execute("INSERT INTO recall_copy_stamps (copy_key, session_id, timestamp) "
+                           f"SELECT copy_key, {owner}, timestamp FROM recall_copy_stamps_review")
+            cursor.execute("DROP TABLE recall_copy_stamps_review")
         columns = {row[1] for row in cursor.execute('PRAGMA table_info("recalled_messages")')}
         if "pending" not in columns or not cursor.execute(
                 "SELECT 1 FROM recalled_messages WHERE pending = 1 LIMIT 1").fetchone():
