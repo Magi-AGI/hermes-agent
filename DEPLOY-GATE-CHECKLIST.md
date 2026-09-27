@@ -85,9 +85,9 @@ Status key: DONE (on sync branch, triad-approved) / OPEN / IN PROGRESS / VERIFY 
 |---|---|---|
 | E1 | Pass A remainder (private-wiki-backup-environments, decko-local-browser-write-flows, AUDIT sweep) | DONE (T6, both reviewers through f83e848, incl. Pass C depersonalization); live apply = F10 |
 | E2 | Pass B: slim triad-review-workflows, persistent-agent-triad, wiki-source-triangulation; collapse reference sprawl; delete superseded | DONE (T6, both reviewers through f83e848); live apply = F10 |
-| E5 | Skill-learning bug (T6 finding): Hermes's learner treats reviewer text Lake pastes as Lake's own corrections. Hermes code fix; confirming from real transcripts needs Lake's OK to read a COPY of claudetriad/state.db | OPEN - owner needed (Hermes learner code: injected summaries / consent blocks / pasted reviewer text treated as Lake's words). Recommended owner: T6 |
+| E5 | Skill-learning bug (T6 finding): Hermes's learner treats reviewer text Lake pastes as Lake's own corrections. Hermes code fix; confirming from real transcripts needs Lake's OK to read a COPY of claudetriad/state.db | DONE (E5 session, Codex + Antigravity after 3 rounds; on sync branch through 4725f6d47a; 36/36 on the combined head) |
 | E6 | Team skills export without personal skills (job-application-workflows, household-finance reference, business-entity-formation-planning); minor upstream skill issues (format_findings broken with no callers; bundled grounded-citations references archived research-paper-writing) | DONE (T6: team zip export/team-skills-5eb0696.zip, host IPs placeholdered, both reviewers); minor upstream skill issues noted, no deploy impact |
-| E3 | `curator.consolidate` decision (after Pass B) | LAKE (after E5: start with `hermes curator run --dry-run --consolidate`) |
+| E3 | `curator.consolidate` decision (after Pass B) | LAKE (after deploy: `hermes curator run --dry-run --consolidate` on the live profile, then decide) |
 | E4 | Lake's additional skills-improvement ideas | LAKE |
 
 ## F. Deploy (last)
