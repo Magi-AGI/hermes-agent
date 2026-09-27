@@ -463,11 +463,14 @@ def recover_op(prefix: str, *, abandon: bool = False) -> str:
                 f"{op_id[:8]}` completes it if it reads again, or releases it (its logins stay paused).")
         if abandon:
             return _abandon_locked(op_id)
-        if op.get("status") == OP_STUCK:
+        was_stuck = op.get("status") == OP_STUCK
+        if was_stuck:
             _update_op(op_id, status=OP_RUNNING)
             op = read_registry().ops[op_id]
         from hermes_cli.auth_codex_ops import roll_forward_one
         outcome = roll_forward_one(op_id, op)
+        if outcome == "busy" and was_stuck:
+            _update_op(op_id, status=OP_STUCK)  # not resumed: stays terminal for automatic dispatch
         if outcome == "stuck":
             entry = read_registry().ops.get(op_id) or {}
             raise CodexProfileMoveStuck(op_id, ", ".join(entry.get("profiles") or ()),
