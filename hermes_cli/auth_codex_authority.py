@@ -91,13 +91,16 @@ def dispatch_locked() -> str:
     if view.status == "unreadable":
         preserve_unreadable_registry()
         return "unreadable"
+    from hermes_cli.auth_codex_rescue import settle_legacy_rescues
     recover_ops()
     if read_registry().status == "absent":
         if not _codex_material_present(all_store_paths()):
             return "idle"
         _bootstrap()
+        settle_legacy_rescues()
         return "bootstrapped"
     _fence_new_legacy_rescues()
+    settle_legacy_rescues()
     return "done"
 
 
@@ -146,7 +149,9 @@ def startup_dispatch() -> str:
             if not _codex_material_present(paths) and not ops_dir().is_dir():
                 return "idle"
         elif not dispatch_needed() and not unrecorded_legacy_rescues(view):
-            return "idle"
+            from hermes_cli.auth_codex_rescue import settlement_needed
+            if not settlement_needed(view):
+                return "idle"
     except Exception:
         return "idle"
     return authority_dispatch()
@@ -411,7 +416,9 @@ def migrate(*, rebuild: bool = False) -> Dict[str, Any]:
             return {"rebuilt": True, "chains": len(read_registry().chains)}
         if view is None:
             raise CodexRegistryUnreadable()
+        from hermes_cli.auth_codex_rescue import settle_legacy_rescues
         report = {"legacy_fenced": _fence_new_legacy_rescues()}
+        report["legacy_settled"] = settle_legacy_rescues()
         view = read_registry()
         payload = plan_registration(view, snaps, only_unregistered=True, kind="adopt")
         if payload.chains:

@@ -84,7 +84,9 @@ def test_legacy_rescue_in_a_borrowing_profile_fences_the_root_chain(codex_home, 
     (chain,) = registry(root)["chains"].values()
     assert chain["fence"]["reason"] == "legacy-rescue"
     assert endpoint.calls == [], "a rescued token is never spent"
-    assert (profile / "auth.codex-rotation-rescue.json").exists(), "stage 1 never touches the file"
+    assert not (profile / "auth.codex-rotation-rescue.json").exists(), "stage 2 archives it (untrusted)"
+    assert list((root / "auth.ops" / "archive").glob("legacy-rescue.*.untrusted.json"))
+    assert registry(root)["chains"][next(iter(registry(root)["chains"]))]["state"] == "fenced",         "a rescued pair the rows do not hold keeps the fence"
 
 
 def test_cold_start_read_only_resolution_writes_nothing(codex_home):
