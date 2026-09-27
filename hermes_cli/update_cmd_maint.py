@@ -115,6 +115,9 @@ def _print_fts_optimize_available_notice() -> None:
     # Small DBs: the win isn't worth the nag.
     if size_gb < 0.5:
         return
+    from hermes_cli.backup import _db_restore_refusal
+    if _db_restore_refusal(db_path) is not None:  # even a read-only open writes -shm
+        return
     db = None
     needs_upgrade = False
     try:
@@ -401,15 +404,18 @@ def _print_update_summary(*, node_failures: list, desktop_build_ok: bool, pre_up
 def _restore_state_db_from_snapshot(state_path: Path, snap_state: Path) -> bool:
     """Replace *state_path* with the snapshot image; True when the result passes integrity.
 
-    Stale sidecars are cleared first so the corrupt DB's WAL can't replay over the image.
+    The corrupt DB and its sidecars are first COPIED into a preserved folder beside it, then its
+    sidecars are removed (so its WAL can't replay over the image) and the image replaces it with
+    one rename (``backup._publish_over_corrupt_db``): a failure never leaves state.db missing.
     Refuses (False) while another process — or a live connection in THIS process — holds the
     DB: copying over a live writer's inode desyncs its page cache and its next checkpoint
     clobbers pages. Holder scan ``None`` proceeds (gateways drained; refusing on unknown would
     disable auto-restore on non-Linux). Raises OSError if the copy fails.
     """
-    from hermes_cli.backup import _db_restore_refusal, _foreign_db_holder_pids, verify_sqlite_integrity
+    from hermes_cli.backup import (
+        _db_restore_refusal, _foreign_db_holder_pids, _publish_over_corrupt_db, verify_sqlite_integrity)
     from hermes_cli.sqlite_safe_read import LiveConnectionError, offline_file_access
-    refusal = _db_restore_refusal(state_path)  # the copy below writes into state.db: never an alias
+    refusal = _db_restore_refusal(state_path)  # the restore below must never touch an alias
     if refusal is not None:
         print(f"  ✗ Auto-restore refused: {refusal}. Restore manually with /snapshot restore once fixed.")
         return False
@@ -423,11 +429,11 @@ def _restore_state_db_from_snapshot(state_path: Path, snap_state: Path) -> bool:
         return False
     # The foreign-pid scan excludes THIS process; an in-process SessionDB handle is just as
     # live (it would checkpoint through deleted-inode sidecars). offline_file_access fails
-    # CLOSED on any tracked connection and holds the lock across clear + copy.
+    # CLOSED on any tracked connection and holds the lock across preserve + replace.
     try:
         with offline_file_access(state_path, what="restore a snapshot over"):
-            _clear_stale_sqlite_sidecars(state_path)
-            shutil.copy2(snap_state, state_path)
+            preserved = _publish_over_corrupt_db(snap_state, state_path)
+        print(f"  The corrupt state.db and its sidecars are preserved at {preserved}")
     except LiveConnectionError as exc:
         print(
             f"  ✗ Auto-restore refused: {exc} Close the in-process database "
@@ -447,6 +453,10 @@ def _verify_and_restore_one_state_db(home: Path, *, label: str) -> None:
         if not state_path.exists():
             return
         ok = verify_sqlite_integrity(state_path, check_header=True, run_pragma=True)
+        if ok.get("refused"):  # an alias guard refusal: never probed, never restored
+            print()
+            print(f"⚠ state.db was not verified ({label}): {ok.get('message')}")
+            return
         if ok.get("valid"):
             logger.debug("Post-update state.db integrity OK (%s): %s", label, ok.get("message"))
             return
@@ -671,6 +681,9 @@ def _verify_state_db_after_snapshot(snapshot_id: str) -> None:
         _src_path, check_header=True, run_pragma=True, max_bytes=_PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE,
     )
     if _integrity.get("valid"):
+        return
+    if _integrity.get("refused"):
+        print(f"  ⚠ state.db was not verified after the snapshot: {_integrity.get('message')}")
         return
     print(f"  ⚠ state.db integrity check FAILED after snapshot: {_integrity.get('message', 'unknown error')}")
     _snap_state = _quick_snapshot_root(get_hermes_home()) / snapshot_id / "state.db"

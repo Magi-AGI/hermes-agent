@@ -335,6 +335,10 @@ def _safe_copy_db(src: Path, dst: Path, *, timeout_seconds: float = 10.0) -> boo
     Fails closed when no consistent snapshot can be made: copying only the main file loses WAL data.
     """
     conn = backup_conn = None
+    refusal = _db_restore_refusal(src)  # before SQLite opens the source (and writes its -shm)
+    if refusal is not None:
+        logger.warning("SQLite safe copy refused for %s: %s", src, refusal)
+        return False
     try:
         # sqlite3.connect() creates a missing destination with the process
         # umask, which is commonly 0022 (0644).  Snapshot databases contain
@@ -430,6 +434,9 @@ def verify_sqlite_integrity(
     except OSError as exc:
         return _done(f"cannot stat: {exc}")
     size = st.st_size
+    refusal = _db_restore_refusal(path)  # before ANY SQLite open: a mode=ro open writes -shm
+    if refusal is not None:
+        return {"valid": False, "refused": True, "message": f"not verified: {refusal}", "size": size}
     if size < 100:  # SQLite minimum viable size (header + 1 page)
         return _done(f"too small ({size} bytes) to be a valid SQLite database", size=size)
     if check_header:
@@ -567,33 +574,24 @@ _DB_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400  # Windows: junctions, symlinks and other reparse points
 
 
-def _db_staging_name(dst: Path) -> Path:
-    """The fixed staging name upstream's fallback (:func:`_unlink_move_restore_db`) copies into."""
-    return dst.parent / f".{dst.name}.snap_restore"
-
-
 def _db_restore_refusal(dst: Path) -> Optional[str]:
-    """Why database *dst* must NOT be restored, or None. A PRE-OPEN guard (credential recovery
+    """Why SQLite must NOT open database *dst* here, or None. A PRE-OPEN guard (credential recovery
     protocol, stage 1): ``lstat`` / ``stat`` and the restore classification only — nothing is opened
-    through SQLite, written or checkpointed — run before upstream's database restore, whose SQLite
-    page copy, checkpoint and fallback write into the database, its ``-wal`` / ``-shm`` /
-    ``-journal`` sidecars and its staging name. Each of those that exists must be a plain regular
-    file with ONE link, resolve inside the database's own directory and not be protected credential
-    state; the staging name must not exist at all. Anything that cannot be inspected refuses too.
-    The rest of the restore proceeds; only this database is not restored."""
+    through SQLite, written or checkpointed. Every SQLite open of a restore, snapshot, backup or
+    update-verification path runs it first (even a ``mode=ro`` open writes the ``-shm`` index):
+    the database and each of its ``-wal`` / ``-shm`` / ``-journal`` sidecars that exists must be a
+    plain regular file with ONE link, resolve inside the database's own directory and not be
+    protected credential state. Anything that cannot be inspected refuses too."""
     from hermes_cli.auth_codex_registry import CodexAuthorityRefused
     from hermes_cli.auth_codex_restore import restore_action
     expected_dir = os.path.normcase(os.path.realpath(dst.parent))
-    staging = _db_staging_name(dst)
-    for path in [dst, *(dst.with_name(dst.name + s) for s in _DB_SIDECAR_SUFFIXES), staging]:
+    for path in [dst, *(dst.with_name(dst.name + s) for s in _DB_SIDECAR_SUFFIXES)]:
         try:
             st = os.lstat(path)
         except FileNotFoundError:
             continue
         except OSError as exc:
             return f"{path.name} cannot be inspected ({exc})"
-        if path == staging:
-            return f"{path.name} already exists (the database restore's staging name)"
         if stat.S_ISLNK(st.st_mode) or getattr(st, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT:
             return f"{path.name} is a link"
         if not stat.S_ISREG(st.st_mode):
@@ -610,19 +608,46 @@ def _db_restore_refusal(dst: Path) -> Optional[str]:
     return None
 
 
+def _db_main_file_is_corrupt(dst: Path) -> bool:
+    """Whether the MAIN file of *dst* is verifiably not a usable database, judged WITHOUT touching
+    anything: an empty main file (its data can only be in sidecars), or SQLite reporting the file
+    unreadable through an ``immutable=1`` read-only open (no locks, no ``-shm``, the WAL ignored —
+    SQLite writes nothing). Reads the header and the schema, not every page."""
+    try:
+        if os.stat(dst).st_size == 0:
+            return True
+    except OSError:
+        return False
+    try:
+        with closing(sqlite3.connect(f"{dst.absolute().as_uri()}?mode=ro&immutable=1", uri=True)) as conn:
+            conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+    except sqlite3.DatabaseError as exc:
+        return (getattr(exc, "sqlite_errorcode", 0) & 0xFF) in (11, 26)  # CORRUPT, NOTADB
+    return False
+
+
 def _safe_restore_db(src: Path, dst: Path) -> bool:
-    """Restore snapshot *src* into live *dst* through the backup() API; unlink+move fallback.
+    """Restore snapshot *src* into live *dst* through the backup() API.
 
     Writing pages into the live file preserves its inode and WAL state, so other holders (gateway,
     dashboard, another CLI) see the restored data instead of stale pages from a replaced inode.
-    The fallback runs ONLY when no other process or in-process connection holds the file
-    (replacing the inode under a live holder is the #90950 split-brain); otherwise it fails closed
-    (``False``) and the caller reports the file as skipped. Callers run :func:`_db_restore_refusal`
-    first (the files this writes are never an alias of anything).
+    Callers run :func:`_db_restore_refusal` on *dst* first; *src* is checked here.
+
+    A destination whose main file is verifiably corrupt (:func:`_db_main_file_is_corrupt`, decided
+    before SQLite opens it — opening a corrupt database can discard its WAL) is not page-copied: it
+    is replaced by :func:`_restore_over_corrupt_db`, which preserves the old database and sidecars
+    first. A page copy that fails on a database NOT verified corrupt (a lock, a transient error)
+    is refused: the destination is left as it is, and the caller reports the file as skipped.
     """
+    refusal = _db_restore_refusal(src)
+    if refusal is not None:
+        logger.error("Not restoring %s from %s: %s", dst, src, refusal)
+        return False
+    if _db_main_file_is_corrupt(dst):
+        return _restore_over_corrupt_db(src, dst)
     try:
-        # Closed on every path: a handle left open by a failed page copy makes the fallback's
-        # unlink fail on Windows (WinError 32).
+        # Closed on every path: a handle left open by a failed page copy used to block the old
+        # unlink+move fallback on Windows (WinError 32).
         with closing(sqlite3.connect(str(dst))) as dst_conn:
             # Checkpoint first so the backup starts clean rather than writing on top of a deep WAL.
             with suppress(Exception):
@@ -633,12 +658,77 @@ def _safe_restore_db(src: Path, dst: Path) -> bool:
             dst.chmod(src.stat().st_mode)
         return True
     except Exception as exc:
-        logger.warning("SQLite safe restore failed for %s -> %s: %s", src, dst, exc)
-        return _unlink_move_restore_db(src, dst)
+        logger.error("SQLite safe restore failed for %s -> %s (%s); the database is not verified corrupt, so "
+                     "it was left as it is", src, dst, exc)
+        return False
 
 
-def _unlink_move_restore_db(src: Path, dst: Path) -> bool:
-    """Fallback restore: unlink+move. Only safe when no process holds the DB open.
+def _preserve_db_evidence(dst: Path) -> Path:
+    """COPY the old database and every existing sidecar into a new, exclusively created, timestamped
+    folder beside it (``.<name>.preserved-<ts>-<random>/``), each fsynced. Returns the folder; raises
+    (after logging what was kept) when the copy cannot be completed. Never deleted by Hermes."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    folder = Path(tempfile.mkdtemp(dir=str(dst.parent), prefix=f".{dst.name}.preserved-{stamp}-"))
+    try:
+        for suffix in ("", *_DB_SIDECAR_SUFFIXES):
+            old = dst.with_name(dst.name + suffix)
+            if not os.path.lexists(old):
+                continue
+            kept = folder / old.name
+            with open(old, "rb") as data, open(kept, "xb") as out:
+                shutil.copyfileobj(data, out)
+                out.flush()
+                os.fsync(out.fileno())
+        if os.name != "nt":
+            fd = os.open(folder, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+    except BaseException:
+        logger.error("Could not preserve %s before replacing it; the partial copy is kept at %s", dst, folder)
+        raise
+    return folder
+
+
+def _publish_over_corrupt_db(src: Path, dst: Path) -> Path:
+    """Replace the verifiably corrupt database *dst* with image *src* (the caller has excluded live
+    holders). Returns the folder holding the preserved old database and sidecars.
+
+    (a) COPY the old database and its sidecars into a preserved folder (failure: nothing changed);
+    stage *src* in an exclusively created temp file beside *dst*; (b) remove the old sidecars (their
+    bytes are preserved; beside the new image SQLite would replay them); (c) ``os.replace`` the image
+    over *dst* — never unlinking it first. A crash between (b) and (c) leaves the old corrupt
+    database without sidecars plus the preserved copy (nothing lost; the restore can run again); a
+    failure at (c) leaves the old database in place."""
+    preserved = _preserve_db_evidence(dst)
+    fd, tmp_name = tempfile.mkstemp(dir=str(dst.parent), prefix=f".{dst.name}.", suffix=".snap_restore")
+    try:
+        with os.fdopen(fd, "wb") as out, open(src, "rb") as data:
+            shutil.copyfileobj(data, out)
+            out.flush()
+            os.fsync(out.fileno())
+        shutil.copystat(src, tmp_name)
+        for suffix in _DB_SIDECAR_SUFFIXES:
+            dst.with_name(dst.name + suffix).unlink(missing_ok=True)
+        os.replace(tmp_name, dst)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.error("Restore of %s failed; its staged image %s could not be removed (%s)", dst, tmp_name, exc)
+        logger.error("Restore of %s failed; the old database and its sidecars are preserved at %s", dst, preserved)
+        raise
+    logger.warning("Replaced corrupt database %s; the old database and its sidecars are preserved at %s",
+                   dst, preserved)
+    return preserved
+
+
+def _restore_over_corrupt_db(src: Path, dst: Path) -> bool:
+    """Restore over a verifiably corrupt database (:func:`_publish_over_corrupt_db`). Only safe when no
+    process holds the DB open.
 
     Replacing the inode under a live holder is the #90950 corruption class (the holder keeps
     writing through a deleted-inode fd and loses its WAL index), so fail closed. The foreign-pid
@@ -649,26 +739,18 @@ def _unlink_move_restore_db(src: Path, dst: Path) -> bool:
     try:
         holders = _foreign_db_holder_pids(dst)
         if holders:
-            logger.error("Refusing unlink+move restore of %s: process(es) %s still "
+            logger.error("Refusing to replace corrupt database %s: process(es) %s still "
                          "hold the database or its WAL open. Stop them and retry.", dst, holders)
             return False
-        with offline_file_access(dst, what="unlink+move restore of"):
-            tmp = _db_staging_name(dst)
-            shutil.copy2(src, tmp)
-            dst.unlink(missing_ok=True)
-            # The snapshot owns no WAL, so any -wal/-shm here belongs to the DB just unlinked (a
-            # killed gateway leaves them — exactly when a restore runs); SQLite would replay that
-            # foreign WAL over the restored file: "malformed" or resurrected post-snapshot rows.
-            for _sidecar_suffix in ("-wal", "-shm", "-journal"):
-                dst.with_name(dst.name + _sidecar_suffix).unlink(missing_ok=True)
-            shutil.move(str(tmp), str(dst))
+        with offline_file_access(dst, what="replace the corrupt database"):
+            _publish_over_corrupt_db(src, dst)
         return True
     except LiveConnectionError as exc2:
-        logger.error("Refusing unlink+move restore of %s: %s Close the in-process "
+        logger.error("Refusing to replace corrupt database %s: %s Close the in-process "
                      "database handles (or restart Hermes) and retry.", dst, exc2)
         return False
     except Exception as exc2:
-        logger.error("Fallback restore also failed for %s -> %s: %s", src, dst, exc2)
+        logger.error("Restore over corrupt database %s from %s failed: %s", dst, src, exc2)
         return False
 
 
@@ -939,7 +1021,7 @@ def _count_session_rows(path: Path) -> Optional[Tuple[int, int]]:
     acting on an unreadable database would mask the very loss this count exists to surface.
     Same contract as :func:`_count_cron_jobs`.
     """
-    if not path.is_file():
+    if not path.is_file() or _db_restore_refusal(path) is not None:
         return None
     try:
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)

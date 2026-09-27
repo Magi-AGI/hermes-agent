@@ -17,9 +17,11 @@ precedes every extension/type handler of the restore paths:
   is never treated as absent), and no restore writes into a file that has another name: restored
   files are staged in exclusively created temp files and published by fsync + replace, so another
   hard link keeps its content (write-in-place remains only for single-link files: the rename
-  fallbacks of ``atomic_replace``); a database member first passes ``backup._db_restore_refusal``
-  (a pre-open alias guard over the database, its sidecars and upstream's staging name) and is then
-  restored by upstream's own path, or not at all;
+  fallbacks of ``atomic_replace``); every SQLite open of a restore / snapshot / update-verification
+  path first passes ``backup._db_restore_refusal`` (a pre-open alias guard over the database and
+  its sidecars), then a database is restored by upstream's page copy, or — only when its main file
+  is verifiably corrupt — replaced after its old database and sidecars are copied to a preserved
+  folder;
 * an ``auth.json`` is written ONLY at one of the protected authority's own stores, and as one
   read-merge-write under the migration lock + that store's lock with the strict writer: the
   restored content with ALL Codex material removed (a legacy-format store first converted by
