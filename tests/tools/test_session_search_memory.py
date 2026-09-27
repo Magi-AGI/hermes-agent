@@ -60,3 +60,44 @@ def test_read_shape_still_reports_the_whole_session(huge):
     ids = [m["content"][:5] for m in result["messages"]]
     assert result["message_count"] == ROWS and result["truncated"] is True
     assert ids == [f"{i:05d}" for i in [*range(20), *range(ROWS - 10, ROWS)]]
+
+
+@pytest.mark.requires_wal
+def test_read_shape_count_and_rows_agree_when_a_writer_commits_mid_read(tmp_path, monkeypatch):
+    """A second connection committing 1,200 rows right after the count (D5 r1, Codex): the count,
+    ``truncated`` and the rows come from one snapshot, and no payload read is unbounded."""
+    from contextlib import contextmanager
+
+    path = tmp_path / "state.db"
+    db, writer = SessionDB(path), SessionDB(path)
+    db.create_session("racy", source="cli")
+    db.append_message("racy", "user", "only row at the snapshot")
+    real_ctx = db._read_ctx
+
+    class _CommitAfterCount:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *args):
+            cursor = self._conn.execute(sql, *args)
+            if sql.lstrip().upper().startswith("SELECT COUNT(*)"):
+                writer.append_messages_batch("racy", [
+                    {"role": "assistant", "content": f"late {i}"} for i in range(ROWS)])
+            return cursor
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    @contextmanager
+    def racing_ctx():
+        with real_ctx() as conn:
+            yield _CommitAfterCount(conn)
+
+    monkeypatch.setattr(db, "_read_ctx", racing_ctx)
+    try:
+        result = json.loads(session_search(session_id="racy", db=db))
+    finally:
+        writer.close()
+        db.close()
+    assert (result["message_count"], result["truncated"]) == (1, False)
+    assert [m["content"] for m in result["messages"]] == ["only row at the snapshot"]

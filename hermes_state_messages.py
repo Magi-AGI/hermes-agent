@@ -1393,9 +1393,28 @@ class SessionMessagesMixin:
         sql = "SELECT COUNT(*) FROM messages" + (" WHERE session_id = ?" if session_id else "")
         return self._read_one(sql, (session_id,) if session_id else ())[0]
 
-    def active_message_count(self, session_id: str) -> int:
-        """Rows a default ``get_messages(session_id)`` returns, counted without loading them."""
-        return self._read_one("SELECT COUNT(*) FROM messages WHERE session_id = ? AND active = 1", (session_id,))[0]
+    def get_messages_head_tail(self, session_id: str, head: int, tail: int
+                               ) -> Tuple[int, List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """``(total, first head rows, last tail rows after them)`` of the rows a default
+        ``get_messages(session_id)`` returns, from ONE read snapshot so the count and both pages agree
+        under a concurrent writer; never more than ``head + tail`` payloads."""
+        with self._read_ctx() as conn:
+            conn.execute("BEGIN")
+            try:
+                total = conn.execute(
+                    "SELECT COUNT(*) FROM messages WHERE session_id = ? AND active = 1", (session_id,)).fetchone()[0]
+                first = conn.execute(
+                    "SELECT * FROM messages WHERE session_id = ? AND active = 1 ORDER BY id LIMIT ?",
+                    (session_id, head)).fetchall()
+                last = conn.execute(
+                    "SELECT * FROM messages WHERE session_id = ? AND active = 1 AND id > ? ORDER BY id DESC LIMIT ?",
+                    (session_id, first[-1]["id"] if first else 0, tail)).fetchall()
+            finally:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+        def decode(row):
+            return self._row_to_message_dict(row, warn_context="get_messages_head_tail", summary_flag=True)
+        return total, [decode(row) for row in first], [decode(row) for row in reversed(last)]
 
     def has_gateway_input_owner(self, session_id: str, owner: str) -> bool:
         """Probe the accepted-input marker without allocating message bodies or archives."""
