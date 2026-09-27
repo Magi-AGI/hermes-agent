@@ -458,6 +458,11 @@ def _windows_bash_candidates(custom: "str | None") -> list[str]:
         os.path.join(getenv("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Git", "bin"),
         lad and os.path.join(lad, "Programs", "Git", "bin"),
     ]
+    # Git for Windows puts only ``<Git>\cmd`` on PATH; its bash lives beside it. This finds an install on
+    # any drive or directory (ProgramFiles names only the system drive's).
+    if git := shutil.which("git"):
+        git_root = os.path.dirname(os.path.dirname(os.path.abspath(git)))
+        roots += [os.path.join(git_root, "bin"), os.path.join(git_root, "usr", "bin")]
     raw = [custom or "", *(os.path.join(r, "bash.exe") for r in roots if r)]
     candidates = list(dict.fromkeys(c for c in raw if c and os.path.isfile(c)))
     found = shutil.which("bash")

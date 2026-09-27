@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from tools.environments.local import _find_bash
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 STAGE2_HOOK = REPO_ROOT / "docker" / "stage2-hook.sh"
 
@@ -38,7 +40,8 @@ def test_seed_one_refuses_symlinked_destinations(
     stage2_text: str,
     tmp_path: Path,
 ) -> None:
-    bash = shutil.which("bash")
+    # The backend's bash, not the first on PATH (a bare ``bash`` is WSL's launcher on Windows).
+    bash = _find_bash() if shutil.which("bash") else None
     if bash is None:
         pytest.skip("bash not available")
 
@@ -76,7 +79,8 @@ def test_seed_one_is_quiet_for_existing_symlinked_files(
     stage2_text: str,
     tmp_path: Path,
 ) -> None:
-    bash = shutil.which("bash")
+    # The backend's bash, not the first on PATH (a bare ``bash`` is WSL's launcher on Windows).
+    bash = _find_bash() if shutil.which("bash") else None
     if bash is None:
         pytest.skip("bash not available")
 
