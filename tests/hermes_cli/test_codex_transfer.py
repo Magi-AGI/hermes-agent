@@ -144,3 +144,19 @@ def test_transfer_crash_at_every_step_recovers_the_decided_state(codex_home, mon
             assert (r["store"], r["row"]) not in seen, "a row in two chains"
             seen.add((r["store"], r["row"]))
     assert len(set(endpoint.calls)) == len(endpoint.calls), "a refresh token was presented twice"
+
+
+def test_transfer_refuses_ends_that_are_one_file(codex_home, monkeypatch):
+    """The destination's auth.json is the source file under another name. Through a bind-mounted
+    directory, writing the destination and then emptying the source would empty both; a hard link
+    (used here: it can be made in a test) is the same identity to the check, which refuses both."""
+    import os
+    root, endpoint = codex_home
+    work, _pair = _profile_login(root, endpoint)
+    other = make_profile(root, "other")
+    os.link(work / "auth.json", other / "auth.json")
+    snapshot = registry(root)
+    monkeypatch.setenv("HERMES_HOME", str(work))
+    with pytest.raises(AuthError, match="same credential file"):
+        transfer_chain(other)
+    assert registry(root) == snapshot and _codex_rows(work / "auth.json")

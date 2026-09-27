@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from hermes_cli import auth_codex_rows as rows_mod
 from hermes_cli.auth_codex_registry import (
-    STATE_ACTIVE, STATE_FENCED, RegistryView, RescueScanIncomplete, ops_dir, pair_fp, read_registry,
+    STATE_ACTIVE, STATE_FENCED, RegistryView, RescueScanIncomplete, new_id, ops_dir, pair_fp, read_registry,
     rescue_locations, store_locks)
 from hermes_cli.auth_credential_io import (
     read_witnessed_bytes, require_committed, store_key, unlink_retrying, write_credential_file)
@@ -161,13 +161,20 @@ def settle_legacy_rescues() -> Dict[str, List[str]]:
 
 def archive_rescue(rescue: Path, raw: bytes, sha: str) -> Path:
     """Copy the exact bytes read to the untrusted archive, then remove the original name only while
-    it still holds those bytes (never a blind unlink of whatever is there now)."""
-    target = ops_dir() / "archive" / f"legacy-rescue.{sha[:24]}.untrusted.json"
-    try:
-        existing, existing_sha = read_witnessed_bytes(target)
-    except OSError:
-        existing_sha = None
-    if existing_sha != sha:
+    it still holds those bytes (never a blind unlink of whatever is there now). An archive already
+    holding these bytes (a replay after a crash) is reused; a new one gets an unpredictable name, so
+    nothing can be planted where it will be written."""
+    directory = ops_dir() / "archive"
+    target = None
+    for existing in sorted(directory.glob(f"legacy-rescue.{sha[:24]}.*.untrusted.json")) if directory.is_dir() else ():
+        try:
+            if read_witnessed_bytes(existing)[1] == sha and not existing.is_symlink():
+                target = existing
+                break
+        except OSError:
+            continue
+    if target is None:
+        target = directory / f"legacy-rescue.{sha[:24]}.{new_id()}.untrusted.json"
         require_committed(write_credential_file(target, raw), f"archive of legacy rescue file {rescue}")
     try:
         _now, now_sha = read_witnessed_bytes(rescue)

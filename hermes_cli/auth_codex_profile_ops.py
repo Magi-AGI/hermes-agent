@@ -156,8 +156,11 @@ def _holds_codex_material(store: Path) -> bool:
     from hermes_cli.auth_codex_registry import legacy_rescue_path
     if _exists(legacy_rescue_path(store)) is not False:
         return True
+    present = _exists(store)
+    if present is None:
+        return True
     try:
-        return bool(rows_mod.codex_rows(_load_auth_store(store))) if _exists(store) else False
+        return bool(rows_mod.codex_rows(_load_auth_store(store))) if present else False
     except OSError:
         return True
 
@@ -181,10 +184,13 @@ def _prepared_view(action: str, store: Path) -> RegistryView:
 
 # ── Rename (RULE-P2) ─────────────────────────────────────────────────────────────────────────
 
-def plan_rename(view: RegistryView, old_key: str, new_key: str, profiles: List[str], old_dir: Path,
-                new_dir: Path, affected: Dict[str, Dict[str, Any]]) -> Payload:
+def plan_rename(view: RegistryView, old_key: str, new_key: str, reserved: List[str], lock_profiles: List[str],
+                old_dir: Path, new_dir: Path, affected: Dict[str, Dict[str, Any]]) -> Payload:
+    """*reserved*: the source and destination names (RULE-G4); *lock_profiles*: every profile whose
+    lifecycle lock the op and its recovery take up front, sorted (RULE-L1), incl. other stores of the
+    moving chains."""
     payload = Payload(kind=RENAME, scope_chains=sorted(affected), scope_stores=sorted({old_key, new_key}),
-                      scope_profiles=profiles)
+                      scope_profiles=reserved)
 
     def moved(key: str) -> str:
         return new_key if key == old_key else key
@@ -198,7 +204,7 @@ def plan_rename(view: RegistryView, old_key: str, new_key: str, profiles: List[s
                                     "epoch": final["epoch"]})
         payload.chains[cid] = final
     payload.extra = {"source_dir": str(_abs(old_dir)), "dest_dir": str(_abs(new_dir)),
-                     "source_key": old_key, "dest_key": new_key, "profiles": profiles,
+                     "source_key": old_key, "dest_key": new_key, "profiles": lock_profiles,
                      "before": json.loads(json.dumps(affected))}
     return payload
 
@@ -266,7 +272,8 @@ def profile_rename(old_name: str, new_name: str, old_dir: Path, new_dir: Path) -
                 yield handle
                 return
             with store_locks([store_path_of(k) for k in _stores_of(affected) if k != keys[0]] + [old_dir / "auth.json"]):
-                payload = plan_rename(view, keys[0], keys[1], profiles, old_dir, new_dir, affected)
+                payload = plan_rename(view, keys[0], keys[1], sorted({lock_name(old_name), lock_name(new_name)}),
+                                      profiles, old_dir, new_dir, affected)
                 body = decide_op(payload, view)
             logger.info("Codex: renaming profile %s -> %s moves %d login(s) (op %s)",
                         old_name, new_name, len(live), payload.op_id)
@@ -274,19 +281,20 @@ def profile_rename(old_name: str, new_name: str, old_dir: Path, new_dir: Path) -
             with continuation(payload.op_id, FORWARD):
                 try:
                     yield handle
-                except BaseException:
-                    if not handle.moved:
-                        _abandon_unmoved(payload.op_id, old_name)
+                except BaseException as exc:
+                    if not handle.moved and not _abandon_unmoved(payload.op_id, old_name) and isinstance(exc, Exception):
+                        raise CodexProfileMoveStuck(payload.op_id, old_name, f"interrupted before the move: {exc}") from exc
                     raise
-                if not handle.moved:
-                    _abandon_unmoved(payload.op_id, old_name)
+                if not handle.moved and not _abandon_unmoved(payload.op_id, old_name):
+                    raise CodexProfileMoveStuck(payload.op_id, old_name, "the rename stopped before the move")
 
 
-def _abandon_unmoved(op_id: str, profile: str) -> None:
+def _abandon_unmoved(op_id: str, profile: str) -> bool:
     """The rename stopped before its move: compensate now (RULE-P4) so no later dispatch moves the
-    directory. If even that fails the op is left stuck (terminal, named to the user)."""
+    directory. If even that fails the op is left stuck (terminal, named to the user): False."""
     try:
         _abandon_locked(op_id)
+        return True
     except Exception as exc:
         logger.warning("Codex rename op %s could not be cancelled; left for `hermes auth recover`", op_id,
                        exc_info=True)
@@ -295,6 +303,7 @@ def _abandon_unmoved(op_id: str, profile: str) -> None:
                 _mark_stuck(op_id, f"the rename stopped before the move and could not be cancelled: {exc}")
         except Exception:
             logger.warning("Codex rename op %s could not be marked stuck", op_id, exc_info=True)
+        return False
 
 
 # ── Recovery (M1 for lifecycle ops), resume, abandonment (RULE-P4) ───────────────────────────
@@ -535,6 +544,7 @@ def plan_transfer(view: RegistryView, snaps: Dict[str, Any], cid: str, dest: str
     src, dst = snaps.get(source), snaps.get(dest)
     if src is None or dst is None:
         raise CodexAuthorityRefused("The Codex login's store or the destination can't be read right now.")
+    _refuse_aliased_ends(store_path_of(source), store_path_of(dest))
     record = read_record(store_path_of(source), cid)
     if record.status != "ok":
         raise CodexAuthorityRefused(
@@ -599,6 +609,19 @@ def plan_transfer(view: RegistryView, snaps: Dict[str, Any], cid: str, dest: str
     payload.result = {"chain_id": cid, "from": source, "to": dest, "rows": [r["row"] for r in moved_rows],
                       "state": entry.get("state"), "fence": (entry.get("fence") or {}).get("reason")}
     return payload
+
+
+def _refuse_aliased_ends(source: Path, dest: Path) -> None:
+    """Two ends that are ONE file under two canonical names (a bind-mounted directory, a hard link):
+    writing the destination and then emptying the source would empty the destination too. Refused
+    before anything is decided (a check that cannot be made refuses as well)."""
+    try:
+        same = os.path.exists(source) and os.path.exists(dest) and os.path.samefile(source, dest)
+    except OSError:
+        same = True
+    if same:
+        raise CodexAuthorityRefused(
+            "The source and destination are the same credential file under two names; nothing was moved.")
 
 
 def transfer_chain(dest_home: Path, chain: Optional[str] = None) -> Dict[str, Any]:

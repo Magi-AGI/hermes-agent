@@ -245,3 +245,24 @@ def test_rename_of_a_profile_linking_to_root_moves_no_codex_state(codex_home, qu
     before = json.dumps(registry(root)["chains"], sort_keys=True)
     profiles.rename_profile("work", "play")
     assert json.dumps(registry(root)["chains"], sort_keys=True) == before and not registry(root)["ops"]
+
+
+@pytest.mark.windows_only
+def test_rename_of_a_junction_profile_moves_no_codex_state(codex_home, quiet_profiles, monkeypatch, tmp_path):
+    """The profile directory is a junction to a folder elsewhere: renaming it moves the link, not the
+    store, so the store key (its canonical path) and every chain stay exactly as they are."""
+    import _winapi
+    root, endpoint = codex_home
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+    pair = endpoint.issue()
+    write_store(elsewhere, singleton=pair)
+    (root / "profiles").mkdir(exist_ok=True)
+    _winapi.CreateJunction(str(elsewhere), str(root / "profiles" / "work"))
+    _dispatch()
+    before = json.dumps(registry(root)["chains"], sort_keys=True)
+    profiles.rename_profile("work", "play")
+    assert json.dumps(registry(root)["chains"], sort_keys=True) == before and not registry(root)["ops"]
+    assert (elsewhere / "auth.json").exists()
+    assert _refresh_in(monkeypatch, root / "profiles" / "play") and endpoint.calls == [pair[1]]
