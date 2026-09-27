@@ -189,6 +189,8 @@ def _session_count(state_db_path: Path):
 
 # Above this the snapshot copy a held store needs costs more than the probe is worth; --fix still probes.
 _WRITE_PROBE_SNAPSHOT_MAX_BYTES = 1 << 30
+# How long the snapshot copy waits for a store another process keeps locked (A21: it used to wait forever).
+_WRITE_PROBE_LOCK_SECONDS = 10.0
 
 
 def _write_health_reason(state_db_path: Path, *, should_fix: bool):
@@ -202,15 +204,18 @@ def _write_health_reason(state_db_path: Path, *, should_fix: bool):
         check_info("state.db write-health probe skipped: store is held by a live writer and larger than 1 GB "
                    "(run 'hermes doctor --fix' to probe it)")
         return None
-    import sqlite3
     import tempfile
+    from hermes_cli.sqlite_bounded_backup import BackupLockTimeout, bounded_backup, open_backup_connection
     with tempfile.TemporaryDirectory() as tmp:
         snapshot = Path(tmp) / "state.db"
-        src = sqlite3.connect(read_only_db_uri(state_db_path), uri=True, timeout=1.0)
+        src = open_backup_connection(read_only_db_uri(state_db_path), uri=True)
         try:
-            dest = sqlite3.connect(str(snapshot))
+            dest = open_backup_connection(snapshot)
             try:
-                src.backup(dest)
+                bounded_backup(src, dest, lock_seconds=_WRITE_PROBE_LOCK_SECONDS, what="state.db")
+            except BackupLockTimeout as exc:
+                check_info(f"state.db write-health probe skipped: {exc} (run 'hermes doctor' again when it is idle)")
+                return None
             finally:
                 dest.close()
         finally:

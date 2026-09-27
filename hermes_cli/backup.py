@@ -26,6 +26,7 @@ from utils import (
     default_new_file_mode,
 )
 
+from hermes_cli.sqlite_bounded_backup import BackupLockTimeout, bounded_backup, open_backup_connection
 from hermes_cli.sizefmt import format_bytes as _format_size
 
 logger = logging.getLogger(__name__)
@@ -145,10 +146,6 @@ class BackupInProgressError(RuntimeError):
 
 class _SQLiteSnapshotError(RuntimeError):
     pass
-
-
-class _SQLiteBackupTimeout(RuntimeError):
-    """Raised when a SQLite snapshot remains busy past its deadline."""
 
 
 @contextmanager
@@ -355,22 +352,10 @@ def _safe_copy_db(src: Path, dst: Path, *, timeout_seconds: float = 10.0) -> boo
                 os.fchmod(secure_fd, 0o600)
             finally:
                 os.close(secure_fd)
-        # timeout=0.0 disables sqlite3's implicit busy wait so the progress callback owns the
-        # full locked-source deadline instead of adding the default timeout before each callback.
-        conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True, timeout=0.0)
-        backup_conn = sqlite3.connect(str(dst))
-        busy_deadline = time.monotonic() + max(0.0, timeout_seconds)
-
-        def _check_backup_progress(status: int, _remaining: int, _total: int) -> None:
-            nonlocal busy_deadline
-            now = time.monotonic()
-            if status in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
-                if now >= busy_deadline:
-                    raise _SQLiteBackupTimeout(f"database remained locked for {timeout_seconds:g} seconds")
-            else:
-                busy_deadline = now + max(0.0, timeout_seconds)
-
-        conn.backup(backup_conn, pages=256, progress=_check_backup_progress, sleep=0.1)
+        # No implicit busy wait on either side: the one explicit clock owns the whole lock wait.
+        conn = open_backup_connection(f"file:{src}?mode=ro", uri=True)
+        backup_conn = open_backup_connection(dst)
+        bounded_backup(conn, backup_conn, lock_seconds=timeout_seconds, what=str(src))
         return True
     except Exception as exc:
         logger.warning("SQLite safe copy failed for %s: %s", src, exc)
@@ -659,17 +644,18 @@ def _page_copy_db(src: Path, dst: Path) -> bool:
     :data:`_RESTORE_LOCK_DEADLINE_SECONDS`; False (the destination left as it is) on any failure."""
     try:
         # Closed on every path: a handle left open by a failed page copy used to block the old
-        # unlink+move fallback on Windows (WinError 32).
-        with closing(sqlite3.connect(str(dst), timeout=1.0)) as dst_conn:
+        # unlink+move fallback on Windows (WinError 32). No implicit busy wait on either side (the
+        # checkpoint below simply does not happen under contention): the deadline owns every wait.
+        with closing(open_backup_connection(dst)) as dst_conn:
             # Checkpoint first so the backup starts clean rather than writing on top of a deep WAL.
             with suppress(Exception):
                 dst_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            with closing(sqlite3.connect(f"file:{src}?mode=ro", uri=True)) as src_conn:
+            with closing(open_backup_connection(f"file:{src}?mode=ro", uri=True)) as src_conn:
                 _bounded_backup(src_conn, dst_conn, _RESTORE_LOCK_DEADLINE_SECONDS)
         with suppress(Exception):
             dst.chmod(src.stat().st_mode)
         return True
-    except _SQLiteBackupTimeout as exc:
+    except BackupLockTimeout as exc:
         logger.error("Not restoring %s: %s (another process holds it); it was left as it is. Stop the "
                      "gateway/dashboard using it and retry.", dst, exc)
         return False
@@ -685,22 +671,9 @@ _RESTORE_LOCK_DEADLINE_SECONDS = 10.0
 
 
 def _bounded_backup(src_conn: sqlite3.Connection, dst_conn: sqlite3.Connection, deadline_seconds: float) -> None:
-    """``src_conn.backup(dst_conn)`` in steps, aborted (:class:`_SQLiteBackupTimeout`) once the
-    destination or source has stayed busy / locked for *deadline_seconds*. SQLite keeps the partial
-    copy inside the destination's write transaction, so an abort leaves the destination as it was."""
-    busy_since: list = []
-
-    def progress(status: int, _remaining: int, _total: int) -> None:
-        if status in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
-            now = time.monotonic()
-            if not busy_since:
-                busy_since.append(now)
-            elif now - busy_since[0] >= deadline_seconds:
-                raise _SQLiteBackupTimeout(f"database remained locked for {deadline_seconds:g} seconds")
-        else:
-            busy_since.clear()
-
-    src_conn.backup(dst_conn, pages=256, progress=progress, sleep=0.1)
+    """The restore's page copy: :func:`~hermes_cli.sqlite_bounded_backup.bounded_backup`, the clock
+    started before the first step (connections from ``open_backup_connection``)."""
+    bounded_backup(src_conn, dst_conn, lock_seconds=deadline_seconds, what="the database or its snapshot image")
 
 
 def _preserve_db_evidence(dst: Path) -> Path:

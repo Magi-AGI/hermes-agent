@@ -59,12 +59,18 @@ def _placeholders(items) -> str:
 # Export
 # ---------------------------------------------------------------------------
 
+# How long an export waits for a board database another process keeps locked (A21: it used to wait
+# forever); then the export is refused (BackupLockTimeout, an OSError) with nothing written.
+_SNAPSHOT_LOCK_SECONDS = 10.0
+
+
 def _snapshot_db(source: Path, target: Path) -> None:
     """Consistent copy of ``source`` via the online-backup API (a file copy
-    would miss pages still in the ``-wal`` sidecar and could tear)."""
-    with contextlib.closing(sqlite3.connect(str(source))) as src, \
-            contextlib.closing(sqlite3.connect(str(target))) as dst:
-        src.backup(dst)
+    would miss pages still in the ``-wal`` sidecar and could tear), with a bounded lock wait."""
+    from hermes_cli.sqlite_bounded_backup import bounded_backup, open_backup_connection
+    with contextlib.closing(open_backup_connection(source)) as src, \
+            contextlib.closing(open_backup_connection(target)) as dst:
+        bounded_backup(src, dst, lock_seconds=_SNAPSHOT_LOCK_SECONDS, what=f"board database {source}")
 
 
 def _scrub_local_state(conn: sqlite3.Connection) -> None:
