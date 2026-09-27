@@ -633,34 +633,74 @@ def _safe_restore_db(src: Path, dst: Path) -> bool:
     dashboard, another CLI) see the restored data instead of stale pages from a replaced inode.
     Callers run :func:`_db_restore_refusal` on *dst* first; *src* is checked here.
 
-    A destination whose main file is verifiably corrupt (:func:`_db_main_file_is_corrupt`, decided
-    before SQLite opens it — opening a corrupt database can discard its WAL) is not page-copied: it
-    is replaced by :func:`_restore_over_corrupt_db`, which preserves the old database and sidecars
-    first. A page copy that fails on a database NOT verified corrupt (a lock, a transient error)
-    is refused: the destination is left as it is, and the caller reports the file as skipped.
+    Corruption is judged on the database TOGETHER with its sidecars, never on the main file alone
+    (a main file can look corrupt while its committed WAL makes the database whole). When the main
+    file looks corrupt (:func:`_db_main_file_is_corrupt`, decided before SQLite opens it — opening
+    a corrupt database can discard its WAL), :func:`_restore_over_corrupt_db` preserves the old
+    database and sidecars, opens a scratch copy of the complete set normally and runs
+    ``PRAGMA integrity_check``: only a verifiably corrupt set is replaced; a set that reads
+    correctly is page-copied like any other. A page copy that fails, or that cannot get the
+    destination within :data:`_RESTORE_LOCK_DEADLINE_SECONDS` (another process holds its write
+    lock), is refused: the destination is left as it is and the caller reports the file as skipped.
     """
     refusal = _db_restore_refusal(src)
     if refusal is not None:
         logger.error("Not restoring %s from %s: %s", dst, src, refusal)
         return False
     if _db_main_file_is_corrupt(dst):
-        return _restore_over_corrupt_db(src, dst)
+        outcome = _restore_over_corrupt_db(src, dst)
+        if outcome != "readable":
+            return outcome == "replaced"
+    return _page_copy_db(src, dst)
+
+
+def _page_copy_db(src: Path, dst: Path) -> bool:
+    """Upstream's page copy of image *src* onto live database *dst* (WAL-aware), bounded by
+    :data:`_RESTORE_LOCK_DEADLINE_SECONDS`; False (the destination left as it is) on any failure."""
     try:
         # Closed on every path: a handle left open by a failed page copy used to block the old
         # unlink+move fallback on Windows (WinError 32).
-        with closing(sqlite3.connect(str(dst))) as dst_conn:
+        with closing(sqlite3.connect(str(dst), timeout=1.0)) as dst_conn:
             # Checkpoint first so the backup starts clean rather than writing on top of a deep WAL.
             with suppress(Exception):
                 dst_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             with closing(sqlite3.connect(f"file:{src}?mode=ro", uri=True)) as src_conn:
-                src_conn.backup(dst_conn)
+                _bounded_backup(src_conn, dst_conn, _RESTORE_LOCK_DEADLINE_SECONDS)
         with suppress(Exception):
             dst.chmod(src.stat().st_mode)
         return True
+    except _SQLiteBackupTimeout as exc:
+        logger.error("Not restoring %s: %s (another process holds it); it was left as it is. Stop the "
+                     "gateway/dashboard using it and retry.", dst, exc)
+        return False
     except Exception as exc:
         logger.error("SQLite safe restore failed for %s -> %s (%s); the database is not verified corrupt, so "
                      "it was left as it is", src, dst, exc)
         return False
+
+
+# How long a restore's page copy waits for a destination whose write lock another process holds
+# before it gives up (upstream's unbounded ``Connection.backup`` waited forever: A21).
+_RESTORE_LOCK_DEADLINE_SECONDS = 10.0
+
+
+def _bounded_backup(src_conn: sqlite3.Connection, dst_conn: sqlite3.Connection, deadline_seconds: float) -> None:
+    """``src_conn.backup(dst_conn)`` in steps, aborted (:class:`_SQLiteBackupTimeout`) once the
+    destination or source has stayed busy / locked for *deadline_seconds*. SQLite keeps the partial
+    copy inside the destination's write transaction, so an abort leaves the destination as it was."""
+    busy_since: list = []
+
+    def progress(status: int, _remaining: int, _total: int) -> None:
+        if status in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+            now = time.monotonic()
+            if not busy_since:
+                busy_since.append(now)
+            elif now - busy_since[0] >= deadline_seconds:
+                raise _SQLiteBackupTimeout(f"database remained locked for {deadline_seconds:g} seconds")
+        else:
+            busy_since.clear()
+
+    src_conn.backup(dst_conn, pages=256, progress=progress, sleep=0.1)
 
 
 def _preserve_db_evidence(dst: Path) -> Path:
@@ -691,17 +731,52 @@ def _preserve_db_evidence(dst: Path) -> Path:
     return folder
 
 
-def _publish_over_corrupt_db(src: Path, dst: Path) -> Path:
-    """Replace the verifiably corrupt database *dst* with image *src* (the caller has excluded live
-    holders). Returns the folder holding the preserved old database and sidecars.
+def _preserved_set_is_corrupt(preserved: Path, name: str) -> bool:
+    """Whether the database preserved in *preserved* is corrupt TOGETHER with its sidecars: a SECOND
+    copy of the complete set goes into an exclusively created scratch folder (never the preserved
+    one, never the live files), is opened normally — the WAL applied, a hot journal resolved — and
+    ``PRAGMA integrity_check`` must report ``ok``. NOTADB / CORRUPT on open or a failed check is
+    corrupt; any other error raises (the caller refuses). The scratch copy is removed afterwards."""
+    scratch = Path(tempfile.mkdtemp(dir=str(preserved.parent), prefix=f".{name}.check-"))
+    try:
+        for kept in preserved.iterdir():
+            with open(kept, "rb") as data, open(scratch / kept.name, "xb") as out:
+                shutil.copyfileobj(data, out)
+        try:
+            with closing(sqlite3.connect(str(scratch / name), timeout=1.0)) as conn:
+                rows = [str(r[0]) for r in conn.execute("PRAGMA integrity_check")]
+        except sqlite3.DatabaseError as exc:
+            if (getattr(exc, "sqlite_errorcode", 0) & 0xFF) in (11, 26):  # CORRUPT, NOTADB
+                return True
+            raise
+        return rows != ["ok"]
+    finally:
+        try:
+            shutil.rmtree(scratch)
+        except OSError as exc:
+            logger.error("Could not remove the scratch copy %s (%s); it is not evidence and may be deleted",
+                         scratch, exc)
 
-    (a) COPY the old database and its sidecars into a preserved folder (failure: nothing changed);
-    stage *src* in an exclusively created temp file beside *dst*; (b) remove the old sidecars (their
-    bytes are preserved; beside the new image SQLite would replay them); (c) ``os.replace`` the image
-    over *dst* — never unlinking it first. A crash between (b) and (c) leaves the old corrupt
-    database without sidecars plus the preserved copy (nothing lost; the restore can run again); a
-    failure at (c) leaves the old database in place."""
+
+def _publish_over_corrupt_db(src: Path, dst: Path) -> Optional[Path]:
+    """Replace database *dst* with image *src* IF it is corrupt together with its sidecars (the
+    caller has excluded live holders). Returns the folder holding the preserved old database and
+    sidecars, or None when the complete set reads correctly (nothing replaced; the evidence copy is
+    kept).
+
+    (a) COPY the old database and its sidecars into a preserved folder (failure: nothing changed),
+    and decide on a scratch copy of that complete set (:func:`_preserved_set_is_corrupt`) — main-
+    file corruption alone never justifies removing a WAL; stage *src* in an exclusively created
+    temp file beside *dst*; (b) remove the old sidecars (their bytes are preserved; beside the new
+    image SQLite would replay them); (c) ``os.replace`` the image over *dst* — never unlinking it
+    first. A crash between (b) and (c) leaves a database that was already unreadable plus the
+    preserved copy (no regression; the restore can run again); a failure at (c) leaves the old
+    database in place."""
     preserved = _preserve_db_evidence(dst)
+    if not _preserved_set_is_corrupt(preserved, dst.name):
+        logger.warning("%s reads correctly together with its sidecars; it is not replaced as corrupt (an "
+                       "evidence copy is kept at %s)", dst, preserved)
+        return None
     fd, tmp_name = tempfile.mkstemp(dir=str(dst.parent), prefix=f".{dst.name}.", suffix=".snap_restore")
     try:
         with os.fdopen(fd, "wb") as out, open(src, "rb") as data:
@@ -726,9 +801,10 @@ def _publish_over_corrupt_db(src: Path, dst: Path) -> Path:
     return preserved
 
 
-def _restore_over_corrupt_db(src: Path, dst: Path) -> bool:
-    """Restore over a verifiably corrupt database (:func:`_publish_over_corrupt_db`). Only safe when no
-    process holds the DB open.
+def _restore_over_corrupt_db(src: Path, dst: Path) -> str:
+    """Restore over a database whose main file looks corrupt (:func:`_publish_over_corrupt_db`):
+    ``replaced``, ``readable`` (the complete set reads correctly: nothing replaced, the caller
+    page-copies) or ``failed``. Only safe when no process holds the DB open.
 
     Replacing the inode under a live holder is the #90950 corruption class (the holder keeps
     writing through a deleted-inode fd and loses its WAL index), so fail closed. The foreign-pid
@@ -741,17 +817,17 @@ def _restore_over_corrupt_db(src: Path, dst: Path) -> bool:
         if holders:
             logger.error("Refusing to replace corrupt database %s: process(es) %s still "
                          "hold the database or its WAL open. Stop them and retry.", dst, holders)
-            return False
+            return "failed"
         with offline_file_access(dst, what="replace the corrupt database"):
-            _publish_over_corrupt_db(src, dst)
-        return True
+            preserved = _publish_over_corrupt_db(src, dst)
+        return "replaced" if preserved is not None else "readable"
     except LiveConnectionError as exc2:
         logger.error("Refusing to replace corrupt database %s: %s Close the in-process "
                      "database handles (or restart Hermes) and retry.", dst, exc2)
-        return False
+        return "failed"
     except Exception as exc2:
         logger.error("Restore over corrupt database %s from %s failed: %s", dst, src, exc2)
-        return False
+        return "failed"
 
 
 def _zip_sqlite_snapshot(zf: zipfile.ZipFile, abs_path: Path, rel_path: Path, out_path: Path) -> Optional[int]:

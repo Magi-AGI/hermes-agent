@@ -404,16 +404,18 @@ def _print_update_summary(*, node_failures: list, desktop_build_ok: bool, pre_up
 def _restore_state_db_from_snapshot(state_path: Path, snap_state: Path) -> bool:
     """Replace *state_path* with the snapshot image; True when the result passes integrity.
 
-    The corrupt DB and its sidecars are first COPIED into a preserved folder beside it, then its
-    sidecars are removed (so its WAL can't replay over the image) and the image replaces it with
-    one rename (``backup._publish_over_corrupt_db``): a failure never leaves state.db missing.
+    The DB and its sidecars are first COPIED into a preserved folder beside it and judged TOGETHER
+    on a scratch copy (``backup._publish_over_corrupt_db``): a corrupt set has its sidecars removed
+    (so its WAL can't replay over the image) and is replaced with one rename, never leaving
+    state.db missing; a set that reads correctly is restored by the bounded page copy instead.
     Refuses (False) while another process — or a live connection in THIS process — holds the
     DB: copying over a live writer's inode desyncs its page cache and its next checkpoint
     clobbers pages. Holder scan ``None`` proceeds (gateways drained; refusing on unknown would
     disable auto-restore on non-Linux). Raises OSError if the copy fails.
     """
     from hermes_cli.backup import (
-        _db_restore_refusal, _foreign_db_holder_pids, _publish_over_corrupt_db, verify_sqlite_integrity)
+        _db_restore_refusal, _foreign_db_holder_pids, _page_copy_db, _publish_over_corrupt_db,
+        verify_sqlite_integrity)
     from hermes_cli.sqlite_safe_read import LiveConnectionError, offline_file_access
     refusal = _db_restore_refusal(state_path)  # the restore below must never touch an alias
     if refusal is not None:
@@ -433,7 +435,15 @@ def _restore_state_db_from_snapshot(state_path: Path, snap_state: Path) -> bool:
     try:
         with offline_file_access(state_path, what="restore a snapshot over"):
             preserved = _publish_over_corrupt_db(snap_state, state_path)
-        print(f"  The corrupt state.db and its sidecars are preserved at {preserved}")
+        if preserved is None:
+            # The complete set (database + WAL) reads correctly: never replaced as corrupt; restored
+            # by the bounded, WAL-aware page copy instead (an evidence copy is kept beside it).
+            if not _page_copy_db(snap_state, state_path):
+                print("  ✗ Auto-restore refused: state.db could not be page-copied (see the log); it was "
+                      "left as it is.")
+                return False
+        else:
+            print(f"  The corrupt state.db and its sidecars are preserved at {preserved}")
     except LiveConnectionError as exc:
         print(
             f"  ✗ Auto-restore refused: {exc} Close the in-process database "

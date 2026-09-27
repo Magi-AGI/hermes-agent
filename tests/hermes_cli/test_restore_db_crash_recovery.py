@@ -10,9 +10,11 @@ the restore / snapshot / update-verification paths (round 14: even a ``mode=ro``
 ``-shm``) — ``lstat`` / ``stat`` and the restore classification only: the database and each of its
 ``-wal`` / ``-shm`` / ``-journal`` sidecars must not be a link, a hard link, credential state,
 outside the database's directory or uninspectable. Then upstream's page copy restores it; a page
-copy that fails on a database not verified corrupt is refused; a VERIFIABLY corrupt database is
-replaced only after its old database and sidecars are copied into a preserved folder (A20), with
-one ``os.replace`` and never a window without a database.
+copy (bounded: a destination another process keeps locked refuses, A21) that fails is refused;
+corruption is judged on the database TOGETHER with its sidecars (a scratch copy opened normally +
+``integrity_check``), and only a verifiably corrupt set is replaced — after its old database and
+sidecars are copied into a preserved folder (A20), with one ``os.replace`` and never a window
+without a database.
 
 Codex's round-12 reproductions are adapted here (its fixture gives sessions.db a second hard link,
 so every one of them is now refused by the guard); ``_prepare`` / ``_read`` / ``_run`` /
@@ -405,3 +407,155 @@ def test_a_page_copy_failure_on_a_healthy_database_refuses_and_keeps_every_row(c
     assert os.stat(live).st_ino == identity, "a refused restore replaced the database"
     assert _preserved(root) == [], "a healthy database took the corrupt-database fallback"
     assert _read(live) == {"rows": ["committed-live"], "integrity": "ok"}
+
+
+# ── Round 15: corruption is judged on the database WITH its sidecars; the page copy is bounded ──
+
+SEED_SCHEMA_IN_WAL = (
+    "import os, sqlite3, sys\n"
+    "c = sqlite3.connect(sys.argv[1])\n"
+    "c.execute('PRAGMA journal_mode=WAL')\n"
+    "c.execute('PRAGMA wal_autocheckpoint=0')\n"
+    "c.execute('CREATE TABLE initial_rows(v TEXT)')\n"
+    "c.commit()\n"
+    "c.execute('PRAGMA wal_checkpoint(TRUNCATE)')\n"
+    "c.execute('CREATE TABLE review_rows(v TEXT)')\n"
+    "c.execute(\"INSERT INTO review_rows VALUES ('committed-live')\")\n"
+    "c.commit()\n"
+    "os._exit(71)\n"
+)
+
+
+def _wal_healthy_main_corrupt(root, tmp_path):
+    """Codex (round 14): the schema page is damaged in the MAIN file only; the committed WAL holds a
+    newer copy of it, so the complete database reads correctly and passes integrity_check."""
+    from hermes_cli import backup
+    live = root / "sessions.db"
+    assert _run(SEED_SCHEMA_IN_WAL, live).returncode == 71
+    with live.open("r+b") as handle:
+        handle.seek(100)
+        handle.write(b"\xff")
+    verify = tmp_path / "verify.db"
+    verify.write_bytes(live.read_bytes())
+    verify.with_name(verify.name + "-wal").write_bytes(live.with_name(live.name + "-wal").read_bytes())
+    assert _read(verify) == {"rows": ["committed-live"], "integrity": "ok"}
+    assert backup._db_main_file_is_corrupt(live), "the main-file probe alone calls it corrupt (control)"
+    return live, _snapshot(root, {"sessions.db": _backup_image(tmp_path).read_bytes()})
+
+
+CRASH_AT = (
+    "import os, sys\n"
+    "from pathlib import Path\n"
+    "from hermes_cli import backup\n"
+    "root, snapshot_id, point = Path(sys.argv[1]), sys.argv[2], sys.argv[3]\n"
+    "live = root / 'sessions.db'\n"
+    "real_replace = os.replace\n"
+    "def replace(src, dst, *a, **k):\n"
+    "    if point == 'before-replace' and Path(dst) == live:\n"
+    "        os._exit(85)\n"
+    "    return real_replace(src, dst, *a, **k)\n"
+    "os.replace = replace\n"
+    "if point == 'during-check':\n"
+    "    backup._preserved_set_is_corrupt = lambda *a, **k: os._exit(86)\n"
+    "if point == 'before-page-copy':\n"
+    "    backup._bounded_backup = lambda *a, **k: os._exit(87)\n"
+    "print(backup.restore_quick_snapshot(snapshot_id, hermes_home=root))\n"
+)
+
+
+@pytest.mark.parametrize("point", ["before-replace", "during-check", "before-page-copy"])
+def test_a_wal_healthy_database_is_never_made_unreadable_by_an_interrupted_restore(codex_home, tmp_path, point):
+    """The complete set reads correctly, so it is never treated as corrupt: no sidecar is removed and
+    no replacement happens (a kill 'before-replace' never fires: the restore page-copies instead). An
+    interruption anywhere leaves normal Hermes startup reading the committed row."""
+    root, _endpoint = codex_home
+    live, snapshot_id = _wal_healthy_main_corrupt(root, tmp_path)
+
+    out = _run(CRASH_AT, root, snapshot_id, point)
+
+    if point == "before-replace":
+        assert out.returncode == 0 and out.stdout.strip().endswith("True"), out.stderr[-2000:]
+        assert _read(live) == {"rows": ["backup-image"], "integrity": "ok"}
+    else:
+        assert out.returncode == (86 if point == "during-check" else 87), out.stderr[-2000:]
+        assert _read(live) == {"rows": ["committed-live"], "integrity": "ok"}
+
+
+def test_a_wal_healthy_database_with_a_failing_replace_is_restored_by_the_page_copy(codex_home, tmp_path, monkeypatch):
+    """Codex's publication-error case: the replacement is never used for a set that reads correctly,
+    so an os.replace that would raise does not matter; the evidence copy still holds the WAL."""
+    from hermes_cli import backup
+    root, _endpoint = codex_home
+    live, snapshot_id = _wal_healthy_main_corrupt(root, tmp_path)
+    evidence = live.with_name(live.name + "-wal").read_bytes()
+    real_replace = os.replace
+
+    def replace(src, dst, *args, **kwargs):
+        if Path(dst) == live:
+            raise PermissionError(errno.EACCES, "injected publication failure", str(dst))
+        return real_replace(src, dst, *args, **kwargs)
+    monkeypatch.setattr(os, "replace", replace)
+
+    assert backup.restore_quick_snapshot(snapshot_id, hermes_home=root) is True
+    monkeypatch.undo()
+    assert evidence in [p.read_bytes() for p in _preserved(root)]
+    assert not list(root.glob(".sessions.db.check-*")), "the scratch copy was left behind"
+    assert _read(live) == {"rows": ["backup-image"], "integrity": "ok"}
+
+
+HANG_GUARD_SECONDS = 60  # the restore's own deadline is 10 s; upstream's page copy never returned
+
+RESTORE_WITH_DEADLINE = (
+    "import sys, time\n"
+    "from pathlib import Path\n"
+    "from hermes_cli import backup\n"
+    "started = time.monotonic()\n"
+    "ok = backup.restore_quick_snapshot(sys.argv[2], hermes_home=Path(sys.argv[1]))\n"
+    "print(ok, round(time.monotonic() - started, 1))\n"
+)
+
+
+def test_a_page_copy_onto_a_write_locked_database_gives_up_within_its_deadline(codex_home, tmp_path):
+    """A21: upstream's Connection.backup waited forever for a destination whose write lock another
+    process holds. The restore (run in a child with a hang guard) now refuses within its deadline,
+    leaving the database as it was and the holder's work intact."""
+    import time
+    root, _endpoint = codex_home
+    live, snapshot_id = _prepare(root, tmp_path, link=False)
+    ready, gate = tmp_path / "ready", tmp_path / "gate"
+    holder = subprocess.Popen([sys.executable, "-B", "-c", HOLD_WRITE_LOCK_COMMITTING, str(live), str(ready), str(gate)],
+                              cwd=str(REPO), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        deadline = time.monotonic() + 60
+        while not ready.exists():
+            assert holder.poll() is None and time.monotonic() < deadline, holder.communicate()
+            time.sleep(0.05)
+        identity = os.stat(live).st_ino
+        try:
+            out = subprocess.run([sys.executable, "-B", "-c", RESTORE_WITH_DEADLINE, str(root), snapshot_id],
+                                 cwd=str(REPO), capture_output=True, text=True, timeout=HANG_GUARD_SECONDS)
+        except subprocess.TimeoutExpired:
+            pytest.fail("the restore waited without bound for the write-locked database")
+        result, elapsed = out.stdout.split()[-2:]
+        assert result == "False", out.stderr[-2000:]
+        assert float(elapsed) < HANG_GUARD_SECONDS
+        assert os.stat(live).st_ino == identity and _preserved(root) == []
+    finally:
+        gate.write_text("go")
+        holder.communicate(timeout=60)
+    assert _read(live) == {"rows": ["committed-live", "holder-committed"], "integrity": "ok"}
+
+
+HOLD_WRITE_LOCK_COMMITTING = (
+    "import sqlite3, sys, time\n"
+    "from pathlib import Path\n"
+    "path, ready, gate = sys.argv[1:4]\n"
+    "c = sqlite3.connect(path, isolation_level=None)\n"
+    "c.execute('BEGIN IMMEDIATE')\n"
+    "c.execute(\"INSERT INTO review_rows VALUES ('holder-committed')\")\n"
+    "Path(ready).write_text('ready')\n"
+    "while not Path(gate).exists():\n"
+    "    time.sleep(0.05)\n"
+    "c.execute('COMMIT')\n"
+    "c.close()\n"
+)
