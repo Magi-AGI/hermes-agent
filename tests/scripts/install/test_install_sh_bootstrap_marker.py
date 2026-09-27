@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.linux_only  # POSIX installer (install.sh / setup-hermes.sh); see A2-DISPOSITIONS.md (A17)
+
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 INSTALL_SH = REPO_ROOT / "scripts" / "install.sh"
 
@@ -55,7 +57,6 @@ def make_checkout(tmp_path):
     return install_dir
 
 
-@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 def test_marker_matches_the_schema_the_desktop_validates(tmp_path):
     """Desktop's isBootstrapComplete() needs schemaVersion 1 + a >=7 char commit."""
     install_dir = make_checkout(tmp_path)
@@ -73,7 +74,6 @@ def test_marker_matches_the_schema_the_desktop_validates(tmp_path):
     assert payload["completedAt"].endswith("Z")
 
 
-@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 def test_marker_publish_leaves_no_temp_sibling(tmp_path):
     """The launcher predicate is existence-only, so the write must be atomic."""
     install_dir = make_checkout(tmp_path)
@@ -84,7 +84,6 @@ def test_marker_publish_leaves_no_temp_sibling(tmp_path):
     assert not (install_dir / ".hermes-bootstrap-complete.tmp").exists()
 
 
-@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 def test_explicit_commit_pin_wins_over_head(tmp_path):
     install_dir = make_checkout(tmp_path)
     pinned = "abcdef1234567890abcdef1234567890abcdef12"
@@ -95,7 +94,6 @@ def test_explicit_commit_pin_wins_over_head(tmp_path):
     assert payload["pinnedCommit"] == pinned
 
 
-@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 def test_no_marker_written_when_head_cannot_be_resolved(tmp_path):
     """A malformed marker is worse than none: absent means a clean re-bootstrap."""
     install_dir = tmp_path / "not-a-checkout"
@@ -107,7 +105,6 @@ def test_no_marker_written_when_head_cannot_be_resolved(tmp_path):
     assert not (install_dir / ".hermes-bootstrap-complete").exists()
 
 
-@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 def test_missing_install_dir_is_not_fatal(tmp_path):
     result = run_write_marker(tmp_path / "does-not-exist")
 

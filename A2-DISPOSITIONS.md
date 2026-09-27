@@ -30,6 +30,11 @@ Production was checked for the same pattern: the bare-`bash` spawns there are PO
 (`gateway/slash_commands.py`, `gateway/run_shutdown.py` return early on Windows), PowerShell on Windows
 (`hermes_cli/dep_ensure.py`), or an argv run inside a remote sandbox (`tools/environments/remote_common.py`).
 
+Round 1 (Antigravity): `_find_bash()` itself missed a Git for Windows install off the system drive when only
+`<Git>\cmd` is on PATH (this deploy host keeps Git on `E:`); `_windows_bash_candidates` now also looks beside
+the `git` on PATH. `tests/tools/test_stage2_hook_seed_one_symlinks.py` took `shutil.which("bash")` (WSL
+first on Windows) and now takes `_find_bash()`.
+
 ## 2. The 42 `tests/scripts/install/` failures (39 test functions; one is parametrized 4 ways)
 
 **Disposition: host-specific by design → `@pytest.mark.linux_only`.**
@@ -42,10 +47,16 @@ Production was checked for the same pattern: the bare-`bash` spawns there are PO
   as `E:GitHubMagi-AGI…install.sh`; others need symlink privilege (WinError 1314), `apt`/Termux probes or
   POSIX permissions. Running them under Git Bash instead would still test a script the product never runs on
   Windows.
-- `linux_only` keeps CI coverage exactly as it was: unmarked tests already ran only on the Linux lane (the
-  macOS/Windows lanes import only files carrying their own marker; `scripts/ci/list_os_marked_tests.py
-  linux_only` now lists the 19 files). Only the failing functions are marked; the `install.ps1` tests in the
-  mixed files still run on Windows.
+- `linux_only` keeps CI selection exactly as it was: unmarked tests already ran only on the Linux lane (the
+  macOS/Windows lanes import only files carrying their own marker). It is selection neutrality, not new
+  native macOS coverage.
+- Applied per behaviour group, not per observed failure (round 1, Codex: two Termux cases still ran
+  `install.sh` on Windows once Git Bash was on PATH and failed at "Windows detected"): every
+  `test_install_sh_*.py` file and `test_install_macos_launcher.py` is POSIX-installer-only and carries a
+  file-level `pytestmark` (merged with an existing one where present, as `test_install_sh_system_package_probe.py`
+  already did). In the five files that also test `install.ps1` (autostash, commit-pin rollback, lockfile
+  churn, no initial commit, unmerged index) only the `install.sh` functions are marked, so the `install.ps1`
+  tests still run on Windows.
 
 ## 3. `tests/scripts/test_contributor_map.py::test_add_contributor_refuses_a_case_collision`
 

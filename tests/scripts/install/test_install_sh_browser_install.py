@@ -170,7 +170,6 @@ echo "FINAL_RC=$?"
         Path(runlog).unlink(missing_ok=True)
 
 
-@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 def test_override_retry_fires_on_ubuntu_26() -> None:
     """Ubuntu 26.04 (too new) → native fails → retry with ubuntu24.04 override."""
     r = _run_install_fn("ubuntu", "26.04", native_fails=True)
@@ -184,7 +183,6 @@ def test_override_retry_fires_on_ubuntu_26() -> None:
 
 
 
-@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 def test_override_retry_fires_on_debian_14() -> None:
     """Debian 14 (> 13) is the too-new apt case → retry with override."""
     r = _run_install_fn("debian", "14", native_fails=True)
@@ -193,7 +191,6 @@ def test_override_retry_fires_on_debian_14() -> None:
     assert r["final_rc"] == 0
 
 
-@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 def test_no_retry_when_native_succeeds_on_ubuntu_26() -> None:
     """Even on Ubuntu 26.04, a successful native install is never retried."""
     r = _run_install_fn("ubuntu", "26.04", native_fails=False)
@@ -202,6 +199,8 @@ def test_no_retry_when_native_succeeds_on_ubuntu_26() -> None:
     assert r["final_rc"] == 0
 
 import re
+
+pytestmark = pytest.mark.linux_only  # POSIX installer (install.sh / setup-hermes.sh); see A2-DISPOSITIONS.md (A17)
 
 
 def _extract_function_body(source: str, name: str) -> str:

@@ -18,6 +18,8 @@ from unittest.mock import patch
 
 import pytest
 
+pytestmark = pytest.mark.linux_only  # POSIX installer (install.sh / setup-hermes.sh); see A2-DISPOSITIONS.md (A17)
+
 INSTALL_SH = Path(__file__).resolve().parent.parent.parent.parent / "scripts" / "install.sh"
 
 ACP_BLOCK = re.compile(
@@ -67,7 +69,6 @@ def _run_block(tmp_path: Path, use_venv: str) -> Path:
     return command_link_dir / "hermes-acp"
 
 
-@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 def test_venv_install_writes_executable_acp_launcher(tmp_path):
     shim = _run_block(tmp_path, "true")
     assert shim.is_file()
@@ -81,14 +82,12 @@ def test_venv_install_writes_executable_acp_launcher(tmp_path):
     assert re.search(r'exec .*\bacp\b', text), text
 
 
-@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 def test_non_venv_install_writes_acp_launcher(tmp_path):
     shim = _run_block(tmp_path, "false")
     text = shim.read_text(encoding="utf-8")
     assert re.search(r'exec .*\bacp\b', text), text
 
 
-@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 def test_acp_launcher_does_not_follow_a_symlink_into_the_venv(tmp_path):
     """Guards the #21454 failure mode for the new launcher.
 
@@ -190,7 +189,6 @@ def _run_hermes_agent_block(tmp_path: Path, use_venv: str) -> Path | None:
     return command_link_dir / "hermes-agent"
 
 
-@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 def test_venv_install_writes_executable_hermes_agent_launcher(tmp_path):
     """venv install must write a user-executable hermes-agent launcher."""
     shim = _run_hermes_agent_block(tmp_path, "true")

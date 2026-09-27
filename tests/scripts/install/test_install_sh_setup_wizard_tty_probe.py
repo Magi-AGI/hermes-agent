@@ -20,6 +20,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.linux_only  # POSIX installer (install.sh / setup-hermes.sh); see A2-DISPOSITIONS.md (A17)
+
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 INSTALL_SH = REPO_ROOT / "scripts" / "install.sh"
 

@@ -22,6 +22,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.linux_only  # POSIX installer (install.sh / setup-hermes.sh); see A2-DISPOSITIONS.md (A17)
+
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
@@ -59,7 +61,6 @@ def test_setup_path_shim_block_removes_old_link_before_writing() -> None:
     )
 
 
-@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 def test_re_running_setup_path_block_preserves_pip_entry_point(tmp_path: Path) -> None:
     """Behavioral repro: simulate prior-install symlink + new-install heredoc.
 

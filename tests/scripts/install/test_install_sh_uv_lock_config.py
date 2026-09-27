@@ -9,6 +9,8 @@ import subprocess
 
 import pytest
 
+pytestmark = pytest.mark.linux_only  # POSIX installer (install.sh / setup-hermes.sh); see A2-DISPOSITIONS.md (A17)
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 INSTALL_SCRIPTS = (
@@ -54,7 +56,6 @@ def test_installers_keep_bootstrap_isolation_but_restore_project_config_for_lock
     assert 'run_locked_uv_sync "$SCRIPT_DIR/venv"' in setup_text
 
 
-@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 def test_locked_sync_helper_sanitizes_only_its_subprocess(tmp_path: Path) -> None:
     bash = shutil.which("bash")
     if bash is None:

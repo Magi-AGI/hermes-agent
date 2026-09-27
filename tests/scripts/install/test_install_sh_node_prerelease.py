@@ -21,6 +21,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.linux_only  # POSIX installer (install.sh / setup-hermes.sh); see A2-DISPOSITIONS.md (A17)
+
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 INSTALL_SH = REPO_ROOT / "scripts" / "install.sh"
 NODE_BOOTSTRAP = REPO_ROOT / "scripts" / "lib" / "node-bootstrap.sh"
@@ -54,7 +56,6 @@ def test_prerelease_node_never_satisfies_the_build_floor() -> None:
     assert not _node_satisfies_build("v22.22.0-pre")
 
 
-@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 def test_final_releases_still_satisfy_the_build_floor() -> None:
     """The guard must not cost us any version that actually works."""
     assert _node_satisfies_build("v22.22.0")  # the floor itself
@@ -68,7 +69,6 @@ def test_versions_below_the_floor_are_still_rejected() -> None:
     assert not _node_satisfies_build("not-a-version")
 
 
-@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 def test_install_node_falls_back_to_an_older_release_line(tmp_path: Path) -> None:
     """A rejected line must not end the install — the next one is tried.
 

@@ -21,7 +21,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 INSTALL_SH = REPO_ROOT / "scripts" / "install.sh"
 
-pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+pytestmark = [pytest.mark.linux_only, pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")]  # POSIX installer; A17
 
 
 def workspace_args(install_dir: Path) -> list[str]:
@@ -54,7 +54,6 @@ def selected_workspaces(args: list[str]) -> list[str]:
     return [value for flag, value in zip(args, args[1:]) if flag == "--workspace"]
 
 
-@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 @pytest.mark.parametrize(
     "workspaces",
     [("ui-tui", "web"), ("ui-tui",), ("web",), ()],
@@ -71,7 +70,6 @@ def test_desktop_workspace_is_never_selected(tmp_path, workspaces):
     assert "--workspaces=false" in args or selected_workspaces(args)
 
 
-@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 def test_present_workspaces_are_installed_alongside_the_root(tmp_path):
     """ui-tui and web are what a CLI install needs; the root owns shared
     devDependencies that a scoped install would otherwise prune."""
@@ -81,7 +79,6 @@ def test_present_workspaces_are_installed_alongside_the_root(tmp_path):
     assert "--include-workspace-root" in args
 
 
-@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 def test_absent_workspace_is_not_named(tmp_path):
     """npm fails hard on a workspace it cannot find, so a partial checkout
     must only name the workspaces that exist."""
@@ -90,7 +87,6 @@ def test_absent_workspace_is_not_named(tmp_path):
     assert selected_workspaces(args) == ["ui-tui"]
 
 
-@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 def test_bare_checkout_installs_the_root_only(tmp_path):
     """With no installable workspace, npm still must not walk apps/*."""
     args = workspace_args(make_checkout(tmp_path, ()))

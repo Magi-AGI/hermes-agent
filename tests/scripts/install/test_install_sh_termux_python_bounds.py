@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.linux_only  # POSIX installer (install.sh / setup-hermes.sh); see A2-DISPOSITIONS.md (A17)
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 INSTALL_SH = REPO_ROOT / "scripts" / "install.sh"
@@ -162,7 +164,6 @@ def test_install_stage_rejects_post_install_unsupported_default(tmp_path: Path) 
     assert "pkg install tur-repo && pkg install python3.13" in result.stdout
 
 
-@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 def test_install_stage_provisions_supported_python_from_tur(tmp_path: Path) -> None:
     """When the default Termux python is too new, the installer falls back to
     the Termux User Repository (TUR) and picks up a supported interpreter that
@@ -194,7 +195,6 @@ def test_install_stage_provisions_supported_python_from_tur(tmp_path: Path) -> N
     assert "Python installed from TUR: Python 3.13.7" in result.stdout
 
 
-@pytest.mark.linux_only  # POSIX installer; see A2-DISPOSITIONS.md (A17)
 def test_setup_script_prefers_compatible_minor_over_unsupported_default(
     tmp_path: Path,
 ) -> None:
