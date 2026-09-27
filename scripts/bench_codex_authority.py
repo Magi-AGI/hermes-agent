@@ -6,6 +6,7 @@ single-use, a reused one is rejected, and every presented token is recorded in i
 
   python scripts/bench_codex_authority.py progress   # 24 processes x 4 threads, real entry points
   python scripts/bench_codex_authority.py kills      # a real process kill at every boundary
+  python scripts/bench_codex_authority.py kills2     # stage 2: kills at every rename / abandon / transfer / delete step
   python scripts/bench_codex_authority.py latency --tree <checkout>   # read-path p50/p99
   python scripts/bench_codex_authority.py startup --baseline <checkout>  # A/B, bench-reports/STARTUP-AB-PROTOCOL.md
   python scripts/bench_codex_authority.py rescue-scan  # per-refresh rescue-location scan vs profile count
@@ -95,6 +96,14 @@ def start_endpoint(ledger: Ledger):
             self.wfile.write(json.dumps(payload).encode())
 
         def do_GET(self):  # noqa: N802
+            if self.path.startswith("/issue"):  # a fresh sign-in's pair for a worker (stage 2 races)
+                chain = (parse_qs(self.path.partition("?")[2]).get("chain") or ["x"])[0]
+                with ledger.lock:
+                    pair = ledger.issue(chain)
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(json.dumps(pair).encode())
+                return
             with ledger.lock:
                 counts: dict = {}
                 for _t, _tok, chain, outcome in ledger.presented:
@@ -220,7 +229,8 @@ def worker_progress(args) -> None:
 
     probe_failures = _ProbeFailures()
     targets = json.loads(args.targets)
-    stats = {"attempts": 0, "ok": 0, "refused": 0, "fenced": 0, "lock_timeout": 0, "errors": {}, "lat": []}
+    stats = {"attempts": 0, "ok": 0, "refused": 0, "fenced": 0, "lock_timeout": 0, "moved": 0, "errors": {},
+             "lat": [], "fence_reasons": {}}
     lock = threading.Lock()
     deadline = time.monotonic() + args.seconds
 
@@ -237,13 +247,16 @@ def worker_progress(args) -> None:
                 return
             kind, target = targets[rng.randrange(len(targets))]
             t0 = time.perf_counter()
-            outcome = "ok"
+            outcome, fence_reason = "ok", None
             try:
                 outcome, _ = run_entry(kind, target, probe_failures)
             except auth.AuthError as exc:
                 from hermes_cli.auth_codex_registry import CodexStoreLockBusy
+                fence_reason = str(getattr(exc, "reason", None) or exc.code)
                 if isinstance(exc, CodexStoreLockBusy):
                     outcome = "lock_timeout"  # local store-lock contention: retryable busy
+                elif exc.code in ("profile_store_missing", "profile_being_moved"):
+                    outcome = "moved"  # this worker's profile is being / was renamed away (profile-ops race)
                 else:
                     outcome = "refused" if getattr(exc, "reason", None) == "in-progress" else (
                         "fenced" if exc.code in ("codex_recovery_fenced", "codex_refresh_indeterminate")
@@ -255,10 +268,14 @@ def worker_progress(args) -> None:
                 import traceback
                 with lock:
                     stats.setdefault("tracebacks", []).append(traceback.format_exc()[-3000:])
+            if outcome not in ("ok", "moved") and args.moving and not Path(os.environ["HERMES_HOME"]).is_dir():
+                outcome = "moved"  # the profile was renamed away while this attempt ran
             with lock:
                 stats["attempts"] += 1
                 stats["lat"].append(time.perf_counter() - t0)
-                if outcome in ("ok", "refused", "fenced", "lock_timeout"):
+                if outcome == "fenced":
+                    stats["fence_reasons"][fence_reason] = stats["fence_reasons"].get(fence_reason, 0) + 1
+                if outcome in ("ok", "refused", "fenced", "lock_timeout", "moved"):
                     stats[outcome] += 1
                 else:
                     stats["errors"][outcome] = stats["errors"].get(outcome, 0) + 1
@@ -269,6 +286,58 @@ def worker_progress(args) -> None:
         t.start()
     for t in threads:
         t.join()
+    print(json.dumps(stats))
+
+
+def worker_mover(args) -> None:
+    """Stage-2 profile ops racing the refresh workers: rename ``mover`` <-> ``moverb`` (a profile
+    holding its own Codex chain) and create / sign in / delete scratch profiles, until the progress
+    target is reached."""
+    _worker_setup()
+    _quiet_profile_commands()
+    import hermes_cli.auth as auth
+    from hermes_cli import profiles
+    root = Path(os.environ["HERMES_HOME"])
+    stats: dict = {"renames": 0, "rename_refused": 0, "rename_errors": {}, "deletes": 0, "sign_ins": 0,
+                   "scratch_errors": {}, "rename_ms": []}
+    deadline = time.monotonic() + args.seconds
+
+    def done() -> bool:
+        with urlopen(os.environ["BENCH_TOKEN_URL"] + "/stats", timeout=5) as r:
+            counts = json.loads(r.read())["ok"]
+        return sum(counts.values()) >= args.n and all(counts.get(c, 0) >= args.per_chain for c in args.chains.split(","))
+
+    i = 0
+    while time.monotonic() < deadline and not done():
+        i += 1
+        current = "mover" if (root / "profiles" / "mover").is_dir() else "moverb"
+        target = "moverb" if current == "mover" else "mover"
+        t0 = time.perf_counter()
+        try:
+            profiles.rename_profile(current, target)
+            stats["renames"] += 1
+            stats["rename_ms"].append(round((time.perf_counter() - t0) * 1000, 1))
+        except (ValueError, auth.AuthError, TimeoutError) as exc:
+            key = type(exc).__name__
+            stats["rename_refused"] += 1
+            stats["rename_errors"][key] = stats["rename_errors"].get(key, 0) + 1
+        name = f"scratch{i % 3}"
+        try:
+            profiles.create_profile(name, no_alias=True, no_skills=True)
+            with urlopen(os.environ["BENCH_TOKEN_URL"] + "/issue?chain=scratch", timeout=5) as r:
+                pair = json.loads(r.read())
+            os.environ["HERMES_HOME"] = str(root / "profiles" / name)
+            try:
+                auth._save_codex_tokens({"access_token": pair[0], "refresh_token": pair[1]})
+                stats["sign_ins"] += 1
+            finally:
+                os.environ["HERMES_HOME"] = str(root)
+            profiles.delete_profile(name, yes=True)
+            stats["deletes"] += 1
+        except Exception as exc:
+            key = f"{type(exc).__name__}: {str(exc)[:120]}"
+            stats["scratch_errors"][key] = stats["scratch_errors"].get(key, 0) + 1
+        time.sleep(0.2)
     print(json.dumps(stats))
 
 
@@ -341,10 +410,27 @@ def worker_check(args) -> None:
     print(json.dumps(out))
 
 
+def _lock_files(root: Path) -> list:
+    return sorted(str(p) for p in root.rglob("*.lock"))
+
+
 def worker_latency(args) -> None:
     sys.path.insert(0, args.tree)
     import hermes_cli.auth as auth
     from agent.credential_pool import load_pool
+    root = Path(args.root) if args.root else None
+    out: dict = {}
+    if root is not None:
+        # The read-only diagnostic path FIRST, in a process that has taken no lock yet: it must stay
+        # lock-free (no lock taken, no lock file created) and is timed on its own (design §13).
+        before = _lock_files(root)
+        lat_ro = []
+        for _ in range(args.iterations):
+            t0 = time.perf_counter()
+            auth.resolve_codex_runtime_credentials(read_only=True)
+            lat_ro.append(time.perf_counter() - t0)
+        out["read_only"] = lat_ro
+        out["lock_files_created_by_read_only"] = [p for p in _lock_files(root) if p not in before]
     auth.resolve_codex_runtime_credentials()  # warm
     lat_resolve, lat_pool = [], []
     for _ in range(args.iterations):
@@ -354,7 +440,8 @@ def worker_latency(args) -> None:
         t0 = time.perf_counter()
         load_pool("openai-codex").select()
         lat_pool.append(time.perf_counter() - t0)
-    print(json.dumps({"resolve": lat_resolve, "pool": lat_pool}))
+    out.update(resolve=lat_resolve, pool=lat_pool)
+    print(json.dumps(out))
 
 
 # ── parent side ─────────────────────────────────────────────────────────────────────────────────
@@ -401,13 +488,25 @@ def run_progress(args) -> int:
         write_store(homes[name], singleton=ledger.issue(name))
     homes["borrower"] = make_profile(root, "borrower")
     write_store(homes["borrower"])
+    if args.profile_ops:
+        chains.append("mover")
+        homes["mover"] = make_profile(root, "mover")
+        write_store(homes["mover"], singleton=ledger.issue("mover"))
+        homes["moverb"] = root / "profiles" / "moverb"  # its other name: exists half of the time
     plans = {  # (HERMES_HOME, targets)
         "root": [["singleton", "root"]], "pools": [["pool", "poolaa"], ["pool", "poolbb"]],
         "probe": [["probe", "probecc"], ["pool", "probecc"]],
         "work1": [["singleton", "work1"]], "work2": [["singleton", "work2"]],
         "borrower": [["singleton", "root"]],
+        "mover": [["singleton", "mover"]], "moverb": [["singleton", "mover"]],
     }
     order = ["root", "pools", "work1", "probe", "work2", "borrower", "pools", "probe"]
+    if args.profile_ops:
+        order = ["root", "pools", "work1", "mover", "probe", "work2", "moverb", "borrower", "pools", "probe"]
+        # bootstrap before anything races (the cold start is measured by the stage-1 runs)
+        subprocess.run([sys.executable, str(Path(__file__).resolve()), "worker-check", "--job"],
+                       env=sandbox_env(sandbox, root, url), cwd=str(sandbox), capture_output=True, text=True,
+                       timeout=180)
     procs = []
     t0 = time.monotonic()
     for i in range(args.processes):
@@ -417,8 +516,17 @@ def run_progress(args) -> int:
         procs.append(subprocess.Popen(
             [sys.executable, str(Path(__file__).resolve()), "worker-progress", "--targets", json.dumps(plans[plan]),
              "--threads", str(args.threads), "--seconds", str(args.seconds), "--n", str(args.n),
-             "--per-chain", str(args.per_chain), "--chains", ",".join(chains)],
+             "--per-chain", str(args.per_chain), "--chains", ",".join(chains),
+             *(["--moving"] if plan in ("mover", "moverb") else [])],
             env=env, cwd=str(sandbox), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+    plan_of = [order[i % len(order)] for i in range(args.processes)]
+    mover = None
+    if args.profile_ops:
+        mover = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "worker-mover", "--seconds", str(args.seconds),
+             "--n", str(args.n), "--per-chain", str(args.per_chain), "--chains", ",".join(chains)],
+            env=sandbox_env(sandbox, root, url), cwd=str(sandbox), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True)
     results = []
     for p in procs:
         out, err = p.communicate(timeout=args.seconds + 300)
@@ -426,10 +534,30 @@ def run_progress(args) -> int:
             results.append(json.loads(out.strip().splitlines()[-1]))
         except Exception:
             results.append({"crash": (err or out)[-2000:]})
+    mover_stats = None
+    if mover is not None:
+        out, err = mover.communicate(timeout=args.seconds + 300)
+        try:
+            mover_stats = json.loads(out.strip().splitlines()[-1])
+        except Exception:
+            mover_stats = {"crash": (err or out)[-2000:]}
     wall = time.monotonic() - t0
     server.shutdown()
 
     report = {"wall_s": round(wall, 1), "processes": args.processes, "threads": args.threads}
+    if args.profile_ops:
+        # The gate's refusal rate is over the workers of profiles that do NOT move; the moving
+        # profile's own workers are reported separately (half of them point at the name it is not
+        # at, by construction), and must show no fence, error or replay.
+        moving = [r for r, plan in zip(results, plan_of) if plan in ("mover", "moverb")]
+        results = [r for r, plan in zip(results, plan_of) if plan not in ("mover", "moverb")]
+        report["profile_ops"] = {
+            "mover": mover_stats,
+            "moving_profile_workers": {k: sum(r.get(k, 0) for r in moving)
+                                       for k in ("attempts", "ok", "refused", "fenced", "lock_timeout", "moved")},
+            "moving_profile_errors": [r.get("errors") for r in moving if r.get("errors")],
+            "moving_profile_fence_reasons": [r.get("fence_reasons") for r in moving if r.get("fence_reasons")],
+            "moving_profile_crashes": [r["crash"] for r in moving if "crash" in r]}
     ok_by_chain: dict = {}
     for _t, token, chain, outcome in ledger.presented:
         if outcome == "ok":
@@ -460,11 +588,13 @@ def run_progress(args) -> int:
     if len(seen_tokens) != len(set(seen_tokens)):
         failures.append("a refresh token was presented twice")
     registry = _load(root / "auth.chains.json")
-    fenced = [c for c in registry["chains"].values() if c["state"] != "active"]
+    fenced = [c for c in registry["chains"].values() if c["state"] == "fenced"]
     if fenced:
         failures.append(f"{len(fenced)} chain(s) fenced: {[c.get('fence') for c in fenced]}")
     rows_by_store = {}
-    for home in {root, homes["work1"], homes["work2"], homes["borrower"]}:
+    for home in {root, *[d for d in (root / "profiles").iterdir() if d.is_dir() and not d.name.startswith(".")]}:
+        if not (home / "auth.json").exists():
+            continue
         try:
             rows_by_store[str(home)] = _rows_of(_load(home / "auth.json"))
         except Exception as exc:
@@ -494,6 +624,15 @@ def run_progress(args) -> int:
                         "(refused + fenced + lock timeouts + errors)")
     if report["fenced_outcomes"] or report["worker_errors"] or report["worker_crashes"]:
         failures.append("fences / errors / crashes in workers")
+    if args.profile_ops:
+        ops_report = report["profile_ops"]
+        if ops_report["moving_profile_workers"]["fenced"] or ops_report["moving_profile_errors"] \
+                or ops_report["moving_profile_crashes"]:
+            failures.append("fences / errors / crashes in the moving profile's workers")
+        if not (mover_stats or {}).get("renames") or (mover_stats or {}).get("scratch_errors") or "crash" in (mover_stats or {}):
+            failures.append(f"the mover did not rename / sign in / delete cleanly: {mover_stats}")
+        if registry["ops"]:
+            failures.append(f"ops left unfinished: {list(registry['ops'])}")
     report["failures"] = failures
     print(json.dumps(report, indent=2))
     if not args.keep:
@@ -600,6 +739,314 @@ def run_kills(args) -> int:
     return 1 if failures else 0
 
 
+# ── stage 2: profile lifecycle / transfer / abandonment fault matrix (design rev 9.1 §13) ────────
+
+S2_CASES = {
+    "rename": ["rename-payload", "rename-decision", "rename-moving", "rename-moved-dir", "rename-moved",
+               "rename-apply", "rename-commit"],
+    "abandon": ["abandon-payload2", "abandon-decision2", "abandon-apply2"],
+    "transfer": ["transfer-payload", "transfer-decision", "transfer-apply-mid", "transfer-apply", "transfer-commit"],
+    "delete": ["delete-payload", "delete-decision", "delete-apply", "delete-commit", "delete-before-rmtree"],
+    # a rename killed after its decision, then the RECOVERING dispatcher is killed too
+    "recovery": ["recovery-rename-move", "recovery-rename-apply"],
+}
+
+
+def _quiet_profile_commands() -> None:
+    """The profile commands' service / process side effects are stubbed: a worker never looks for,
+    signals or stops a real process."""
+    from hermes_cli import profiles
+    for name, value in (("_cleanup_gateway_service", None), ("_maybe_unregister_gateway_service", None),
+                        ("_stop_gateway_process", None), ("_stop_profile_backends", None),
+                        ("_notify_multiplexer", None), ("_check_gateway_running", False),
+                        ("_purge_identity", True), ("_live_default_multiplexer", False),
+                        ("create_wrapper_script", None), ("remove_wrapper_script", None)):
+        setattr(profiles, name, lambda *a, _v=value, **k: _v)
+    import hermes_cli.profile_identity as identity
+    identity._migrate_profile_identity = lambda *a, **k: None
+
+
+def _install_s2_kill(boundary: str) -> None:
+    """os._exit at a stage-2 step boundary (no finally, no handler: a real process death)."""
+    from hermes_cli import auth_codex_ops as ops
+    from hermes_cli import auth_codex_profile_ops as pops
+    from hermes_cli import profiles
+
+    def die(*_a, **_k):
+        os._exit(137)
+
+    family, _, step = boundary.partition("-")
+    kind = {"rename": pops.RENAME, "transfer": pops.TRANSFER, "delete": pops.DELETE}.get(family)
+    if step == "payload":  # PAYLOAD written, DECISION not: die at the decision's registry write
+        real_write = ops.write_registry
+        ops.write_registry = lambda data: die() if any(
+            o.get("kind") == kind for o in data.get("ops", {}).values()) else real_write(data)
+    elif boundary == "rename-decision":
+        real_decide = pops.decide_op
+        pops.decide_op = lambda *a, **k: (real_decide(*a, **k), die())[0]
+    elif boundary in ("rename-moving", "rename-moved"):
+        real_update = pops._update_op
+        phase = pops.PHASE_MOVING if boundary == "rename-moving" else pops.PHASE_MOVED
+
+        def update(op_id, **fields):
+            real_update(op_id, **fields)
+            if fields.get("phase") == phase:
+                die()
+        pops._update_op = update
+    elif boundary == "rename-moved-dir":
+        real_move = pops.ProfileRename.move
+        pops.ProfileRename.move = lambda self, fn: real_move(self, lambda: (fn(), die()))
+    elif boundary in ("rename-apply", "recovery-rename-apply"):
+        real_apply = pops.apply_payload
+        pops.apply_payload = (lambda body: (real_apply(body), die())) if boundary == "rename-apply" else die
+    elif step == "commit":  # the COMMIT registry write landed; the payload is not archived yet
+        real_archive = ops._archive_payload
+        ops._archive_payload = lambda path, label: die() if label == "committed" else real_archive(path, label)
+    elif boundary in ("transfer-decision", "delete-decision"):
+        ops.apply_payload = die
+        pops.apply_payload = die
+    elif boundary == "transfer-apply-mid":  # the destination is written, the source not yet
+        real_edits, calls = ops._apply_store_edits, []
+
+        def edits(path, items):
+            calls.append(path)
+            if len(calls) == 2:
+                die()
+            return real_edits(path, items)
+        ops._apply_store_edits = edits
+    elif boundary == "transfer-apply":
+        ops.commit_op = die
+    elif boundary == "delete-apply":
+        pops.commit_op = die
+    elif boundary == "delete-before-rmtree":
+        profiles._rmtree_with_retry = die
+    elif boundary == "abandon-payload2":  # PAYLOAD-2 written; DECISION-2 is its next registry write
+        pops.write_registry = die
+    elif boundary == "abandon-decision2":
+        pops.apply_payload = die
+    elif boundary == "abandon-apply2":
+        pops.commit_op = die
+    elif boundary == "recovery-rename-move":
+        real_rename = pops.os.rename
+        pops.os.rename = lambda src, dst: (real_rename(src, dst), die())
+    else:  # pragma: no cover - a typo in the matrix
+        raise SystemExit(f"unknown boundary {boundary}")
+
+
+def worker_s2(args) -> None:
+    _worker_setup()
+    _quiet_profile_commands()
+    from hermes_cli import profiles
+    from hermes_cli.auth_codex_registry import read_registry
+    if args.boundary:
+        _install_s2_kill(args.boundary)
+    root = Path(os.environ["HERMES_HOME"])
+    out: dict = {}
+
+    def only_op():
+        ops = list(read_registry().ops)
+        return ops[0] if len(ops) == 1 else None
+
+    try:
+        if args.action == "rename":
+            profiles.rename_profile("work", "workb")
+        elif args.action == "rename-stuck":
+            real = profiles._rename_checked_profile
+
+            def failing(old_canon, new_canon, old_dir, new_dir, move):
+                def locked():
+                    raise PermissionError(13, "The process cannot access the file (bench: held open)")
+                return real(old_canon, new_canon, old_dir, new_dir, lambda fn: move(locked))
+            profiles._rename_checked_profile = failing
+            try:
+                profiles.rename_profile("work", "workb")
+            except ValueError as exc:
+                out["stuck"] = "recover --op" in str(exc)
+        elif args.action in ("abandon", "recover"):
+            from hermes_cli.auth_codex_profile_ops import recover_op
+            out["outcome"] = recover_op(only_op(), abandon=args.action == "abandon")
+        elif args.action == "transfer":
+            from hermes_cli.auth_codex_profile_ops import transfer_chain
+            os.environ["HERMES_HOME"] = str(root / "profiles" / "work")
+            out["transfer"] = transfer_chain(root)["chain_id"]
+        elif args.action == "delete":
+            profiles.delete_profile("work", yes=True)
+        elif args.action == "dispatch":
+            from hermes_cli.auth_codex_authority import authority_dispatch
+            out["dispatch"] = authority_dispatch(budget_seconds=5)
+        elif args.action == "tokens":  # RULE-G5 negative continuation probes
+            from hermes_cli.auth_codex_lifecycle import continuation
+            from hermes_cli.auth_codex_registry import CodexAuthorityRefused, migration_lock
+            for direction in ("forward", "abandon"):
+                with migration_lock():
+                    try:
+                        with continuation(args.op or only_op() or "", direction):
+                            out[direction] = "accepted"
+                    except CodexAuthorityRefused:
+                        out[direction] = "refused"
+    except Exception as exc:
+        out["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
+    print(json.dumps(out))
+
+
+def _s2_sandbox(family: str):
+    ledger = Ledger()
+    server, url = start_endpoint(ledger)
+    sandbox = Path(tempfile.mkdtemp(prefix="bench-s2-"))
+    root = sandbox / "hroot"
+    write_store(root, singleton=None if family == "transfer" else ledger.issue("r"))
+    for name, chain in (("other", "o"), ("work", "c")):
+        write_store(make_profile(root, name), singleton=ledger.issue(chain))
+    return ledger, server, url, sandbox, root
+
+
+def _registry_of(root: Path) -> dict:
+    return _load(root / "auth.chains.json")
+
+
+def _chain_of(reg: dict, ledger: Ledger, name: str, root: Path):
+    """The live registry entry whose owner rows hold chain *name*'s material (by the ledger)."""
+    for cid, entry in reg["chains"].items():
+        if entry["state"] == "retired":
+            continue
+        owner_dir = Path(entry["owner"]).parent
+        for home in [root, *[p for p in (root / "profiles").iterdir() if p.is_dir()]]:
+            if os.path.normcase(str(home.resolve())) == os.path.normcase(str(owner_dir)):
+                rows = _rows_of(_load(home / "auth.json")) if (home / "auth.json").exists() else {}
+                held = {rows.get(r["row"]) for r in entry["rows"] if os.path.normcase(r["store"]) == os.path.normcase(entry["owner"])}
+                if any(pair and ledger.chain_of.get(pair[1]) == name for pair in held):
+                    return cid, entry, home
+    return None, None, None
+
+
+def run_kills2(args) -> int:
+    me = str(Path(__file__).resolve())
+    failures, report = [], {}
+    cases = [(family, b) for family, bs in S2_CASES.items() for b in bs]
+    for family, boundary in cases:
+        ledger, server, url, sandbox, root = _s2_sandbox(family)
+        env_root = sandbox_env(sandbox, root, url)
+        work, workb = root / "profiles" / "work", root / "profiles" / "workb"
+
+        def run(*argv, home=root, timeout=180):
+            proc = subprocess.run([sys.executable, me, *argv], env={**env_root, "HERMES_HOME": str(home)},
+                                  cwd=str(sandbox), capture_output=True, text=True, timeout=timeout)
+            try:
+                data = json.loads(proc.stdout.strip().splitlines()[-1]) if proc.stdout.strip() else {}
+            except Exception:
+                data = {"raw": proc.stdout[-300:]}
+            return proc.returncode, data, proc.stderr[-800:]
+
+        entry: dict = {"steps": []}
+        run("worker-check", "--job")                                     # bootstrap
+        run("worker-check", "--path", "singleton", "--force", home=work)  # c: R0 -> R1 (history)
+        before_reg = _registry_of(root)
+        c_before = _chain_of(before_reg, ledger, "c", root)
+        rotated = ledger.last_issued["c"]
+        if family == "abandon":
+            rc, data, _err = run("worker-s2", "--action", "rename-stuck")
+            entry["steps"].append(("rename-stuck", rc, data))
+        stuck_reg = _registry_of(root)
+        action = {"rename": "rename", "recovery": "rename", "abandon": "abandon", "transfer": "transfer",
+                  "delete": "delete"}[family]
+        first_kill = "rename-decision" if family == "recovery" else boundary
+        rc, data, err = run("worker-s2", "--action", action, "--boundary", first_kill)
+        entry["steps"].append((first_kill, rc, data))
+        kills = [rc]
+        if family == "recovery":
+            rc, data, err = run("worker-s2", "--action", "dispatch", "--boundary", boundary)
+            entry["steps"].append((boundary, rc, data))
+            kills.append(rc)
+        if any(k != 137 for k in kills):
+            failures.append(f"{boundary}: a kill point was not reached ({entry['steps']} {err})")
+        if boundary == "abandon-decision2":
+            _rc, probe, _e = run("worker-s2", "--action", "tokens")
+            entry["tokens_after_decision2"] = probe
+            if probe.get("forward") != "refused" or probe.get("abandon") != "accepted":
+                failures.append(f"{boundary}: continuation after DECISION-2 {probe} (forward must be refused)")
+            op_id = next(iter(_registry_of(root)["ops"]), "")
+        posts_before = len(ledger.presented)
+        rc, data, _err = run("worker-check", "--job")  # recovery by the job alone
+        entry["job"] = data
+        reg = _registry_of(root)
+        if family == "abandon" and boundary == "abandon-payload2":
+            unchanged = reg == stuck_reg
+            archived = list((root / "auth.ops" / "archive").glob("*.abandon.abandoned-compensation.*.json"))
+            entry.update(op_unchanged=unchanged, compensation_archived=bool(archived))
+            if not unchanged or not archived:
+                failures.append(f"{boundary}: the original op/epochs changed or PAYLOAD-2 was not archived")
+            rc, data, _err = run("worker-s2", "--action", "abandon")  # the explicit retry
+            entry["steps"].append(("abandon-retry", rc, data))
+            reg = _registry_of(root)
+        if boundary == "abandon-decision2":
+            _rc, probe, _e = run("worker-s2", "--action", "tokens", "--op", op_id)
+            entry["tokens_after_commit2"] = probe
+            if probe != {"forward": "refused", "abandon": "refused"}:
+                failures.append(f"{boundary}: a continuation token was accepted after the entry was removed: {probe}")
+        # END STATE
+        if reg["ops"]:
+            failures.append(f"{boundary}: ops left unfinished: {list(reg['ops'])}")
+        cid, chain, home = _chain_of(reg, ledger, "c", root)
+        moved = family in ("rename", "recovery") and boundary != "rename-payload"
+        expect_home = {"transfer": root if boundary != "transfer-payload" else work}.get(family, workb if moved else work)
+        retired = family == "delete" and boundary != "delete-payload"
+        if retired:
+            gone = [c for c, e in reg["chains"].items() if c == c_before[0]]
+            if not gone or reg["chains"][gone[0]]["state"] != "retired":
+                failures.append(f"{boundary}: the deleted profile's login was not retired")
+            if any(os.path.normcase(r["store"]).startswith(os.path.normcase(str(work.resolve()))) for e in
+                   reg["chains"].values() for r in e["rows"]):
+                failures.append(f"{boundary}: a row still names the deleted store")
+        else:
+            if chain is None or os.path.normcase(str(home.resolve())) != os.path.normcase(str(expect_home.resolve())):
+                failures.append(f"{boundary}: chain c not owned by {expect_home} (got {home})")
+            elif chain.get("lifecycle"):
+                failures.append(f"{boundary}: lifecycle exclusion left set")
+            elif chain["epoch"] < c_before[1]["epoch"]:
+                failures.append(f"{boundary}: epoch moved backward")
+            else:
+                record = _load(Path(chain["owner"]).parent / "auth.recovery" / f"{cid}.json")
+                if record["epoch"] != chain["epoch"]:
+                    failures.append(f"{boundary}: record epoch {record['epoch']} != registry {chain['epoch']} (S1)")
+        # a SEPARATE process: normal startup + dispatch + a forced refresh where the login lives now
+        final_home = expect_home if not retired else (work if work.exists() else root)
+        rc, data, _err = run("worker-check", "--job", "--path", "singleton", "--force", home=final_home)
+        entry["final_refresh"] = data
+        _rc, other, _e = run("worker-check", "--path", "singleton", "--force", home=root / "profiles" / "other")
+        entry["unrelated_refresh"] = other
+        server.shutdown()
+        posts = ledger.presented[posts_before:]
+        entry["posts_after"] = [(p[2], p[3]) for p in posts]
+        entry["replays"] = sum(1 for p in ledger.presented if p[3] == "reused")
+        if entry["replays"]:
+            failures.append(f"{boundary}: {entry['replays']} replayed refresh token(s)")
+        c_posts = [p for p in posts if p[2] == "c"]
+        if retired:
+            if c_posts:
+                failures.append(f"{boundary}: the deleted login was refreshed")
+        elif data.get("outcome") != "ok" or not c_posts or c_posts[0][1] != rotated[1]:
+            failures.append(f"{boundary}: the recovered login did not continue from its current token ({data})")
+        if other.get("outcome") != "ok":
+            failures.append(f"{boundary}: the unrelated profile stopped working ({other})")
+        try:
+            json.loads((final_home / "auth.json").read_text(encoding="utf-8")) if (final_home / "auth.json").exists() else None
+        except Exception as exc:
+            failures.append(f"{boundary}: auth.json does not parse: {exc}")
+        seen = set()
+        for c in reg["chains"].values():
+            for r in c["rows"]:
+                if (r["store"], r["row"]) in seen:
+                    failures.append(f"{boundary}: row {r} in two chains")
+                seen.add((r["store"], r["row"]))
+        report[boundary] = entry
+        if not args.keep:
+            shutil.rmtree(sandbox, ignore_errors=True)
+    report["cases"] = len(cases)
+    report["failures"] = failures
+    print(json.dumps(report, indent=2, default=str))
+    return 1 if failures else 0
+
+
 def run_latency(args) -> int:
     tree = Path(args.tree).resolve()
     ledger = Ledger()
@@ -608,17 +1055,27 @@ def run_latency(args) -> int:
     s = ledger.issue("root")
     write_store(root, singleton=s, pool=[{"id": "devcod", "label": "d", "auth_type": "oauth", "priority": 0,
                                           "source": "device_code", "access_token": s[0], "refresh_token": s[1]}])
-    env = sandbox_env(sandbox, root, "http://127.0.0.1:9", tree)
+    home = root
+    if args.profile:  # a PROFILE store: every store-lock acquisition takes its lifecycle lock (stage 2)
+        home = make_profile(root, "work")
+        p = ledger.issue("work")
+        write_store(home, singleton=p, pool=[{"id": "devcow", "label": "w", "auth_type": "oauth", "priority": 0,
+                                              "source": "device_code", "access_token": p[0], "refresh_token": p[1]}])
+    env = sandbox_env(sandbox, home, "http://127.0.0.1:9", tree)
     if (tree / "hermes_cli" / "auth_codex_authority.py").exists():
         subprocess.run([sys.executable, str(Path(__file__).resolve()), "worker-check", "--job"], env=env,
                        cwd=str(sandbox), capture_output=True, text=True, timeout=120)
+    for lock in root.rglob("*.lock"):  # the read-only probe starts with no lock file anywhere
+        lock.unlink()
     proc = subprocess.run([sys.executable, str(Path(__file__).resolve()), "worker-latency", "--tree", str(tree),
-                           "--iterations", str(args.iterations)], env=env, cwd=str(sandbox),
+                           "--iterations", str(args.iterations), "--root", str(root)], env=env, cwd=str(sandbox),
                           capture_output=True, text=True, timeout=900)
     data = json.loads(proc.stdout.strip().splitlines()[-1])
+    created = data.pop("lock_files_created_by_read_only", [])
     out = {k: {"p50_ms": round(_pct(v, .5) * 1000, 3), "p99_ms": round(_pct(v, .99) * 1000, 3),
                "mean_ms": round(statistics.mean(v) * 1000, 3)} for k, v in data.items()}
-    print(json.dumps({"tree": str(tree), **out}, indent=2))
+    print(json.dumps({"tree": str(tree), "profile_store": bool(args.profile), **out,
+                      "lock_files_created_by_read_only": created}, indent=2))
     shutil.rmtree(sandbox, ignore_errors=True)
     return 0
 
@@ -787,8 +1244,17 @@ def main() -> int:
     p.add_argument("--per-chain", type=int, default=40)
     p.add_argument("--seconds", type=int, default=600)
     p.add_argument("--keep", action="store_true")
+    p.add_argument("--profile-ops", action="store_true",
+                   help="stage 2: a mover process renames a Codex profile back and forth and signs scratch "
+                        "profiles in / deletes them while every refresh worker runs")
     k = sub.add_parser("kills")
     k.add_argument("--keep", action="store_true")
+    k2 = sub.add_parser("kills2")
+    k2.add_argument("--keep", action="store_true")
+    w2 = sub.add_parser("worker-s2")
+    w2.add_argument("--action")
+    w2.add_argument("--boundary")
+    w2.add_argument("--op")
     st = sub.add_parser("startup")
     st.add_argument("--baseline", required=True)
     st.add_argument("--processes", type=int, default=24)
@@ -804,6 +1270,7 @@ def main() -> int:
     lt = sub.add_parser("latency")
     lt.add_argument("--tree", default=str(REPO))
     lt.add_argument("--iterations", type=int, default=500)
+    lt.add_argument("--profile", action="store_true", help="measure a profile store (lifecycle lock path)")
     w = sub.add_parser("worker-progress")
     w.add_argument("--targets")
     w.add_argument("--threads", type=int)
@@ -811,6 +1278,12 @@ def main() -> int:
     w.add_argument("--n", type=int)
     w.add_argument("--per-chain", type=int)
     w.add_argument("--chains")
+    w.add_argument("--moving", action="store_true")
+    wm = sub.add_parser("worker-mover")
+    wm.add_argument("--seconds", type=int)
+    wm.add_argument("--n", type=int)
+    wm.add_argument("--per-chain", type=int)
+    wm.add_argument("--chains")
     wk = sub.add_parser("worker-kill")
     wk.add_argument("--boundary")
     wk.add_argument("--pair")
@@ -822,11 +1295,12 @@ def main() -> int:
     wl = sub.add_parser("worker-latency")
     wl.add_argument("--tree")
     wl.add_argument("--iterations", type=int)
+    wl.add_argument("--root")
     args = ap.parse_args()
-    handlers = {"progress": run_progress, "kills": run_kills, "latency": run_latency, "startup": run_startup, "rescue-scan": run_rescue_scan,
+    handlers = {"progress": run_progress, "kills": run_kills, "kills2": run_kills2, "worker-s2": worker_s2, "latency": run_latency, "startup": run_startup, "rescue-scan": run_rescue_scan,
                 "worker-rescue-scan": worker_rescue_scan,
                 "worker-progress": worker_progress, "worker-kill": worker_kill, "worker-check": worker_check,
-                "worker-latency": worker_latency, "worker-startup": worker_startup}
+                "worker-latency": worker_latency, "worker-startup": worker_startup, "worker-mover": worker_mover}
     return handlers[args.cmd](args) or 0
 
 
