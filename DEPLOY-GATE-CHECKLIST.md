@@ -24,7 +24,7 @@ Status key: DONE (on sync branch, triad-approved) / OPEN / IN PROGRESS / VERIFY 
 | A3 | A4 residual R-A4-1: reload can let Reopen advance before the replacement document commits | OPEN |
 | A4 | A4 residual R-A4-2: null report token passes when no document is current | OPEN |
 | A5 | Yuanbao recall redaction rewrites the whole transcript unfenced (targeted, fenced redaction) | OPEN |
-| A6 | Compute-host fallback session: a full turn through it stalls after message.start | OPEN (under G1) |
+| A6 | Compute-host fallback session: a full turn through it stalls after message.start | APPROVED (T2 magi/track-lifecycle f08426d166, both reviewers); AWAITING REBASE onto current sync (code conflicts in methods_prompt.py / prompt_turn.py) |
 | A7 | Upstream `test_shell_hooks` writes mangled-name files into the working tree on Windows (recurs on every run, incl. reviewers'; must force all temp paths under the sandbox TEMP). Also an older untracked `%SystemDrive%/ProgramData/...` tree in the repo root (2026-09-06, predates the runner sandbox; an unexpanded env var): find the writer, then delete | DONE (T5, Codex + Antigravity r4; on sync branch; runner now fails a green run if the checkout gains files; junk trees deleted 2026-09-26) |
 | A8 | Source scans (`test_model_alias_credentials`, config-read guard) trip on nested `.claude/worktrees` | DONE (T5; scans skip nested worktrees/other checkouts via one shared rule) |
 | A9 | Flaky under load: fast-lane first-chunk timing, late-ack TTL (`test_late_ack_handlers_are_bounded_by_ttl_and_cap`), update-handoff-marker PowerShell, `test_peer_dm_into_open_bot_chat` (streamed), `test_profiles_sidebar_cache.py::test_projects_tree_coalesces_concurrent_scans_and_returns_copies` (1 s wait; flaked under load 2/2 full runs) | DONE (T5: all named flakes incl. sidebar-cache, Codex r3; on sync branch) |
@@ -37,12 +37,13 @@ Status key: DONE (on sync branch, triad-approved) / OPEN / IN PROGRESS / VERIFY 
 | A22 | New flake: test_minimax_oauth.py::test_refresh_error_body_bounded_and_readable_with_real_client (local-socket WinError 10054 once, passed on retry in r15/r17; failed BOTH attempts in r18 under -j 4 load; passes 14/14 alone on branch and baseline -> load-dependent) | OPEN (unowned) |
 | A23 | Shared git helper (`bounded_git_probe` / `bounded_probe_run`, hermes_cli/_subprocess_compat.py) can be left stuck if Python fails to start a Windows pipe-reader thread; reproduced on baseline (Codex, during A19a). Shared well beyond A19a | OPEN (unowned) |
 | A24 | From gateway-3: full session.history read falls back to in-memory history when a profile's DB can't open (pre-existing); MCP server event bridge re-reads every session on each state.db change; three live-system-guard tests fail on Windows (A2-DISPOSITIONS.md) | OPEN (unowned) |
+| A25 | From T2 (all pre-existing on base 242bad5ab4): (a) the in-process busy interrupt can land on the queued prompt's own turn (Codex r10-13 probes reproduce); (b) a /loop wake-up stays marked running when its turn is stopped, fails, or is refused before start, so the loop stops firing; (c) the queued-drain generation check (#84417) re-queues the prompt without draining it, incl. after a Stop | OPEN (unowned) |
 | A10 | Bucket C residual R3: the first turn of a NEW session skips the durable lease (no session row yet, `agent/turn_facade_lease.py:310`). Prove production entry points serialize concurrent first turns for the same new session id, or fix it | DONE (Codex + Antigravity; on sync branch a9378a1ee3..8607f59f02). Lake chose A: keep upstream derived-id grouping |
 | A13 | TUI `prompt.submit` checks `running` and claims it under two separate lock acquisitions (`tui_gateway/methods_prompt.py:637-639` vs `:551`): two submits in one process can both pass; only the durable lease backstops it (found by A10 audit) | DONE (5b0e027a7b; Codex + Antigravity) |
 | A14 | Lease admission: a FAILED row probe is treated as "row exists" and sets `_session_db_created=True`, which suppresses lazy row creation for a genuinely new session (pre-existing; found by A10 audit) | DONE (92b23cfb66; Codex + Antigravity) |
-| A15 | `tests/tui_gateway/test_compute_host_phase1.py` hangs on both base and branch (excluded from A10 batches); needs a disposition or fix before A2 | OPEN |
+| A15 | `tests/tui_gateway/test_compute_host_phase1.py` hangs on both base and branch (excluded from A10 batches); needs a disposition or fix before A2 | APPROVED (T2 magi/track-lifecycle f08426d166, both reviewers); AWAITING REBASE onto current sync (code conflicts in methods_prompt.py / prompt_turn.py) |
 | A11 | Bucket C residual R1: registry lag after a mid-turn rotation (a 2nd window can claim the new id while the durable lease still serializes its turns). Lake chose (c) accept + document on 2026-09-23 (sync map); revisit (a) async re-anchor only if seen in practice | ACCEPTED BY LAKE |
-| A12 | Bucket C residual R4: orphan detection latency (parent-guard confirmations + drain up to 10 s). Transcript fencing stops an orphan's WRITES mixing with a successor's; it does NOT prove the orphan's running tool has stopped. Needs its own closure, tied to G1/D2 child lifecycle | OPEN |
+| A12 | Bucket C residual R4: orphan detection latency (parent-guard confirmations + drain up to 10 s). Transcript fencing stops an orphan's WRITES mixing with a successor's; it does NOT prove the orphan's running tool has stopped. Needs its own closure, tied to G1/D2 child lifecycle | APPROVED (T2 magi/track-lifecycle f08426d166, both reviewers); AWAITING REBASE onto current sync (code conflicts in methods_prompt.py / prompt_turn.py) |
 
 ## B. Phase 2b — credential recovery (Codex only)
 | # | item | status |
@@ -57,7 +58,7 @@ Status key: DONE (on sync branch, triad-approved) / OPEN / IN PROGRESS / VERIFY 
 ## C. Group 2 (plan phase 4) on the synced base
 | # | item | status |
 |---|---|---|
-| G1 | Compute-host latch reset + safe in-process fallback + stdin-EOF instrumentation (incl. A6) | OPEN |
+| G1 | Compute-host latch reset + safe in-process fallback + stdin-EOF instrumentation (incl. A6) | APPROVED (T2 magi/track-lifecycle f08426d166, both reviewers); AWAITING REBASE onto current sync (code conflicts in methods_prompt.py / prompt_turn.py) |
 | G2 | Saved windows persist until explicit Forget (not "mirror live windows"): ordinary closes keep entries, duplicate-session windows stay distinct, age/count never evict | LARGELY DONE via A4; VERIFY in live check |
 | G3 | Config-load convoy (upstream-main lock-free reads need Lake's explicit OK: exception to stable-release policy) | DONE (T1: 4 upstream/main config.py lock-free read commits cherry-picked, config.py only) |
 | G4 | Shared-gateway concurrency (DESIGN-SHARED-GATEWAY-CONCURRENCY-2026-09-24.md, option A approved with notes) | DONE (T1 magi/track-gateway, Codex + Antigravity; on sync branch through 6951c62e10; 27-window harness 20/20 grades) |
@@ -72,9 +73,9 @@ Status key: DONE (on sync branch, triad-approved) / OPEN / IN PROGRESS / VERIFY 
 ## D. Recorded work-blocking incident fronts (in scope; each needs its own closure evidence)
 | # | item | status |
 |---|---|---|
-| D1 | Backend-pool disown recurrence: ownership + port release of a detached `gateway run` (:8642 squatted through quit-all), not only compute-host children; cross-link G1 child lifecycle | OPEN |
-| D2 | Terminal-tool 420 s hang across compute-host respawns: terminal launcher/worker tree + pipe cleanup across respawns; never root-caused | OPEN |
-| D3 | Two problems: (a) a running post-tool hook wedging a worker; (b) a descendant keeping subprocess output pipes open. Orphan-future cancellation fixes neither | OPEN |
+| D1 | Backend-pool disown recurrence: ownership + port release of a detached `gateway run` (:8642 squatted through quit-all), not only compute-host children; cross-link G1 child lifecycle | APPROVED (T2 magi/track-lifecycle f08426d166, both reviewers); AWAITING REBASE onto current sync (code conflicts in methods_prompt.py / prompt_turn.py) |
+| D2 | Terminal-tool 420 s hang across compute-host respawns: terminal launcher/worker tree + pipe cleanup across respawns; never root-caused | APPROVED (T2 magi/track-lifecycle f08426d166, both reviewers); AWAITING REBASE onto current sync (code conflicts in methods_prompt.py / prompt_turn.py) |
+| D3 | Two problems: (a) a running post-tool hook wedging a worker; (b) a descendant keeping subprocess output pipes open. Orphan-future cancellation fixes neither | APPROVED (T2 magi/track-lifecycle f08426d166, both reviewers); AWAITING REBASE onto current sync (code conflicts in methods_prompt.py / prompt_turn.py) |
 | D4 | Session-ownership lease race ("already has a live owner") — re-verify on the synced lease model | DONE (T1 re-verified on the synced lease model) |
 | D5 | Session-message OOM (unbounded fetchall) — upstream paging `49e6d661a0` arrives with sync | DONE (gateway-3: upstream paging + desktop transcript + switch/history//history//context/session_search/Telegram topic bounded; 48 MB session test) |
 | D6 | Compaction slowed under concurrent load (up to ~8 min) — measure under G4/G5 | MEASURED (T1 harness); confirm on live workload in F5 |
