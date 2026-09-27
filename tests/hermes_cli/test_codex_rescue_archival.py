@@ -141,3 +141,17 @@ def test_a_rescue_beside_a_symlinked_alias_is_archived(codex_home):
     (_cid, chain), = registry(root)["chains"].items()
     assert chain["fence"]["reason"] == "legacy-rescue"
     assert not (work / RESCUE).exists() and len(_archived(root)) == 1
+
+
+def test_a_dispatch_pass_with_nothing_to_settle_takes_no_store_lock(codex_home, monkeypatch):
+    """Settlement runs on EVERY dispatch pass (requests and the job): with no rescue file and no
+    fence to lift it must not lock every store (measured: a 24x4 refresh run went from 0 % to
+    1.3 % refused while each pass locked all stores)."""
+    from hermes_cli import auth_codex_rescue as rescue_mod
+    root, endpoint = codex_home
+    write_store(root, singleton=endpoint.issue())
+    _dispatch()
+    monkeypatch.setattr(rescue_mod, "store_locks", lambda *a, **k: (_ for _ in ()).throw(AssertionError("locked")))
+    from hermes_cli.auth_codex_registry import migration_lock
+    with migration_lock():
+        assert rescue_mod.settle_legacy_rescues() == {"unfenced": [], "archived": []}

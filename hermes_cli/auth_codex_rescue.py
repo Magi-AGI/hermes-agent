@@ -131,6 +131,8 @@ def settle_legacy_rescues() -> Dict[str, List[str]]:
         return report
     present = _present_recorded(view)
     records = json.loads(json.dumps(view.data.get("legacy_rescues", {})))
+    if not present and not _unfence_candidates(view, records):
+        return report  # nothing to settle: no lock taken (this runs on every dispatch pass)
     payload = Payload(kind="legacy-rescue-settle", scope_chains=[], scope_stores=[])
     pending = [(key, raw) for _rescue, key, raw, _sha in present if "verdict" not in records[key]]
     paths = lockable_stores(all_store_paths())
