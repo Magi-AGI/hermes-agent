@@ -321,7 +321,11 @@ def worker_mover(args) -> None:
             key = type(exc).__name__
             stats["rename_refused"] += 1
             stats["rename_errors"][key] = stats["rename_errors"].get(key, 0) + 1
+        if i % 4:
+            time.sleep(0.05)
+            continue  # a scratch sign-in + delete every 4th round; renames every round
         name = f"scratch{i % 3}"
+        t0 = time.perf_counter()
         try:
             profiles.create_profile(name, no_alias=True, no_skills=True)
             with urlopen(os.environ["BENCH_TOKEN_URL"] + "/issue?chain=scratch", timeout=5) as r:
@@ -334,6 +338,7 @@ def worker_mover(args) -> None:
                 os.environ["HERMES_HOME"] = str(root)
             profiles.delete_profile(name, yes=True)
             stats["deletes"] += 1
+            stats.setdefault("scratch_cycle_ms", []).append(round((time.perf_counter() - t0) * 1000, 1))
         except Exception as exc:
             key = f"{type(exc).__name__}: {str(exc)[:120]}"
             stats["scratch_errors"][key] = stats["scratch_errors"].get(key, 0) + 1
