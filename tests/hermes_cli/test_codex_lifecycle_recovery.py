@@ -122,9 +122,9 @@ def test_a_continuation_token_is_refused_after_commit(codex_home, quiet_profiles
     seen = {}
     real = pops._finish_forward
 
-    def spy(op_id, body):
+    def spy(op_id, body, **kw):
         seen["op"] = op_id
-        real(op_id, body)
+        real(op_id, body, **kw)
 
     pops._finish_forward = spy
     try:
@@ -159,8 +159,7 @@ def test_recovery_takes_store_locks_inside_its_own_moving_reservation(codex_home
             pass
     assert err.value.code == "profile_being_moved"
     with migration_lock():
-        assert pops.recover_lifecycle_op(op_id, registry(root)["ops"][op_id],
-                                         read_json(root / "auth.ops" / f"{op_id}.json")) == "rolled_forward"
+        assert pops.recover_lifecycle_op(op_id, registry(root)["ops"][op_id]) == "rolled_forward"
     assert not registry(root)["ops"]
     assert _refresh_in(monkeypatch, play)
 

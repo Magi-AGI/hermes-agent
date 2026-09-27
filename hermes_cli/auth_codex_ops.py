@@ -394,7 +394,13 @@ def recover_ops() -> Dict[str, List[str]]:
 
 def roll_forward_one(op_id: str, op: Dict[str, Any]) -> str:
     """RULE-M1 for one unfinished op (caller holds the migration lock): ``rolled_forward``,
-    ``unrecoverable``, ``stuck`` or ``busy`` (a lifecycle op whose profile locks are held)."""
+    ``unrecoverable``, ``stuck``, ``busy`` (a lifecycle op whose profile locks are held), or a
+    lifecycle op's own outcome. A lifecycle op is completed ONLY from the decision in force (its
+    compensation after DECISION-2), never from the other payload."""
+    from hermes_cli.auth_codex_profile_ops import LIFECYCLE_KINDS, recover_lifecycle_op
+    if op.get("kind") in LIFECYCLE_KINDS:
+        outcome = recover_lifecycle_op(op_id, op)
+        return "rolled_forward" if outcome in ("kept", "retired") else outcome
     body = _read_payload(op_id, op)
     if body is None:
         if op.get("status") != OP_UNRECOVERABLE:
@@ -403,9 +409,6 @@ def roll_forward_one(op_id: str, op: Dict[str, Any]) -> str:
     if op.get("status") == OP_UNRECOVERABLE:
         _reinstate_decision(op_id, body)
         op = read_registry().ops.get(op_id, op)
-    from hermes_cli.auth_codex_profile_ops import LIFECYCLE_KINDS, recover_lifecycle_op
-    if op.get("kind") in LIFECYCLE_KINDS:
-        return recover_lifecycle_op(op_id, op, body)
     apply_payload(body)
     commit_op(op_id)
     return "rolled_forward"
@@ -464,7 +467,9 @@ def resolve_unrecoverable(op_id: str) -> str:
         if op.get("status") != OP_UNRECOVERABLE:
             raise CodexAuthorityRefused(
                 f"Codex login update {op_id[:8]} is not unrecoverable; `hermes auth migrate` completes it.")
-        if _read_payload(op_id, op) is not None:
+        from hermes_cli.auth_codex_profile_ops import LIFECYCLE_KINDS, decision_body
+        readable = decision_body(op_id, op) if op.get("kind") in LIFECYCLE_KINDS else _read_payload(op_id, op)
+        if readable is not None:
             outcome = roll_forward_one(op_id, op)
             if outcome != "rolled_forward":
                 raise CodexAuthorityRefused(

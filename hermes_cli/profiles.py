@@ -2124,13 +2124,16 @@ def _codex_profile_rename(old_canon: str, new_canon: str, old_dir: Path, new_dir
 @contextlib.contextmanager
 def _codex_profile_delete(canon: str, profile_dir: Path):
     """Stage 2: the profile's Codex logins are signed out (chains it owns retired, its rows released)
-    as one ownership op; the migration lock and the profile's lifecycle lock stay held while the
-    caller removes the directory, so no stale writer recreates it."""
+    as one ownership op decided BEFORE the directory removal and settled by what it left (a failed
+    removal retires nothing); the migration lock and the profile's lifecycle lock stay held while
+    the caller removes the directory, so no stale writer recreates it. Deleting an alias (junction /
+    symlink profile) changes no Codex state."""
     from hermes_cli.auth_codex_profile_ops import profile_delete
-    with _codex_refusals_as_value_errors(), profile_delete(canon, profile_dir) as report:
+    with _codex_refusals_as_value_errors():
+        with profile_delete(canon, profile_dir) as report:
+            yield report
         if report["retired"]:
             print(f"✓ Signed out {len(report['retired'])} Codex login(s) held by this profile")
-        yield report
 
 
 def _codex_delete_precheck(canon: str, profile_dir: Path) -> None:
@@ -2208,48 +2211,70 @@ def _rename_checked_profile(old_canon: str, new_canon: str, old_dir: Path, new_d
     try:
         if not sinks_released(hermes_home_key(old_dir)):
             raise RuntimeError(f"an MCP server's stderr log in {old_dir} is still being written; retry the rename")
+        # The Codex op runs finalize_profile_rename after the move (and so does its recovery).
         move(lambda: old_dir.rename(new_dir))
     except Exception:
         if live_mux:
             clear_named_profile_deleted(old_dir)
             _notify_multiplexer(old_canon)
         raise
-    print(f"✓ Renamed {old_dir.name} → {new_dir.name}")
+    return new_dir
+
+
+def finalize_profile_rename(old_canon: str, new_canon: str, old_dir: Path, new_dir: Path, *,
+                            announce: bool = True) -> None:
+    """Everything a rename changes outside the directory, after the directory is at *new_dir*:
+    tombstone cleared, rename recorded, Honcho host, wrapper, ``active_profile``, session/routing
+    identity, multiplexer hot-serve. Idempotent: the uninterrupted rename and the recovery of an
+    interrupted one (``hermes auth recover --op`` / the dispatcher) run exactly this, in this order,
+    and the Codex op is kept until it returned. A failure raises (the op then stays for a retry);
+    a wrapper-name collision is reported, as always, not failed."""
+    say = print if announce else (lambda *_a, **_k: None)
+    say(f"✓ Renamed {old_dir.name} → {new_dir.name}")
+    live_mux = _live_default_multiplexer()
     # The tombstone lives at profiles/.deleted/<old_name>; old_dir is gone so nothing can
     # resurrect it, and a future profile reusing the old name must not read as deleted.
-    if live_mux:
-        clear_named_profile_deleted(old_dir)
+    clear_named_profile_deleted(old_dir)
 
-    # 2b. Record the rename so Bot Mode group chats can re-link persisted
-    # member descriptors to the new slug (#110200). Best-effort: a metadata
-    # write failure must never fail the rename itself.
+    # Record the rename so Bot Mode group chats can re-link persisted member descriptors to the
+    # new slug (#110200). Best-effort: a metadata write failure must never fail the rename itself.
     _record_profile_rename(new_dir, old_canon)
 
-    # 3. Update profile-scoped Honcho host blocks, preserving aiPeer identity
+    # Update profile-scoped Honcho host blocks, preserving aiPeer identity
     _migrate_honcho_profile_host(old_canon, new_canon, new_dir)
 
-    # 4. Update wrapper script
+    # Update wrapper script
     remove_wrapper_script(old_canon)
     collision = check_alias_collision(new_canon)
     if not collision:
         create_wrapper_script(new_canon)
-        print(f"✓ Alias updated: {new_canon}")
+        say(f"✓ Alias updated: {new_canon}")
     else:
         print(f"⚠ Cannot create alias '{new_canon}' — {collision}")
 
-    # 5. Update active_profile if it pointed to old name
-    _retarget_active_profile(old_canon, new_canon, f"✓ Active profile updated: {new_canon}")
+    # Update active_profile if it pointed to the old name (a write failure raises: retried).
+    if get_active_profile() == old_canon:
+        set_active_profile(new_canon)
+        say(f"✓ Active profile updated: {new_canon}")
 
-    # 6. Migrate profile-name-keyed session/routing state (session keys, profile_name, heartbeats,
+    # Migrate profile-name-keyed session/routing state (session keys, profile_name, heartbeats,
     # delivery + routing index) from the old name to the new one. A stale ``agent:<old>:*`` routing
     # key otherwise resolves to a profile that no longer exists on every inbound event.
     from hermes_cli.profile_identity import _migrate_profile_identity
     _migrate_profile_identity(old_canon, new_canon, live_mux)
 
-    # 7. Hot-serve the renamed profile now (mirrors create; a missed signal only delays it).
+    # Hot-serve the renamed profile now (mirrors create; a missed signal only delays it).
     if live_mux:
         _notify_multiplexer(new_canon)
-    return new_dir
+
+
+def undo_rename_quiesce(old_canon: str, old_dir: Path) -> None:
+    """A rename cancelled before its move: undo its pre-move unroute (tombstone + multiplexer
+    notice) so the profile is never stranded tombstoned-but-present. Idempotent."""
+    from hermes_constants import named_profile_is_deleted
+    if old_dir.is_dir() and named_profile_is_deleted(old_dir):
+        clear_named_profile_deleted(old_dir)
+        _notify_multiplexer(old_canon)
 
 
 # Profile env resolution (called from _apply_profile_override)
