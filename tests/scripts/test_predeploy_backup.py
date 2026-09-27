@@ -58,9 +58,12 @@ def _install(tmp_path: Path):
         _write(home / "config.yaml", f"model: {{default: {sid}}}\n")
         _write(home / "auth.json", json.dumps({"credential_pool": {"openai-codex": [{"refresh_token": "fake"}]}}))
     _write(root / ".env", "OPENAI_API_KEY=fake\n")
+    legacy = tmp_path / "elsewhere" / "legacy" / "auth.codex-rotation-rescue.json"
     _write(root / "auth.chains.json", json.dumps({"version": 1, "chains": {"c1": {
         "owner": str(work / "auth.json"), "state": "fenced", "epoch": 1,
-        "rows": [{"id": "r1", "store": str(external / "credentials.json")}]}}, "ops": {}}))
+        "rows": [{"row": "r1", "store": str(external / "credentials.json")}]}}, "ops": {},
+        "legacy_rescues": {str(legacy): {"store": str(external / "credentials.json"), "chains": ["c1"]}}}))
+    _write(legacy, "{}")
     _write(root / "auth.ops" / "op-1.json", "{}")
     _write(root / "auth.migration.lock", "")
     _write(root / "profiles" / "p1" / "auth.recovery" / "c1.json", "{}")
@@ -120,7 +123,7 @@ def test_backup_covers_every_home_leaves_sources_untouched_and_verifies_by_resto
         "hermes/profiles/.retired-old/auth.codex-rotation-rescue.json",
         "elsewhere/work/state.db", "elsewhere/work/config.yaml", "elsewhere/work/auth.json",
         "elsewhere/external-owner/credentials.json", "elsewhere/external-owner/auth.recovery/c1.json",
-        "elsewhere/external-owner/auth.codex-rotation-rescue.json",
+        "elsewhere/external-owner/auth.codex-rotation-rescue.json", "elsewhere/legacy/auth.codex-rotation-rescue.json",
         "AppData/Hermes/session-windows-state.json", "AppData/Hermes/window-state.json",
         "AppData/Hermes/Local Storage/leveldb/000003.log",
     }
@@ -128,7 +131,8 @@ def test_backup_covers_every_home_leaves_sources_untouched_and_verifies_by_resto
     assert sources["hermes/profiles/p1/state.db"]["tables"]["messages"] == 40
 
 
-@pytest.mark.parametrize("damage", ["zeroed_database", "unreadable_registry", "missing_extra_home"])
+@pytest.mark.parametrize("damage", ["zeroed_database", "unreadable_registry", "registry_without_sections",
+                                    "registry_with_a_malformed_chain", "missing_extra_home"])
 def test_an_incomplete_backup_never_verifies(tmp_path, damage):
     root, _work, _external, desktop, wal = _install(tmp_path)
     wal.close()
@@ -137,6 +141,11 @@ def test_an_incomplete_backup_never_verifies(tmp_path, damage):
         (root / "profiles" / "p1" / "state.db").write_bytes(b"\0" * 4096)  # the #68474 zeroed signature
     elif damage == "unreadable_registry":
         (root / "auth.chains.json").write_text("{not json", encoding="utf-8")
+    elif damage == "registry_without_sections":  # the credential protocol reads this as unreadable
+        (root / "auth.chains.json").write_text("{}", encoding="utf-8")
+    elif damage == "registry_with_a_malformed_chain":  # the store it names must not silently drop out
+        (root / "auth.chains.json").write_text(json.dumps({"version": 1, "ops": {}, "chains": {
+            "c1": str(tmp_path / "elsewhere" / "external-owner" / "credentials.json")}}), encoding="utf-8")
     else:
         args += ["--extra-home", str(tmp_path / "no-such-home")]
     out = tmp_path / "backup"
@@ -170,3 +179,54 @@ def test_refuses_an_output_directory_inside_the_install(tmp_path):
     run = _run(tmp_path, "--root", str(root), "--desktop-data", str(desktop), "--out", str(root / "backups-x"))
     assert run.returncode != 0 and "overlaps the source" in (run.stdout + run.stderr)
     assert not (root / "backups-x").exists()
+
+
+def _load_tool():
+    spec = importlib.util.spec_from_file_location("predeploy_backup_under_test", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # dataclasses resolve their module through sys.modules
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_a_home_inside_the_desktop_data_keeps_its_database_verification(tmp_path):
+    """The desktop may keep the Hermes home inside its data directory (HERMES_DESKTOP_USER_DATA_DIR/
+    hermes-home): the desktop walk must not downgrade that home's databases to plain files, which skipped
+    the snapshot and integrity check and let a corrupt database verify (F7 r2, Codex)."""
+    desktop = tmp_path / "AppData" / "Hermes"
+    root = desktop / "hermes-home"
+    root.mkdir(parents=True)
+    healthy = sqlite3.connect(root / "state.db")
+    healthy.executescript("CREATE TABLE t (x); INSERT INTO t VALUES (1);")
+    healthy.close()
+    corrupt = sqlite3.connect(root / "kanban.db")
+    corrupt.executescript("CREATE TABLE t (x TEXT); " + "INSERT INTO t VALUES (randomblob(3000));" * 20)
+    corrupt.close()
+    data = bytearray((root / "kanban.db").read_bytes())
+    data[4096:8192] = bytes([0xFF]) * 4096  # header intact, a b-tree page destroyed
+    (root / "kanban.db").write_bytes(bytes(data))
+    out = tmp_path / "backup"
+
+    run = _run(tmp_path, "--root", str(root), "--desktop-data", str(desktop), "--out", str(out))
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    kinds = {Path(e["source"]).name: e["kind"] for e in manifest["entries"]}
+    assert kinds["state.db"] == "sqlite"
+    assert run.returncode == 1 and "kanban.db" in run.stdout, run.stdout + run.stderr
+
+
+def test_a_database_that_disappears_after_the_inventory_is_a_failure_not_an_empty_backup(tmp_path):
+    tool = _load_tool()
+    root = tmp_path / "hermes"
+    root.mkdir()
+    conn = sqlite3.connect(root / "state.db")
+    conn.executescript("CREATE TABLE t (x); INSERT INTO t VALUES (1);")
+    conn.close()
+    inv = tool.build_inventory(root, [], None)
+    (root / "state.db").unlink()
+    out = tmp_path / "backup"
+
+    tool.backup(out, inv, None)
+    problems = tool.verify(out)
+    assert any("disappeared" in p and "state.db" in p for p in problems), problems
+    assert not [e for e in json.loads((out / "manifest.json").read_text(encoding="utf-8"))["entries"]
+                if e["kind"] == "sqlite"]

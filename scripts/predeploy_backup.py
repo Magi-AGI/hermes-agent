@@ -69,6 +69,8 @@ _ROOT_TOP_EXCLUDED = {*_HOME_TOP_EXCLUDED, "hermes-agent", "profiles"}
 _PROFILE_LOCKS_DIR = ".locks"  # <root>/profiles/.locks: lifecycle locks, runtime state
 # The credential protocol's names (stage-1: hermes_cli/auth_codex_registry.py).
 _REGISTRY = "auth.chains.json"
+_REGISTRY_VERSION = 1
+_CHAIN_STATES = ("active", "fenced", "retired")
 _RECORDS_DIR = "auth.recovery"
 _OPS_DIR = "auth.ops"
 _RESCUE = "auth.codex-rotation-rescue.json"
@@ -160,28 +162,60 @@ def _is_sqlite(path: Path) -> bool:
         return fh.read(len(_SQLITE_MAGIC)) == _SQLITE_MAGIC
 
 
-def _registry_stores(root: Path, inv: Inventory) -> List[Path]:
-    """Stores the credential registry names: chain owners, their rows' stores, unfinished ops' stores.
-    Absent registry: none. Present but unreadable: a failure (the stores it names cannot be known)."""
+def _validate_registry(data) -> None:
+    """The registry structure the credential protocol accepts (stage-1 ``validate_registry``, mirrored until
+    that code is on this branch); anything else is unreadable, so the stores it names are unknown."""
+    if not isinstance(data, dict) or data.get("version") != _REGISTRY_VERSION:
+        raise ValueError("bad version")
+    if not isinstance(data.get("ops"), dict) or not isinstance(data.get("chains"), dict):
+        raise ValueError("bad sections")
+    if not isinstance(data.get("legacy_rescues", {}), dict):
+        raise ValueError("bad legacy_rescues")
+    seen = {}
+    for cid, entry in data["chains"].items():
+        if not isinstance(entry, dict):
+            raise ValueError(f"chain {cid} is not an object")
+        if entry.get("state") not in _CHAIN_STATES:
+            raise ValueError(f"chain {cid} has a bad state")
+        if not isinstance(entry.get("epoch"), int) or not isinstance(entry.get("owner"), str):
+            raise ValueError(f"chain {cid} lacks epoch/owner")
+        if not isinstance(entry.get("rows"), list):
+            raise ValueError(f"chain {cid} rows")
+        for row in entry["rows"]:
+            key = (row.get("store"), row.get("row")) if isinstance(row, dict) else (None, None)
+            if not all(isinstance(k, str) for k in key):
+                raise ValueError(f"chain {cid} has a malformed row")
+            if key in seen:
+                raise ValueError(f"row {key} is in chains {seen[key]} and {cid}")
+            seen[key] = cid
+    for oid, op in data["ops"].items():
+        stores = op.get("stores", []) if isinstance(op, dict) else None
+        if not isinstance(stores, list) or not all(isinstance(s, str) for s in stores):
+            raise ValueError(f"op {oid} has malformed stores")
+
+
+def _registry_paths(root: Path, inv: Inventory) -> Tuple[List[Path], List[Path]]:
+    """``(stores, rescue files)`` the credential registry names: chain owners, their rows' stores, unfinished
+    ops' stores, recorded legacy rescues and their stores. Absent registry: none. Present but unreadable or
+    malformed: a failure (the stores it names cannot be known)."""
     path = root / _REGISTRY
     if not path.exists():
-        return []
+        return [], []
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            raise ValueError("not a JSON object")
+        _validate_registry(data)
     except (OSError, ValueError) as exc:
         inv.failures.append(f"credential registry unreadable ({exc}), so the stores it names are unknown: {path}")
-        return []
-    keys = []
-    for chain in (data.get("chains") or {}).values():
-        if isinstance(chain, dict):
-            keys.append(chain.get("owner"))
-            keys += [row.get("store") for row in chain.get("rows") or () if isinstance(row, dict)]
-    for op in (data.get("ops") or {}).values():
-        if isinstance(op, dict):
-            keys += list(op.get("stores") or ())
-    return [Path(k) for k in dict.fromkeys(k for k in keys if isinstance(k, str) and k)]
+        return [], []
+    stores = []
+    for chain in data["chains"].values():
+        stores += [chain["owner"], *(row["store"] for row in chain["rows"])]
+    for op in data["ops"].values():
+        stores += op.get("stores", [])
+    rescues = data.get("legacy_rescues", {})
+    stores += [r["store"] for r in rescues.values() if isinstance(r, dict) and isinstance(r.get("store"), str)]
+    return ([Path(s) for s in dict.fromkeys(s for s in stores if s)],
+            [Path(r) for r in rescues if isinstance(r, str) and r])
 
 
 def _add_home(inv: Inventory, label: str, home: Path) -> None:
@@ -229,7 +263,7 @@ def build_inventory(root: Path, extra: List[Path], desktop: Optional[Path]) -> I
         if profiles.is_dir():
             inv.homes += [(f"profiles/{entry.name}", entry) for entry in sorted(profiles.iterdir())
                           if entry.is_dir() and entry.name != _PROFILE_LOCKS_DIR]
-        stores = _registry_stores(root, inv)
+        stores, rescues = _registry_paths(root, inv)
         known = {_key(home) for _, home in inv.homes}
         # A registered store's directory is a home of its own when it looks like one.
         registered = [s.parent for s in stores if (s.parent / "config.yaml").is_file() or (s.parent / "state.db").is_file()]
@@ -243,9 +277,15 @@ def build_inventory(root: Path, extra: List[Path], desktop: Optional[Path]) -> I
             _add_home(inv, label, home)
         for store in [*(home / "auth.json" for _, home in inv.homes), *stores]:
             _add_store(inv, store)
+        for rescue in rescues:
+            if rescue.is_file():
+                inv.add("file", rescue, rescue.parent)
         if desktop is not None and desktop.is_dir():
+            # A home may live inside the desktop's data directory (HERMES_DESKTOP_USER_DATA_DIR/hermes-home):
+            # the home owns its subtree (databases stay snapshots, its exclusions and sidecars apply).
             for path in _walk(desktop, excluded=_DESKTOP_CACHE_DIRS):
-                inv.items[_key(path)] = Item("file", path, f"desktop/{path.relative_to(desktop).as_posix()}")
+                if not any(_under(path, home) is not None for _, home in inv.homes):
+                    inv.items[_key(path)] = Item("file", path, f"desktop/{path.relative_to(desktop).as_posix()}")
     except OSError as exc:
         inv.failures.append(f"inventory incomplete ({exc})")
     return inv
@@ -306,6 +346,8 @@ def _snapshot_db(source: Path, dest: Path, staging: Path) -> Optional[str]:
     source is only read as files; SQLite recovers its WAL/journal in the private staged copy."""
     group = [source, *(source.with_name(source.name + s) for s in _DB_SIDECARS)]
     before = _stamps(group)
+    if before[0] is None:
+        return "the database file disappeared after the inventory (stop Hermes first)"
     staged = staging / "snapshot.db"
     try:
         for path, stamp in zip(group, before):
@@ -313,7 +355,8 @@ def _snapshot_db(source: Path, dest: Path, staging: Path) -> Optional[str]:
                 shutil.copyfile(path, staged.with_name(staged.name + path.name[len(source.name):]))
         if _stamps(group) != before:
             return "changed while being copied (stop Hermes first)"
-        src, dst = sqlite3.connect(staged), sqlite3.connect(dest)
+        # mode=rw: never let SQLite create an empty database in place of a missing copy.
+        src, dst = sqlite3.connect(f"file:{staged}?mode=rw", uri=True), sqlite3.connect(dest)
         try:
             src.backup(dst)
             dst.execute("PRAGMA journal_mode=DELETE")  # a self-contained file: no -wal/-shm on every open
