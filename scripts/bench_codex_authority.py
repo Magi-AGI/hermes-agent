@@ -7,6 +7,7 @@ single-use, a reused one is rejected, and every presented token is recorded in i
   python scripts/bench_codex_authority.py progress   # 24 processes x 4 threads, real entry points
   python scripts/bench_codex_authority.py kills      # a real process kill at every boundary
   python scripts/bench_codex_authority.py kills2     # stage 2: kills at every rename / abandon / transfer / delete step
+                                                     # (incl. the rename's profile-state finalization)
   python scripts/bench_codex_authority.py latency --tree <checkout>   # read-path p50/p99
   python scripts/bench_codex_authority.py startup --baseline <checkout>  # A/B, bench-reports/STARTUP-AB-PROTOCOL.md
   python scripts/bench_codex_authority.py rescue-scan  # per-refresh rescue-location scan vs profile count
@@ -777,7 +778,7 @@ def run_kills(args) -> int:
 
 S2_CASES = {
     "rename": ["rename-payload", "rename-decision", "rename-moving", "rename-moved-dir", "rename-moved",
-               "rename-apply", "rename-commit"],
+               "rename-apply", "rename-finalize", "rename-commit"],
     "abandon": ["abandon-payload2", "abandon-decision2", "abandon-apply2"],
     "transfer": ["transfer-payload", "transfer-decision", "transfer-apply-mid", "transfer-apply", "transfer-commit"],
     "delete": ["delete-payload", "delete-decision", "delete-apply", "delete-commit", "delete-before-rmtree"],
@@ -827,6 +828,8 @@ def _install_s2_kill(boundary: str) -> None:
             if fields.get("phase") == phase:
                 die()
         pops._update_op = update
+    elif boundary == "rename-finalize":  # credentials applied, profile state not yet finalized
+        pops._finalize_profile_state = die
     elif boundary == "rename-moved-dir":
         real_move = pops.ProfileRename.move
         pops.ProfileRename.move = lambda self, fn: real_move(self, lambda: (fn(), die()))
@@ -1023,8 +1026,17 @@ def run_kills2(args) -> int:
         cid, chain, home = _chain_of(reg, ledger, "c", root)
         moved = family in ("rename", "recovery") and boundary != "rename-payload"
         expect_home = {"transfer": root if boundary != "transfer-payload" else work}.get(family, workb if moved else work)
-        retired = family == "delete" and boundary != "delete-payload"
-        if retired:
+        # A delete is settled by what the directory removal left (review r1-3): killed before the
+        # removal the login is KEPT (the tombstoned profile keeps its credential, no refresh from a
+        # tombstoned home); killed after it, the recovery retires it.
+        kept_by_delete = boundary == "delete-before-rmtree"
+        retired = family == "delete" and boundary not in ("delete-payload", "delete-before-rmtree")
+        if kept_by_delete:
+            chain_now = reg["chains"].get(c_before[0]) or {}
+            if chain_now.get("state") != "active" or chain_now.get("lifecycle") or rotated[1] not in (
+                    work / "auth.json").read_text(encoding="utf-8"):
+                failures.append(f"{boundary}: a delete killed before the removal changed the login")
+        elif retired:
             gone = [c for c, e in reg["chains"].items() if c == c_before[0]]
             if not gone or reg["chains"][gone[0]]["state"] != "retired":
                 failures.append(f"{boundary}: the deleted profile's login was not retired")
@@ -1043,7 +1055,9 @@ def run_kills2(args) -> int:
                 if record["epoch"] != chain["epoch"]:
                     failures.append(f"{boundary}: record epoch {record['epoch']} != registry {chain['epoch']} (S1)")
         # a SEPARATE process: normal startup + dispatch + a forced refresh where the login lives now
-        final_home = expect_home if not retired else (work if work.exists() else root)
+        final_home = expect_home if not (retired or kept_by_delete) else (work if work.exists() else root)
+        if kept_by_delete:
+            final_home = root  # the tombstoned profile is not resumable; root's own login refreshes
         rc, data, _err = run("worker-check", "--job", "--path", "singleton", "--force", home=final_home)
         entry["final_refresh"] = data
         _rc, other, _e = run("worker-check", "--path", "singleton", "--force", home=root / "profiles" / "other")
@@ -1055,7 +1069,7 @@ def run_kills2(args) -> int:
         if entry["replays"]:
             failures.append(f"{boundary}: {entry['replays']} replayed refresh token(s)")
         c_posts = [p for p in posts if p[2] == "c"]
-        if retired:
+        if retired or kept_by_delete:
             if c_posts:
                 failures.append(f"{boundary}: the deleted login was refreshed")
         elif data.get("outcome") != "ok" or not c_posts or c_posts[0][1] != rotated[1]:
