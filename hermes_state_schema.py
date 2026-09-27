@@ -746,6 +746,48 @@ class SessionSchemaMixin:
         return table_columns
 
     @staticmethod
+    def _copy_stamps_from(legacy: str, owner: str) -> str:
+        """Copy *legacy*'s copy-timestamp rows into the per-session table: each keeps its recorded owner
+        (or none), and every compression continuation of an owner gets its own row, as publication gives
+        continuations created from now on."""
+        return (
+            "INSERT OR IGNORE INTO recall_copy_stamps (copy_key, session_id, timestamp) "
+            "WITH RECURSIVE held(copy_key, session_id, timestamp) AS ("
+            f"SELECT copy_key, {owner}, timestamp FROM {legacy} UNION "
+            "SELECT h.copy_key, c.id, h.timestamp FROM held h JOIN sessions p ON p.id = h.session_id "
+            "AND p.end_reason = 'compression' JOIN sessions c ON c.parent_session_id = p.id) "
+            "SELECT copy_key, session_id, timestamp FROM held")
+
+    @staticmethod
+    def _migrate_review_build_copy_stamps(cursor: sqlite3.Cursor) -> None:
+        """Rekey a review build's copy-keyed ``recall_copy_stamps`` per session, as one write transaction
+        (``_rebuild_table``); rows a previously interrupted rekey stranded in the legacy table are
+        recovered the same way."""
+        legacy = "recall_copy_stamps_review"
+        if cursor.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (legacy,)).fetchone():
+            owner = ("session_id" if any(row[1] == "session_id" for row in
+                                         cursor.execute(f'PRAGMA table_info("{legacy}")')) else "NULL")
+            own_txn = not cursor.connection.in_transaction
+            if own_txn:
+                cursor.execute("BEGIN IMMEDIATE")
+            try:
+                cursor.execute(SessionSchemaMixin._copy_stamps_from(legacy, owner))
+                cursor.execute(f"DROP TABLE {legacy}")
+            except BaseException:
+                if own_txn:
+                    cursor.execute("ROLLBACK")
+                raise
+            if own_txn:
+                cursor.execute("COMMIT")
+        stamp_pk = {row[1]: row[5] for row in cursor.execute('PRAGMA table_info("recall_copy_stamps")')}
+        if stamp_pk and not stamp_pk.get("session_id"):
+            SessionSchemaMixin._rebuild_table(
+                cursor, "recall_copy_stamps", legacy,
+                "CREATE TABLE recall_copy_stamps (copy_key TEXT NOT NULL, session_id TEXT, "
+                "timestamp REAL NOT NULL, PRIMARY KEY (copy_key, session_id))",
+                SessionSchemaMixin._copy_stamps_from(legacy, "session_id" if "session_id" in stamp_pk else "NULL"))
+
+    @staticmethod
     def _migrate_review_build_recalls(cursor: sqlite3.Cursor) -> None:
         """Stores opened by the unreleased review builds of recall redaction: drop the triggers one
         enforced recalls with, and turn another's ``pending`` text notes (an unresolved recall) into open
@@ -755,18 +797,7 @@ class SessionSchemaMixin:
             if cursor.execute("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?",
                               (obsolete,)).fetchone():
                 cursor.execute(f"DROP TRIGGER {obsolete}")
-        stamp_pk = {row[1]: row[5] for row in cursor.execute('PRAGMA table_info("recall_copy_stamps")')}
-        if stamp_pk and not stamp_pk.get("session_id"):
-            # Keyed by copy alone (review builds): rekey per session, keeping each row's recorded owner or
-            # none (an unowned row travels with every moved session, see SCHEMA_SQL).
-            cursor.execute("ALTER TABLE recall_copy_stamps RENAME TO recall_copy_stamps_review")
-            cursor.execute(
-                "CREATE TABLE recall_copy_stamps (copy_key TEXT NOT NULL, session_id TEXT, "
-                "timestamp REAL NOT NULL, PRIMARY KEY (copy_key, session_id))")
-            owner = "session_id" if "session_id" in stamp_pk else "NULL"
-            cursor.execute("INSERT INTO recall_copy_stamps (copy_key, session_id, timestamp) "
-                           f"SELECT copy_key, {owner}, timestamp FROM recall_copy_stamps_review")
-            cursor.execute("DROP TABLE recall_copy_stamps_review")
+        SessionSchemaMixin._migrate_review_build_copy_stamps(cursor)
         columns = {row[1] for row in cursor.execute('PRAGMA table_info("recalled_messages")')}
         if "pending" not in columns or not cursor.execute(
                 "SELECT 1 FROM recalled_messages WHERE pending = 1 LIMIT 1").fetchone():

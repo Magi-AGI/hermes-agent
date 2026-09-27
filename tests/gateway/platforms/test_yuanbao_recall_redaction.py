@@ -1235,3 +1235,60 @@ def test_a_copy_mapping_recorded_before_ownership_still_follows_a_move(tmp_path)
     finally:
         source.close()
         target.close()
+
+
+# The copy-timestamp map of the review build that recorded one owning session (a historical fixture).
+_OWNER_BUILD_STAMPS = ("CREATE TABLE {name} (copy_key TEXT PRIMARY KEY, session_id TEXT, timestamp REAL NOT NULL); "
+                       "INSERT INTO {name} VALUES ('pending-copy.json', 'parent', 1700000000.0);")
+
+
+def _recalled_parent_store(path, *, child=False):
+    """A store holding one written retry copy in "parent" at T, withdrawn by text (guard at T)."""
+    db = SessionDB(db_path=path)
+    db.create_session("parent", "yuanbao")
+    db.append_message(session_id="parent", role="user", content=SECRET, timestamp=1_700_000_000.0)
+    assert _db_recall(db, "parent", "r1", content=SECRET, replacement=RecallGuardMiddleware._REDACTED)[1] == "resolved"
+    if child:
+        _compress(db, "parent", "child", messages=[
+            {"role": "user", "content": RecallGuardMiddleware._REDACTED, "timestamp": 1_700_000_000.0}])
+    return db
+
+
+def test_an_interrupted_copy_map_rekey_is_recovered(tmp_path):
+    """Round 13 (Codex): the rekey of the review build's copy map ran statement by statement; stopped
+    after creating the new table, it left the live map empty and the rows stranded, the next open
+    skipped the migration, and a replay of the copy restored the withdrawn text."""
+    path = tmp_path / "state.db"
+    db = _recalled_parent_store(path)
+    db._execute_write(lambda conn: conn.executescript(  # the state an interruption after CREATE left
+        "DROP TABLE recall_copy_stamps; " + _OWNER_BUILD_STAMPS.format(name="recall_copy_stamps_review") +
+        " CREATE TABLE recall_copy_stamps (copy_key TEXT NOT NULL, session_id TEXT, timestamp REAL NOT NULL, "
+        "PRIMARY KEY (copy_key, session_id));"))
+    db.close()
+    db = SessionDB(db_path=path)
+    try:
+        db.append_message(session_id="parent", role="user", content=SECRET, recall_copy_key="pending-copy.json")
+        rows = _rows(db, "parent")
+        assert rows and not [r for r in rows if SECRET in (r[1] or "")]
+    finally:
+        db.close()
+
+
+def test_an_existing_continuation_gets_the_copy_map_on_upgrade(tmp_path):
+    """Round 13 (Codex): upgraded rows kept only their parent owner, so moving a continuation that
+    already existed left its mapping behind, and a replay of the copy there restored the text."""
+    path = tmp_path / "state.db"
+    db = _recalled_parent_store(path, child=True)
+    db._execute_write(lambda conn: conn.executescript(
+        "DROP TABLE recall_copy_stamps; " + _OWNER_BUILD_STAMPS.format(name="recall_copy_stamps")))
+    db.close()
+    db, target = SessionDB(db_path=path), SessionDB(db_path=tmp_path / "target.db")
+    try:
+        target.import_moved_session(db.export_session_for_move("child"), profile_name="elsewhere")
+        db.delete_moved_session("child")
+        target.append_message(session_id="child", role="user", content=SECRET, recall_copy_key="pending-copy.json")
+        rows = _rows(target, "child")
+        assert rows and not [r for r in rows if SECRET in (r[1] or "")]
+    finally:
+        db.close()
+        target.close()
