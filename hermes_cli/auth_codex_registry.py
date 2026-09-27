@@ -519,7 +519,13 @@ def store_locks(paths: Iterable[Path], timeout_seconds: float = AUTH_LOCK_TIMEOU
     ordered = [by_key[k] for k in sorted(k for k in by_key if k != root)]
     if root in by_key:
         ordered.append(by_key[root])
+    from hermes_cli.auth_codex_lifecycle import lifecycle_locks, profile_of_store
     with ExitStack() as stack:
+        # RULE-L1: EVERY lifecycle lock of the plan (sorted) before ANY store lock. Taking each
+        # store's lifecycle lock just before that store (interleaved) let a refresh hold a custom
+        # home's store lock while waiting for a profile's lifecycle lock that a rename held while
+        # waiting for that store (stage-2 review r1-4). Each store lock below re-enters its own.
+        stack.enter_context(lifecycle_locks([profile_of_store(p) for p in ordered], timeout_seconds))
         for p in ordered:
             stack.enter_context(_auth_store_lock(timeout_seconds, target_path=p))
         yield
