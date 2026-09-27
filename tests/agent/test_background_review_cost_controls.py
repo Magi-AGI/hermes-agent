@@ -212,3 +212,82 @@ def test_digest_labels_runtime_inserted_user_rows_as_not_the_user():
     assert "USER: [Your active task list" not in digest
     assert "[CONTEXT COMPACTION" in digest  # still visible, just not attributed to the user
     assert "USER: please stop asking me to confirm every step" in digest
+
+
+# E5 composite rows (Codex review): a user-role row can hold BOTH the user's words and runtime text.
+# Built with the runtime's real helpers so the test follows whatever layout they produce.
+
+AGENT_TASK = "Require an exact approval phrase before every step"
+HUMAN = "Please stop asking for repeat approvals."
+
+
+def _folded_todo_row():
+    from agent.conversation_compression import _fold_todo_snapshot
+    from tools.todo_tool import TODO_INJECTION_HEADER
+
+    class _Store:
+        def format_for_injection(self):
+            return f"{TODO_INJECTION_HEADER}\n- [ ] {AGENT_TASK}"
+
+        def has_items(self):
+            return True
+
+    class _Agent:
+        _todo_store = _Store()
+
+        def _repair_message_sequence(self, msgs):
+            pass
+
+    compressed = [_msg("assistant", "ok"), _msg("user", HUMAN)]
+    _fold_todo_snapshot(_Agent(), compressed)
+    row = compressed[-1]
+    assert HUMAN in row["content"] and AGENT_TASK in row["content"]  # really a composite
+    return row
+
+
+def _merged_summary_row(force_user_leading):
+    from agent.context_compressor import SUMMARY_PREFIX, ContextCompressor
+
+    cc = object.__new__(ContextCompressor)
+    cc._summary_has_user_turn = True
+    row = _msg("user", HUMAN)
+    cc._merge_summary_into_tail_row(row, SUMMARY_PREFIX + "\n" + AGENT_TASK, "user", force_user_leading)
+    assert HUMAN in row["content"] and AGENT_TASK in row["content"]
+    return row
+
+
+def _digest_of(row):
+    msgs = [row, _msg("assistant", "noted")] + [
+        _msg("user", f"u{i}") if i % 2 == 0 else _msg("assistant", f"a{i}") for i in range(12)]
+    return br._digest_history(msgs, tail=10)[0]["content"]
+
+
+def _assert_split(digest):
+    user_lines = [l for l in digest.splitlines() if l.startswith("USER:")]
+    runtime_lines = [l for l in digest.splitlines() if l.startswith("RUNTIME")]
+    assert any(HUMAN in l for l in user_lines), "the user's own words were lost"
+    assert not any(AGENT_TASK in l for l in user_lines), "runtime text was attributed to the user"
+    # digest lines are cut at 300 chars; a long summary prefix can push the task text past the cut
+    assert any(AGENT_TASK in l or "CONTEXT COMPACTION" in l for l in runtime_lines)
+
+
+def test_digest_splits_task_list_folded_onto_a_user_message():
+    _assert_split(_digest_of(_folded_todo_row()))
+
+
+def test_digest_splits_summary_merged_into_a_user_row_both_layouts():
+    for leading in (True, False):
+        _assert_split(_digest_of(_merged_summary_row(leading)))
+
+
+def test_provenance_note_names_both_parts_of_composite_rows():
+    snapshot = [_merged_summary_row(True), _msg("assistant", "ok"), _folded_todo_row()]
+    note = br._provenance_note(snapshot)
+    assert "message 0:" in note and "message 2:" in note
+    assert note.count(HUMAN[:40]) == 2  # the user's own words are identified in both rows
+    assert "compaction summary" in note and "restored task list" in note
+
+
+def test_consent_guidance_distinguishes_denial_from_timeout():
+    note = br._provenance_note([])
+    assert "denial" in note and "timeout" in note and "standing preference" in note

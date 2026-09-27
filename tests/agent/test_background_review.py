@@ -929,5 +929,5 @@ def test_review_prompt_names_runtime_inserted_user_rows_and_keeps_history_intact
     prompt = captured["user_message"]
     assert "message 2:" in prompt and "message 4:" in prompt  # the two runtime rows are named
     assert "message 0:" not in prompt and "message 6:" not in prompt  # typed words and /steer are not
-    assert "not the user's own" in prompt
+    assert "WHO SAID WHAT" in prompt
     assert captured["conversation_history"] == before  # replayed history untouched (cache parity)
