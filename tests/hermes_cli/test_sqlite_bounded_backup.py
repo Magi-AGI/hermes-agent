@@ -6,7 +6,9 @@ the 10 s restore budget took 17.4 s (Codex, round 15). ``hermes_cli.sqlite_bound
 both sides with the implicit wait disabled and one clock, started before the first step, owns the
 whole wait; the restore page copy, the snapshot copy, ``hermes doctor``'s write-health snapshot and
 the kanban export all use it. Real separate processes hold the locks; each copy runs in a child with
-a hang guard (the old code never returned). Fake data only.
+a hang guard (the old code never returned). A source that keeps CHANGING restarts the copy with every
+step "OK" (Codex, round 16): progress is the pages remaining, and the copy is capped overall; a real
+writer process churns the source between steps, under a watchdog. Fake data only.
 """
 
 import json
@@ -170,3 +172,114 @@ def test_a_kanban_export_snapshot_gives_up_on_a_locked_board(tmp_path, monkeypat
     assert report["outcome"].startswith("BackupLockTimeout"), report
     assert report["elapsed"] <= kanban_transfer._SNAPSHOT_LOCK_SECONDS + MARGIN_SECONDS + 3, report
     assert _rows(board) == [("live",)]
+
+
+# ── Round 17: a source that keeps changing (every step "OK", no progress) is bounded too ──
+
+CHURN_WRITER = (
+    "import sqlite3, sys\n"
+    "c = sqlite3.connect(sys.argv[1], timeout=2, isolation_level=None)\n"
+    "print('ready', flush=True)\n"
+    "for line in sys.stdin:\n"
+    "    if line.strip() == 'stop':\n"
+    "        break\n"
+    "    c.execute('UPDATE counter SET value = value + 1')\n"
+    "    print('committed', flush=True)\n"
+    "c.close()\n"
+)
+WATCHDOG_SECONDS = 30.0
+
+
+class _Watchdog(RuntimeError):
+    pass
+
+
+def _churn_copy(tmp_path, monkeypatch, *, churn_every, lock_seconds, step_delay=0.0):
+    """Adapted from Codex (round 16): a real separate writer commits one source update after every
+    *churn_every*-th successful backup step (0 = quiet), synchronised through an observing connection
+    that only watches progress; a watchdog stops the old, unbounded helper instead of hanging."""
+    from contextlib import closing
+    from hermes_cli import sqlite_bounded_backup as helper
+    source, destination = tmp_path / "source.db", tmp_path / "destination.db"
+    with closing(sqlite3.connect(source)) as seed:
+        seed.execute("PRAGMA journal_mode=WAL")
+        seed.execute("CREATE TABLE payload(value BLOB)")
+        seed.executemany("INSERT INTO payload VALUES (zeroblob(4000))", [()] * 1200)
+        seed.execute("CREATE TABLE counter(value INTEGER)")
+        seed.execute("INSERT INTO counter VALUES (0)")
+        seed.commit()
+    with closing(sqlite3.connect(destination)) as seed:
+        seed.execute("CREATE TABLE original(value TEXT)")
+        seed.execute("INSERT INTO original VALUES ('keep on failure')")
+        seed.commit()
+    writer = subprocess.Popen([sys.executable, "-u", "-B", "-c", CHURN_WRITER, str(source)], cwd=str(REPO),
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    real_connect, steps, started = sqlite3.connect, [], [time.monotonic()]
+
+    class Observed(sqlite3.Connection):
+        def backup(self, target, *, progress=None, **kwargs):
+            def observed(status, remaining, total):
+                steps.append((status, remaining))
+                if status == sqlite3.SQLITE_OK:
+                    time.sleep(step_delay)
+                    if churn_every and len(steps) % churn_every == 0:
+                        writer.stdin.write("write\n")
+                        writer.stdin.flush()
+                        assert writer.stdout.readline().strip() == "committed"
+                progress(status, remaining, total)
+                if time.monotonic() - started[0] >= WATCHDOG_SECONDS:
+                    raise _Watchdog("the copy never ended")
+            return super().backup(target, progress=observed, **kwargs)
+
+    try:
+        assert writer.stdout.readline().strip() == "ready"
+        monkeypatch.setattr(helper.sqlite3, "connect", lambda *a, **k: real_connect(*a, **{**k, "factory": Observed}))
+        with closing(helper.open_backup_connection(source)) as src, closing(helper.open_backup_connection(destination)) as dst:
+            started[0] = time.monotonic()
+            try:
+                helper.bounded_backup(src, dst, lock_seconds=lock_seconds)
+                outcome = "finished"
+            except helper.BackupLockTimeout as exc:
+                outcome = type(exc).__name__
+            except _Watchdog:
+                outcome = "watchdog"
+            elapsed = time.monotonic() - started[0]
+    finally:
+        monkeypatch.setattr(helper.sqlite3, "connect", real_connect)
+        writer.stdin.write("stop\n")
+        writer.stdin.flush()
+        writer.communicate(timeout=10)
+    report = {"outcome": outcome, "elapsed": round(elapsed, 3), "steps": len(steps)}
+    print(f"measured: {report}")
+    with closing(real_connect(destination)) as check:
+        tables = {r[0] for r in check.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    return report, tables
+
+
+def test_the_quiet_control_still_completes(tmp_path, monkeypatch):
+    report, tables = _churn_copy(tmp_path, monkeypatch, churn_every=0, lock_seconds=0.2)
+    assert report["outcome"] == "finished" and "payload" in tables, report
+
+
+def test_a_source_that_changes_after_every_step_is_refused_within_the_budget(tmp_path, monkeypatch):
+    report, tables = _churn_copy(tmp_path, monkeypatch, churn_every=1, lock_seconds=0.2)
+    assert report["outcome"] == "BackupNoProgress", report
+    assert report["elapsed"] <= 0.2 + MARGIN_SECONDS, report
+    assert tables == {"original"}, "an aborted copy changed the destination"
+
+
+def test_a_source_that_changes_every_other_step_hits_the_overall_cap(tmp_path, monkeypatch):
+    """Alternating churn shows 'progress' on every other step, so only the overall cap ends it."""
+    from hermes_cli import sqlite_bounded_backup as helper
+    monkeypatch.setattr(helper, "MIN_COPY_SECONDS", 2.0)
+    monkeypatch.setattr(helper, "MIN_PAGES_PER_SECOND", 1e9)
+    report, tables = _churn_copy(tmp_path, monkeypatch, churn_every=2, lock_seconds=0.2)
+    assert report["outcome"] == "BackupNoProgress", report
+    assert report["elapsed"] <= 2.0 + MARGIN_SECONDS, report
+    assert tables == {"original"}
+
+
+def test_a_slow_but_steady_copy_is_never_aborted(tmp_path, monkeypatch):
+    """Each step takes longer than the whole lock budget, yet reduces the pages remaining: not a stall."""
+    report, tables = _churn_copy(tmp_path, monkeypatch, churn_every=0, lock_seconds=0.2, step_delay=0.3)
+    assert report["outcome"] == "finished" and report["elapsed"] > 0.2 * 3 and "payload" in tables, report
