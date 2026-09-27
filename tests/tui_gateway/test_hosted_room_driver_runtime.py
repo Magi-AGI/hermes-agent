@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 import time
 from contextlib import contextmanager
@@ -2103,11 +2104,11 @@ def test_stop_is_bounded_and_does_not_interrupt_active_turn(db: Path):
     assert not [call for call in rpc.calls if call[0] == "interrupt"]
 
 
-def test_stop_of_a_session_past_the_resume_limit_reaches_its_interrupt(tmp_path: Path, monkeypatch):
-    """The receipt lookup must not trip session.history's full-lineage refusal (4130 past
-    sessions.max_resume_messages): Stop read history before interrupting, so a long room session could
-    never be stopped (D5 r2, Codex). Real SessionDB, real session.history handler and in-process adapter."""
-    import hermes_state
+
+def _stop_through_real_history(tmp_path: Path, monkeypatch, *, active: bool, prepare) -> tuple[dict, list, list]:
+    """Stop a running room task whose receipt is read through the REAL session.history handler and the
+    in-process adapter over a real SessionDB; ``prepare(db_path, db)`` shapes the stored session first.
+    Returns (task, rpc calls, adapter error codes)."""
     from hermes_state import SessionDB
     from tui_gateway import server
     from tui_gateway.hosted_room_server_rpc import HostedRoomServerRPC, HostedRoomSessionError
@@ -2118,7 +2119,7 @@ def test_stop_of_a_session_past_the_resume_limit_reaches_its_interrupt(tmp_path:
                              authority_gateway_id=BINDING.gateway_id, now=time.time())
     identity = _identity()
     _admit(room_db, identity)
-    adapter, refusals = HostedRoomServerRPC(server), []
+    adapter, errors = HostedRoomServerRPC(server), []
 
     class RealHistoryRPC(FakeSessionRPC):
         def history(self, *, profile: str, session_id: str, source: str):
@@ -2126,55 +2127,66 @@ def test_stop_of_a_session_past_the_resume_limit_reaches_its_interrupt(tmp_path:
             try:
                 return adapter.history(profile=None, session_id=session_id, source=source)
             except HostedRoomSessionError as exc:
-                refusals.append(exc.code)
+                errors.append(exc.code)
                 raise
 
     rpc = RealHistoryRPC(auto_complete=False)
     runtime = _runtime(room_db, rpc, lease_ttl_seconds=60)
-    lease = state.acquire_lease(room_db, room_id=ROOM_ID, gateway_id=BINDING.gateway_id,
-                                authority_epoch=BINDING.authority_epoch,
-                                process_generation=runtime.process_generation, ttl_seconds=60, clock=time.time)
-    runtime._leases[ROOM_ID] = lease
-    attempt = state.start_task(room_db, identity, lease, expected_cancel_generation=0, clock=time.time)
-    sid = rpc.add_session(active=True, task_id=identity.task_id)
+    runtime._leases[ROOM_ID] = state.acquire_lease(
+        room_db, room_id=ROOM_ID, gateway_id=BINDING.gateway_id, authority_epoch=BINDING.authority_epoch,
+        process_generation=runtime.process_generation, ttl_seconds=60, clock=time.time)
+    attempt = state.start_task(room_db, identity, runtime._leases[ROOM_ID], expected_cancel_generation=0,
+                               clock=time.time)
+    sid = rpc.add_session(active=active, task_id=identity.task_id)
     rpc.states[sid]["execution_generation"] = attempt.execution_generation
-    db = SessionDB(tmp_path / "session.db")
+    db_path = tmp_path / "session.db"
+    db = SessionDB(db_path)
     try:
         db.create_session("tip", source=ROOM_SESSION_SOURCE)
         db.append_messages_batch("tip", [{"role": "user", "content": "earlier"} for _ in range(5)])
-        monkeypatch.setattr(hermes_state, "resolved_max_resume_messages", lambda: 3)
         monkeypatch.setattr(server, "_db", db)
         monkeypatch.setitem(server._sessions, sid, {"session_key": "tip", "history": [],
-                                                    "history_lock": threading.Lock(), "running": True,
+                                                    "history_lock": threading.Lock(), "running": active,
                                                     "agent": None})
-        result = runtime.cancel(identity, cancel_id="stop-long-session")
+        prepare(db_path, db)
+        result = runtime.cancel(identity, cancel_id="stop-through-real-history")
     finally:
         db.close()
-    assert refusals == []
-    assert [call for call in rpc.calls if call[0] == "interrupt"]
+    return result, rpc.calls, errors
+
+
+def test_stop_of_a_session_past_the_resume_limit_reaches_its_interrupt(tmp_path: Path, monkeypatch):
+    """The receipt lookup must not trip session.history's full-lineage refusal (4130 past
+    sessions.max_resume_messages): Stop read history before interrupting, so a long room session could
+    never be stopped (D5 r2, Codex)."""
+    import hermes_state
+
+    result, calls, errors = _stop_through_real_history(
+        tmp_path, monkeypatch, active=True,
+        prepare=lambda _path, _db: monkeypatch.setattr(hermes_state, "resolved_max_resume_messages", lambda: 3))
+    assert errors == []
+    assert [call for call in calls if call[0] == "interrupt"]
     assert result["status"] == "cancelled"
 
 
 @pytest.mark.parametrize("still_running", [True, False], ids=["active_task", "inactive_session"])
-def test_unreadable_history_never_blocks_stopping_an_exactly_active_task(db: Path, still_running: bool):
-    """A receipt lookup that fails is not a Stop blocker for the exactly identified running task, and not
-    an acknowledgement either: an inactive session may have settled the task, so Stop stays pending."""
-    identity = _identity()
-    _admit(db, identity)
-    rpc = FakeSessionRPC(auto_complete=False)
-    runtime = _runtime(db, rpc)
-    runtime.start()
-    try:
-        assert rpc.submitted.wait(1.0)
-        (session_id,) = rpc.states
-        rpc.history_failures = 10**6
-        if not still_running:
-            rpc.states[session_id]["active"] = False
-        result = runtime.cancel(identity, cancel_id="stop-unreadable-history")
-    finally:
-        rpc.history_failures = 0
-        assert runtime.stop(timeout=5.0)
-    interrupts = [call for call in rpc.calls if call[0] == "interrupt"]
+def test_unreadable_history_never_blocks_stopping_an_exactly_active_task(tmp_path: Path, monkeypatch,
+                                                                         still_running: bool):
+    """A real SQLite read failure crosses the RPC boundary as an error (D5 r3, Codex: it was swallowed into
+    an empty success). It does not block interrupting the exactly identified running task, and it is not an
+    acknowledgement of an inactive session either (the task may have settled): Stop stays pending."""
+    def break_the_store(db_path: Path, _db) -> None:
+        damage = sqlite3.connect(db_path)
+        try:
+            damage.execute("DROP TABLE messages")
+            damage.commit()
+        finally:
+            damage.close()
+
+    result, calls, errors = _stop_through_real_history(
+        tmp_path, monkeypatch, active=still_running, prepare=break_the_store)
+    interrupts = [call for call in calls if call[0] == "interrupt"]
+    assert errors and all(code == 5000 for code in errors)
     if still_running:
         assert interrupts and result["status"] == "cancelled"
     else:

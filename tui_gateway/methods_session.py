@@ -1791,8 +1791,13 @@ def _(rid, params: dict, session: dict) -> dict:
         if session.get("session_key"):
             with _session_db(session) as db:
                 if db is not None:
-                    with contextlib.suppress(Exception):
+                    # A failed read is an error, never the in-memory fallback: a Stop must tell "no receipt
+                    # in the durable history" from "the durable history could not be read".
+                    try:
                         history = db.get_conversation_tail(session["session_key"], tail)
+                    except Exception as exc:
+                        logger.warning("session.history tail read failed for %s: %s", session["session_key"], exc)
+                        return _err(rid, 5000, f"session history could not be read: {exc}")
         return _ok(rid, {"count": len(history), "messages": _history_to_messages(history)})
     if session.get("session_key"):
         with _session_db(session) as db:
