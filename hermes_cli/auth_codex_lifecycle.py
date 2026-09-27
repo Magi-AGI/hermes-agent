@@ -227,4 +227,3 @@ def reservation_message(view: Any, op_id: str, action: str) -> str:
         hint = f"`hermes auth recover --op {op_id[:8]}` completes it"
     return (f"Another Codex login update ({op.get('kind')}, op {op_id[:8]}) is unfinished and reserves "
             f"what {action} would change; {hint}, then try again.")
-
