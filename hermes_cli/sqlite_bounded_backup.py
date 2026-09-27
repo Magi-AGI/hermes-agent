@@ -14,12 +14,16 @@ time). Progress is therefore measured on the pages REMAINING, checked on every c
 * no progress — neither a busy step nor a successful one reduced the remaining page count — for
   *lock_seconds* aborts (:class:`BackupLockTimeout` while locked, :class:`BackupNoProgress` while the
   source keeps restarting the copy);
-* the whole copy is capped at ``max(3 * lock_seconds, MIN_COPY_SECONDS, total_pages /
-  MIN_PAGES_PER_SECOND)`` (:class:`BackupNoProgress`), finite even for a source that changes only
-  every other step.
+* the whole copy is capped at ``max(3 * lock_seconds, MIN_COPY_SECONDS, initial_pages /
+  MIN_PAGES_PER_SECOND)`` (:class:`BackupNoProgress`), computed ONCE from the first known page
+  count and never extended — finite even for a source that changes every other step and grows
+  meanwhile (round 18). A finite cap may refuse a legitimately slow copy; that is a refusal like any
+  other.
 
-SQLite keeps an aborted copy inside the destination's write transaction, so the destination is left
-as it was.
+Completion always wins: a callback reporting ``SQLITE_DONE`` comes after SQLite has COMMITTED the
+destination, so nothing is checked or raised there. Every refusal therefore happens while the copy is
+unfinished, and SQLite keeps an unfinished copy inside the destination's write transaction: a
+refused copy leaves the destination exactly as it was, and callers may say so.
 """
 
 from __future__ import annotations
@@ -60,9 +64,11 @@ def bounded_backup(src_conn: sqlite3.Connection, dst_conn: sqlite3.Connection, *
 
     def progress(status: int, remaining: int, total: int) -> None:
         nonlocal last_progress, previous_remaining, cap_at
+        if status == sqlite3.SQLITE_DONE:
+            return  # committed: completion wins, nothing may be reported as refused now
         now = time.monotonic()
-        cap = max(3 * budget, MIN_COPY_SECONDS, total / MIN_PAGES_PER_SECOND)
-        cap_at = started + cap if cap_at is None else max(cap_at, started + cap)
+        if cap_at is None and total > 0:  # once, from the first known page count; growth never extends it
+            cap_at = started + max(3 * budget, MIN_COPY_SECONDS, total / MIN_PAGES_PER_SECOND)
         if status in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
             if now - last_progress >= budget:
                 raise BackupLockTimeout(f"{what} stayed locked by another process for {lock_seconds:g} seconds")
@@ -73,8 +79,9 @@ def bounded_backup(src_conn: sqlite3.Connection, dst_conn: sqlite3.Connection, *
                 raise BackupNoProgress(f"{what} kept changing during the copy (no progress for {lock_seconds:g} "
                                        "seconds); try again when it is idle")
             previous_remaining = remaining
-        if now >= cap_at:
-            raise BackupNoProgress(f"copying {what} did not finish within {cap_at - started:.0f} seconds (it kept "
-                                   "changing during the copy); try again when it is idle")
+        if cap_at is not None and now >= cap_at:
+            raise BackupNoProgress(f"copying {what} did not finish within its {cap_at - started:.0f}-second budget "
+                                   "(too slow, or it kept changing during the copy); nothing was copied — try "
+                                   "again when it is idle")
 
     src_conn.backup(dst_conn, pages=pages, progress=progress, sleep=sleep)

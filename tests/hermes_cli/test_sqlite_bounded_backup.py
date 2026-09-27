@@ -8,7 +8,9 @@ whole wait; the restore page copy, the snapshot copy, ``hermes doctor``'s write-
 the kanban export all use it. Real separate processes hold the locks; each copy runs in a child with
 a hang guard (the old code never returned). A source that keeps CHANGING restarts the copy with every
 step "OK" (Codex, round 16): progress is the pages remaining, and the copy is capped overall; a real
-writer process churns the source between steps, under a watchdog. Fake data only.
+writer process churns the source between steps, under a watchdog. Round 18: a copy whose DONE
+callback arrives past the cap committed and is reported as success (also by the restore caller),
+and a source that grows meanwhile cannot move the cap, fixed at the start. Fake data only.
 """
 
 import json
@@ -283,3 +285,133 @@ def test_a_slow_but_steady_copy_is_never_aborted(tmp_path, monkeypatch):
     """Each step takes longer than the whole lock budget, yet reduces the pages remaining: not a stall."""
     report, tables = _churn_copy(tmp_path, monkeypatch, churn_every=0, lock_seconds=0.2, step_delay=0.3)
     assert report["outcome"] == "finished" and report["elapsed"] > 0.2 * 3 and "payload" in tables, report
+
+
+# ── Round 18: completion always wins; the overall cap is fixed at the start ──
+
+def _seed(path, value):
+    from contextlib import closing
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE data(value TEXT)")
+        conn.execute("INSERT INTO data VALUES (?)", (value,))
+        conn.commit()
+
+
+def _observe(monkeypatch, helper, on_step):
+    real_connect = sqlite3.connect
+
+    class Observed(sqlite3.Connection):
+        def backup(self, target, *, progress=None, **kwargs):
+            def observed(status, remaining, total):
+                on_step(status, remaining, total)
+                progress(status, remaining, total)
+            return super().backup(target, progress=observed, **kwargs)
+
+    monkeypatch.setattr(helper.sqlite3, "connect", lambda *a, **k: real_connect(*a, **{**k, "factory": Observed}))
+    return real_connect
+
+
+@pytest.mark.parametrize("late_done", [False, True], ids=["quiet", "done-after-the-deadline"])
+def test_a_copy_that_committed_is_never_reported_as_refused(tmp_path, monkeypatch, late_done):
+    """Codex (round 17): the DONE callback arrives after SQLite committed; if it is scheduled past
+    the cap, the copy still finished and must be reported so."""
+    from contextlib import closing
+    from hermes_cli import sqlite_bounded_backup as helper
+    source, destination = tmp_path / "source.db", tmp_path / "destination.db"
+    _seed(source, "snapshot")
+    _seed(destination, "live")
+    monkeypatch.setattr(helper, "MIN_COPY_SECONDS", 0.1)
+    monkeypatch.setattr(helper, "MIN_PAGES_PER_SECOND", 1e9)
+    real_connect = _observe(monkeypatch, helper, lambda status, *_: time.sleep(
+        0.2 if late_done and status == sqlite3.SQLITE_DONE else 0))
+    with closing(helper.open_backup_connection(source)) as src, closing(helper.open_backup_connection(destination)) as dst:
+        helper.bounded_backup(src, dst, lock_seconds=0.01)  # must not raise
+    with closing(real_connect(destination)) as conn:
+        assert conn.execute("SELECT value FROM data").fetchall() == [("snapshot",)]
+
+
+def test_the_restore_reports_success_when_its_copy_committed_at_the_deadline(tmp_path, monkeypatch):
+    """Codex's real-caller case: _page_copy_db said False / 'left as it is' while the database held
+    the restored snapshot."""
+    from contextlib import closing
+    from hermes_cli import backup, sqlite_bounded_backup as helper
+    source, destination = tmp_path / "source.db", tmp_path / "destination.db"
+    _seed(source, "restored snapshot")
+    _seed(destination, "original live data")
+    monkeypatch.setattr(helper, "MIN_COPY_SECONDS", 0.1)
+    monkeypatch.setattr(helper, "MIN_PAGES_PER_SECOND", 1e9)
+    monkeypatch.setattr(backup, "_RESTORE_LOCK_DEADLINE_SECONDS", 0.01)
+    real_connect = _observe(monkeypatch, helper, lambda status, *_: time.sleep(
+        0.2 if status == sqlite3.SQLITE_DONE else 0))
+    assert backup._page_copy_db(source, destination) is True
+    with closing(real_connect(destination)) as conn:
+        assert conn.execute("SELECT value FROM data").fetchall() == [("restored snapshot",)]
+
+
+GROW_WRITER = (
+    "import sqlite3, sys\n"
+    "c = sqlite3.connect(sys.argv[1], timeout=2, isolation_level=None)\n"
+    "print('ready', flush=True)\n"
+    "for line in sys.stdin:\n"
+    "    if line.strip() == 'stop':\n"
+    "        break\n"
+    "    c.execute('BEGIN')\n"
+    "    c.executemany('INSERT INTO payload VALUES (zeroblob(4000))', [()] * 100)\n"
+    "    c.execute('COMMIT')\n"
+    "    print('committed', flush=True)\n"
+    "c.close()\n"
+)
+
+
+def test_a_growing_source_cannot_extend_the_overall_cap(tmp_path, monkeypatch):
+    """Codex (round 17): alternating restarts plus a writer growing the source faster than the
+    1000 pages/s allowance kept moving the cap (1.2 s -> 8.6 s). The cap is fixed at the start."""
+    from contextlib import closing
+    from hermes_cli import sqlite_bounded_backup as helper
+    source, destination = tmp_path / "growing.db", tmp_path / "destination.db"
+    with closing(sqlite3.connect(source)) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE payload(value BLOB)")
+        conn.executemany("INSERT INTO payload VALUES (zeroblob(4000))", [()] * 1200)
+        conn.commit()
+    _seed(destination, "live")
+    monkeypatch.setattr(helper, "MIN_COPY_SECONDS", 0.6)  # only the floor is shortened
+    writer = subprocess.Popen([sys.executable, "-u", "-B", "-c", GROW_WRITER, str(source)], cwd=str(REPO),
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    steps, started = [], [time.monotonic()]
+
+    def on_step(status, remaining, total):
+        steps.append((status, remaining, total))
+        if status == sqlite3.SQLITE_OK:
+            time.sleep(0.01)
+            if len(steps) % 2 == 0:
+                writer.stdin.write("grow\n")
+                writer.stdin.flush()
+                assert writer.stdout.readline().strip() == "committed"
+        if time.monotonic() - started[0] >= WATCHDOG_SECONDS:
+            raise _Watchdog("the copy never ended")
+
+    try:
+        assert writer.stdout.readline().strip() == "ready"
+        real_connect = _observe(monkeypatch, helper, on_step)
+        with closing(helper.open_backup_connection(source)) as src, closing(helper.open_backup_connection(destination)) as dst:
+            started[0] = time.monotonic()
+            try:
+                helper.bounded_backup(src, dst, lock_seconds=0.2)
+                outcome = "finished"
+            except helper.BackupNoProgress:
+                outcome = "BackupNoProgress"
+            except _Watchdog:
+                outcome = "watchdog"
+            elapsed = time.monotonic() - started[0]
+    finally:
+        writer.stdin.write("stop\n")
+        writer.stdin.flush()
+        writer.communicate(timeout=10)
+    initial_cap = max(0.6, 3 * 0.2, steps[0][2] / helper.MIN_PAGES_PER_SECOND)
+    report = {"outcome": outcome, "elapsed": round(elapsed, 3), "steps": len(steps), "initial_cap": initial_cap,
+              "pages": (steps[0][2], steps[-1][2])}
+    print(f"measured: {report}")
+    with closing(real_connect(destination)) as conn:
+        assert conn.execute("SELECT value FROM data").fetchall() == [("live",)], report
+    assert outcome == "BackupNoProgress" and elapsed <= initial_cap + MARGIN_SECONDS, report

@@ -656,8 +656,9 @@ def _page_copy_db(src: Path, dst: Path) -> bool:
             dst.chmod(src.stat().st_mode)
         return True
     except BackupLockTimeout as exc:
-        logger.error("Not restoring %s: %s (another process holds it); it was left as it is. Stop the "
-                     "gateway/dashboard using it and retry.", dst, exc)
+        # Raised only before SQLite committed anything (sqlite_bounded_backup), so this is true.
+        logger.error("Not restoring %s: %s. It was left as it is; stop the gateway/dashboard using it and "
+                     "retry.", dst, exc)
         return False
     except Exception as exc:
         logger.error("SQLite safe restore failed for %s -> %s (%s); the database is not verified corrupt, so "
