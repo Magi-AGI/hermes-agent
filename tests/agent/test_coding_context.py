@@ -138,6 +138,20 @@ def _git_probes_fail(monkeypatch, *subcommands):
     monkeypatch.setattr(cc, "bounded_git_probe", probe)
 
 
+def _canned_git(monkeypatch, *, status=None):
+    """No real git: the quick probes answer at once with a clean ``main`` repo's output, and
+    ``status`` runs the given callable (default: clean). Timing tests then depend only on the
+    probe they hold, not on how fast git starts on a loaded runner."""
+    answers = {"symbolic-ref": "main", "rev-parse": ".git\n.git", "log": "abc1234 init commit"}
+
+    def probe(argv, timeout):
+        if "status" in argv:
+            return status() if status else "# branch.oid abc\n# branch.head main\n"
+        return next(out for sub, out in answers.items() if sub in argv)
+
+    monkeypatch.setattr(cc, "bounded_git_probe", probe)
+
+
 class TestWorkspaceSnapshotProbeFailures:
     """A git probe that did not answer is reported as unknown, never as a normal state, and the
     other probes' facts survive (A19a: a failed `git status` read as "Status: clean" with no Branch
@@ -182,15 +196,8 @@ class TestWorkspaceSnapshotProbeFailures:
         import time
 
         _git_init(tmp_path)
-        real, stuck = cc.bounded_git_probe, threading.Event()
-
-        def probe(argv, timeout):
-            if "status" in argv:
-                stuck.wait(60)  # a git that never answers inside the budget
-                return ""
-            return real(argv, timeout=timeout)
-
-        monkeypatch.setattr(cc, "bounded_git_probe", probe)
+        stuck = threading.Event()
+        _canned_git(monkeypatch, status=lambda: stuck.wait(60) and "")  # never answers in budget
         monkeypatch.setattr(cc, "_GIT_TIMEOUT", 1.0)
         try:
             started = time.monotonic()
@@ -200,6 +207,65 @@ class TestWorkspaceSnapshotProbeFailures:
             stuck.set()
         assert f"- Status: {_UNKNOWN}" in block and "- Branch: main" in block
         assert elapsed < 10.0  # the shared 1 s deadline, far from the 60 s stuck probe
+
+    def test_an_answer_after_the_deadline_is_not_used(self, tmp_path, monkeypatch):
+        from tests.driven_clock import DrivenClock
+
+        _git_init(tmp_path)
+        clock = DrivenClock("monotonic")
+        monkeypatch.setattr(cc, "time", clock)
+
+        def late_status():
+            clock.advance(cc._GIT_TIMEOUT + 1)  # git answered, but only after the cutoff
+            return "# branch.oid abc\n# branch.head main\n"
+
+        _canned_git(monkeypatch, status=late_status)
+        block = cc.build_coding_workspace_block(tmp_path)
+        assert f"- Status: {_UNKNOWN}" in block and "Status: clean" not in block
+
+    @pytest.mark.parametrize("failure", ["refused", "bootstrap-dies"])
+    def test_a_lane_that_never_starts_is_unknown_and_bounded(self, tmp_path, monkeypatch, failure):
+        import time
+
+        _git_init(tmp_path)
+        _canned_git(monkeypatch)
+        monkeypatch.setattr(cc, "_GIT_TIMEOUT", 1.0)
+        real_start = cc._thread.start_new_thread
+
+        def start(fn, args):
+            if args != (("status",),):
+                return real_start(fn, args)
+            if failure == "refused":
+                raise RuntimeError("can't start new thread")
+            return real_start(lambda *_: None, ())  # the thread exists but never runs its lane
+
+        monkeypatch.setattr(cc._thread, "start_new_thread", start)
+        started = time.monotonic()
+        block = cc.build_coding_workspace_block(tmp_path)
+        assert time.monotonic() - started < 10.0  # the 1 s deadline, not a hang
+        assert f"- Status: {_UNKNOWN}" in block and "- Branch: main" in block and "init commit" in block
+
+    def test_a_refused_lane_still_pins_the_snapshot(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+
+        from agent import system_prompt
+
+        _git_init(tmp_path)
+        monkeypatch.setattr(system_prompt, "resolve_context_cwd", lambda: tmp_path)
+        agent = SimpleNamespace(valid_tool_names={"terminal"}, platform="cli", model="gpt-4o",
+                                _frozen_workspace_snapshot=None)
+        real_start = cc._thread.start_new_thread
+
+        def refuse_status_lane(fn, args):
+            if args == (("status",),):
+                raise RuntimeError("can't start new thread")
+            return real_start(fn, args)
+
+        with monkeypatch.context() as starved:
+            starved.setattr(cc._thread, "start_new_thread", refuse_status_lane)
+            first = system_prompt._coding_parts(agent)
+        assert first[1] and f"- Status: {_UNKNOWN}" in first[1][0]
+        assert system_prompt._coding_parts(agent) == first  # threads available again: same bytes
 
     # Normal absence is not failure: complete snapshot, no "unknown".
     def test_no_commits_yet_is_normal(self, tmp_path):

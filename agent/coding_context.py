@@ -11,11 +11,14 @@ workspace snapshot is probed once per session and replayed through
 
 from __future__ import annotations
 
+import _thread
 import json
 import logging
 import os
 import re
 import tempfile
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -450,25 +453,38 @@ def _collect_snapshot_git(root: Path) -> dict[str, Optional[str]]:
     """Probe name -> stdout, or ``None`` for a probe not answered by the shared deadline (a probe
     still running then finishes its own bounded cleanup in the background). Each probe gets the
     time left, so the collection is bounded by one budget instead of one per probe."""
-    import threading
-    import time
-
-    from agent.memory_provider import spawn_context_thread
+    from agent.memory_provider import ctx_bound
 
     results: dict[str, Optional[str]] = {}
     finished = threading.Condition()
     deadline = time.monotonic() + _GIT_TIMEOUT
 
+    def publish(name: str, out: Optional[str]) -> None:
+        with finished:
+            results.setdefault(name, out)
+            finished.notify_all()
+
     def lane(names: tuple[str, ...]) -> None:
-        for name in names:
-            left = deadline - time.monotonic()
-            out = _git(root, *_SNAPSHOT_PROBES[name], timeout=left) if left > 0 else None
-            with finished:
-                results[name] = out
-                finished.notify_all()
+        try:
+            for name in names:
+                left = deadline - time.monotonic()
+                out = _git(root, *_SNAPSHOT_PROBES[name], timeout=left) if left > 0 else None
+                # Answered after the deadline is as unavailable as never answered.
+                publish(name, out if time.monotonic() <= deadline else None)
+        finally:
+            for name in names:
+                publish(name, None)  # no-op for names already published
 
     for names in _SNAPSHOT_LANES:
-        spawn_context_thread(lane, name=f"workspace-snapshot-git-{names[0]}", args=(names,)).start()
+        try:
+            # The low-level start: threading.Thread.start() waits, without a bound, for the new
+            # thread to signal it started, which never happens if its bootstrap fails (MemoryError
+            # under commit exhaustion). A refused start makes its lane's facts unavailable; the
+            # snapshot is still built and pinned.
+            _thread.start_new_thread(ctx_bound(lane), (names,))
+        except (RuntimeError, MemoryError):
+            for name in names:
+                publish(name, None)
     with finished:
         finished.wait_for(lambda: len(results) == len(_SNAPSHOT_PROBES),
                           timeout=max(deadline - time.monotonic(), 0.0))
