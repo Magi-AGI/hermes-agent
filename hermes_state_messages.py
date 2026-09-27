@@ -879,6 +879,10 @@ class SessionMessagesMixin:
         session_id, stamp = params[self._P_SESSION], float(params[self._P_TIMESTAMP])
         variants = self._recall_content_variants(params[self._P_CONTENT])
         marks = ",".join("?" * len(variants))
+        written = conn.execute("SELECT timestamp FROM recall_copy_stamps WHERE copy_key = ?", (copy_key,)).fetchone()
+        if written is not None:  # the same copy again (its spool file outlived the first write): same identity
+            self._guard_keyed_copy(conn, session_id, copy_key, variants, written[0])
+            return written[0]
         taken = self._CONVERSATION_UP_SQL + (
             "SELECT 1 FROM messages m JOIN lineage l ON m.session_id = l.id WHERE m.role = 'user' "
             f"AND COALESCE(m.platform_message_id, '') = '' AND m.timestamp = ? AND m.content IN ({marks}) "
@@ -886,15 +890,25 @@ class SessionMessagesMixin:
             f"AND r.copy_key IS NULL AND r.timestamp = ? AND r.content IN ({marks}) LIMIT 1")
         while conn.execute(taken, (session_id, stamp, *variants, session_id, stamp, *variants)).fetchone():
             stamp = math.nextafter(stamp, math.inf)
+        conn.execute("INSERT INTO recall_copy_stamps (copy_key, timestamp) VALUES (?, ?)", (copy_key, stamp))
+        self._guard_keyed_copy(conn, session_id, copy_key, variants, stamp)
+        return stamp
+
+    @staticmethod
+    def _guard_keyed_copy(conn, session_id: str, copy_key: str, variants: Sequence[Any], stamp: float) -> None:
+        """A keyed copy whose own withdrawal applies: guard its content at its stored timestamp as well."""
         guard = conn.execute("SELECT request_id, replacement FROM recalled_messages WHERE session_id = ? "
                              "AND copy_key = ? LIMIT 1", (session_id, copy_key)).fetchone()
-        if guard is not None:
-            for variant in variants:
+        if guard is None:
+            return
+        for variant in variants:
+            if not conn.execute("SELECT 1 FROM recalled_messages WHERE session_id = ? AND platform_message_id IS NULL "
+                                "AND copy_key IS NULL AND content = ? AND timestamp = ?",
+                                (session_id, variant, stamp)).fetchone():
                 conn.execute(
                     "INSERT INTO recalled_messages (session_id, request_id, content, timestamp, replacement, "
                     "recalled_at) VALUES (?, ?, ?, ?, ?, ?)",
                     (session_id, guard[0], variant, stamp, guard[1], time.time()))
-        return stamp
 
     def _recall_content_variants(self, content: Any) -> list:
         # Stored bytes may carry whitespace the loaded view strips: match either form.

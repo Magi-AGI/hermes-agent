@@ -616,6 +616,12 @@ CREATE TABLE IF NOT EXISTS recalled_messages (
     recalled_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_recalled_messages_session ON recalled_messages(session_id);
+-- The timestamp a retry copy without one of its own (keyed, see recalled_messages.copy_key) was first
+-- written with: a replay of the same copy (its spool file outlived the write) keeps that identity.
+CREATE TABLE IF NOT EXISTS recall_copy_stamps (
+    copy_key TEXT PRIMARY KEY,
+    timestamp REAL NOT NULL
+);
 """
 
 # Indexes on later-added columns must run AFTER _reconcile_columns(), or executescript fails on legacy DBs.

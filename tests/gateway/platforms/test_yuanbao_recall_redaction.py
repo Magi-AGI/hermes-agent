@@ -1095,3 +1095,27 @@ def test_two_undated_copies_written_in_one_second_are_both_displayed(store):
     assert recover_pending_to_db(db) == 2
     shown = [m for m in db.get_messages(sid, include_compacted=True) if m.get("role") == "user"]
     assert [m.get("content") for m in shown] == [SECRET, SECRET]
+
+
+@pytest.mark.windows_only
+def test_a_copy_replayed_again_after_its_spool_file_survived_keeps_its_identity(store):
+    """Round 10 (Codex): the write of an undated spooled copy succeeded but its file could not be
+    deleted; the retry of the same file was given a new timestamp, so the one message became two and a
+    later recall of its text reported ambiguity and left both copies visible."""
+    from gateway.shutdown_flush import recover_pending_to_db
+
+    tasks: list = []
+    adapter = _adapter(store, tasks)
+    sid = _session(store, adapter)
+    db = store._db
+    path = _spool_undated(sid, 1)
+    release = _hold_windows_file(path, 0x1)  # FILE_SHARE_READ only: readable, not deletable
+    try:
+        recover_pending_to_db(db)
+    finally:
+        release()
+    assert path.exists()
+    recover_pending_to_db(db)  # the same copy again
+    assert _db_recall(db, sid, "r1", content=SECRET, replacement=RecallGuardMiddleware._REDACTED)[1] == "resolved"
+    rows = _rows(db, sid)
+    assert rows and not [r for r in rows if SECRET in (r[1] or "")]
