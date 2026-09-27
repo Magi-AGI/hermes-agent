@@ -313,14 +313,17 @@ def _split_user_row(m: Any) -> Tuple[str, str, List[str]]:
     if not isinstance(m, dict) or m.get("role") != "user":
         return "", "", []
     full = _msg_text(m)
-    from agent.context_compressor import _synthetic_user_row, split_user_originated_turn
+    from agent.context_compressor import ContextCompressor, _synthetic_user_row, split_user_originated_turn
     from agent.conversation_compression import (
         _SYNTHETIC_USER_FLAGS, _is_real_user_message, _strip_stale_todo_snapshot,
     )
-    from agent.prompt_builder import CONTROL_FRAME_OPENERS, STEER_MARKER_OPEN
-    if full.startswith(STEER_MARKER_OPEN):
-        return full, "", []
+    from agent.prompt_builder import CONTROL_FRAME_OPENERS, STEER_DISPLAY_KIND, STEER_MARKER_OPEN
+    steer = m.get("display_kind") == STEER_DISPLAY_KIND
     handoff, live = split_user_originated_turn(m)
+    if handoff is not None and live is None and steer:
+        # The summary projection rejects non-"hidden" display kinds, but a steer carrier's unwrapped
+        # prior-tail content is the user's steering text: keep it.
+        live = ContextCompressor._strip_context_summary_handoff_message(m)
     kinds: List[str] = ["compaction summary"] if handoff is not None else []
     runtime: List[str] = [_msg_text(handoff)] if handoff is not None else []
     if live is None:
@@ -334,8 +337,10 @@ def _split_user_row(m: Any) -> Tuple[str, str, List[str]]:
     probe = {k: v for k, v in live.items() if k != "_todo_snapshot_synthetic"}
     probe["content"] = stripped
     other_flags = any(m.get(f) for f in _SYNTHETIC_USER_FLAGS if f != "_todo_snapshot_synthetic")
-    if human and (other_flags or not _is_real_user_message(probe) or _synthetic_user_row(human)
-                  or re.match(r"\[(?:" + "|".join(CONTROL_FRAME_OPENERS) + ")", human)):
+    # /steer authority applies to the extracted human part only, after runtime additions are split off.
+    is_steer_text = steer or human.lstrip().startswith(STEER_MARKER_OPEN)
+    if human and not is_steer_text and (other_flags or not _is_real_user_message(probe) or _synthetic_user_row(human)
+                                        or re.match(r"\[(?:" + "|".join(CONTROL_FRAME_OPENERS) + ")", human)):
         kinds.append("runtime notice")
         runtime.append(human)
         human = ""

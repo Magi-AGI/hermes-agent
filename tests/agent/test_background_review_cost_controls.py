@@ -221,7 +221,7 @@ AGENT_TASK = "Require an exact approval phrase before every step"
 HUMAN = "Please stop asking for repeat approvals."
 
 
-def _folded_todo_row():
+def _folded_todo_row(base=None):
     from agent.conversation_compression import _fold_todo_snapshot
     from tools.todo_tool import TODO_INJECTION_HEADER
 
@@ -238,19 +238,19 @@ def _folded_todo_row():
         def _repair_message_sequence(self, msgs):
             pass
 
-    compressed = [_msg("assistant", "ok"), _msg("user", HUMAN)]
+    compressed = [_msg("assistant", "ok"), base or _msg("user", HUMAN)]
     _fold_todo_snapshot(_Agent(), compressed)
     row = compressed[-1]
     assert HUMAN in row["content"] and AGENT_TASK in row["content"]  # really a composite
     return row
 
 
-def _merged_summary_row(force_user_leading):
+def _merged_summary_row(force_user_leading, base=None):
     from agent.context_compressor import SUMMARY_PREFIX, ContextCompressor
 
     cc = object.__new__(ContextCompressor)
     cc._summary_has_user_turn = True
-    row = _msg("user", HUMAN)
+    row = base or _msg("user", HUMAN)
     cc._merge_summary_into_tail_row(row, SUMMARY_PREFIX + "\n" + AGENT_TASK, "user", force_user_leading)
     assert HUMAN in row["content"] and AGENT_TASK in row["content"]
     return row
@@ -291,3 +291,24 @@ def test_provenance_note_names_both_parts_of_composite_rows():
 def test_consent_guidance_distinguishes_denial_from_timeout():
     note = br._provenance_note([])
     assert "denial" in note and "timeout" in note and "standing preference" in note
+
+
+def _steer_row():
+    from agent.prompt_builder import steer_user_row
+    return steer_user_row(HUMAN)
+
+
+def test_steer_row_alone_is_entirely_the_users_words():
+    human, runtime, _kinds = br._split_user_row(_steer_row())
+    assert HUMAN in human and not runtime
+
+
+def test_digest_splits_task_list_folded_onto_a_steer_row():
+    """Codex round 2: /steer authority applies to the extracted human part, not to runtime text
+    folded onto the same row."""
+    _assert_split(_digest_of(_folded_todo_row(_steer_row())))
+
+
+def test_digest_keeps_steering_text_when_a_summary_is_merged_into_a_steer_row():
+    for leading in (True, False):
+        _assert_split(_digest_of(_merged_summary_row(leading, _steer_row())))
