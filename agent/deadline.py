@@ -414,9 +414,12 @@ def kill_process_tree(pid: int, *, sig: Optional[int] = None) -> bool:
         except Exception:
             creationflags = 0
         try:
+            # Output is unused and not captured: capturing starts pipe-reader threads whose
+            # Thread.start() waits with no bound, and this runs on bounded cleanup paths.
             proc = subprocess.run(
                 ["taskkill", "/F", "/T", "/PID", str(pid)],
-                capture_output=True, timeout=15, check=False, creationflags=creationflags,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=15, check=False, creationflags=creationflags,
             )
             # taskkill exits non-zero for not-found / access-denied (False = nothing terminated).
             return proc.returncode == 0

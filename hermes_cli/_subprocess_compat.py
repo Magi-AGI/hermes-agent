@@ -534,12 +534,13 @@ def bounded_probe_run(
         if raise_on_spawn_failure:
             raise
         return None
-    readers = _PipeReaders(proc) if IS_WINDOWS else None
+    readers = None
     try:
-        if readers is None:
-            stdout, stderr = proc.communicate(timeout=timeout)
-        else:
+        if IS_WINDOWS:
+            readers = _PipeReaders(proc)
             stdout, stderr = readers.communicate(timeout)
+        else:
+            stdout, stderr = proc.communicate(timeout=timeout)
     except Exception:
         # Timeout OR any other failure (torn-down pipe, decode error, a reader that could not start):
         # tree-kill and drain bounded — leaving it running would leak the suspended-descendant class
@@ -547,9 +548,9 @@ def bounded_probe_run(
         _close_job(job)
         kill_process_tree(proc)
         try:
-            if readers is None:
+            if not IS_WINDOWS:
                 proc.communicate(timeout=1)
-            else:
+            elif readers is not None:
                 readers.drain(1.0)
         except Exception:
             pass
@@ -606,10 +607,18 @@ class _PipeReaders:
             self._readers.append((latch, box))
             try:
                 _thread.start_new_thread(_read_pipe, (pipe, box, latch))
-            except BaseException:
-                # Nothing will read these pipes: they are ours to close, and this reader is done.
+            except RuntimeError:
+                # A definite refusal ("can't start new thread"): nothing reads these pipes, so they
+                # are ours to close and this reader is done.
                 latch.release()
                 for unread in pipes[index:]:
+                    unread.close()
+                raise
+            except BaseException:
+                # Ambiguous: CPython starts the thread before allocating the ident it returns, so a
+                # MemoryError here may come with a live reader. It keeps its pipe and its latch (the
+                # deadline covers one that never ran); only the pipes never handed out are ours.
+                for unread in pipes[index + 1:]:
                     unread.close()
                 raise
 

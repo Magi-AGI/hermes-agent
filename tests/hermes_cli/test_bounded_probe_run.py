@@ -114,19 +114,25 @@ def test_posix_child_gets_own_process_group():
     assert result.stdout.strip() == "True"
 
 
-# A sacrificial child runs one git probe with the Nth thread started during it failing: refused
-# (start raises) or dying before it runs (a bootstrap MemoryError under commit exhaustion). Every
-# thread start goes through both _thread and threading's own binding, so the fault lands the same
-# way whichever kind of reader the helper uses. The child reports what it got back and what it
-# left behind; a child still blocked when the test's timeout fires is the stranded-caller failure.
-_FAULT_CHILD = r'''
+# A sacrificial child runs one probe while thread starts fail from the Nth on:
+#   refused       the Nth start raises (a definite refusal)
+#   dies          the Nth thread dies before it runs (a bootstrap MemoryError under commit exhaustion)
+#   dies-from     every start from the Nth on dies, so cleanup cannot lean on new threads either
+#   late-raise    the Nth thread starts, then the start call raises MemoryError (CPython allocates the
+#                 returned ident after the thread exists), so a live reader must keep what it owns
+# Probes: `git` is a real `git status` (warm or cold safe.directory cache); `live` is a child that
+# never exits on its own, so the failure path itself must end it. Every thread start goes through
+# both _thread and threading's own binding, so the fault lands the same way whichever kind of reader
+# the helper uses. The child reports what it got back and what it left behind; a child still blocked
+# when the test's timeout fires is the stranded-caller failure.
+_FAULT_CHILD = r"""
 import _thread, json, subprocess, sys, threading, time
 from hermes_cli import _subprocess_compat as sc
 
-repo, cache, fault, target = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+probe, repo, cache, fault, target = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5])
 if cache == "warm":
     sc.noninteractive_git_env()
-launched, ran, finished, children = [], set(), set(), []
+launched, ran, finished, errors, children = [], set(), set(), [], []
 real_init = subprocess.Popen.__init__
 
 def init(self, *args, **kwargs):
@@ -137,19 +143,25 @@ def failing(real):
     def start(fn, args=(), *rest):
         launched.append(fn)
         n = len(launched)
-        if n == target:
-            if fault == "refused":
-                raise RuntimeError("can't start new thread")
+        if n == target and fault == "refused":
+            raise RuntimeError("can't start new thread")
+        if n == target and fault == "dies" or n >= target and fault == "dies-from":
             def dies(*_):
-                raise MemoryError("reader died before running")
+                raise MemoryError("thread died before running")
             return real(dies, ())
         ran.add(n)
         def run(*a):
             try:
                 fn(*a)
+            except BaseException as exc:
+                errors.append(repr(exc))
+                raise
             finally:
                 finished.add(n)
-        return real(run, args, *rest)
+        ident = real(run, args, *rest)
+        if n == target and fault == "late-raise":
+            raise MemoryError("thread started; allocating its ident failed")
+        return ident
     return start
 
 subprocess.Popen.__init__ = init
@@ -157,30 +169,38 @@ before = set(threading.enumerate())
 _thread.start_new_thread = failing(_thread.start_new_thread)
 threading._start_new_thread = failing(threading._start_new_thread)
 started = time.monotonic()
-out = sc.bounded_git_probe(["git", "-C", repo, "status", "--porcelain=v2", "--branch"], timeout=5.0)
+if probe == "git":
+    out = sc.bounded_git_probe(["git", "-C", repo, "status", "--porcelain=v2", "--branch"], timeout=5.0)
+else:
+    result = sc.bounded_probe_run([sys.executable, "-c", "import time; print('up', flush=True); time.sleep(300)"],
+                                  timeout=2.0)
+    out = "" if result is None else result.stdout
 seconds = time.monotonic() - started
 settle = time.monotonic() + 15
 while time.monotonic() < settle and (ran - finished or any(c.poll() is None for c in children)):
     time.sleep(0.05)
 print(json.dumps({
-    "fired": len(launched) >= target, "out": out, "seconds": seconds,
+    "fired": len(launched) >= target, "out": out, "seconds": seconds, "reader_errors": errors,
     "readers_left": sorted(ran - finished),
     "children_left": [c.args for c in children if c.poll() is None],
     "records": sorted(t.name for t in set(threading.enumerate()) - before),
 }))
-'''
+"""
 
 
 @pytest.mark.windows_only
-@pytest.mark.parametrize("cache, fault, target", [
-    ("warm", "dies", 1), ("warm", "dies", 2), ("warm", "refused", 1), ("warm", "refused", 2),
-    ("cold", "dies", 1), ("cold", "refused", 1),
+@pytest.mark.parametrize("probe, cache, fault, target", [
+    ("git", "warm", "dies", 1), ("git", "warm", "dies", 2), ("git", "warm", "refused", 1),
+    ("git", "warm", "refused", 2), ("git", "cold", "dies", 1), ("git", "cold", "refused", 1),
+    ("live", "warm", "none", 0), ("live", "warm", "dies-from", 3), ("live", "warm", "late-raise", 2),
 ])
-def test_a_pipe_reader_that_cannot_start_leaves_git_probe_bounded(tmp_path, cache, fault, target):
-    """A reader thread that is refused or dies in bootstrap must not strand the caller: communicate()'s
-    Thread.start() waits for its new thread with no bound. Warm: the probe's own reader fails, so the
-    probe fails (""). Cold: the safe.directory read in front of the probe fails, which is best-effort, so
-    the probe still answers. Either way the call returns, raises nothing and leaves no reader or child."""
+def test_a_thread_that_cannot_start_leaves_the_probe_bounded(tmp_path, probe, cache, fault, target):
+    """A thread that is refused or dies in bootstrap must not strand the caller: communicate()'s
+    Thread.start() waits for its new thread with no bound, on the probe's readers and on anything the
+    failure path starts. Warm git: the probe's own reader fails, so the probe fails (""). Cold git: the
+    safe.directory read in front of the probe fails, which is best-effort, so the probe still answers.
+    Live: the child outlives the budget, so the failure path must end it (and, for late-raise, leave a
+    started reader its pipe). Every call returns, raises nothing and leaves no reader, child or record."""
     from pathlib import Path
 
     repo = tmp_path / "repo"
@@ -190,19 +210,21 @@ def test_a_pipe_reader_that_cannot_start_leaves_git_probe_bounded(tmp_path, cach
         subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
     root = str(Path(__file__).resolve().parents[2])
     try:
-        child = subprocess.run([_PY, "-c", _FAULT_CHILD, str(repo), cache, fault, str(target)], cwd=root,
-                               capture_output=True, text=True, timeout=90)
+        child = subprocess.run([_PY, "-c", _FAULT_CHILD, probe, str(repo), cache, fault, str(target)],
+                               cwd=root, capture_output=True, text=True, timeout=90)
     except subprocess.TimeoutExpired:
         child = None
-    assert child is not None, "bounded_git_probe never returned: the caller is stranded on a reader that never started"
-    assert child.returncode == 0, child.stderr  # an exception escaped bounded_git_probe
+    assert child is not None, "the probe never returned: its caller is stranded on a thread that never started"
+    assert child.returncode == 0, child.stderr  # an exception escaped the probe helper
     row = json.loads(child.stdout.splitlines()[-1])
-    assert row["fired"], row
-    if cache == "warm":
-        assert row["out"] == "", row
-    else:
+    if probe == "git":
+        assert row["fired"], row
+    if probe == "git" and cache == "cold":
         assert row["out"].startswith("# branch.oid"), row
-    assert row["seconds"] < 60, row  # probe 5 s (+ 5 s per cold config read) + tree-kill + 1 s drain
+    else:
+        assert row["out"] == "", row
+    assert row["seconds"] < 60, row  # probe budget (+ 5 s per cold config read) + tree-kill + 1 s drain
+    assert not row["reader_errors"], row
     assert not row["readers_left"] and not row["children_left"] and not row["records"], row
 
 
