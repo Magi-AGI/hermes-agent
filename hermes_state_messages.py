@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import logging
 import re
 import time
@@ -321,7 +322,8 @@ class SessionMessagesMixin:
         def _do(conn):
             self._check_transcript_write_guards(conn, session_id, compression_lock_holder,
                 turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds)
-            msg_id = conn.execute(_INSERT_MESSAGE_SQL, self._recall_normalized(conn, params, recall_copy_key)).lastrowid
+            row = self._keyed_copy_params(conn, params, recall_copy_key) if recall_copy_key else params
+            msg_id = conn.execute(_INSERT_MESSAGE_SQL, self._recall_normalized(conn, row, recall_copy_key)).lastrowid
             self._bump_session_counters(conn, session_id, 1, _tool_calls_count(tool_calls), unit=True)
             return msg_id
         # THE critical write (failure aborts the turn): long patience so a sibling legitimately
@@ -855,6 +857,39 @@ class SessionMessagesMixin:
         normalized[self._P_API_CONTENT] = None
         return tuple(normalized)
 
+    _CONVERSATION_UP_SQL = (
+        "WITH RECURSIVE lineage(id) AS (SELECT ? UNION SELECT s.parent_session_id FROM sessions s "
+        "JOIN lineage l ON s.id = l.id JOIN sessions p ON p.id = s.parent_session_id "
+        "WHERE p.end_reason = 'compression') ")
+
+    def _keyed_copy_params(self, conn, params: tuple, copy_key: str) -> tuple:
+        """Write-txn preparation of a retry copy that had no timestamp of its own (*copy_key*). Stored
+        rows are told apart by content and timestamp, so the copy is given a timestamp no id-less user
+        row with the same text has in its conversation (two such copies replayed in one second stay two
+        messages). When its own withdrawal applies (a ``copy_key`` guard), the row's content and final
+        timestamp are guarded too, so a later rewrite of the stored row cannot restore it."""
+        if params[self._P_ROLE] != "user" or params[self._P_PLATFORM_ID]:
+            return params
+        session_id, stamp = params[self._P_SESSION], float(params[self._P_TIMESTAMP])
+        variants = self._recall_content_variants(params[self._P_CONTENT])
+        taken = self._CONVERSATION_UP_SQL + (
+            "SELECT 1 FROM messages m JOIN lineage l ON m.session_id = l.id WHERE m.role = 'user' "
+            "AND COALESCE(m.platform_message_id, '') = '' AND m.timestamp = ? "
+            f"AND m.content IN ({','.join('?' * len(variants))}) LIMIT 1")
+        while conn.execute(taken, (session_id, stamp, *variants)).fetchone():
+            stamp = math.nextafter(stamp, math.inf)
+        row = list(params)
+        row[self._P_TIMESTAMP] = stamp
+        guard = conn.execute("SELECT request_id, replacement FROM recalled_messages WHERE session_id = ? "
+                             "AND copy_key = ? LIMIT 1", (session_id, copy_key)).fetchone()
+        if guard is not None:
+            for variant in variants:
+                conn.execute(
+                    "INSERT INTO recalled_messages (session_id, request_id, content, timestamp, replacement, "
+                    "recalled_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (session_id, guard[0], variant, stamp, guard[1], time.time()))
+        return tuple(row)
+
     def _recall_content_variants(self, content: Any) -> list:
         # Stored bytes may carry whitespace the loaded view strips: match either form.
         return sorted({self._encode_content(content),
@@ -867,17 +902,23 @@ class SessionMessagesMixin:
 
     def _check_recall_lineage(self, conn, ids: Sequence[str]) -> List[str]:
         """Inside a write txn: *ids* (a lineage, tip first, read before the txn) must still be current.
-        A compression that published a continuation of the tip since raises
-        ``CompressionSessionClosedError`` (the caller re-reads the lineage and retries). Returns the ids
-        whose session no longer exists (deleted meanwhile): the caller re-reads, or, when none survives,
-        settles those anchors as gone."""
+        A compression that published a continuation of the tip since, or a link of the captured chain
+        that no longer holds (a child detached or re-parented), raises ``CompressionSessionClosedError``:
+        the caller re-reads the lineage and retries, so each part is decided under its own fence. Returns
+        the ids whose session no longer exists (deleted meanwhile): the caller re-reads, or, when none
+        survives, settles those anchors as gone."""
         from hermes_state_compression import _CHAIN_STEP_SQL
         from hermes_state_errors import CompressionSessionClosedError
-        present = {row[0] for row in conn.execute(
-            f"SELECT id FROM sessions WHERE id IN ({','.join('?' * len(ids))})", tuple(ids))}
-        if ids[0] in present and conn.execute(_CHAIN_STEP_SQL, (ids[0],)).fetchone() is not None:
+        rows = {row[0]: (row[1], row[2]) for row in conn.execute(
+            f"SELECT id, parent_session_id, end_reason FROM sessions WHERE id IN ({','.join('?' * len(ids))})",
+            tuple(ids))}
+        if ids[0] in rows and conn.execute(_CHAIN_STEP_SQL, (ids[0],)).fetchone() is not None:
             raise CompressionSessionClosedError(ids[0])
-        return [sid for sid in ids if sid not in present]
+        for child, parent in zip(ids, ids[1:]):
+            if child in rows and parent in rows and (
+                    rows[child][0] != parent or rows[parent][1] != "compression"):
+                raise CompressionSessionClosedError(child)
+        return [sid for sid in ids if sid not in rows]
 
     def open_recall_request(self, lineage: Sequence[str], *, request_id: str, platform_message_id: Optional[str],
                             content: Any, replacement: str, note: Optional[str] = None) -> None:

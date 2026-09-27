@@ -977,3 +977,86 @@ def test_a_later_undated_spool_copy_is_not_taken_for_one_already_recalled(store)
     spool(names[1], 2)  # a later, distinct message spooled in the same second
     recover_pending_to_db(db)
     assert [r[1] for r in _rows(db, sid) if r[0] == "user"] == [RecallGuardMiddleware._REDACTED, SECRET]
+
+
+def _spool_undated(sid, seq):
+    from gateway.shutdown_flush import TRANSCRIPT_CAP_DROP_REASON, _get_flush_dir, _write_payload
+    return _write_payload(_get_flush_dir(), {
+        "session_key": sid, "reason": TRANSCRIPT_CAP_DROP_REASON, "ts": 1_700_000_000, "seq": seq,
+        "data": {"session_id": sid, "message": {"role": "user", "content": SECRET}}})
+
+
+def test_two_undated_copies_stay_two_messages_once_written(store):
+    """Round 8 (Codex, boot_identity): two distinct undated copies spooled in the same second were
+    written with one timestamp and no identity left, so a later recall of their text redacted both
+    instead of reporting ambiguity."""
+    from gateway.shutdown_flush import recover_pending_to_db
+
+    tasks: list = []
+    adapter = _adapter(store, tasks)
+    sid = _session(store, adapter)
+    db = store._db
+    _spool_undated(sid, 1)
+    _spool_undated(sid, 2)
+    assert recover_pending_to_db(db) == 2
+    assert store.recall_message(sid, request_id="p1", platform_message_id="p1", content=SECRET,
+                                replacement=RecallGuardMiddleware._REDACTED, note="[recall] p1")[1] == "ambiguous"
+    assert [r[1] for r in _rows(db, sid) if r[0] == "user"] == [SECRET, SECRET]
+
+
+def test_a_recalled_undated_copy_cannot_be_restored_by_rewriting_its_row(store):
+    """Round 8 (Codex, copy_update): the withdrawal of an undated copy was keyed to the copy only; once
+    written, rewriting the stored row with its original text restored it."""
+    from gateway.shutdown_flush import recover_pending_to_db
+
+    tasks: list = []
+    adapter = _adapter(store, tasks)
+    sid = _session(store, adapter)
+    db = store._db
+    _spool_undated(sid, 1)
+    assert store.recall_message(sid, request_id="r1", content=SECRET,
+                                replacement=RecallGuardMiddleware._REDACTED)[1] == "resolved"
+    recover_pending_to_db(db)
+    with db._read_ctx() as conn:
+        (row_id,) = conn.execute("SELECT id FROM messages WHERE session_id = ? AND role = 'user'", (sid,)).fetchone()
+    db.set_user_message_content(sid, row_id, SECRET)
+    assert [r[1] for r in _rows(db, sid)] == [RecallGuardMiddleware._REDACTED]
+
+
+def test_a_child_detached_before_the_decision_leaves_the_parent_to_its_own_fence(tmp_path):
+    """Round 8 (Codex, detach_fence): the captured chain was checked for deleted sessions and new
+    continuations, not for a link that no longer held; a child detached just before resolution let the
+    recall overwrite the retained parent while its conversation's live turn still held the lease."""
+    from gateway.transcript_recall import settle_open_recalls, settle_recall
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("parent", "yuanbao", session_key="agent:alpha:yuanbao:dm:u")
+        db.append_message(session_id="parent", role="user", content=SECRET, platform_message_id="p1",
+                          timestamp=1_700_000_100.0)
+        _compress(db, "parent", "child", messages=[
+            {"role": "user", "content": SECRET, "platform_message_id": "p1", "timestamp": 1_700_000_100.0}])
+        lineage = db.recall_lineage("child")
+        db.open_recall_request(lineage, request_id="p1", platform_message_id="p1", content=SECRET,
+                               replacement=RecallGuardMiddleware._REDACTED)
+        original = db.resolve_recall
+
+        def detached_first(ids, **kw):
+            if db.get_session("child")["parent_session_id"]:
+                assert db.acquire_session_turn_lease("child", "live-turn", wait_seconds=0)
+                db._write_sql("UPDATE sessions SET session_key = ? WHERE id = 'child'", ("agent:beta:yuanbao:dm:u",))
+                assert db.sever_crossed_parents(["child"]) == 1
+            return original(ids, **kw)
+
+        db.resolve_recall = detached_first
+        try:
+            settle_recall(db, db.recall_request(["child"], "p1"))
+        finally:
+            db.resolve_recall = original
+        assert _rows(db, "parent")[0][1] == SECRET  # its conversation's live turn still holds it
+        assert _rows(db, "child")[0][1] == RecallGuardMiddleware._REDACTED
+        db.release_session_turn_lease("parent", "live-turn")  # the lease stayed with the parent's conversation
+        settle_open_recalls(db)
+        assert _rows(db, "parent")[0][1] == RecallGuardMiddleware._REDACTED
+    finally:
+        db.close()
