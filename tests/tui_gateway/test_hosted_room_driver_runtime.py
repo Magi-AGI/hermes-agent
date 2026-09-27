@@ -2107,7 +2107,8 @@ def test_stop_is_bounded_and_does_not_interrupt_active_turn(db: Path):
 
 def _stop_through_real_history(tmp_path: Path, monkeypatch, *, active: bool, prepare) -> tuple[dict, list, list]:
     """Stop a running room task whose receipt is read through the REAL session.history handler and the
-    in-process adapter over a real SessionDB; ``prepare(db_path, db)`` shapes the stored session first.
+    in-process adapter over a real SessionDB; ``prepare(db_path, db, record)`` shapes the stored session
+    (and the live session record) first.
     Returns (task, rpc calls, adapter error codes)."""
     from hermes_state import SessionDB
     from tui_gateway import server
@@ -2145,10 +2146,10 @@ def _stop_through_real_history(tmp_path: Path, monkeypatch, *, active: bool, pre
         db.create_session("tip", source=ROOM_SESSION_SOURCE)
         db.append_messages_batch("tip", [{"role": "user", "content": "earlier"} for _ in range(5)])
         monkeypatch.setattr(server, "_db", db)
-        monkeypatch.setitem(server._sessions, sid, {"session_key": "tip", "history": [],
-                                                    "history_lock": threading.Lock(), "running": active,
-                                                    "agent": None})
-        prepare(db_path, db)
+        record = {"session_key": "tip", "history": [], "history_lock": threading.Lock(), "running": active,
+                  "agent": None}
+        monkeypatch.setitem(server._sessions, sid, record)
+        prepare(db_path, db, record)
         result = runtime.cancel(identity, cancel_id="stop-through-real-history")
     finally:
         db.close()
@@ -2163,28 +2164,40 @@ def test_stop_of_a_session_past_the_resume_limit_reaches_its_interrupt(tmp_path:
 
     result, calls, errors = _stop_through_real_history(
         tmp_path, monkeypatch, active=True,
-        prepare=lambda _path, _db: monkeypatch.setattr(hermes_state, "resolved_max_resume_messages", lambda: 3))
+        prepare=lambda *_: monkeypatch.setattr(hermes_state, "resolved_max_resume_messages", lambda: 3))
     assert errors == []
     assert [call for call in calls if call[0] == "interrupt"]
     assert result["status"] == "cancelled"
 
 
+def _drop_the_messages_table(db_path: Path, _db, _record) -> None:
+    damage = sqlite3.connect(db_path)
+    try:
+        damage.execute("DROP TABLE messages")
+        damage.commit()
+    finally:
+        damage.close()
+
+
+def _profile_store_that_cannot_open(tmp_path: Path):
+    def prepare(_db_path: Path, _db, record: dict) -> None:
+        profile = tmp_path / "profile"
+        (profile / "state.db").mkdir(parents=True)  # a directory where the profile's database should be
+        record["profile_home"] = str(profile)
+    return prepare
+
+
+@pytest.mark.parametrize("failure", ["read_fails", "store_cannot_open"])
 @pytest.mark.parametrize("still_running", [True, False], ids=["active_task", "inactive_session"])
 def test_unreadable_history_never_blocks_stopping_an_exactly_active_task(tmp_path: Path, monkeypatch,
-                                                                         still_running: bool):
-    """A real SQLite read failure crosses the RPC boundary as an error (D5 r3, Codex: it was swallowed into
-    an empty success). It does not block interrupting the exactly identified running task, and it is not an
-    acknowledgement of an inactive session either (the task may have settled): Stop stays pending."""
-    def break_the_store(db_path: Path, _db) -> None:
-        damage = sqlite3.connect(db_path)
-        try:
-            damage.execute("DROP TABLE messages")
-            damage.commit()
-        finally:
-            damage.close()
-
+                                                                         still_running: bool, failure: str):
+    """A persisted session whose durable history cannot be read (a real SQLite failure) or whose store cannot
+    be opened crosses the RPC boundary as an error (D5 r3/r4, Codex: both were an empty success). It does
+    not block interrupting the exactly identified running task, and it is not an acknowledgement of an
+    inactive session either (the task may have settled): Stop stays pending."""
+    prepare = _drop_the_messages_table if failure == "read_fails" else _profile_store_that_cannot_open(tmp_path)
     result, calls, errors = _stop_through_real_history(
-        tmp_path, monkeypatch, active=still_running, prepare=break_the_store)
+        tmp_path, monkeypatch, active=still_running, prepare=prepare)
     interrupts = [call for call in calls if call[0] == "interrupt"]
     assert errors and all(code == 5000 for code in errors)
     if still_running:
