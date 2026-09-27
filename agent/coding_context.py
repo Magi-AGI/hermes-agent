@@ -418,14 +418,14 @@ def coding_compact_skill_categories(*, platform: Optional[str] = None, cwd: Opti
 
 # ── git/workspace probe ─────────────────────────────────────────────────────
 
-def _git(cwd: Path, *args: str) -> str:
+def _git(cwd: Path, *args: str, timeout: Optional[float] = None) -> str:
     """``git -C <cwd> <args>`` → stripped stdout, or ``""`` on any failure. bounded_git_probe
     bounds post-kill cleanup on Windows — plain ``subprocess.run(timeout=...)`` deadlocked
     when a killed git left a suspended descendant holding the pipe handles.
 
     See #66037.
     """
-    return bounded_git_probe(["git", "-C", str(cwd), *args], timeout=_GIT_TIMEOUT)
+    return bounded_git_probe(["git", "-C", str(cwd), *args], timeout=_GIT_TIMEOUT if timeout is None else timeout)
 
 
 # The snapshot's probes. A successful `status --porcelain=2 --branch` always prints branch headers
@@ -439,28 +439,36 @@ _SNAPSHOT_PROBES = {
 }
 
 
+# Two lanes under one shared deadline: the slow probe alone, the quick ones in turn. Measured
+# against all four at once, one at a time, and the old per-probe budgets (A19a, 20 simultaneous
+# session starts under CPU load): two lanes lost no facts and had the lowest worst case; all four
+# at once doubled the git processes and lost Status in 14% of starts.
+_SNAPSHOT_LANES = (("status",), ("head", "dirs", "log"))
+
+
 def _collect_snapshot_git(root: Path) -> dict[str, Optional[str]]:
-    """Run the snapshot probes concurrently under one shared deadline: probe name -> stdout, or
-    ``None`` for a probe still running when the deadline passed (its thread finishes its own
-    bounded cleanup in the background). Sequential probes each had their own budget, so four
-    slow ones cost four budgets."""
+    """Probe name -> stdout, or ``None`` for a probe not answered by the shared deadline (a probe
+    still running then finishes its own bounded cleanup in the background). Each probe gets the
+    time left, so the collection is bounded by one budget instead of one per probe."""
     import threading
     import time
 
     from agent.memory_provider import spawn_context_thread
 
-    results: dict[str, str] = {}
+    results: dict[str, Optional[str]] = {}
     finished = threading.Condition()
-
-    def probe(name: str, args: tuple[str, ...]) -> None:
-        out = _git(root, *args)
-        with finished:
-            results[name] = out
-            finished.notify_all()
-
     deadline = time.monotonic() + _GIT_TIMEOUT
-    for name, args in _SNAPSHOT_PROBES.items():
-        spawn_context_thread(probe, name=f"workspace-snapshot-git-{name}", args=(name, args)).start()
+
+    def lane(names: tuple[str, ...]) -> None:
+        for name in names:
+            left = deadline - time.monotonic()
+            out = _git(root, *_SNAPSHOT_PROBES[name], timeout=left) if left > 0 else None
+            with finished:
+                results[name] = out
+                finished.notify_all()
+
+    for names in _SNAPSHOT_LANES:
+        spawn_context_thread(lane, name=f"workspace-snapshot-git-{names[0]}", args=(names,)).start()
     with finished:
         finished.wait_for(lambda: len(results) == len(_SNAPSHOT_PROBES),
                           timeout=max(deadline - time.monotonic(), 0.0))
