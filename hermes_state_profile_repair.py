@@ -198,8 +198,10 @@ class SessionProfileRepairMixin:
                 "SELECT * FROM recalled_messages WHERE session_id = ?", (session_id,))]
             recall_requests = [dict(r) for r in conn.execute(
                 "SELECT * FROM recall_requests WHERE session_id = ?", (session_id,))]
+            copy_stamps = [dict(r) for r in conn.execute(
+                "SELECT * FROM recall_copy_stamps WHERE session_id = ?", (session_id,))]
             return {"session": dict(session), "system_prompt": prompt, "messages": messages, "usage": usage,
-                    "recalls": recalls, "recall_requests": recall_requests}
+                    "recalls": recalls, "recall_requests": recall_requests, "copy_stamps": copy_stamps}
         return self._read_retrying_ioerr(_read)
 
     def import_moved_session(self, payload: Dict[str, Any], *, profile_name: str) -> str:
@@ -223,6 +225,8 @@ class SessionProfileRepairMixin:
                 self._insert_row(conn, "recalled_messages", {**recall, "session_id": session_id}, skip=frozenset())
             for request in payload.get("recall_requests") or []:
                 self._insert_row(conn, "recall_requests", {**request, "session_id": session_id}, skip=frozenset())
+            for stamp in payload.get("copy_stamps") or []:  # a retry copy written here keeps its identity there
+                self._insert_row(conn, "recall_copy_stamps", {**stamp, "session_id": session_id}, skip=frozenset())
             for message in payload.get("messages") or []:
                 self._insert_row(conn, "messages", {**message, "session_id": session_id}, skip=_MESSAGE_MOVE_SKIP)
             for usage in payload.get("usage") or []:
@@ -249,6 +253,7 @@ class SessionProfileRepairMixin:
             conn.execute("DELETE FROM session_model_usage WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM recalled_messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM recall_requests WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM recall_copy_stamps WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             self._delete_unreferenced_system_prompts(conn)
             return True

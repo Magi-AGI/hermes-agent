@@ -1119,3 +1119,58 @@ def test_a_copy_replayed_again_after_its_spool_file_survived_keeps_its_identity(
     assert _db_recall(db, sid, "r1", content=SECRET, replacement=RecallGuardMiddleware._REDACTED)[1] == "resolved"
     rows = _rows(db, sid)
     assert rows and not [r for r in rows if SECRET in (r[1] or "")]
+
+
+def _written_but_undeletable(db, sid):
+    """An undated copy written by boot recovery whose spool file could not be deleted (and remains)."""
+    from gateway.shutdown_flush import recover_pending_to_db
+    path = _spool_undated(sid, 1)
+    release = _hold_windows_file(path, 0x1)  # FILE_SHARE_READ only: readable, not deletable
+    try:
+        recover_pending_to_db(db)
+    finally:
+        release()
+    assert path.exists()
+    return path
+
+
+@pytest.mark.windows_only
+def test_a_recall_resolves_while_a_written_copy_spool_file_remains(store):
+    """Round 11 (Codex): the leftover spool file of a copy already written counted as a second message
+    beside its own row, so the recall settled as ambiguous and the text stayed visible."""
+    from gateway.shutdown_flush import recover_pending_to_db
+
+    tasks: list = []
+    adapter = _adapter(store, tasks)
+    sid = _session(store, adapter)
+    db = store._db
+    _written_but_undeletable(db, sid)
+    assert _db_recall(db, sid, "r1", content=SECRET, replacement=RecallGuardMiddleware._REDACTED)[1] == "resolved"
+    recover_pending_to_db(db)  # the leftover copy replays too
+    rows = _rows(db, sid)
+    assert rows and not [r for r in rows if SECRET in (r[1] or "")]
+
+
+@pytest.mark.windows_only
+def test_a_moved_session_keeps_its_written_copies_identity(store, tmp_path):
+    """Round 11 (Codex): the mapping of a written copy to its timestamp did not travel with a session
+    move, so the copy's leftover spool file replayed at the destination as a second message and a recall
+    there reported ambiguity."""
+    from gateway.shutdown_flush import recover_pending_to_db
+
+    tasks: list = []
+    adapter = _adapter(store, tasks)
+    sid = _session(store, adapter)
+    db = store._db
+    _written_but_undeletable(db, sid)
+    target = SessionDB(db_path=tmp_path / "moved.db")
+    try:
+        target.import_moved_session(db.export_session_for_move(sid), profile_name="elsewhere")
+        db.delete_moved_session(sid)
+        recover_pending_to_db(target)  # the leftover copy replays at the destination
+        assert _db_recall(target, sid, "r1", content=SECRET,
+                          replacement=RecallGuardMiddleware._REDACTED)[1] == "resolved"
+        rows = _rows(target, sid)
+        assert rows and not [r for r in rows if SECRET in (r[1] or "")]
+    finally:
+        target.close()

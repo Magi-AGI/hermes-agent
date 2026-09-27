@@ -620,6 +620,7 @@ CREATE INDEX IF NOT EXISTS idx_recalled_messages_session ON recalled_messages(se
 -- written with: a replay of the same copy (its spool file outlived the write) keeps that identity.
 CREATE TABLE IF NOT EXISTS recall_copy_stamps (
     copy_key TEXT PRIMARY KEY,
+    session_id TEXT,
     timestamp REAL NOT NULL
 );
 """

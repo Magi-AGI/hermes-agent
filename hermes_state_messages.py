@@ -890,7 +890,8 @@ class SessionMessagesMixin:
             f"AND r.copy_key IS NULL AND r.timestamp = ? AND r.content IN ({marks}) LIMIT 1")
         while conn.execute(taken, (session_id, stamp, *variants, session_id, stamp, *variants)).fetchone():
             stamp = math.nextafter(stamp, math.inf)
-        conn.execute("INSERT INTO recall_copy_stamps (copy_key, timestamp) VALUES (?, ?)", (copy_key, stamp))
+        conn.execute("INSERT INTO recall_copy_stamps (copy_key, session_id, timestamp) VALUES (?, ?, ?)",
+                     (copy_key, session_id, stamp))
         self._guard_keyed_copy(conn, session_id, copy_key, variants, stamp)
         return stamp
 
@@ -1094,7 +1095,11 @@ class SessionMessagesMixin:
                     f"AND content IN ({','.join('?' * len(variants))})", (*ids, *variants))}
                 for copy_pid, text_matches, ts, copy_key in retry_copies:
                     if not copy_pid and text_matches:
-                        if copy_key:
+                        written = copy_key and conn.execute(
+                            "SELECT timestamp FROM recall_copy_stamps WHERE copy_key = ?", (copy_key,)).fetchone()
+                        if written:  # already stored (its spool file outlived the write): that row's identity
+                            stamps.add(written[0])
+                        elif copy_key:
                             keys.add(copy_key)
                         else:
                             stamps.add(ts)
