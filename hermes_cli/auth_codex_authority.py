@@ -10,15 +10,16 @@ holds an auth-store lock; the dispatcher checks and returns ``"busy"`` instead.
 * ``sign_in`` / ``import_pair`` — RULE-A2 / A1.
 * ``remove_rows`` — removal / logout as ownership ops (RULE-K1).
 * ``grant_retry_override`` — RULE-O1 (``hermes auth codex --retry-refresh``).
-* ``refuse_if_registered_store`` — stage-1 refusal of profile rename/delete/restore (RULE-P1).
+* ``migrate(rebuild=True)`` — RULE-M6 reconstruction of an UNREADABLE registry, every chain fenced.
+
+Profile rename / delete and transfers are ownership ops in ``auth_codex_profile_ops`` (stage 2).
 """
 
 from __future__ import annotations
 
 import logging
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from hermes_cli import auth_codex_rows as rows_mod
 from hermes_cli.auth_codex_ops import recover_ops, record_legacy_rescues, run_op
@@ -55,7 +56,7 @@ def _bootstrap(fence_all: Optional[str] = None) -> Dict[str, Any]:
 
 def _fence_new_legacy_rescues() -> List[str]:
     view = read_registry()
-    paths = all_store_paths()
+    paths = lockable_stores(all_store_paths())
     found = unrecorded_legacy_rescues(view)
     if not found:
         return []
@@ -127,11 +128,13 @@ def authority_dispatch(*, read_only: bool = False, budget_seconds: float = 0.0) 
 
 def dispatch_needed() -> bool:
     """Unfinished ops to roll forward (incl. an ``unrecoverable`` one whose payload may read again),
-    or payloads left by an op that never reached its decision."""
+    or payloads left by an op that never reached its decision. A ``lifecycle-stuck`` op (and its
+    payload) is not work for automatic dispatch (RULE-P3)."""
+    from hermes_cli.auth_codex_ops import unreferenced_payloads
     view = read_registry()
     return (view.status == "absent"
             or any(op.get("status") in ("running", "unrecoverable") for op in view.ops.values())
-            or (ops_dir().is_dir() and any(ops_dir().glob("*.json"))))
+            or bool(unreferenced_payloads(view)))
 
 
 def startup_dispatch() -> str:
@@ -162,7 +165,26 @@ def _ready_view() -> RegistryView:
     return view
 
 
-def _run_with_all_stores(build) -> Any:
+def lockable_stores(paths: Iterable[Path]) -> List[Path]:
+    """*paths* minus the stores of profiles reserved by an op in a moving phase (a stuck rename's
+    source): locking one would be refused, and no op may touch them anyway (RULE-G4 refuses any
+    op whose scope intersects that reservation), so an ownership op elsewhere proceeds (r8-1)."""
+    from hermes_cli.auth_codex_lifecycle import blocking_op, profile_of_store
+    return [p for p in paths if blocking_op(profile_of_store(Path(p)), store_key(p)) is None]
+
+
+def _refuse_moving_targets(targets: Iterable[Path]) -> None:
+    """The op's own target store (the active one, a transfer destination) reserved by a moving op:
+    refused with that op's message (the store-lock helper's own refusal, raised before any lock)."""
+    from hermes_cli.auth_codex_lifecycle import refuse_blocked, blocking_op, profile_of_store
+    for target in targets:
+        profile = profile_of_store(target)
+        found = blocking_op(profile, store_key(target))
+        if found is not None:
+            raise refuse_blocked(profile or str(target.parent), found)
+
+
+def _run_with_all_stores(build, extra_paths: Iterable[Path] = ()) -> Any:
     """Migration lock, registry ready, ALL store locks (ownership ops are rare), then build + run."""
     if thread_holds_store_lock():
         raise RuntimeError("Codex ownership operations must not run inside an auth-store lock")
@@ -174,9 +196,12 @@ def _run_with_all_stores(build) -> Any:
         else:
             view = _ready_view()
         paths = all_store_paths()
-        active = active_store_path()
-        if store_key(active) not in {store_key(p) for p in paths}:
-            paths.append(active)
+        targets = [Path(p) for p in (active_store_path(), *extra_paths)]
+        for extra in targets:
+            if store_key(extra) not in {store_key(p) for p in paths}:
+                paths.append(extra)
+        _refuse_moving_targets(targets)
+        paths = lockable_stores(paths)
         with store_locks(paths):
             snaps = load_snapshots(paths)
             return build(view, snaps)
@@ -199,14 +224,7 @@ def sign_in(access: str, refresh: str, *, kind: str = "singleton", last_refresh:
 
     def build(view, snaps):
         if view is None:
-            # The damaged file is copied, the old generation's records are folded into the
-            # retired-token index, and the fenced reconstruction's DECISION then atomically
-            # replaces the damaged registry: it is never ABSENT in between (an absent registry
-            # would be bootstrapped with active chains).
-            from hermes_cli.auth_codex_evidence import retain_orphan_records
-            preserve_unreadable_registry()
-            retain_orphan_records([s.path for s in snaps.values()])
-            _bootstrap(fence_all="registry-rebuilt")
+            _rebuild_fenced([s.path for s in snaps.values()])
             view = read_registry()
             snaps = load_snapshots([s.path for s in snaps.values()])
         payload = plan_sign_in(view, snaps, store_key(active_store_path()), access, refresh, kind=kind,
@@ -365,9 +383,32 @@ def grant_retry_override(chain: Optional[str] = None) -> Dict[str, Any]:
     return _run_with_all_stores(build)
 
 
-def migrate() -> Dict[str, Any]:
-    """``hermes auth migrate``: bootstrap / roll forward, then register rows that are not yet."""
+def _rebuild_fenced(stores: Iterable[Path]) -> None:
+    """RULE-M6 (caller holds the migration lock; the registry is UNREADABLE). The damaged file is
+    copied, the old generation's records are folded into the retired-token index, and the fenced
+    reconstruction's DECISION then atomically replaces the damaged registry: it is never ABSENT in
+    between (an absent registry would be bootstrapped with active chains)."""
+    from hermes_cli.auth_codex_evidence import retain_orphan_records
+    preserve_unreadable_registry()
+    retain_orphan_records(list(stores))
+    _bootstrap(fence_all="registry-rebuilt")
+
+
+def migrate(*, rebuild: bool = False) -> Dict[str, Any]:
+    """``hermes auth migrate``: bootstrap / roll forward, register rows that are not yet, and retire
+    chains whose owner store no longer exists. ``rebuild=True`` (``--rebuild``) reconstructs an
+    UNREADABLE registry with EVERY chain fenced (RULE-M6): matching token copies prove duplication,
+    not usability, so only a sign-in (RULE-A2) or the retry override reactivates one. A sign-in over
+    a damaged registry does the same reconstruction on its own; ``--rebuild`` exists for an install
+    that must change profiles (rename, delete, restore) without signing in to Codex."""
     def build(view, snaps):
+        if rebuild:
+            if view is not None:
+                raise CodexAuthorityRefused(
+                    "The Codex login registry is readable; there is nothing to rebuild (`hermes auth migrate` "
+                    "registers any login that is missing from it).")
+            _rebuild_fenced([s.path for s in snaps.values()])
+            return {"rebuilt": True, "chains": len(read_registry().chains)}
         if view is None:
             raise CodexRegistryUnreadable()
         report = {"legacy_fenced": _fence_new_legacy_rescues()}
@@ -376,35 +417,43 @@ def migrate() -> Dict[str, Any]:
         if payload.chains:
             run_op(payload, view)
         report["registered"] = len(payload.chains)
+        report["retired_orphans"] = _retire_orphaned_chains()
         report["chains"] = len(read_registry().chains)
         return report
     return _run_with_all_stores(build)
 
 
-def refuse_if_registered_store(store: Path, action: str) -> None:
-    """RULE-P1 (stage 1): profile rename/delete/credential-bearing restore of a store that owns a
-    chain or holds registered rows is refused."""
+def _retire_orphaned_chains() -> List[str]:
+    """A chain whose OWNER store's directory is gone (the profile was removed outside Hermes) can
+    never be refreshed again: it is retired as an ownership op (RULE-A3). Its record went with the
+    directory, so the retired-token index marks its evidence incomplete (imports then fail closed).
+    Only a directory that is genuinely ABSENT counts; one that cannot be inspected is kept. Chains
+    reserved by an unfinished op are left to that op."""
+    import errno
+    import os
+    from hermes_cli.auth_codex_ops import Payload, conflicting_op, retire_entry
     view = read_registry()
-    if view.status == "unreadable":
-        raise CodexAuthorityRefused(
-            f"The Codex authority file is damaged; {action} isn't possible until you sign in to Codex again.")
-    key = store_key(store)
-    for entry in view.chains.values():
-        if entry.get("state") == "retired":
-            continue  # a retired login's leftover rows hold nothing refreshable
-        if entry.get("owner") == key or any(r.get("store") == key for r in entry.get("rows", ())):
-            raise CodexAuthorityRefused(
-                f"This profile holds your Codex login; {action} isn't supported for it yet.")
-
-
-@contextmanager
-def owner_store_exclusion(store: Path, action: str) -> Iterator[None]:
-    """RULE-P1 for a profile move/delete/restore: the check runs under the migration lock, which is
-    then HELD through the caller's filesystem operation. Every sign-in / import / bootstrap takes
-    that lock first, so none can register a login in *store* between the check and the move."""
-    with migration_lock():
-        refuse_if_registered_store(store, action)
-        yield
+    orphans = []
+    for cid, entry in view.chains.items():
+        if entry.get("state") == STATE_RETIRED or conflicting_op(view, [cid], [entry["owner"]], []):
+            continue
+        try:
+            os.stat(Path(entry["owner"]).parent)
+        except OSError as exc:
+            if isinstance(exc, (FileNotFoundError, NotADirectoryError)) or exc.errno in (errno.ENOENT, errno.ENOTDIR):
+                orphans.append(cid)
+    if not orphans:
+        return []
+    payload = Payload(kind="retire-orphaned", scope_chains=sorted(orphans),
+                      scope_stores=sorted({view.chains[c]["owner"] for c in orphans}))
+    for cid in orphans:
+        entry = view.chains[cid]
+        payload.chains[cid] = retire_entry(entry, [r for r in entry["rows"] if r["store"] != entry["owner"]])
+        payload.records.append({"action": "archive", "owner": entry["owner"], "chain_id": cid,
+                                "reason": "owner-missing", "rows": []})
+    run_op(payload, view)
+    logger.warning("Codex: retired %d login(s) whose profile directory no longer exists", len(orphans))
+    return orphans
 
 
 def report() -> Dict[str, Any]:

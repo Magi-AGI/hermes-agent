@@ -681,6 +681,10 @@ def _auth_store_lock(
     # The lock belongs to the store's canonical file: every alias of one store (a profile whose
     # auth.json is a symlink to root's) takes the same kernel lock (store identity, design §1).
     with ExitStack() as stack:
+        # The profile's lifecycle lock (outside its directory) comes IMMEDIATELY BEFORE the store
+        # lock, then the store is revalidated: not moved away, not reserved by a moving op (RULE-P2).
+        from hermes_cli.auth_codex_lifecycle import store_lock_admission
+        stack.enter_context(store_lock_admission(auth_path, timeout_seconds))
         try:
             stack.enter_context(_file_lock(
                 canonical_path(auth_path).with_suffix(".lock"), _auth_lock_holder_for(auth_path),

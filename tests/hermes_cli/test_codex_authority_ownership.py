@@ -17,8 +17,8 @@ Invariants:
   observed since (r6-4 / RULE-M7);
 - a late failure from a replaced login cannot mark the replacement dead (RULE-T5);
 - UNREADABLE registry: refresh is fenced with no network call; a sign-in preserves the damaged file
-  and rebuilds with every old chain fenced (r5-3);
-- profile delete / rename of a store holding a registered login is refused in stage 1 (r5-9).
+  and rebuilds with every old chain fenced (r5-3).
+Profile rename / delete of a store holding a login (stage 2): ``test_codex_profile_lifecycle.py``.
 """
 
 import json
@@ -240,18 +240,3 @@ def test_unreadable_registry_blocks_refresh_and_sign_in_rebuilds_fenced(codex_ho
     fenced = [c for c in registry(root)["chains"].values() if c["state"] != "active"]
     assert all(c["state"] == "retired" or c["fence"]["reason"] == "registry-rebuilt" for c in fenced)
     assert auth.resolve_codex_runtime_credentials(force_refresh=True)["api_key"]
-
-
-def test_profile_holding_a_registered_login_cannot_be_deleted_or_renamed(codex_home):
-    from hermes_cli import profiles
-
-    root, endpoint = codex_home
-    profile = make_profile(root, "work")
-    write_store(profile, singleton=endpoint.issue())
-    from hermes_cli.auth_codex_authority import authority_dispatch
-    assert authority_dispatch() == "bootstrapped"
-    with pytest.raises(ValueError, match="holds your Codex login"):
-        profiles.delete_profile("work", yes=True)
-    with pytest.raises(ValueError, match="holds your Codex login"):
-        profiles.rename_profile("work", "play")
-    assert profile.is_dir()

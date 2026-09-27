@@ -1160,7 +1160,13 @@ def create_profile(
             if stripped:
                 logger.info("profile %s: cloned without messaging channels %s", canon, stripped)
         _finish_profile_layout(staging, no_skills=no_skills, clone_all=clone_all, description=description)
-        os.rename(staging, profile_dir)
+        # The name may be reserved by an unfinished Codex profile move (RULE-G4): checked under the
+        # name's lifecycle lock, held through the publish.
+        from hermes_cli.auth_codex_lifecycle import profile_publish_guard
+        with _codex_refusals_as_value_errors(), profile_publish_guard(canon, profile_dir, "creating the profile"):
+            if profile_dir.exists():
+                raise _profile_exists_error(canon)
+            os.rename(staging, profile_dir)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
@@ -1519,8 +1525,7 @@ def delete_profile(name: str, yes: bool = False) -> Path:
     if canon == "default":
         raise ValueError("Cannot delete the default profile (~/.hermes).\nTo remove everything, use: hermes uninstall")
     canon, profile_dir = _existing_profile_dir(canon)
-    with _codex_owner_exclusion(profile_dir, "deleting the profile"):
-        pass  # early refusal, before the prompt; re-checked (and held) after the confirmation
+    _codex_delete_precheck(canon, profile_dir)  # early refusal, before the prompt
     gw_running = _check_gateway_running(profile_dir)
     wrapper_path = _get_wrapper_dir() / canon
     has_wrapper = wrapper_path.exists()
@@ -1535,7 +1540,7 @@ def delete_profile(name: str, yes: bool = False) -> Path:
         if confirm != canon:
             print("Cancelled.")
             return profile_dir
-    with _codex_owner_exclusion(profile_dir, "deleting the profile"):
+    with _codex_profile_delete(canon, profile_dir):
         return _delete_confirmed_profile(canon, profile_dir, gw_running, wrapper_path, has_wrapper)
 
 
@@ -2017,8 +2022,12 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
             raise ValueError(str(exc)) from exc
         staged = [(profile_dir / f.relative_to(final_source), f.read_bytes)
                   for f in final_source.rglob("*") if f.is_file()]
+        from hermes_cli.auth_codex_lifecycle import profile_publish_guard
         try:
-            with restore_guard(lambda: staged, "importing it with the profile"):
+            with restore_guard(lambda: staged, "importing it with the profile"), \
+                    profile_publish_guard(canon, profile_dir, "importing the profile"):
+                if profile_dir.exists():
+                    raise _profile_exists_error(canon)
                 shutil.move(str(final_source), str(profile_dir))
         except CodexAuthorityRefused as exc:
             raise ValueError(str(exc)) from exc
@@ -2091,17 +2100,57 @@ def _record_profile_rename(new_dir: Path, old_canon: str) -> None:
 
 
 @contextlib.contextmanager
-def _codex_owner_exclusion(profile_dir: Path, action: str):
-    """Credential recovery protocol stage 1 (RULE-P1): a profile whose store owns a Codex chain or
-    holds registered Codex rows cannot be moved or deleted until profile lifecycle ops exist. The
-    check runs under the migration lock, held for the body (``owner_store_exclusion``)."""
-    from hermes_cli.auth_codex_authority import owner_store_exclusion
+def _codex_refusals_as_value_errors():
+    """Codex authority refusals (an unfinished login update reserving this profile, a damaged login
+    registry, a stuck move) reach the profile commands as ``ValueError`` like every other refusal."""
     from hermes_cli.auth_codex_registry import CodexAuthorityRefused
     try:
-        with owner_store_exclusion(profile_dir / "auth.json", action):
-            yield
+        yield
     except CodexAuthorityRefused as exc:
         raise ValueError(str(exc)) from exc
+
+
+@contextlib.contextmanager
+def _codex_profile_rename(old_canon: str, new_canon: str, old_dir: Path, new_dir: Path):
+    """Credential recovery protocol stage 2 (RULE-P1/P2): the rename is an ownership op for the Codex
+    logins its store holds. Yields ``move(fn)``, which the rename calls for the directory move once
+    its in-directory handles are closed; a move that fails leaves the op stuck with the command
+    that finishes or cancels it."""
+    from hermes_cli.auth_codex_profile_ops import profile_rename
+    with _codex_refusals_as_value_errors(), profile_rename(old_canon, new_canon, old_dir, new_dir) as handle:
+        yield handle.move
+
+
+@contextlib.contextmanager
+def _codex_profile_delete(canon: str, profile_dir: Path):
+    """Stage 2: the profile's Codex logins are signed out (chains it owns retired, its rows released)
+    as one ownership op; the migration lock and the profile's lifecycle lock stay held while the
+    caller removes the directory, so no stale writer recreates it."""
+    from hermes_cli.auth_codex_profile_ops import profile_delete
+    with _codex_refusals_as_value_errors(), profile_delete(canon, profile_dir) as report:
+        if report["retired"]:
+            print(f"✓ Signed out {len(report['retired'])} Codex login(s) held by this profile")
+        yield report
+
+
+def _codex_delete_precheck(canon: str, profile_dir: Path) -> None:
+    """Refuse before the confirmation prompt what the delete itself would refuse: a damaged login
+    registry, or an unfinished Codex login update reserving this profile (re-checked under the locks
+    after the confirmation)."""
+    from hermes_cli.auth_codex_lifecycle import reservation_message
+    from hermes_cli.auth_codex_ops import conflicting_op
+    from hermes_cli.auth_codex_registry import read_registry
+    from hermes_cli.auth_credential_io import store_key
+    view = read_registry()
+    if view.status == "unreadable":
+        raise ValueError("The Codex login registry is damaged, so deleting this profile can't tell which "
+                         "Codex logins it holds. Run `hermes auth migrate --rebuild` first.")
+    key = store_key(profile_dir / "auth.json")
+    chains = [cid for cid, e in view.chains.items()
+              if e.get("owner") == key or any(r.get("store") == key for r in e.get("rows", ()))]
+    blocking = conflicting_op(view, chains, [key], [canon])
+    if blocking is not None:
+        raise ValueError(reservation_message(view, blocking, "deleting the profile"))
 
 
 def rename_profile(old_name: str, new_name: str) -> Path:
@@ -2124,11 +2173,11 @@ def rename_profile(old_name: str, new_name: str) -> Path:
         raise _unknown_profile_error(old_canon)
     if new_dir.exists():
         raise _profile_exists_error(new_canon)
-    with _codex_owner_exclusion(old_dir, "renaming the profile"):
-        return _rename_checked_profile(old_canon, new_canon, old_dir, new_dir)
+    with _codex_profile_rename(old_canon, new_canon, old_dir, new_dir) as move:
+        return _rename_checked_profile(old_canon, new_canon, old_dir, new_dir, move)
 
 
-def _rename_checked_profile(old_canon: str, new_canon: str, old_dir: Path, new_dir: Path) -> Path:
+def _rename_checked_profile(old_canon: str, new_canon: str, old_dir: Path, new_dir: Path, move) -> Path:
     # 1. Stop gateway if running
     if _check_gateway_running(old_dir):
         _cleanup_gateway_service(old_canon, old_dir)
@@ -2153,13 +2202,13 @@ def _rename_checked_profile(old_canon: str, new_canon: str, old_dir: Path, new_d
     from tools.mcp_tool_stderr import sinks_released
     shutdown_mcp_servers(scope=hermes_home_key(old_dir))
 
-    # 2. Rename directory. If the move fails (cross-device EXDEV, permissions, a racing writer, an
-    # MCP stderr log still being written into it), undo the unroute so the profile is never stranded
-    # tombstoned-but-present.
+    # 2. Rename directory (inside the Codex lifecycle op: ``move``). If the move fails (cross-device
+    # EXDEV, permissions, a racing writer, an MCP stderr log still being written into it), undo the
+    # unroute so the profile is never stranded tombstoned-but-present.
     try:
         if not sinks_released(hermes_home_key(old_dir)):
             raise RuntimeError(f"an MCP server's stderr log in {old_dir} is still being written; retry the rename")
-        old_dir.rename(new_dir)
+        move(lambda: old_dir.rename(new_dir))
     except Exception:
         if live_mux:
             clear_named_profile_deleted(old_dir)

@@ -158,7 +158,7 @@ def test_clone_is_published_atomically_after_stripping(home, monkeypatch):
 
     assert seen == {"final_exists": False, "served": ["default"], "work_dir_hidden": True}
     assert profile_dir.is_dir() and [n for n, _ in profiles.profiles_to_serve(multiplex=True)] == ["default", "bot2"]
-    assert not [p for p in (home / "profiles").iterdir() if p.name.startswith(".")]
+    assert not [p for p in (home / "profiles").iterdir() if ".staging-" in p.name], "a staging tree was left behind"
 
 
 def test_clone_channels_refusal_lives_in_create_profile(home, monkeypatch):

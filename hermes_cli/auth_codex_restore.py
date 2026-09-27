@@ -407,13 +407,53 @@ def restore_guard(targets_fn: Callable[[], Iterable[Tuple[Path, Callable[[], byt
     targets = list(targets_fn())
     with classification_scope():
         stores = any(restore_action(Path(t)) == "store" for t, _ in targets)
-    if not stores:
+    profiles = _target_profiles(Path(t) for t, _ in targets)
+    if not stores and not profiles:
         with classification_scope():
             yield
         return
     with migration_lock(), classification_scope():
-        check_restore(targets, action)
+        if profiles:
+            _refuse_reserved_profiles(profiles, targets, action)
+        if stores:
+            check_restore(targets, action)
         yield
+
+
+def _target_profiles(paths: Iterable[Path]) -> List[str]:
+    """Named profiles (by directory under the authority's ``profiles/``, logical OR canonical) the
+    restore writes into."""
+    from hermes_cli.auth_codex_lifecycle import lock_name
+    from hermes_cli.auth_codex_registry import profiles_root
+    roots = {_key(_logical(profiles_root())), _key(canonical_path(profiles_root()))}
+    names = set()
+    for path in paths:
+        for candidate in (_logical(path), _destination(path)):
+            parent = candidate
+            while parent.parent != parent:
+                if _key(parent.parent) in roots and not parent.name.startswith("."):
+                    names.add(lock_name(parent.name))
+                    break
+                parent = parent.parent
+    return sorted(names)
+
+
+def _refuse_reserved_profiles(profiles: List[str], targets: List[Tuple[Path, Any]], action: str) -> None:
+    """RULE-G4 (r8-1): a restore writing into a profile (or store) an unfinished Codex profile move
+    reserves is refused; with a damaged registry the reservations cannot be known (refused)."""
+    from hermes_cli.auth_codex_lifecycle import reservation_message
+    from hermes_cli.auth_codex_ops import conflicting_op
+    from hermes_cli.auth_codex_registry import read_registry
+    from hermes_cli.auth_credential_io import store_key
+    view = read_registry()
+    if view.status == "unreadable":
+        raise _refuse_incomplete(f"the credential registry {registry_path()}", view.error)
+    if not view.ops:
+        return
+    stores = [store_key(t) for t, _ in targets if Path(t).name == AUTH_STORE_NAME]
+    blocking = conflicting_op(view, [], stores, profiles)
+    if blocking is not None:
+        raise CodexAuthorityRefused(reservation_message(view, blocking, action))
 
 
 # ── The Codex-stripping store merge ────────────────────────────────────────────────────────────

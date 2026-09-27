@@ -100,6 +100,14 @@ def path_memo():
         _path_memo.reset(token)
 
 
+def invalidate_path_memo() -> None:
+    """Forget every canonical path the active pass memoized (in place, so enclosing scopes see it
+    too): a store directory moved, and paths resolved before the move name the old location."""
+    cache = _path_memo.get()
+    if cache is not None:
+        cache.clear()
+
+
 def memo() -> Optional[dict]:
     """The active pass memo, or None (callers may cache other per-pass values in it)."""
     return _path_memo.get()

@@ -636,6 +636,9 @@ def auth_codex_command(args) -> None:
     """`hermes auth codex [--retry-refresh]`: fresh Codex sign-in for this profile, or the one-shot
     retry override for a login paused after an unconfirmed refresh (RULE-O1)."""
     from hermes_cli.auth_codex_authority import grant_retry_override
+    if getattr(args, "transfer_to", None):
+        _codex_transfer(args.transfer_to, getattr(args, "chain", None))
+        return
     if getattr(args, "retry_refresh", False):
         try:
             result = grant_retry_override(chain=getattr(args, "chain", None))
@@ -650,15 +653,52 @@ def auth_codex_command(args) -> None:
     _login_openai_codex(args, PROVIDER_REGISTRY["openai-codex"], force_new_login=True)
 
 
-def auth_migrate_command(args) -> None:
-    """`hermes auth migrate`: create the Codex authority registry / finish interrupted updates, and
-    register Codex credentials that are not registered yet."""
-    from hermes_cli.auth_codex_authority import migrate
+def _codex_transfer(destination: str, chain) -> None:
+    """`hermes auth codex --transfer-to <profile>`: an explicit ownership transfer (RULE-M3)."""
+    from hermes_cli.auth_codex_profile_ops import transfer_chain
+    from hermes_cli.profiles import _get_default_hermes_home, get_profile_dir, normalize_profile_name
+    name = normalize_profile_name(destination)
+    home = _get_default_hermes_home() if name == "default" else get_profile_dir(name)
+    if not home.is_dir():
+        raise SystemExit(f"Profile '{destination}' does not exist.")
     try:
-        report = migrate()
+        result = transfer_chain(home, chain)
     except auth_mod.AuthError as exc:
         raise SystemExit(auth_mod.format_auth_error(exc)) from exc
+    paused = f" It stays paused ({result['fence']}); sign in again there to use it." if result.get("fence") else ""
+    print(f"Moved the Codex login {result['chain_id'][:12]} to profile '{name}'.{paused}")
+
+
+def auth_recover_command(args) -> None:
+    """`hermes auth recover --op <id> [--abandon]`: finish or cancel one interrupted Codex login update
+    (a stuck profile move included, RULE-P3/P4)."""
+    from hermes_cli.auth_codex_profile_ops import recover_op
+    try:
+        outcome = recover_op(args.op, abandon=bool(getattr(args, "abandon", False)))
+    except auth_mod.AuthError as exc:
+        raise SystemExit(auth_mod.format_auth_error(exc)) from exc
+    print({"abandoned": "The interrupted update was cancelled; every Codex login is back where it was.",
+           "rolled_forward": "The interrupted Codex login update was completed.",
+           "unrecoverable": "The update's record can't be read; its logins stay paused "
+                            "(`hermes auth recovery list` shows what to do)."}.get(outcome, outcome))
+
+
+def auth_migrate_command(args) -> None:
+    """`hermes auth migrate [--rebuild]`: create the Codex authority registry / finish interrupted
+    updates, and register Codex credentials that are not registered yet; ``--rebuild`` reconstructs a
+    DAMAGED registry with every login paused (RULE-M6)."""
+    from hermes_cli.auth_codex_authority import migrate
+    try:
+        report = migrate(rebuild=bool(getattr(args, "rebuild", False)))
+    except auth_mod.AuthError as exc:
+        raise SystemExit(auth_mod.format_auth_error(exc)) from exc
+    if report.get("rebuilt"):
+        print(f"Codex login registry rebuilt: {report['chains']} login(s), all paused. Sign in again with "
+              "`hermes auth codex` to use Codex; the damaged file was kept.")
+        return
     print(f"Codex login registry: {report['chains']} login(s); {report['registered']} newly registered.")
+    if report.get("retired_orphans"):
+        print(f"Retired {len(report['retired_orphans'])} Codex login(s) whose profile no longer exists.")
     if report["legacy_fenced"]:
         print(f"Paused {len(report['legacy_fenced'])} login(s) that an older Hermes left unconfirmed; "
               "sign in again with `hermes auth codex`.")
@@ -993,7 +1033,7 @@ _AUTH_ACTIONS = {
     "add": auth_add_command, "list": auth_list_command, "remove": auth_remove_command,
     "reset": auth_reset_command, "priority": auth_priority_command, "refresh": auth_refresh_command, "status": auth_status_command,
     "logout": auth_logout_command, "upgrade": auth_upgrade_command, "codex": auth_codex_command,
-    "migrate": auth_migrate_command, "recovery": auth_recovery_command,
+    "migrate": auth_migrate_command, "recovery": auth_recovery_command, "recover": auth_recover_command,
     "spotify": auth_spotify_command}
 
 

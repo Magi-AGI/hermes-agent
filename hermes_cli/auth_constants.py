@@ -166,6 +166,24 @@ class ProfileStoreMissing(AuthError):
         self.profile_dir = profile_dir
 
 
+class ProfileBeingMoved(AuthError):
+    """A profile's store is reserved by an unfinished profile move (credential recovery protocol
+    RULE-P2): its directory may change under any lock or handle taken now, so nothing is locked or
+    opened. Transient while the move runs; a stuck move names the command that resolves it."""
+
+    def __init__(self, profile: str, op_id: str, *, stuck: bool = False) -> None:
+        if stuck:
+            message = (f"The Hermes profile '{profile}' could not be moved and is paused (op {op_id[:8]}). "
+                       f"Close whatever holds it open, then run `hermes auth recover --op {op_id[:8]}` "
+                       f"(or `hermes auth recover --op {op_id[:8]} --abandon` to cancel the move).")
+        else:
+            message = f"The Hermes profile '{profile}' is being moved; try again in a moment."
+        super().__init__(message, code="profile_being_moved", relogin_required=False, retryable=not stuck)
+        self.profile = profile
+        self.op_id = op_id
+        self.stuck = stuck
+
+
 def _provider_error_factory(provider: str) -> Callable[..., AuthError]:
     def factory(message: str, code: Optional[str] = None, *, relogin: bool = False) -> AuthError:
         return AuthError(message, provider=provider, code=code, relogin_required=relogin)

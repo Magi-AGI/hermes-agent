@@ -1,11 +1,12 @@
-"""Profile delete / rename cannot race a Codex login landing in that profile (RULE-P1, stage 1).
+"""Profile delete / rename cannot race a Codex login landing in that profile (RULE-P1).
 
-The refusal was an unlocked pre-check: delete checked an unregistered profile, waited for the typed
-confirmation, another process signed into Codex there, and the delete went ahead — the new
-credential vanished while the registry still named that store as its owner. The check is now
-repeated under the migration lock (every sign-in / import / bootstrap takes it first) and the lock
-is held through the filesystem operation. Fake credentials only; every service / process helper of
-the profile commands is stubbed so nothing outside the temp root is touched.
+Stage 1 refused the delete of a registered profile with an unlocked pre-check: another process
+signed into Codex there while the user typed the confirmation, and the delete went ahead — the new
+credential vanished while the registry still named that store as its owner. Stage 2 deletes such a
+profile as an ownership op decided under the migration lock AFTER the confirmation, and that lock
+(with the profile's lifecycle lock) is held through the filesystem operation: whatever landed
+during the prompt is retired in the registry, never left owned by a store that no longer exists.
+Fake credentials only; every service / process helper of the profile commands is stubbed.
 """
 
 import threading
@@ -26,7 +27,10 @@ def quiet_profiles(monkeypatch):
         monkeypatch.setattr(profiles, name, lambda *a, _v=value, **k: _v)
 
 
-def test_a_sign_in_during_the_delete_confirmation_is_not_deleted(codex_home, quiet_profiles, monkeypatch):
+def test_a_sign_in_during_the_delete_confirmation_is_retired_not_orphaned(codex_home, quiet_profiles, monkeypatch):
+    from hermes_cli.auth_credential_io import store_key
+    from tests.hermes_cli.codex_authority_env import registry
+
     root, endpoint = codex_home
     work = make_profile(root, "work")
     write_store(work)
@@ -39,10 +43,16 @@ def test_a_sign_in_during_the_delete_confirmation_is_not_deleted(codex_home, qui
         monkeypatch.setenv("HERMES_HOME", str(root))
         return "work"
 
+    key = store_key(work / "auth.json")
     monkeypatch.setattr("builtins.input", confirm)
-    with pytest.raises(ValueError, match="Codex login"):
-        profiles.delete_profile("work")
-    assert (work / "auth.json").exists() and pair[1] in (work / "auth.json").read_text(encoding="utf-8")
+    profiles.delete_profile("work")
+    assert not work.exists()
+    chains = registry(root)["chains"].values()
+    assert chains and all(c["state"] == "retired" for c in chains if c["owner"] == key)
+    assert not any(r["store"] == key for c in chains for r in c["rows"]), "a row left in a deleted store"
+    from hermes_cli.auth_codex_evidence import known_material
+    from hermes_cli.auth_codex_registry import read_registry
+    assert known_material(read_registry()).retired(*pair), "the deleted login's token is still known"
 
 
 def _migration_lock_free_elsewhere() -> bool:

@@ -26,12 +26,12 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 from hermes_cli.auth_codex_records import (
-    ATTEMPT_INDETERMINATE, archive_record, read_record, record_path, write_record)
+    ATTEMPT_INDETERMINATE, archive_record, read_record, write_record)
 from hermes_cli.auth_codex_registry import (
-    OP_RUNNING, OP_UNRECOVERABLE, STATE_ACTIVE, STATE_FENCED, STATE_RETIRED, CodexAuthorityRefused,
+    OP_RUNNING, OP_STUCK, OP_UNRECOVERABLE, STATE_ACTIVE, STATE_FENCED, STATE_RETIRED, CodexAuthorityRefused,
     RegistryView, RepairRequest, empty_registry, migration_lock, migration_lock_held, new_id, ops_dir,
     read_registry, store_locks, store_path_of, utc_now, validate_registry, write_registry)
 from hermes_cli.auth_credential_io import (
@@ -55,13 +55,20 @@ class Payload:
     records: List[Dict[str, Any]] = field(default_factory=list)
     result: Dict[str, Any] = field(default_factory=dict)   # returned to the caller, not persisted
     op_id: str = field(default_factory=new_id)
+    apply_order: List[str] = field(default_factory=list)   # stores applied first, in this order
+    extra: Dict[str, Any] = field(default_factory=dict)    # kind-specific recovery data (persisted)
 
     def to_json(self) -> Dict[str, Any]:
-        return {"op_id": self.op_id, "kind": self.kind, "created_at": utc_now(),
+        body = {"op_id": self.op_id, "kind": self.kind, "created_at": utc_now(),
                 "scope": {"chains": self.scope_chains, "stores": self.scope_stores,
                           "profiles": self.scope_profiles},
                 "chains": self.chains, "legacy_rescues": self.legacy_rescues,
                 "edits": self.edits, "records": self.records}
+        if self.apply_order:
+            body["apply_order"] = self.apply_order
+        if self.extra:
+            body["extra"] = self.extra
+        return body
 
 
 def _payload_path(op_id: str) -> Path:
@@ -81,18 +88,20 @@ def _archive_payload(path: Path, label: str) -> None:
 
 # ── G4 reservations ───────────────────────────────────────────────────────────────────────────
 
-def conflicting_op(view: RegistryView, chains: Any, stores: Iterable[str], profiles: Iterable[str],
-                   continuing: Optional[str] = None) -> Optional[str]:
-    """RULE-G4/G5: the first unfinished op (other than *continuing*) whose reservation intersects."""
+def conflicting_op(view: RegistryView, chains: Any, stores: Iterable[str], profiles: Iterable[str]) -> Optional[str]:
+    """RULE-G4/G5: the first unfinished op whose reservation intersects — except the op this context
+    holds a validated continuation token for (``auth_codex_lifecycle.continuation``: same op, same
+    direction as the entry has NOW)."""
+    from hermes_cli.auth_codex_lifecycle import continues, lock_name
     chains_set = set() if chains == "*" else set(chains or ())
-    stores_set, profiles_set = set(stores), set(profiles)
+    stores_set, profiles_set = set(stores), {lock_name(p) for p in profiles}
     for op_id, op in view.ops.items():
-        if op_id == continuing:
+        if continues(op_id, op):
             continue
         op_chains = op.get("chains")
         if chains == "*" or op_chains == "*" or chains_set & set(op_chains or ()):
             return op_id
-        if stores_set & set(op.get("stores") or ()) or profiles_set & set(op.get("profiles") or ()):
+        if stores_set & set(op.get("stores") or ()) or profiles_set & {lock_name(p) for p in op.get("profiles") or ()}:
             return op_id
     return None
 
@@ -111,20 +120,22 @@ def _decided_registry(current: Dict[str, Any], payload: Payload, payload_sha: st
     return data
 
 
-def run_op(payload: Payload, view: RegistryView, *, continuing: Optional[str] = None) -> Payload:
-    """PAYLOAD -> DECISION -> APPLY -> COMMIT. Caller holds the migration lock and the store locks
-    of ``payload.scope_stores``; *view* is the registry read under the migration lock."""
+def refuse_conflicts(view: RegistryView, chains: Any, stores: Iterable[str], profiles: Iterable[str],
+                     action: str = "this change") -> None:
+    """RULE-G4 fresh admission (continuation per RULE-G5): refused while an unfinished op's
+    reservation intersects, with the command that resolves it."""
+    blocking = conflicting_op(view, chains, stores, profiles)
+    if blocking is not None:
+        from hermes_cli.auth_codex_lifecycle import reservation_message
+        raise CodexAuthorityRefused(reservation_message(view, blocking, action))
+
+
+def decide_op(payload: Payload, view: RegistryView) -> Dict[str, Any]:
+    """PAYLOAD -> DECISION (the caller runs APPLY and COMMIT). Caller holds the migration lock; *view*
+    is the registry read under it. Returns the payload body as written."""
     if not migration_lock_held():
         raise RuntimeError("ownership ops run only under the migration lock")
-    blocking = conflicting_op(view, payload.scope_chains, payload.scope_stores, payload.scope_profiles,
-                              continuing)
-    if blocking is not None:
-        op = view.ops[blocking]
-        action = (f"`hermes auth recovery resolve {blocking[:8]}` releases it (its logins stay paused)"
-                  if op.get("status") == OP_UNRECOVERABLE else "run `hermes auth migrate` to complete it")
-        raise CodexAuthorityRefused(
-            f"Another Codex login update ({op.get('kind')}, op {blocking[:8]}) is unfinished; {action}, "
-            "then try again.")
+    refuse_conflicts(view, payload.scope_chains, payload.scope_stores, payload.scope_profiles)
     body = payload.to_json()
     decided = _decided_registry(view.data if view.ok else {}, payload, "")
     validate_registry(decided)  # RULE-G2 checked BEFORE anything is written
@@ -132,18 +143,32 @@ def run_op(payload: Payload, view: RegistryView, *, continuing: Optional[str] = 
     require_committed(write_credential_file(_payload_path(payload.op_id), raw),
                       f"ownership payload {payload.op_id}")
     write_registry(_decided_registry(view.data if view.ok else {}, payload, sha256_hex(raw)))
+    return body
+
+
+def run_op(payload: Payload, view: RegistryView) -> Payload:
+    """PAYLOAD -> DECISION -> APPLY -> COMMIT. Caller holds the migration lock and the store locks
+    of ``payload.scope_stores``; *view* is the registry read under the migration lock."""
+    body = decide_op(payload, view)
     apply_payload(body)
     commit_op(payload.op_id)
     return payload
 
 
-def commit_op(op_id: str) -> None:
+def commit_op(op_id: str, extra_archives: Iterable[Path] = ()) -> None:
+    """COMMIT: one registry write removing ``ops[op_id]`` AND clearing the ``lifecycle`` exclusion it
+    set on its chains (their ``state`` / ``fence`` are left exactly as they are, RULE-P2 step 5)."""
     view = read_registry()
     if view.ok and op_id in view.ops:
-        data = dict(view.data)
-        data["ops"] = {k: v for k, v in view.ops.items() if k != op_id}
+        data = json.loads(json.dumps(view.data))
+        data["ops"].pop(op_id)
+        for entry in data["chains"].values():
+            if (entry.get("lifecycle") or {}).get("op_id") == op_id:
+                entry["lifecycle"] = None
         write_registry(data)
     _archive_payload(_payload_path(op_id), "committed")
+    for path in extra_archives:
+        _archive_payload(path, "committed")
 
 
 # ── APPLY (idempotent, conditional) ───────────────────────────────────────────────────────────
@@ -208,9 +233,15 @@ def _edit_suppression(store: Dict[str, Any], sources: List[str], *, add: bool) -
 
 
 def _apply_record_action(action: Dict[str, Any]) -> None:
-    from hermes_cli.auth_codex_records import history_entry
     owner = store_path_of(action["owner"])
     cid, kind = action["chain_id"], action["action"]
+    if kind == "drop_moved":
+        # RULE-M3: the record moved WITH the chain. The copy left here is archived (not indexed as
+        # retired: the chain lives on) — and only once the destination holds the moved record.
+        moved = read_record(store_path_of(action["moved_to"]), cid)
+        if moved.status == "ok" and moved.data.get("epoch", 0) >= action["epoch"]:
+            archive_record(owner, cid, "transferred")
+        return
     if kind == "archive":
         # The record is about to leave the live set: its token material goes to the durable
         # retired-token index FIRST, so recognition never depends on the archive (RULE-A1/A3).
@@ -233,6 +264,12 @@ def _apply_record_action(action: Dict[str, Any]) -> None:
         if view.status != "ok" or view.data.get("epoch", 0) >= action["epoch"]:
             return
         record = {**view.data, "epoch": action["epoch"]}
+    elif kind == "import_moved":
+        # RULE-M3: the chain's record (attempt, fence evidence, full history) arrives unchanged but
+        # for its epoch; a replay after it landed (or after newer writes there) changes nothing.
+        if view.status == "ok" and view.data.get("epoch", 0) >= action["epoch"]:
+            return
+        record = {**action["record"], "epoch": action["epoch"]}
     elif kind == "override":
         if view.status != "ok" or view.data.get("epoch", 0) >= action["epoch"]:
             return
@@ -258,14 +295,38 @@ def apply_payload(body: Dict[str, Any]) -> None:
     and idempotent (RULE-M7), so the per-store order is recovery-safe."""
     from hermes_cli.auth_codex_registry import is_root_store
     keys = set(body["edits"]) | {a["owner"] for a in body["records"]}
-    for key in sorted(keys, key=lambda k: (is_root_store(k), k)):
+    first = [k for k in body.get("apply_order") or () if k in keys]
+    rest = sorted(keys - set(first), key=lambda k: (is_root_store(k), k))
+    for key in first + rest:  # a transfer writes the destination before it empties the source
+        edits = body["edits"].get(key) or []
+        actions = [a for a in body["records"] if a["owner"] == key]
+        if _store_dir_gone(key) and all(e["op"] == "remove_row" for e in edits) and all(
+                a["action"] in _REMOVAL_ACTIONS for a in actions):
+            # The store's directory is gone (a profile removed meanwhile): its rows went with it and
+            # there is nothing to lock. What it retires is still indexed (RULE-A3, fail closed).
+            for action in actions:
+                _apply_record_action(action)
+            continue
         with store_locks([store_path_of(key)]):
-            edits = body["edits"].get(key) or []
             if edits:
                 _apply_store_edits(store_path_of(key), edits)
-            for action in body["records"]:
-                if action["owner"] == key:
-                    _apply_record_action(action)
+            for action in actions:
+                _apply_record_action(action)
+
+
+_REMOVAL_ACTIONS = frozenset({"archive", "drop_moved"})
+
+
+def _store_dir_gone(key: str) -> bool:
+    """The store's directory is genuinely ABSENT (anything else — present, or not inspectable — is
+    not gone: the normal locked path then decides)."""
+    import errno
+    import os
+    try:
+        os.stat(Path(key).parent)
+    except OSError as exc:
+        return isinstance(exc, (FileNotFoundError, NotADirectoryError)) or exc.errno in (errno.ENOENT, errno.ENOTDIR)
+    return False
 
 
 # ── RULE-M1 recovery ──────────────────────────────────────────────────────────────────────────
@@ -279,39 +340,75 @@ def _read_payload(op_id: str, op: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
 
 
+ABANDON_SUFFIX = ".abandon"
+
+
+def _payload_is_referenced(path: Path, view: RegistryView) -> bool:
+    """An op payload file is referenced by its registry entry; a compensation payload
+    (``<op>.abandon.json``, RULE-P4) only once DECISION-2 turned that entry to ``abandon``."""
+    from hermes_cli.auth_codex_lifecycle import ABANDON, op_direction
+    stem = path.stem
+    if stem.endswith(ABANDON_SUFFIX):
+        op = view.ops.get(stem[:-len(ABANDON_SUFFIX)])
+        return op is not None and op_direction(op) == ABANDON
+    return stem in view.ops
+
+
+def unreferenced_payloads(view: RegistryView) -> List[Path]:
+    directory = ops_dir()
+    if not directory.is_dir():
+        return []
+    return [p for p in sorted(directory.glob("*.json")) if not (view.ok and _payload_is_referenced(p, view))]
+
+
 def recover_ops() -> Dict[str, List[str]]:
     """Roll unfinished ops forward; archive undecided payloads. Caller holds the migration lock.
 
     An op whose payload cannot be read is marked ``unrecoverable`` (its chains fenced) but KEEPS
     its entry — and so its reservation (RULE-G4) — and is retried here on every pass: a payload
-    that reads again is rolled forward; only ``resolve_unrecoverable`` releases one that never does."""
-    report: Dict[str, List[str]] = {"abandoned": [], "rolled_forward": [], "unrecoverable": []}
+    that reads again is rolled forward; only ``resolve_unrecoverable`` releases one that never does.
+    A ``lifecycle-stuck`` op is skipped (terminal for automatic dispatch, RULE-P3): only
+    ``hermes auth recover --op`` resumes or abandons it."""
+    report: Dict[str, List[str]] = {"abandoned": [], "rolled_forward": [], "unrecoverable": [], "stuck": []}
     view = read_registry()
     if view.status == "unreadable":
         return report  # never classify payloads against a registry we cannot read (RULE-G3)
-    directory = ops_dir()
-    if directory.is_dir():
-        for path in sorted(directory.glob("*.json")):
-            if not view.ok or path.stem not in view.ops:
-                _archive_payload(path, "abandoned")
-                report["abandoned"].append(path.stem)
+    for path in unreferenced_payloads(view):
+        # Never decided: a compensation payload whose DECISION-2 never landed leaves the original
+        # op exactly as it was (still forward, still reserved); an op payload is abandoned.
+        label = "abandoned-compensation" if path.stem.endswith(ABANDON_SUFFIX) else "abandoned"
+        _archive_payload(path, label)
+        report["abandoned"].append(path.stem)
     if not view.ok:
         return report
     for op_id, op in list(view.ops.items()):
+        if op.get("status") == OP_STUCK:
+            report["stuck"].append(op_id)
+            continue
         if op.get("status") not in (OP_RUNNING, OP_UNRECOVERABLE):
             continue
-        body = _read_payload(op_id, op)
-        if body is None:
-            if op.get("status") != OP_UNRECOVERABLE:
-                _fence_unrecoverable(op_id, op)
-            report["unrecoverable"].append(op_id)
-            continue
-        if op.get("status") == OP_UNRECOVERABLE:
-            _reinstate_decision(op_id, body)
-        apply_payload(body)
-        commit_op(op_id)
-        report["rolled_forward"].append(op_id)
+        outcome = roll_forward_one(op_id, op)
+        report.setdefault(outcome, []).append(op_id)
     return report
+
+
+def roll_forward_one(op_id: str, op: Dict[str, Any]) -> str:
+    """RULE-M1 for one unfinished op (caller holds the migration lock): ``rolled_forward``,
+    ``unrecoverable``, ``stuck`` or ``busy`` (a lifecycle op whose profile locks are held)."""
+    body = _read_payload(op_id, op)
+    if body is None:
+        if op.get("status") != OP_UNRECOVERABLE:
+            _fence_unrecoverable(op_id, op)
+        return "unrecoverable"
+    if op.get("status") == OP_UNRECOVERABLE:
+        _reinstate_decision(op_id, body)
+        op = read_registry().ops.get(op_id, op)
+    from hermes_cli.auth_codex_profile_ops import LIFECYCLE_KINDS, recover_lifecycle_op
+    if op.get("kind") in LIFECYCLE_KINDS:
+        return recover_lifecycle_op(op_id, op, body)
+    apply_payload(body)
+    commit_op(op_id)
+    return "rolled_forward"
 
 
 def _fence_unrecoverable(op_id: str, op: Dict[str, Any]) -> None:
@@ -367,14 +464,18 @@ def resolve_unrecoverable(op_id: str) -> str:
         if op.get("status") != OP_UNRECOVERABLE:
             raise CodexAuthorityRefused(
                 f"Codex login update {op_id[:8]} is not unrecoverable; `hermes auth migrate` completes it.")
-        body = _read_payload(op_id, op)
-        if body is not None:
-            _reinstate_decision(op_id, body)
-            apply_payload(body)
-            commit_op(op_id)
+        if _read_payload(op_id, op) is not None:
+            outcome = roll_forward_one(op_id, op)
+            if outcome != "rolled_forward":
+                raise CodexAuthorityRefused(
+                    f"Codex login update {op_id[:8]} reads again but could not be completed ({outcome}); "
+                    f"`hermes auth recover --op {op_id[:8]}` shows why.")
             return "rolled-forward"
         data = json.loads(json.dumps(view.data))
         data["ops"] = {k: v for k, v in data["ops"].items() if k != op_id}
+        for entry in data["chains"].values():
+            if (entry.get("lifecycle") or {}).get("op_id") == op_id:
+                entry["lifecycle"] = None  # released: its chains stay FENCED (op-unrecoverable)
         write_registry(data)
         path = _payload_path(op_id)
         try:

@@ -48,7 +48,7 @@ LEGACY_RESCUE_NAME = "auth.codex-rotation-rescue.json"
 SINGLETON = "singleton"
 
 STATE_ACTIVE, STATE_FENCED, STATE_RETIRED = "active", "fenced", "retired"
-OP_RUNNING, OP_UNRECOVERABLE = "running", "unrecoverable"
+OP_RUNNING, OP_UNRECOVERABLE, OP_STUCK = "running", "unrecoverable", "lifecycle-stuck"
 
 
 # ── Errors (design §11) ────────────────────────────────────────────────────────────────────────
@@ -432,11 +432,16 @@ def migration_lock_held() -> bool:
 
 
 def thread_holds_store_lock() -> bool:
-    """True when this thread is inside any auth-store lock (then it may not take the migration
-    lock: RULE-L1 orders the migration lock first)."""
+    """True when this thread is inside any auth-store lock or profile lifecycle lock (then it may not
+    take the migration lock: RULE-L1 orders the migration lock first)."""
     from hermes_cli import auth as auth_mod
     with auth_mod._auth_target_lock_holders_guard:
         holders = list(auth_mod._auth_target_lock_holders.values())
+    if any(getattr(h, "depth", 0) > 0 for h in holders):
+        return True
+    from hermes_cli import auth_codex_lifecycle as lifecycle  # lifecycle locks also follow the migration lock
+    with lifecycle._holders_guard:
+        holders = list(lifecycle._holders.values())
     return any(getattr(h, "depth", 0) > 0 for h in holders)
 
 

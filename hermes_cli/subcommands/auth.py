@@ -94,8 +94,22 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
                         "message or `hermes auth recovery list`)")
     auth_codex.add_argument("--browser", action="store_true", help="Use the browser (PKCE) sign-in flow")
     auth_codex.add_argument("--no-browser", action="store_true", help="Do not auto-open a browser")
-    auth_subparsers.add_parser(
+    auth_codex.add_argument(
+        "--transfer-to", metavar="PROFILE",
+        help="Move this profile's Codex login (or --chain's) to PROFILE ('default' = the root profile); "
+             "a paused login stays paused")
+    auth_migrate = auth_subparsers.add_parser(
         "migrate", help="Create the Codex login registry / finish interrupted Codex login updates")
+    auth_migrate.add_argument(
+        "--rebuild", action="store_true",
+        help="Rebuild a DAMAGED Codex login registry from the stored logins, every one paused until you "
+             "sign in again (the damaged file is kept)")
+    auth_recover = auth_subparsers.add_parser(
+        "recover", help="Finish (or with --abandon cancel) one interrupted Codex login update, e.g. a stuck profile move")
+    auth_recover.add_argument("--op", required=True, help="The update's id or prefix (from the error or `hermes auth recovery list`)")
+    auth_recover.add_argument(
+        "--abandon", action="store_true",
+        help="Cancel a profile move that has not happened yet: every login goes back to the original profile")
     auth_recovery = auth_subparsers.add_parser(
         "recovery", help="Inspect the Codex login registry, or clear ARCHIVED recovery files")
     auth_recovery.add_argument("recovery_action", nargs="?", choices=["list", "clear", "resolve"], default="list")

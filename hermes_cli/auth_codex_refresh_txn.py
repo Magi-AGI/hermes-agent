@@ -37,7 +37,7 @@ from hermes_cli.auth_codex_records import (
     ATTEMPT_INDETERMINATE, ATTEMPT_PENDING, ATTEMPT_REJECTED, completed, history_entry, new_attempt,
     read_record, reconcile, write_record)
 from hermes_cli.auth_codex_registry import (
-    OP_UNRECOVERABLE, STATE_FENCED, STATE_RETIRED, CodexAuthorityBusy, CodexRecoveryFenced, CodexStoreLockBusy,
+    OP_STUCK, OP_UNRECOVERABLE, STATE_FENCED, STATE_RETIRED, CodexAuthorityBusy, CodexRecoveryFenced, CodexStoreLockBusy,
     CodexRefreshIndeterminate, CodexRegistryUnreadable, CodexRotationPersistFailed, NeedsAuthorityRepair,
     RepairRequest, RescueScanIncomplete, new_id, pair_fp, read_registry, store_locks, store_path_of,
     thread_holds_store_lock, unrecorded_legacy_rescues)
@@ -96,6 +96,13 @@ def _unrecoverable_message(op_id: str) -> str:
             "again with `hermes auth codex`.")
 
 
+def _stuck_message(op_id: str, op: dict) -> str:
+    profiles = " -> ".join(op.get("profiles") or ()) or "a profile"
+    return (f"Hermes paused this Codex login because moving the profile ({profiles}) did not finish "
+            f"(op {op_id[:8]}). Close whatever holds the profile open, then run `hermes auth recover --op "
+            f"{op_id[:8]}` to finish the move, or `hermes auth recover --op {op_id[:8]} --abandon` to cancel it.")
+
+
 def _dispatch_once(round_: int) -> None:
     from hermes_cli.auth_codex_authority import REQUEST_DISPATCH_BUDGET_SECONDS, authority_dispatch
     if round_ == 0 and authority_dispatch(budget_seconds=REQUEST_DISPATCH_BUDGET_SECONDS) not in ("busy", "failed"):
@@ -142,11 +149,23 @@ def _transaction(row_store: Path, row: str, started: Tuple[str, str], *, force: 
     row_key = store_key(row_store)
     found = view.chain_for_row(row_key, row)
     if found is None:
+        # A profile move decided but not finished names the store's NEW path: this row is then
+        # reserved, not unregistered.
+        moving = [(op_id, op) for op_id, op in view.ops.items() if row_key in (op.get("stores") or ())]
+        stuck = [(op_id, op) for op_id, op in moving if op.get("status") == OP_STUCK]
+        if stuck:
+            raise CodexRecoveryFenced("lifecycle-stuck", _stuck_message(*stuck[0]), relogin=False)
+        if moving:
+            _dispatch_once(round_)
         raise CodexRecoveryFenced(
             "unregistered", "This Codex credential is not registered with Hermes's login registry yet; "
             "run `hermes auth migrate`, or sign in again.")
     cid, entry = found
     touching = view.ops_touching(cid)
+    stuck = [(op_id, op) for op_id, op in touching if op.get("status") == OP_STUCK]
+    if stuck:
+        # RULE-P3: terminal for automatic dispatch; never retried per request.
+        raise CodexRecoveryFenced("lifecycle-stuck", _stuck_message(*stuck[0]), relogin=False)
     if touching and all(op.get("status") == OP_UNRECOVERABLE for _op_id, op in touching):
         # Kept until its payload reads again (the dispatcher retries it) or it is resolved.
         raise CodexRecoveryFenced("op-unrecoverable", _unrecoverable_message(touching[0][0]))
