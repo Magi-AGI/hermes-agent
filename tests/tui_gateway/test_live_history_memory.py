@@ -49,3 +49,32 @@ def test_live_switch_within_the_limit_still_serves_the_persisted_display(tmp_pat
     finally:
         db.close()
     assert [m["content"][:5] for m in history] == [f"{i:05d}" for i in range(ROWS)]
+
+
+def test_history_surfaces_past_the_resume_limit_never_materialize_the_lineage(tmp_path, monkeypatch):
+    """``session.history`` (the desktop's rewind row-id lookup) and ``/history`` read the whole lineage too
+    (D5 r1, Codex). Past the bound the RPC refuses with 4130 (rewind then resubmits instead of trusting
+    a partial list's unique match), and ``/history`` lists the live session with a note."""
+    import threading
+
+    monkeypatch.setattr(hermes_state, "resolved_max_resume_messages", lambda: 500)
+    db = _seed(tmp_path)
+    monkeypatch.setattr(server, "_db", db)
+    session = {"session_key": "huge", "history": [{"role": "user", "content": "live tail"}],
+               "history_lock": threading.Lock(), "running": False, "agent": None}
+    server._sessions["runtime-huge"] = session
+    try:
+        tracemalloc.start()
+        try:
+            response = server.handle_request(
+                {"id": "1", "method": "session.history", "params": {"session_id": "runtime-huge"}})
+            listing = server._format_live_history_output("runtime-huge", session, "")
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+    finally:
+        server._sessions.pop("runtime-huge", None)
+        db.close()
+    assert response["error"]["code"] == 4130, response
+    assert "too long to list in full" in listing and "live tail" in listing
+    assert peak < ROWS * PAYLOAD / 10, f"peak {peak / 1e6:.1f} MB for a {ROWS * PAYLOAD / 1e6:.0f} MB transcript"

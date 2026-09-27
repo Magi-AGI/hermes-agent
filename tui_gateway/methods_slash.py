@@ -83,26 +83,38 @@ def _format_live_usage_output(sid: str, session: dict, arg: str) -> str:
     return "\n".join(lines + [f"{label:<30}{value}" for label, value in rows])
 
 
-def _live_session_messages(session: dict) -> Optional[list]:
-    """Session-scoped transcript read; None when no db/key or the read fails. Uses
-    ``_session_db`` (not ``_get_db()``): a profile session's rows live in its own
-    profile's state.db, and through the launch handle this read comes back empty."""
+def _live_session_messages(session: dict) -> "tuple[Optional[list], bool]":
+    """Session-scoped transcript read -> ``(messages, too_long)``; messages None when no db/key, the read
+    fails, or the lineage is past cold resume's bound (``too_long``: sessions.max_resume_messages, the
+    09-12 OOM was one 102 MB session read in full). Uses ``_session_db`` (not ``_get_db()``): a profile
+    session's rows live in its own profile's state.db, and through the launch handle this read comes
+    back empty."""
+    from hermes_state import SessionResumeTooLargeError
     with _session_db(session) as db:
         if db is not None and session.get("session_key"):
+            try:
+                if callable(guard := getattr(db, "assert_resume_safe", None)):
+                    guard(session["session_key"])
+            except SessionResumeTooLargeError:
+                return None, True
+            except Exception:  # the guard fails open, as resume's does
+                logger.debug("history size guard failed for %s", session["session_key"], exc_info=True)
             with contextlib.suppress(Exception):
                 return db.get_messages_as_conversation(
-                    session["session_key"], include_ancestors=True, include_row_ids=True)
-    return None
+                    session["session_key"], include_ancestors=True, include_row_ids=True), False
+    return None, False
 
 
 def _format_live_history_output(sid: str, session: dict, arg: str) -> str:
     with session["history_lock"]:
         history = list(session.get("history", []))
-    db_history = _live_session_messages(session)
+    db_history, too_long = _live_session_messages(session)
     messages = _history_to_messages(history if db_history is None else db_history)
     if not messages:
         return "No conversation history yet."
     lines = ["Conversation History", "────────────────────────────────────────"]
+    if too_long:
+        lines.append("(This conversation is too long to list in full; showing the live session only.)")
     for idx, message in enumerate(messages, start=1):
         role = str(message.get("role") or "unknown")
         label = {"user": "You", "assistant": "Hermes"}.get(role, role.title())
@@ -128,7 +140,7 @@ def _format_live_prompt_output(sid: str, session: dict, arg: str) -> str:
 def _format_live_context_output(sid: str, session: dict, arg: str) -> str:
     from collections import Counter
     try:
-        messages = _history_to_messages(_live_session_messages(session) or [])
+        messages = _history_to_messages(_live_session_messages(session)[0] or [])
     except Exception:
         messages = []  # malformed db rows fall back to the live history below
     if not messages:

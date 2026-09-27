@@ -1781,6 +1781,17 @@ def _(rid, params: dict, session: dict) -> dict:
     if session.get("session_key"):
         with _session_db(session) as db:
             if db is not None:
+                # Refused, never truncated, past cold resume's bound (sessions.max_resume_messages): the
+                # full lineage is what the 09-12 OOM materialized, and rewind's durable-row lookup must not
+                # take a partial list's unique match as global (the desktop then resubmits, never cuts).
+                from hermes_state import SessionResumeTooLargeError
+                try:
+                    if callable(guard := getattr(db, "assert_resume_safe", None)):
+                        guard(session["session_key"])
+                except SessionResumeTooLargeError as exc:
+                    return _err(rid, 4130, str(exc))
+                except Exception:  # the guard fails open, as resume's does
+                    logger.debug("session.history size guard failed for %s", session["session_key"], exc_info=True)
                 # include_row_ids: the durable row id is how clients address a persisted turn (reactions,
                 # truncation targets); _history_to_messages forwards it.
                 with contextlib.suppress(Exception):
