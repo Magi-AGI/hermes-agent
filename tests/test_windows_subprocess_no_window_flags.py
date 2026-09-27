@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -57,10 +58,16 @@ def _make_fake_popen(spawns, *, stdout="ok\n", returncode=0):
         def __init__(self, cmd, **kwargs):
             if _is_git_spawn(cmd):
                 spawns.append((cmd, kwargs))
+            self.args = cmd
             self.returncode = returncode
+            # Windows reads the pipes on its own bounded readers instead of communicate().
+            self.stdout, self.stderr = io.StringIO(stdout), io.StringIO("")
 
         def communicate(self, timeout=None):
             return (stdout, "")
+
+        def wait(self, timeout=None):
+            return self.returncode
 
         def kill(self):  # pragma: no cover - never reached on the fast path
             raise AssertionError("kill() must not run when git returns in time")

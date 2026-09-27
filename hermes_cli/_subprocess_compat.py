@@ -8,11 +8,13 @@
 
 from __future__ import annotations
 
+import _thread
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 from typing import Mapping, Sequence
 
 __all__ = [
@@ -289,15 +291,12 @@ def _user_safe_directories(base_env: "Mapping[str, str]") -> list[str]:
     env["GIT_TERMINAL_PROMPT"] = "0"
     values: list[str] = []
     for scope in ("--system", "--global"):
-        try:
-            proc = subprocess.run(
-                ["git", "config", scope, "-z", "--get-all", "safe.directory"],
-                capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=5, stdin=subprocess.DEVNULL, env=env, check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if proc.returncode != 0:
+        # bounded_probe_run, not run(): this read sits in front of every cold bounded_git_probe, so
+        # run()'s unbounded post-timeout communicate() (and a refused reader-thread start escaping
+        # as RuntimeError) would defeat the probe's own bound.
+        proc = bounded_probe_run(["git", "config", scope, "-z", "--get-all", "safe.directory"],
+                                 timeout=5, env=env)
+        if proc is None or proc.returncode != 0:
             continue
         # -z terminates every value with NUL, so the trailing split field is always empty and is
         # not a config entry; interior empty fields are real reset markers and must survive.
@@ -513,6 +512,10 @@ def bounded_probe_run(
     handles, so the pipes never reach EOF and the reader-thread join blocks forever. The wmic /
     ``Get-CimInstance Win32_Process`` gateway scan hit exactly this during ``hermes update`` on slow-WMI
     machines (#87134); the git probes hit it first (#68609 / #66037).
+
+    On Windows the pipes are read by :class:`_PipeReaders`, not ``communicate()``, whose reader
+    ``Thread.start()`` has no bound. *timeout* bounds the wait for the probe itself; a failed
+    probe additionally pays the tree-kill and at most 1 s of draining.
     """
     _popen_kwargs: dict = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {"process_group": 0}
     job = None
@@ -531,21 +534,102 @@ def bounded_probe_run(
         if raise_on_spawn_failure:
             raise
         return None
+    readers = _PipeReaders(proc) if IS_WINDOWS else None
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
+        if readers is None:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        else:
+            stdout, stderr = readers.communicate(timeout)
     except Exception:
-        # Timeout OR any other communicate() failure (torn-down pipe, decode error): tree-kill and
-        # drain bounded — leaving it running would leak the suspended-descendant class this guards.
+        # Timeout OR any other failure (torn-down pipe, decode error, a reader that could not start):
+        # tree-kill and drain bounded — leaving it running would leak the suspended-descendant class
+        # this guards. The drain reuses the same readers; re-entering communicate() would start new ones.
         _close_job(job)
         kill_process_tree(proc)
         try:
-            proc.communicate(timeout=1)
+            if readers is None:
+                proc.communicate(timeout=1)
+            else:
+                readers.drain(1.0)
         except Exception:
             pass
         return None
     # The probe exited on its own; anything it left behind (`&` jobs) goes with the job.
     _close_job(job)
     return subprocess.CompletedProcess(list(argv), proc.returncode, stdout, stderr)
+
+
+class _PipeReaders:
+    """Windows ``communicate()`` for :func:`bounded_probe_run` whose every wait is bounded.
+
+    ``Popen.communicate()`` starts two ``threading.Thread`` readers, and ``Thread.start()`` waits for
+    the new thread with no bound: a reader that dies in bootstrap (a MemoryError under commit
+    exhaustion) strands the caller before the probe timeout applies. Here each pipe gets a raw
+    ``_thread`` reader that reads, closes its pipe (as ``communicate``'s readers do, so the caller
+    never closes a pipe a reader may still hold) and then releases a completion latch. A reader that
+    never runs never releases, and the caller's deadline covers it. POSIX ``communicate()`` uses
+    selectors and starts no threads, so only Windows needs this.
+    """
+
+    def __init__(self, proc: "subprocess.Popen") -> None:
+        self._proc = proc
+        self._readers: list[tuple[object, list]] = []  # (latch, result box), registered before launch
+
+    def communicate(self, timeout: float) -> tuple[str, str]:
+        deadline = time.monotonic() + timeout
+        self._start()
+        if not self._wait(deadline):
+            raise subprocess.TimeoutExpired(self._proc.args, timeout)
+        results = []
+        for _latch, box in self._readers:
+            if isinstance(box[0], BaseException):
+                raise box[0]
+            results.append(box[0])
+        self._proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        return results[0], results[1]
+
+    def drain(self, seconds: float) -> bool:
+        """After the tree-kill: give the same readers and the child one shared *seconds*. True once
+        every reader that started has finished."""
+        deadline = time.monotonic() + seconds
+        if not self._wait(deadline):
+            return False
+        self._proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        return True
+
+    def _start(self) -> None:
+        pipes = [self._proc.stdout, self._proc.stderr]
+        for index, pipe in enumerate(pipes):
+            latch = _thread.allocate_lock()
+            latch.acquire()
+            box: list = []
+            self._readers.append((latch, box))
+            try:
+                _thread.start_new_thread(_read_pipe, (pipe, box, latch))
+            except BaseException:
+                # Nothing will read these pipes: they are ours to close, and this reader is done.
+                latch.release()
+                for unread in pipes[index:]:
+                    unread.close()
+                raise
+
+    def _wait(self, deadline: float) -> bool:
+        for latch, _box in self._readers:
+            if not latch.acquire(timeout=max(0.0, deadline - time.monotonic())):
+                return False
+            latch.release()  # stays observable to a later wait (the post-kill drain)
+        return True
+
+
+def _read_pipe(pipe, box: list, latch) -> None:
+    try:
+        try:
+            box.append(pipe.read())
+        except BaseException as exc:  # decode error, torn-down pipe: the caller re-raises it
+            box.append(exc)
+        pipe.close()
+    finally:
+        latch.release()
 
 
 def _close_job(job) -> None:
@@ -563,7 +647,8 @@ def bounded_git_probe(argv: Sequence[str], *, timeout: float) -> str:
     On Windows ``run()``'s post-timeout cleanup calls an unbounded ``communicate()``; a suspended
     descendant git.exe holding the pipe handles then blocks forever. Here: bounded ``communicate``,
     tree-kill plus a 1s drain, then abandon the pipes; on POSIX the probe gets its own process
-    group so cleanup also takes down credential/remote helpers.
+    group so cleanup also takes down credential/remote helpers. *timeout* covers the probe; a cold
+    :func:`_user_safe_directories` read runs first with its own 5 s allowance per config scope.
 
     Security (GHSA-7x36-8jrh-v4pw): these probes run automatically against whatever directory the
     session sits in, before any tool call or trust prompt, and an index refresh executes the
