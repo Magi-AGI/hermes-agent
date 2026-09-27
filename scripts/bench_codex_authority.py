@@ -307,6 +307,19 @@ def worker_mover(args) -> None:
             counts = json.loads(r.read())["ok"]
         return sum(counts.values()) >= args.n and all(counts.get(c, 0) >= args.per_chain for c in args.chains.split(","))
 
+    if args.stick:  # the first rename's move fails as if a handle held the directory: a stuck op
+        real = profiles._rename_checked_profile
+
+        def failing_once(old_canon, new_canon, old_dir, new_dir, move):
+            profiles._rename_checked_profile = real
+
+            def held():
+                raise PermissionError(13, "held open (bench --stick)")
+            return real(old_canon, new_canon, old_dir, new_dir, lambda fn: move(held))
+        profiles._rename_checked_profile = failing_once
+    # The profile commands print progress lines; the parent reads this pipe only at the end, so a
+    # full pipe would block the mover mid-operation (measured: a delete "stalled" 279 s in a print).
+    real_stdout, sys.stdout = sys.stdout, open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115
     i = 0
     while time.monotonic() < deadline and not done():
         i += 1
@@ -321,13 +334,18 @@ def worker_mover(args) -> None:
             key = type(exc).__name__
             stats["rename_refused"] += 1
             stats["rename_errors"][key] = stats["rename_errors"].get(key, 0) + 1
+            messages = stats.setdefault("rename_error_samples", [])
+            if len(messages) < 5 and str(exc)[:300] not in messages:
+                messages.append(str(exc)[:300])
         if i % 4:
             time.sleep(0.05)
             continue  # a scratch sign-in + delete every 4th round; renames every round
         name = f"scratch{i % 3}"
         t0 = time.perf_counter()
+        steps = {}
         try:
             profiles.create_profile(name, no_alias=True, no_skills=True)
+            steps["create"] = time.perf_counter()
             with urlopen(os.environ["BENCH_TOKEN_URL"] + "/issue?chain=scratch", timeout=5) as r:
                 pair = json.loads(r.read())
             os.environ["HERMES_HOME"] = str(root / "profiles" / name)
@@ -336,13 +354,23 @@ def worker_mover(args) -> None:
                 stats["sign_ins"] += 1
             finally:
                 os.environ["HERMES_HOME"] = str(root)
+            steps["sign_in"] = time.perf_counter()
             profiles.delete_profile(name, yes=True)
+            steps["delete"] = time.perf_counter()
             stats["deletes"] += 1
             stats.setdefault("scratch_cycle_ms", []).append(round((time.perf_counter() - t0) * 1000, 1))
+            if time.perf_counter() - t0 > 5:
+                prev, split = t0, {}
+                for step, at in steps.items():
+                    split[step] = round((at - prev) * 1000, 1)
+                    prev = at
+                stats.setdefault("slow_cycles", []).append(split)
         except Exception as exc:
             key = f"{type(exc).__name__}: {str(exc)[:120]}"
             stats["scratch_errors"][key] = stats["scratch_errors"].get(key, 0) + 1
         time.sleep(0.2)
+    sys.stdout.close()
+    sys.stdout = real_stdout
     print(json.dumps(stats))
 
 
@@ -529,7 +557,8 @@ def run_progress(args) -> int:
     if args.profile_ops:
         mover = subprocess.Popen(
             [sys.executable, str(Path(__file__).resolve()), "worker-mover", "--seconds", str(args.seconds),
-             "--n", str(args.n), "--per-chain", str(args.per_chain), "--chains", ",".join(chains)],
+             "--n", str(args.n), "--per-chain", str(args.per_chain), "--chains", ",".join(chains),
+             *(["--stick"] if args.stick else [])],
             env=sandbox_env(sandbox, root, url), cwd=str(sandbox), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True)
     results = []
@@ -1249,6 +1278,7 @@ def main() -> int:
     p.add_argument("--per-chain", type=int, default=40)
     p.add_argument("--seconds", type=int, default=600)
     p.add_argument("--keep", action="store_true")
+    p.add_argument("--stick", action="store_true", help="with --profile-ops: the first move fails (a stuck op)")
     p.add_argument("--profile-ops", action="store_true",
                    help="stage 2: a mover process renames a Codex profile back and forth and signs scratch "
                         "profiles in / deletes them while every refresh worker runs")
@@ -1289,6 +1319,7 @@ def main() -> int:
     wm.add_argument("--n", type=int)
     wm.add_argument("--per-chain", type=int)
     wm.add_argument("--chains")
+    wm.add_argument("--stick", action="store_true")
     wk = sub.add_parser("worker-kill")
     wk.add_argument("--boundary")
     wk.add_argument("--pair")

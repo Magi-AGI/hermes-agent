@@ -227,7 +227,7 @@ class ProfileRename:
         _update_op(self.op_id, phase=PHASE_MOVING)
         invalidate_path_memo()
         try:
-            fn()
+            _move_with_budget(fn)
         except BaseException as exc:
             invalidate_path_memo()
             if directory_location(self.old_dir, self.new_dir) != "dest":
@@ -239,6 +239,15 @@ class ProfileRename:
         invalidate_path_memo()
         self.moved = True
         _finish_forward(self.op_id, self.body)
+
+
+def _move_with_budget(fn: Callable[[], Any]) -> None:
+    """The directory move. A Windows sharing violation from another process's momentary handle (a
+    lock-free reader of auth.json opens it for microseconds) is retried within the strict writer's
+    contended-rename budget (6 attempts, jittered 20..100 ms); anything else, or contention that
+    outlasts the budget, fails at once and the op becomes lifecycle-stuck (RULE-P2)."""
+    from hermes_cli.auth_credential_io import retry_contended
+    retry_contended(fn)
 
 
 def _finish_forward(op_id: str, body: Dict[str, Any]) -> None:
@@ -332,7 +341,7 @@ def _roll_forward(op_id: str, op: Dict[str, Any], body: Dict[str, Any]) -> str:
         _update_op(op_id, phase=PHASE_MOVING)
         invalidate_path_memo()
         try:
-            os.rename(source, dest)
+            _move_with_budget(lambda: os.rename(source, dest))
         except OSError as exc:
             invalidate_path_memo()
             if directory_location(source, dest) != "dest":

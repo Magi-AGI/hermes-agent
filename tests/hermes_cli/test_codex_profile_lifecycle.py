@@ -248,6 +248,33 @@ def test_rename_of_a_profile_linking_to_root_moves_no_codex_state(codex_home, qu
 
 
 @pytest.mark.windows_only
+def test_a_momentary_sharing_violation_does_not_strand_the_move(codex_home, quiet_profiles, monkeypatch):
+    """Another process reading auth.json lock-free holds it open for microseconds; a directory rename
+    in that instant fails with a sharing violation. Within the contended-rename budget the move is
+    retried; only contention that outlasts it leaves the op stuck (measured under the 24x4 benchmark:
+    a rename raced by readers went lifecycle-stuck)."""
+    root, endpoint = codex_home
+    _work_with_login(root, endpoint)
+    real = profiles._rename_checked_profile
+    attempts = []
+
+    def wrapped(old_canon, new_canon, old_dir, new_dir, move):
+        def contended_once(fn):
+            def rename():
+                attempts.append(1)
+                if len(attempts) == 1:
+                    raise PermissionError(13, "The process cannot access the file", None, 32)
+                return fn()
+            return move(rename)
+        return real(old_canon, new_canon, old_dir, new_dir, contended_once)
+
+    monkeypatch.setattr(profiles, "_rename_checked_profile", wrapped)
+    profiles.rename_profile("work", "play")
+    assert len(attempts) == 2 and not registry(root)["ops"]
+    assert (root / "profiles" / "play").is_dir()
+
+
+@pytest.mark.windows_only
 def test_rename_of_a_junction_profile_moves_no_codex_state(codex_home, quiet_profiles, monkeypatch, tmp_path):
     """The profile directory is a junction to a folder elsewhere: renaming it moves the link, not the
     store, so the store key (its canonical path) and every chain stay exactly as they are."""
