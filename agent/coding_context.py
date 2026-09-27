@@ -475,13 +475,24 @@ def _collect_snapshot_git(root: Path) -> dict[str, Optional[str]]:
             for name in names:
                 publish(name, None)  # no-op for names already published
 
-    for names in _SNAPSHOT_LANES:
+    def start(worker: threading.Thread, names: tuple[str, ...]) -> None:
         try:
-            # The low-level start: threading.Thread.start() waits, without a bound, for the new
-            # thread to signal it started, which never happens if its bootstrap fails (MemoryError
-            # under commit exhaustion). A refused start makes its lane's facts unavailable; the
-            # snapshot is still built and pinned.
-            _thread.start_new_thread(ctx_bound(lane), (names,))
+            worker.start()
+        except (RuntimeError, MemoryError):
+            for name in names:
+                publish(name, None)
+
+    for names in _SNAPSHOT_LANES:
+        # Lanes are real threading.Thread objects: a raw _thread worker gets a permanent
+        # _DummyThread record the first time anything inside it asks threading who it is (Windows
+        # subprocess handling does). Only start() runs on a throwaway raw thread, because it waits
+        # without a bound for a bootstrap that can die under commit exhaustion; the collector
+        # never waits on it. A refused start makes that lane's facts unavailable, and the snapshot
+        # is still built and pinned.
+        try:
+            worker = threading.Thread(target=ctx_bound(lane), args=(names,), daemon=True,
+                                      name=f"workspace-snapshot-git-{names[0]}")
+            _thread.start_new_thread(start, (worker, names))
         except (RuntimeError, MemoryError):
             for name in names:
                 publish(name, None)
