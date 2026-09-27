@@ -18,7 +18,6 @@ import logging
 import os
 import time
 import uuid
-import zlib
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -137,11 +136,17 @@ class TranscriptSpoolIncompleteError(OSError):
     """Some spooled transcript files could not be read, so a search of the spool is incomplete."""
 
 
-def spool_message_timestamp(path: Path, payload: Dict[str, Any]) -> float:
-    """The timestamp an undated spooled message replays with, the same for every reader (live drain,
-    boot recovery, a recall resolving it) and every time: derived from its spool file, never written
-    back to it. A recall matches that copy by it."""
-    return float(payload.get("ts") or 0) + (zlib.crc32(path.name.encode("utf-8")) % 999_983 + 1) * 1e-6
+# Key of a transcript copy that had no timestamp of its own (a recall identifies it by this). A spooled
+# copy without one is keyed by its spool file's name, the same for every reader (live drain, boot
+# recovery, a recall resolving it).
+COPY_KEY = "recall_copy_key"
+
+
+def spooled_copy_key(path: Path, message: Dict[str, Any]) -> Optional[str]:
+    """The key a spooled message replays with; None for a dated copy (identified by its timestamp)."""
+    if message.get(COPY_KEY):
+        return message[COPY_KEY]
+    return path.name if message.get("timestamp") is None else None
 
 
 def spooled_transcript_messages(session_ids) -> list:
@@ -187,7 +192,7 @@ def drain_transcript_spool(session_id: str, replay, *, db_known_failing: bool = 
     except Exception as exc:
         logger.debug("Cannot scan transcript spool: %s", exc)
         return 0, 0
-    entries, payload_of = [], {}
+    entries = []
     for path in candidates:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -205,11 +210,11 @@ def drain_transcript_spool(session_id: str, replay, *, db_known_failing: bool = 
             path.unlink(missing_ok=True)
             continue
         entries.append((payload.get("ts", 0), payload.get("seq", 0), path.name, path, message))
-        payload_of[path] = payload
     ordered, replayed, remaining = sorted(entries, key=lambda e: e[:3]), 0, 0
     for idx, (_ts, _seq, _name, path, message) in enumerate(ordered):
-        if message.get("timestamp") is None:
-            message = {**message, "timestamp": spool_message_timestamp(path, payload_of[path])}
+        copy_key = spooled_copy_key(path, message)
+        if copy_key and not message.get(COPY_KEY):
+            message = {**message, COPY_KEY: copy_key}
         try:
             replay(message)
         except Exception as exc:
@@ -320,8 +325,8 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
         # The platform id too, as live replay writes it: a recall recorded by id must still match.
         session_db.append_message(session_id=spooled_sid, role=message.get("role", "unknown"),
                                   content=message.get("content") or "",
-                                  timestamp=(message["timestamp"] if message.get("timestamp") is not None
-                                             else spool_message_timestamp(path, payload)),
+                                  timestamp=message.get("timestamp") or payload.get("ts"),
+                                  recall_copy_key=spooled_copy_key(path, message),
                                   platform_message_id=(message.get("platform_message_id")
                                                        or message.get("message_id")))
         return True

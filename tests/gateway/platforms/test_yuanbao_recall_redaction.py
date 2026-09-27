@@ -9,6 +9,7 @@ path gets there (the recall itself, a spool drain, boot recovery, the housekeepi
 """
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -814,3 +815,165 @@ CREATE INDEX idx_recalled_messages_session ON recalled_messages(session_id);
 INSERT INTO recalled_messages VALUES ('s', 'p1', 'p1', NULL, NULL, 0, '[redacted]', 1);
 INSERT INTO recalled_messages VALUES ('s', 'p1', NULL, '{SECRET}', NULL, 1, '[redacted]', 1);
 """
+
+
+def _compress(db, parent, child, *, messages=None):
+    db.publish_compression_child(parent_session_id=parent, child_session_id=child, source="yuanbao",
+                                 messages=messages or [{"role": "assistant", "content": "summary"}],
+                                 require_compression_lease=False)
+
+
+def test_a_settled_recall_is_not_reopened_by_a_retry_after_compression(store):
+    """Round 7 (Codex, retry_after_compaction): compression copied the guards but not the settled
+    request, so a retry of the same recall on the continuation opened it afresh and the housekeeping
+    tick redacted a newer, unrelated message with the same text."""
+    from gateway.transcript_recall import settle_open_recalls
+
+    tasks: list = []
+    adapter = _adapter(store, tasks)
+    sid = _session(store, adapter)
+    db = store._db
+    db.append_message(session_id=sid, role="user", content=SECRET, timestamp=1_700_000_100.0)
+    recall = dict(request_id="p1", platform_message_id="p1", content=SECRET, replacement=RecallGuardMiddleware._REDACTED)
+    assert store.recall_message(sid, **recall)[1] == "resolved"
+    _compress(db, sid, "child")
+    db.append_message(session_id="child", role="user", content=SECRET, timestamp=1_700_000_200.0)
+    assert store.recall_message("child", **recall)[1] == "resolved"  # the outcome it already had
+    settle_open_recalls(db)
+    assert _rows(db, "child")[-1][1] == SECRET
+
+
+def test_a_compression_publishing_while_a_recall_is_recorded_leaves_it_on_the_continuation(store):
+    """Round 7 (Codex, open_during_rotation): the lineage was read before the request was written; a
+    continuation published in between got no anchor, and pruning the ended parent then lost the recall
+    while the continuation kept the recalled text."""
+    from gateway.transcript_recall import settle_open_recalls
+    from hermes_state_errors import SessionTurnLeaseLostError
+
+    tasks: list = []
+    adapter = _adapter(store, tasks)
+    sid = _session(store, adapter)
+    db = store._db
+    db.append_message(session_id=sid, role="user", content=SECRET, platform_message_id="p1", timestamp=1_700_000_100.0)
+    original_open = db.open_recall_request
+
+    def compression_publishes_first(lineage, **kw):
+        if not db.get_session("child"):
+            _compress(db, sid, "child", messages=[
+                {"role": "user", "content": SECRET, "platform_message_id": "p1", "timestamp": 1_700_000_100.0}])
+            assert db.acquire_session_turn_lease("child", "live-turn", wait_seconds=0)
+        return original_open(lineage, **kw)
+
+    db.open_recall_request = compression_publishes_first
+    try:
+        with pytest.raises(SessionTurnLeaseLostError):  # the continuation's live turn fences the decision
+            store.recall_message(sid, request_id="p1", platform_message_id="p1", content=SECRET,
+                                 replacement=RecallGuardMiddleware._REDACTED)
+    finally:
+        db.open_recall_request = original_open
+    db.release_session_turn_lease("child", "live-turn")
+    assert db.prune_sessions(older_than_days=None, source="yuanbao", exclude_active_write_guards=True) == 1
+    settle_open_recalls(db)
+    assert _rows(db, "child")[0][1] == RecallGuardMiddleware._REDACTED
+
+
+def test_a_tip_deleted_before_the_decision_leaves_the_surviving_ancestor_recalled(store):
+    """Round 7 (Codex, deleted_tip_race): with the captured tip deleted just before resolution, every
+    anchor of the captured lineage, including the retained parent's, was closed as gone and the parent
+    kept the recalled text."""
+    from gateway.transcript_recall import settle_open_recalls, settle_recall
+
+    tasks: list = []
+    adapter = _adapter(store, tasks)
+    sid = _session(store, adapter)
+    db = store._db
+    db.append_message(session_id=sid, role="user", content=SECRET, platform_message_id="p1", timestamp=1_700_000_100.0)
+    _compress(db, sid, "child")
+    lineage = db.recall_lineage("child")
+    db.open_recall_request(lineage, request_id="p1", platform_message_id="p1", content=SECRET,
+                           replacement=RecallGuardMiddleware._REDACTED)
+    original = db.resolve_recall
+
+    def tip_deleted_first(lineage, **kw):
+        if db.get_session("child"):
+            assert db.delete_session("child")
+        return original(lineage, **kw)
+
+    db.resolve_recall = tip_deleted_first
+    try:
+        settle_recall(db, db.recall_request(lineage, "p1"))
+    finally:
+        db.resolve_recall = original
+    settle_open_recalls(db)
+    assert _rows(db, sid)[0][1] == RecallGuardMiddleware._REDACTED
+
+
+@pytest.mark.parametrize("separation", ["delete-child", "detach-child", "move-child"])
+def test_an_ancestor_left_without_its_continuation_still_completes_the_recall(tmp_path, separation):
+    """Round 7 (Codex, delete_and_detach): after the continuation was deleted, detached or moved away,
+    the retained, compression-ended parent refused every attempt as if it were still rotating, and
+    kept the recalled text with an open request for good."""
+    from gateway.transcript_recall import settle_open_recalls
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    moved = None
+    try:
+        db.create_session("parent", "yuanbao", session_key="agent:alpha:yuanbao:dm:u")
+        db.append_message(session_id="parent", role="user", content=SECRET, platform_message_id="p1",
+                          timestamp=1_700_000_100.0)
+        _compress(db, "parent", "child", messages=[
+            {"role": "user", "content": SECRET, "platform_message_id": "p1", "timestamp": 1_700_000_100.0}])
+        db.open_recall_request(db.recall_lineage("child"), request_id="p1", platform_message_id="p1", content=SECRET,
+                               replacement=RecallGuardMiddleware._REDACTED)
+        if separation == "delete-child":
+            assert db.delete_session("child")
+        elif separation == "detach-child":
+            db._write_sql("UPDATE sessions SET session_key = ? WHERE id = 'child'", ("agent:beta:yuanbao:dm:u",))
+            assert db.sever_crossed_parents(["child"]) == 1
+        else:
+            moved = SessionDB(db_path=tmp_path / "moved.db")
+            moved.import_moved_session(db.export_session_for_move("child"), profile_name="beta")
+            db.delete_moved_session("child")
+        settle_open_recalls(db)
+        assert _rows(db, "parent")[0][1] == RecallGuardMiddleware._REDACTED
+        assert not db.open_recall_requests()
+    finally:
+        db.close()
+        if moved is not None:
+            moved.close()
+
+
+def test_a_later_undated_spool_copy_is_not_taken_for_one_already_recalled(store):
+    """Round 7 (Codex, derived_collision): an undated spooled copy was identified by a timestamp derived
+    from its file name, which two files could share; the first copy's recall then redacted a later,
+    unrelated copy with the same text. Each undated copy is identified by its own key."""
+    import zlib
+
+    from gateway.shutdown_flush import TRANSCRIPT_CAP_DROP_REASON, _get_flush_dir, recover_pending_to_db
+
+    tasks: list = []
+    adapter = _adapter(store, tasks)
+    sid = _session(store, adapter)
+    db = store._db
+    seen, names = {}, None
+    for n in range(200_000):  # two real spool file names the file-derived timestamp could not tell apart
+        name = f"pending-{n:08d}.json"
+        fingerprint = zlib.crc32(name.encode("utf-8")) % 999_983
+        if fingerprint in seen:
+            names = (seen[fingerprint], name)
+            break
+        seen[fingerprint] = name
+    assert names
+
+    def spool(name, seq):
+        (_get_flush_dir() / name).write_text(json.dumps({
+            "session_key": sid, "reason": TRANSCRIPT_CAP_DROP_REASON, "ts": 1_700_000_000, "seq": seq,
+            "data": {"session_id": sid, "message": {"role": "user", "content": SECRET}}}), encoding="utf-8")
+
+    spool(names[0], 1)
+    assert store.recall_message(sid, request_id="r1", content=SECRET,
+                                replacement=RecallGuardMiddleware._REDACTED)[1] == "resolved"
+    recover_pending_to_db(db)
+    spool(names[1], 2)  # a later, distinct message spooled in the same second
+    recover_pending_to_db(db)
+    assert [r[1] for r in _rows(db, sid) if r[0] == "user"] == [RecallGuardMiddleware._REDACTED, SECRET]

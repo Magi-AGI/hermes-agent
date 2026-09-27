@@ -600,8 +600,9 @@ CREATE TABLE IF NOT EXISTS recall_requests (
     PRIMARY KEY (request_id, session_id)
 );
 CREATE INDEX IF NOT EXISTS idx_recall_requests_status ON recall_requests(status);
--- A resolved withdrawal, per session of the conversation: by platform id, or for an id-less message
--- by exact stored content at its timestamp. SessionDB writes every user row through it
+-- A resolved withdrawal, per session of the conversation: by platform id, by the key of the one retry
+-- copy withdrawn (a copy that had no timestamp of its own), or for an id-less message by exact stored
+-- content at its timestamp. SessionDB writes every user row through it
 -- (``_recall_normalized``), so a late flush, retry replay (live or at boot) or another process stores
 -- the replacement.
 CREATE TABLE IF NOT EXISTS recalled_messages (
@@ -610,6 +611,7 @@ CREATE TABLE IF NOT EXISTS recalled_messages (
     platform_message_id TEXT,
     content TEXT,
     timestamp REAL,
+    copy_key TEXT,
     replacement TEXT NOT NULL,
     recalled_at REAL NOT NULL
 );

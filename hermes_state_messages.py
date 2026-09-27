@@ -307,7 +307,7 @@ class SessionMessagesMixin:
         effect_disposition: Optional[str] = None, _compressed_summary: bool = False, timestamp: Any = None,
         api_content: Optional[str] = None, display_kind: Optional[str] = None,
         display_metadata: Optional[Dict[str, Any]] = None, compression_lock_holder: Optional[str] = None,
-        turn_lease_holder: Optional[str] = None, turn_lease_ttl_seconds: float = 300.0) -> int:
+        turn_lease_holder: Optional[str] = None, turn_lease_ttl_seconds: float = 300.0, recall_copy_key: Optional[str] = None) -> int:
         """Append one message; returns the row id and bumps the session counters. ``platform_message_id``:
         the platform's own id. ``api_content``: byte-fidelity sidecar, the exact string sent to the API when
         it differed from ``content``, stored as sent except lone surrogates."""
@@ -321,7 +321,7 @@ class SessionMessagesMixin:
         def _do(conn):
             self._check_transcript_write_guards(conn, session_id, compression_lock_holder,
                 turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds)
-            msg_id = conn.execute(_INSERT_MESSAGE_SQL, self._recall_normalized(conn, params)).lastrowid
+            msg_id = conn.execute(_INSERT_MESSAGE_SQL, self._recall_normalized(conn, params, recall_copy_key)).lastrowid
             self._bump_session_counters(conn, session_id, 1, _tool_calls_count(tool_calls), unit=True)
             return msg_id
         # THE critical write (failure aborts the turn): long patience so a sibling legitimately
@@ -825,24 +825,29 @@ class SessionMessagesMixin:
 
     @staticmethod
     def _recall_replacement(conn, session_id: str, platform_message_id: Any, encoded_content: Any,
-                            timestamp: Any) -> Optional[str]:
-        """The replacement a resolved recall in *session_id* prescribes for this user row, else None."""
+                            timestamp: Any, copy_key: Optional[str] = None) -> Optional[str]:
+        """The replacement a resolved recall in *session_id* prescribes for this user row, else None: by
+        platform id, by the key of the one retry copy withdrawn (``copy_key``), or for an id-less row by
+        exact content at its timestamp."""
         row = conn.execute(
             "SELECT replacement FROM recalled_messages WHERE session_id = ? AND ("
             "(platform_message_id IS NOT NULL AND platform_message_id = ?) OR "
-            "(platform_message_id IS NULL AND ? = '' AND content = ? AND timestamp = ?)) LIMIT 1",
-            (session_id, platform_message_id or "", platform_message_id or "", encoded_content, timestamp)).fetchone()
+            "(copy_key IS NOT NULL AND copy_key = ?) OR "
+            "(platform_message_id IS NULL AND copy_key IS NULL AND ? = '' AND content = ? AND timestamp = ?)) LIMIT 1",
+            (session_id, platform_message_id or "", copy_key or "", platform_message_id or "", encoded_content,
+             timestamp)).fetchone()
         return None if row is None else row[0]
 
-    def _recall_normalized(self, conn, params: tuple) -> tuple:
+    def _recall_normalized(self, conn, params: tuple, copy_key: Optional[str] = None) -> tuple:
         """*params* for ``_INSERT_MESSAGE_SQL`` with a withdrawn user message stored as its replacement.
         Every writer goes through here: a turn's late flush, retry-queue and spool replay, boot recovery,
-        another process, so a resolved recall can never be written back."""
+        another process, so a resolved recall can never be written back. *copy_key*: the retry copy this
+        write replays (``gateway.transcript_recall.COPY_KEY``), when it had no timestamp of its own."""
         if params[self._P_ROLE] != "user":
             return params
         replacement = self._recall_replacement(
             conn, params[self._P_SESSION], params[self._P_PLATFORM_ID], params[self._P_CONTENT],
-            params[self._P_TIMESTAMP])
+            params[self._P_TIMESTAMP], copy_key)
         if replacement is None:
             return params
         normalized = list(params)
@@ -860,17 +865,38 @@ class SessionMessagesMixin:
         tip = self.get_compression_tip(session_id) or session_id
         return list(reversed(self.get_compression_lineage(tip))) or [tip]
 
+    def _check_recall_lineage(self, conn, ids: Sequence[str]) -> List[str]:
+        """Inside a write txn: *ids* (a lineage, tip first, read before the txn) must still be current.
+        A compression that published a continuation of the tip since raises
+        ``CompressionSessionClosedError`` (the caller re-reads the lineage and retries). Returns the ids
+        whose session no longer exists (deleted meanwhile): the caller re-reads, or, when none survives,
+        settles those anchors as gone."""
+        from hermes_state_compression import _CHAIN_STEP_SQL
+        from hermes_state_errors import CompressionSessionClosedError
+        present = {row[0] for row in conn.execute(
+            f"SELECT id FROM sessions WHERE id IN ({','.join('?' * len(ids))})", tuple(ids))}
+        if ids[0] in present and conn.execute(_CHAIN_STEP_SQL, (ids[0],)).fetchone() is not None:
+            raise CompressionSessionClosedError(ids[0])
+        return [sid for sid in ids if sid not in present]
+
     def open_recall_request(self, lineage: Sequence[str], *, request_id: str, platform_message_id: Optional[str],
                             content: Any, replacement: str, note: Optional[str] = None) -> None:
         """Durably record a recall to resolve (idempotent per request): from here on the conversation's
         matching retry copies are held from replay until it settles, and every resolver (the live recall,
         a held replay, boot recovery, the housekeeping tick) can finish it. Anchored on every session of
-        *lineage* (and inherited by later compression children), so pruning an ancestor never detaches
-        it from the part of the conversation that survives."""
+        *lineage* (and inherited by later compression children, with its outcome once settled), so pruning
+        an ancestor never detaches it from the part of the conversation that survives; a request already
+        settled in this conversation is never reopened by a retry. Raises ``CompressionSessionClosedError``
+        when *lineage* went stale before the write (the caller re-reads it)."""
         ids = [sid for sid in dict.fromkeys(lineage) if sid]
+        marks = ",".join("?" * len(ids))
         encoded = None if content is None else self._encode_content(content)
 
         def _do(conn):
+            self._check_recall_lineage(conn, ids)
+            if conn.execute(f"SELECT 1 FROM recall_requests WHERE request_id = ? AND session_id IN ({marks}) "
+                            "AND status != 'open' LIMIT 1", (request_id, *ids)).fetchone():
+                return
             now = time.time()
             for sid in ids:
                 conn.execute(
@@ -881,6 +907,7 @@ class SessionMessagesMixin:
         self._execute_write(_do)
 
     def recall_request(self, lineage: Sequence[str], request_id: str) -> Optional[Dict[str, Any]]:
+        """This conversation's request *request_id*: its settled anchor if any (the outcome), else open."""
         ids = [sid for sid in dict.fromkeys(lineage) if sid]
         with self._read_ctx() as conn:
             row = conn.execute(f"SELECT * FROM recall_requests WHERE request_id = ? AND session_id IN "
@@ -934,30 +961,34 @@ class SessionMessagesMixin:
 
         After the admission fence (refused while a live turn lease or a compression holds the tip, or
         the tip just rotated; the caller retries), identity is resolved from the rows as they are now plus
-        *retry_copies* (``(platform id, text matches, timestamp, own)`` of every copy waiting in the retry
-        queue and spool: the caller must have read all of them): the recalled platform id if any copy
+        *retry_copies* (``(platform id, text matches, timestamp, copy key)`` of every copy waiting in the
+        retry queue and spool: the caller must have read all of them): the recalled platform id if any copy
         carries it; otherwise the id-less copies with the recalled text must be one logical message (one
-        timestamp; protected-tail clones share it; an ``own`` copy, one that had no timestamp of its own,
-        is always a message by itself). Outcomes, each settling the request atomically:
+        timestamp; protected-tail clones share it; a keyed copy, one that had no timestamp of its own, is
+        always a message by itself, identified by its key). Outcomes, each settling the request atomically:
         ``resolved`` (guards recorded for every session of the lineage, including an id guard before its
         row exists; stored copies overwritten; later writes normalized), ``none`` (nothing matched: the id
         guard only), ``ambiguous`` (several messages carry the text: none is rewritten, the id guard is
         kept and the request's note is written to the conversation instead). Returns ``(rows overwritten,
-        outcome, identity)``, identity ``("id", platform id)`` or ``("text", timestamp)`` when resolved;
-        an already settled request returns ``(0, its status, None)``."""
+        outcome, identity)``, identity ``("id", platform id)``, ``("copy", key)`` or ``("text", timestamp)``
+        when resolved; an already settled request returns ``(0, its status, None)``. A *lineage* gone stale
+        (a continuation published, or a session deleted, since it was read) is refused before any decision:
+        ``CompressionSessionClosedError`` for a rotation, outcome ``stale`` for a deletion (re-read, retry);
+        when none of its sessions survives, its anchors settle as ``gone``. A compression-ended tip with no
+        continuation left (its child deleted, detached or moved away) is final and is settled like any tip."""
         ids = [sid for sid in dict.fromkeys(lineage) if sid]
         marks = ",".join("?" * len(ids))
 
-        def _guard(conn, request, pid, text, stamp):
+        def _guard(conn, request, pid, text, stamp, copy_key=None):
             now = time.time()
             for sid in ids:
                 if not conn.execute(
                         "SELECT 1 FROM recalled_messages WHERE session_id = ? AND platform_message_id IS ? "
-                        "AND content IS ? AND timestamp IS ?", (sid, pid, text, stamp)).fetchone():
+                        "AND content IS ? AND timestamp IS ? AND copy_key IS ?", (sid, pid, text, stamp, copy_key)).fetchone():
                     conn.execute(
                         "INSERT INTO recalled_messages (session_id, request_id, platform_message_id, content, "
-                        "timestamp, replacement, recalled_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (sid, request["request_id"], pid, text, stamp, request["replacement"], now))
+                        "timestamp, copy_key, replacement, recalled_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (sid, request["request_id"], pid, text, stamp, copy_key, request["replacement"], now))
 
         def _settle(conn, request, status):
             conn.execute(f"UPDATE recall_requests SET status = ?, settled_at = ? WHERE request_id = ? "
@@ -965,16 +996,19 @@ class SessionMessagesMixin:
 
         def _do(conn):
             request = conn.execute(f"SELECT * FROM recall_requests WHERE request_id = ? AND session_id IN ({marks}) "
-                                   "ORDER BY status = 'open' DESC LIMIT 1", (request_id, *ids)).fetchone()
+                                   "ORDER BY status = 'open' LIMIT 1", (request_id, *ids)).fetchone()
             if request is None or request["status"] != "open":
                 return 0, (request["status"] if request is not None else "none"), None
-            if conn.execute("SELECT 1 FROM sessions WHERE id = ?", (ids[0],)).fetchone() is None:
-                # This anchor's conversation is gone (deleted, not merely pruned above a survivor): the
-                # surviving part, if any, holds its own anchor.
+            missing = self._check_recall_lineage(conn, ids)
+            if missing:
+                if len(missing) < len(ids):
+                    return 0, "stale", None
                 _settle(conn, dict(request), "gone")
                 return 0, "gone", None
+            # The tip has no continuation (checked above), so a compression-ended tip is final, not rotating.
             self._check_transcript_write_guards(
-                conn, ids[0], None, reject_active_turn_lease=True, reject_active_compression_lock=True)
+                conn, ids[0], None, reject_active_turn_lease=True, reject_active_compression_lock=True,
+                allow_closed_compression_parent=True)
             request = dict(request)
             pid, content = request["platform_message_id"], request["content"]
             if pid:
@@ -982,7 +1016,7 @@ class SessionMessagesMixin:
             by_id = bool(pid) and (
                 conn.execute(f"SELECT 1 FROM messages WHERE session_id IN ({marks}) AND role = 'user' "
                              "AND platform_message_id = ? LIMIT 1", (*ids, pid)).fetchone() is not None
-                or any(copy_pid == pid for copy_pid, _t, _s, _o in retry_copies))
+                or any(copy_pid == pid for copy_pid, _t, _s, _k in retry_copies))
             if by_id:
                 changed = conn.execute(
                     f"UPDATE messages SET content = ?, api_content = NULL WHERE session_id IN ({marks}) "
@@ -991,26 +1025,34 @@ class SessionMessagesMixin:
                 return changed, "resolved", ("id", pid)
             variants = self._recall_content_variants(content) if content else []
             stamps: set = set()
-            own: list = []
+            keys: set = set()
             if variants:
                 stamps = {row[0] for row in conn.execute(
                     f"SELECT DISTINCT timestamp FROM messages WHERE session_id IN ({marks}) AND role = 'user' "
                     "AND COALESCE(platform_message_id, '') = '' "
                     f"AND content IN ({','.join('?' * len(variants))})", (*ids, *variants))}
-                for copy_pid, text_matches, ts, is_own in retry_copies:
+                for copy_pid, text_matches, ts, copy_key in retry_copies:
                     if not copy_pid and text_matches:
-                        (own.append if is_own or ts is None else stamps.add)(ts)
-            if not stamps and not own:
+                        if copy_key:
+                            keys.add(copy_key)
+                        else:
+                            stamps.add(ts)
+            if not stamps and not keys:
                 _settle(conn, request, "none")
                 return 0, "none", None
-            if len(stamps) + len(own) > 1 or (own and own[0] is None):
+            if len(stamps) + len(keys) > 1:
                 if request["note"]:
                     conn.execute(_INSERT_MESSAGE_SQL, self._message_row_params(
                         ids[0], "system", {"content": request["note"]}, None, time.time(), keep_reasoning=True))
                     self._bump_session_counters(conn, ids[0], 1, 0, unit=True)
                 _settle(conn, request, "ambiguous")
                 return 0, "ambiguous", None
-            (stamp,) = stamps or own
+            if keys:
+                (key,) = keys
+                _guard(conn, request, None, None, None, key)
+                _settle(conn, request, "resolved")
+                return 0, "resolved", ("copy", key)
+            (stamp,) = stamps
             for variant in variants:
                 _guard(conn, request, None, variant, stamp)
             changed = conn.execute(

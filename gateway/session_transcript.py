@@ -9,6 +9,7 @@ import logging
 import threading
 import time
 from agent.turn_context import extract_api_content_sidecar
+from gateway.shutdown_flush import COPY_KEY
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
@@ -416,6 +417,7 @@ class SessionTranscriptMixin:
             # #82888). DB-only; stripped from provider-bound payloads.
             display_kind=message.get("display_kind"),
             display_metadata=message.get("display_metadata"),
+            recall_copy_key=message.get(COPY_KEY),
         )
 
     @staticmethod
@@ -554,10 +556,17 @@ class SessionTranscriptMixin:
         db = self._db_for_session_id(session_id)
         if not db:
             return 0, "none"
+        from hermes_state_errors import CompressionSessionClosedError
         with self._get_transcript_drain_lock():
-            lineage = db.recall_lineage(self._follow_reroutes(session_id))
-            db.open_recall_request(lineage, request_id=request_id, platform_message_id=platform_message_id,
-                                   content=content, replacement=replacement, note=note)
+            for attempt in range(5):  # a compression publishing meanwhile: re-read the lineage
+                lineage = db.recall_lineage(self._follow_reroutes(session_id))
+                try:
+                    db.open_recall_request(lineage, request_id=request_id, platform_message_id=platform_message_id,
+                                           content=content, replacement=replacement, note=note)
+                    break
+                except CompressionSessionClosedError:
+                    if attempt == 4:
+                        raise
             request = db.recall_request(lineage, request_id)
             if request["status"] != "open":  # settled by an earlier attempt or another resolver
                 return 0, request["status"]
