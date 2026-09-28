@@ -116,6 +116,11 @@ Under the migration lock (the lock every ownership change of the new build takes
    registry, or (without `--other-homes-checked`) a registry that was damaged or removed after use,
    REFUSES: a damaged registry cannot prove it knows every home outside `profiles/`.
 3. Runs the normal dispatcher pass. An op still unfinished afterwards REFUSES (nothing removed).
+   With no registry yet (the new build never ran here) but Codex material present, that pass's
+   bootstrap migration first registers every Codex row by its token material across ALL homes:
+   identical pairs anywhere are one login, owned by the default profile when it holds a copy;
+   ambiguous rows are paused (and so removed below). The keep rules then apply exactly as for a
+   governed install; `--check` refuses to certify such an install until it has been prepared.
 4. Settles every active login through the real refresh transaction **with the network disabled**
    (never forced; the token endpoint is replaced by a pre-send failure).
 5. Keeps a Codex row only if it is an owner row of an ACTIVE login holding exactly the pair its
@@ -138,8 +143,8 @@ Under the migration lock (the lock every ownership change of the new build takes
 Other providers' credentials, and every non-Codex part of each `auth.json`, are never changed. Every
 write is one of the new build's own protocol writes (dispatcher, refresh transaction, ownership op,
 strict writer), so a crash leaves a state the new build recovers by itself, and running the
-preparation again completes it. With no registry and no trace of the new build at all, nothing is
-changed (the old build's own state, as it left it).
+preparation again completes it. Only an install with no Codex material at all needs no
+registration (profiles still get Codex OFF).
 
 ## Rolling forward again
 
@@ -181,11 +186,13 @@ and `tests/hermes_cli/test_codex_rollback_review_edges.py` hold the in-process t
 | f | roll forward after the old build rotated once: nothing sent, login paused `unexpected-token` |
 | g | (reported) the old build alone: its own borrow path replays |
 | h | multi-profile workload (Codex-OFF borrowers, a same-account profile login, a copy, another account) cycled 18 steps across homes and both paths: no replay; both kept logins keep refreshing |
+| i | no registry and no trace of the new build, a singleton + `manual:device_code` alias of one pair in the default home and a copy in a profile: `--check` refuses; the preparation registers by token material; the old build cycled on both paths: no replay |
 
-Measured on the commit that adds this text, against a checkout of `1b8cc8c1b5` (full matrix, 353 s):
-zero failures. Controls b0, c0: one replay each without the preparation. a, b, c, d, f, h: zero
+Measured on the commit that adds this text, against a checkout of `1b8cc8c1b5` (full matrix, 387 s):
+zero failures. Controls b0, c0: one replay each without the preparation. a, b, c, d, f, h, i: zero
 replays (h: 11 successful refreshes across the default profile and the other-account profile; every
-Codex-OFF profile answered `codex_auth_missing` and sent nothing). e: all 12 crash points reached
+Codex-OFF profile answered `codex_auth_missing` and sent nothing; i: `--check` refused before the
+preparation, then 5 successful refreshes from the default home). e: all 12 crash points reached
 (exit 137), no receipt left, zero replays after the re-run. Reported, the old build started DIRECTLY
 on a crashed state (rule 2 forbids it): 8 replays (crash before the settle), 3–4 (after the settle,
 before the removals / Codex-OFF switch finished), 0 (crash after all of them). g: the old build
