@@ -289,16 +289,23 @@ class TestDrainWatcher:
         runner._drain_control_watcher = GatewayRunner._drain_control_watcher.__get__(
             runner, GatewayRunner
         )
-        # Drive a few ticks manually rather than spinning the loop.
+        async def settles(expected):
+            # Wait on the state, not on a tick count: each tick reads the marker on a worker
+            # thread and persists the active-agent aggregate, so three 20 ms ticks in a fixed
+            # 60 ms (15.6 ms timer granularity on Windows) was not enough under load.
+            deadline = asyncio.get_running_loop().time() + 10
+            while runner._external_drain_active is not expected:
+                if asyncio.get_running_loop().time() > deadline:
+                    return False
+                await asyncio.sleep(0.01)
+            return True
+
         dc.write_drain_request()
         task = asyncio.create_task(runner._drain_control_watcher(interval=0.02))
-        await asyncio.sleep(0.06)
-        assert runner._external_drain_active is True
+        assert await settles(True), "the watcher never entered drain on the marker"
         dc.clear_drain_request()
-        await asyncio.sleep(0.06)
-        assert runner._external_drain_active is False
+        assert await settles(False), "the watcher never left drain once the marker was cleared"
         runner._running = False
-        await asyncio.sleep(0.04)
         task.cancel()
         try:
             await task
