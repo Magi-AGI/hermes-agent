@@ -20,10 +20,7 @@ def server():
     # tests/tui_gateway/test_protocol.py for the rationale).
     with patch.dict(
         "sys.modules",
-        {
-            "hermes_constants": MagicMock(
-                get_hermes_home=MagicMock(return_value="/tmp/hermes_test_moa_emit")
-            ),
+        {  # hermes_constants stays real: see tests/tui_gateway/test_protocol.py::server
             "hermes_cli.env_loader": MagicMock(),
             "hermes_cli.banner": MagicMock(),
             "hermes_state": MagicMock(),

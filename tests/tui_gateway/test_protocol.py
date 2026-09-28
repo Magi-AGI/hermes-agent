@@ -36,8 +36,11 @@ def server():
     # from sys.modules and a test's own ``from tui_gateway import server_requests`` would get a fresh,
     # unbound copy whose default sinks drop frames and treat every client as answerable.
     import tui_gateway.server_requests  # noqa: F401
+    # hermes_constants stays real: the suite already points HERMES_HOME at a per-test temp dir, and a
+    # mocked module leaks into every module first imported here — one bound get_process_hermes_home
+    # and later opened a real state.db under MagicMock's __fspath__ ("MagicMock/mock.…/<id>") in the
+    # working directory.
     with patch.dict("sys.modules", {
-        "hermes_constants": MagicMock(get_hermes_home=MagicMock(return_value="/tmp/hermes_test")),
         "hermes_cli.env_loader": MagicMock(),
         "hermes_cli.banner": MagicMock(),
         "hermes_state": MagicMock(),
