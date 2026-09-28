@@ -117,6 +117,10 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
     auth_rollback.add_argument(
         "--check", action="store_true",
         help="Only check (read-only) whether this install is ready to roll back")
+    auth_rollback.add_argument(
+        "--other-homes-checked", action="store_true",
+        help="After a damaged or removed Codex login registry: confirm you removed the Codex login from every "
+             "other Hermes home under this root (a HERMES_HOME outside profiles/ is found only via the registry)")
     auth_recovery = auth_subparsers.add_parser(
         "recovery", help="Inspect the Codex login registry, or clear ARCHIVED recovery files")
     auth_recovery.add_argument("recovery_action", nargs="?", choices=["list", "clear", "resolve"], default="list")

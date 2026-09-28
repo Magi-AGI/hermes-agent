@@ -4,8 +4,10 @@ An older build reads and refreshes every Codex row directly and ignores fences, 
 retired-token index, so a backup or the rows as the new build leaves them can hand it a consumed
 pair. The preparation leaves exactly the owner rows of ACTIVE chains holding their recorded current
 pair; everything else goes through the removal op (retired, indexed), non-Codex providers untouched.
-The old build's own behaviour on the prepared state is proven with real processes by
-``scripts/codex_rollback_scenarios.py`` (``test_codex_rollback_scenarios.py``). Fake credentials only.
+The Codex CLI rule, the per-home "Codex off" state, alias trimming, strict inventory and the
+damaged-registry refusals are in ``test_codex_rollback_review_edges.py``; the old build's own
+behaviour on the prepared state is proven with real processes by ``scripts/codex_rollback_scenarios.py``
+(``tests/scripts/test_codex_rollback_*.py``). Fake credentials only.
 """
 
 import json
@@ -173,54 +175,6 @@ def test_an_unfinished_op_refuses_and_changes_nothing(codex_home, monkeypatch):
     assert not (root / "auth.rollback-receipt.json").exists()
 
 
-def test_a_codex_cli_login_hermes_already_used_blocks_the_receipt(codex_home, tmp_path):
-    root, endpoint = codex_home
-    r0 = endpoint.issue()
-    write_store(root, singleton=r0)
-    auth.resolve_codex_runtime_credentials(force_refresh=True)  # r0 consumed by Hermes
-    cli = tmp_path / "no-codex-cli"
-    cli.mkdir()
-    (cli / "auth.json").write_text(json.dumps({"tokens": {"access_token": r0[0], "refresh_token": r0[1]}}),
-                                   encoding="utf-8")
-
-    result, _report = _prepare()
-
-    assert result.codex_cli["status"] == "known" and not result.safe
-    assert not (root / "auth.rollback-receipt.json").exists()
-    fresh = endpoint.issue()  # the user signs the Codex CLI in again
-    (cli / "auth.json").write_text(json.dumps({"tokens": {"access_token": fresh[0], "refresh_token": fresh[1]}}),
-                                   encoding="utf-8")
-    result, _report = _prepare()
-    assert result.safe and result.codex_cli["status"] == "unknown"
-
-
-def test_profiles_left_to_borrow_roots_login_are_reported(codex_home, monkeypatch):
-    """The old build makes a profile without its own Codex login borrow root's, and its borrow path
-    leaves root holding a consumed pair; the preparation cannot change the old build, so it names
-    every such profile."""
-    from hermes_cli.auth_codex_authority import sign_in
-
-    root, endpoint = codex_home
-    write_store(root, singleton=endpoint.issue())
-    work = make_profile(root, "work")
-    make_profile(root, "notes")  # never had a Codex login: it borrows under the old build too
-    auth.resolve_codex_runtime_credentials(force_refresh=True)
-    monkeypatch.setenv("HERMES_HOME", str(work))
-    sign_in(*endpoint.issue())
-    endpoint.mode = "lost"
-    with pytest.raises(auth.AuthError):
-        auth.resolve_codex_runtime_credentials(force_refresh=True)  # work's own login: fenced
-    endpoint.mode = "ok"
-    monkeypatch.setenv("HERMES_HOME", str(root))
-
-    result, _report = _prepare()
-
-    assert result.safe
-    assert not _codex_material(work / "auth.json")
-    assert result.borrowers == ["notes", "work"]
-    assert read_json(root / "auth.rollback-receipt.json")["profiles_that_would_borrow_root"] == ["notes", "work"]
-
-
 def test_no_registry_and_no_protocol_traces_means_nothing_to_prepare(codex_home):
     root, endpoint = codex_home
     write_store(root, singleton=endpoint.issue())  # never touched by the new build
@@ -231,23 +185,6 @@ def test_no_registry_and_no_protocol_traces_means_nothing_to_prepare(codex_home)
     assert result.safe and not report["removed"]
     assert (root / "auth.json").read_bytes() == before
     assert not (root / "auth.chains.json").exists(), "the preparation must not bootstrap the registry"
-
-
-def test_an_unreadable_registry_removes_every_codex_row_and_keeps_other_providers(codex_home):
-    root, endpoint = codex_home
-    write_store(root, singleton=endpoint.issue())
-    auth.resolve_codex_runtime_credentials(force_refresh=True)
-    store = read_json(root / "auth.json")
-    store["providers"].update(OTHER)
-    (root / "auth.json").write_text(json.dumps(store), encoding="utf-8")
-    (root / "auth.chains.json").write_text("{ damaged", encoding="utf-8")
-
-    result, report = _prepare()
-
-    assert result.safe and report["removed"]
-    assert not _codex_material(root / "auth.json")
-    assert read_json(root / "auth.json")["providers"]["nous"] == OTHER["nous"]
-    assert list(root.glob("auth.chains.json.corrupt.*")), "the damaged registry is kept"
 
 
 def test_check_is_read_only_and_tracks_the_preparation(codex_home):

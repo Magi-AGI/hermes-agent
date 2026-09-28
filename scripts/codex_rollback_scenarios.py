@@ -22,6 +22,8 @@ Scenarios (the endpoint ledger must show ZERO replays in every asserted step):
      build started directly on the crashed state
   f  roll forward: the old build rotates once, then the new build starts -> no replay; what is fenced
   g  REPORTED baseline, old build only (no new build involved): two stores using one root login
+  h  the multi-profile workload after the preparation (borrowers, a same-account profile login, a copy,
+     another account): refreshes from different homes back to back, both paths — zero replays
 """
 
 from __future__ import annotations
@@ -42,7 +44,7 @@ from bench_codex_authority import (  # noqa: E402
 
 ME = str(Path(__file__).resolve())
 CRASH_POINTS = ["start", "settle", "settle-adopted", "remove", "op-payload", "op-decision", "op-apply",
-                "op-commit", "between-ops", "final", "receipt"]
+                "op-commit", "between-ops", "fixes", "final", "receipt"]
 
 
 # ── worker side (runs under ONE tree: PYTHONPATH decides new or old) ──────────────────────────────
@@ -111,7 +113,7 @@ def _install_prepare_crash(point: str) -> None:
     from hermes_cli import auth_codex_authority as authority
     from hermes_cli import auth_codex_rollback as rb
     simple = {"start": (authority, "dispatch_locked"), "settle": (rb, "_settle_active_chains"),
-              "remove": (rb, "_remove_rows"), "final": (rb, "_final_assessment"),
+              "remove": (rb, "_remove_rows"), "fixes": (rb, "_apply_fixes"), "final": (rb, "_final_assessment"),
               "receipt": (rb, "_write_receipt")}
     if point in simple:
         module, name = simple[point]
@@ -182,7 +184,8 @@ def _prepare(arg):
         return {"outcome": "refused", "code": exc.code, "message": str(exc)[:600]}
     return {"outcome": "safe" if result.safe else "not-safe", "removed": len(report["removed"]),
             "fenced_while_settling": report["fenced_while_settling"], "cli": result.codex_cli.get("status"),
-            "kept": [(Path(v.store).parent.name, v.row) for v in result.kept], "borrowers": result.borrowers}
+            "kept": [(Path(v.store).parent.name, v.row) for v in result.kept],
+            "codex_off": [Path(k).parent.name for k in result.codex_off], "refusal": result.refusal}
 
 
 def worker(args) -> None:
@@ -372,15 +375,12 @@ def scenario_c(sb: Sandbox, ck: Checks) -> dict:
     prep = sb.run("new", "prepare")
     ck.that(prep["outcome"] == "safe", f"c: prepare {prep}")
     ck.that(not sb.codex_material("work"), "c: the retired copy is still in work")
-    old_work = sb.run("old", "old-refresh", profile="work")
+    for name, op in (("work", "refresh"), ("", "refresh"), ("work", "pool"), ("", "pool"), ("work", "refresh"),
+                     ("", "refresh")):
+        sb.run("old", f"old-{op}", profile=name)
     ck.that(sb.presented_tokens().count(pair[1]) == 1, "c: the old build presented the retired (consumed) pair")
     _no_replay(sb, ck, "c")
-    # REPORTED, not asserted: work now has no Codex login of its own, so the old build BORROWS root's
-    # (scenario g: its singleton path writes the rotated pair into work and leaves root's consumed).
-    old_root = sb.run("old", "old-refresh")
-    return {"prepare": prep, "old_work": old_work.get("outcome"),
-            "reported_old_root_after_work_borrowed": old_root.get("outcome"),
-            "reported_replays_from_the_old_borrow_path": sb.replays()}
+    return {"prepare": prep}
 
 
 def scenario_d(sb: Sandbox, ck: Checks) -> dict:
@@ -421,12 +421,10 @@ def _mixed_state(sb: Sandbox) -> None:
 
 
 def _old_round(sb: Sandbox) -> list:
-    """The old build once per path: root singleton, root pool, then the work profile. work is last:
-    with its own (fenced) login removed it BORROWS root's, and the old build's borrow path leaves
-    root holding a consumed pair (scenario g) — a later root refresh would replay without any
-    help from the new build."""
-    return [sb.run("old", "old-refresh")["outcome"], sb.run("old", "old-pool")["outcome"],
-            sb.run("old", "old-refresh", profile="work")["outcome"]]
+    """The old build across the homes, refreshes from different homes back to back, both paths."""
+    steps = [("", "refresh"), ("work", "refresh"), ("side", "refresh"), ("", "refresh"), ("", "pool"),
+             ("work", "pool"), ("side", "pool"), ("", "refresh")]
+    return [sb.run("old", f"old-{op}", profile=name)["outcome"] for name, op in steps]
 
 
 def _crash_case(make_sandbox, ck: Checks, point: str) -> dict:
@@ -459,6 +457,32 @@ def _crash_case(make_sandbox, ck: Checks, point: str) -> dict:
     finally:
         direct.close()
     return entry
+
+
+def scenario_h(sb: Sandbox, ck: Checks) -> dict:
+    """The multi-profile workload (review ruling): root's login; work signed in with the SAME account;
+    side a copy of root's; notes none; other ANOTHER account. Refreshes from different homes back to
+    back, both paths, repeatedly."""
+    a0 = sb.ledger.issue("A")
+    write_store(sb.root, singleton=a0)
+    for name in ("work", "side", "notes", "other"):
+        make_profile(sb.root, name)
+    write_store(sb.home("side"), singleton=a0)
+    sb.run("new", "new-dispatch")
+    sb.run("new", "new-refresh")
+    sb.run("new", "new-sign-in", sb.ledger.issue("A"), profile="work")
+    sb.run("new", "new-sign-in", sb.ledger.issue("B"), profile="other")
+    prep = sb.run("new", "prepare")
+    ck.that(prep["outcome"] == "safe", f"h: prepare {prep}")
+    steps = [("notes", "refresh"), ("", "refresh"), ("work", "refresh"), ("side", "refresh"), ("", "pool"),
+             ("other", "refresh"), ("notes", "pool"), ("", "refresh"), ("other", "pool"), ("work", "pool"),
+             ("side", "pool"), ("", "refresh"), ("notes", "refresh"), ("other", "refresh"), ("", "pool"),
+             ("work", "refresh"), ("", "refresh"), ("other", "pool")]
+    outcomes = [(name or "root", op, sb.run("old", f"old-{op}", profile=name).get("outcome")) for name, op in steps]
+    _no_replay(sb, ck, "h")
+    ok = {p[2] for p in sb.ledger.presented if p[3] == "ok"}
+    ck.that({"A", "B"} <= ok, "h: root's and the other account's logins must keep working under the old build")
+    return {"prepare": prep, "old_steps": outcomes}
 
 
 def scenario_e(make_sandbox, ck: Checks, points) -> dict:
@@ -496,14 +520,14 @@ def scenario_g(sb: Sandbox, ck: Checks) -> dict:
 
 
 SCENARIOS = {"a": scenario_a, "b0": scenario_b0, "b": scenario_b, "c0": scenario_c0, "c": scenario_c,
-             "d": scenario_d, "f": scenario_f, "g": scenario_g}
+             "d": scenario_d, "f": scenario_f, "g": scenario_g, "h": scenario_h}
 
 
 def run(args) -> int:
     old_tree = Path(args.old_tree).resolve()
     if not (old_tree / "hermes_cli" / "auth.py").is_file():
         raise SystemExit(f"--old-tree {old_tree} is not a Hermes checkout")
-    only = [s for s in (args.only or "b0,c0,a,b,c,d,e,f,g").split(",") if s]
+    only = [s for s in (args.only or "b0,c0,a,b,c,d,e,f,g,h").split(",") if s]
     points = [p for p in (args.crash_points or ",".join(CRASH_POINTS)).split(",") if p]
     ck = Checks()
     report = {"old_tree": str(old_tree), "new_tree": str(REPO)}
