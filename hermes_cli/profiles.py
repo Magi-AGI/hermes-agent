@@ -10,6 +10,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -407,17 +408,30 @@ def create_wrapper_script(name: str, target: Optional[str] = None) -> Optional[P
         print(f"⚠ Could not create {wrapper_dir}: {e}")
         return None
     wrapper_path = _wrapper_path(canon)
+    if sys.platform == "win32":
+        content = f"@echo off\r\nhermes -p {profile} %*\r\n"
+    else:
+        hermes_exe = shutil.which("hermes") or "hermes"
+        content = f'#!/bin/sh\nexec {shlex.quote(hermes_exe)} -p {profile} "$@"\n'
+    # Published by one replace from an exclusively created temp file: never a partial wrapper, and
+    # never a write THROUGH whatever the destination name is (a link) into another file.
+    tmp_name = None
     try:
-        if sys.platform == "win32":
-            wrapper_path.write_text(f"@echo off\r\nhermes -p {profile} %*\r\n", encoding="utf-8")
-        else:
-            hermes_exe = shutil.which("hermes") or "hermes"
-            wrapper_path.write_text(f'#!/bin/sh\nexec {shlex.quote(hermes_exe)} -p {profile} "$@"\n', encoding="utf-8")
-            wrapper_path.chmod(wrapper_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{wrapper_path.name}.", suffix=".tmp", dir=str(wrapper_dir))
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(content)
+        if sys.platform != "win32":
+            os.chmod(tmp_name, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+        os.replace(tmp_name, wrapper_path)
+        tmp_name = None
         return wrapper_path
     except OSError as e:
         print(f"⚠ Could not create wrapper at {wrapper_path}: {e}")
         return None
+    finally:
+        if tmp_name is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_name)
 
 
 def remove_wrapper_script(name: str) -> bool:
@@ -2326,16 +2340,23 @@ def finalize_profile_rename(old_canon: str, new_canon: str, old_dir: Path, new_d
             failed.append(f"the old command alias could not be removed ({', '.join(map(str, left))})")
     except _Uninspectable as exc:
         failed.append(f"the old command alias could not be inspected: {exc}")
-    collision = check_alias_collision(new_canon)
-    unreadable_own = None
-    if collision:  # the lenient check calls an unreadable wrapper at our own path a collision
-        try:
-            _wrapper_is_ours_strict(_wrapper_path(new_canon))
-        except _Uninspectable as exc:
-            unreadable_own = exc
-    if unreadable_own is not None:
-        failed.append(f"the command alias '{new_canon}' could not be inspected: {unreadable_own}")
-    elif collision:
+    # The new alias: the EXACT destination is inspected first, whatever PATH says (a wrapper
+    # directory off PATH makes the PATH lookup report nothing): missing -> create; a Hermes wrapper
+    # -> update; someone else's file -> preserved, an accepted and reported collision; a file that
+    # cannot be read -> the step fails (left untouched, retried by recovery). The PATH lookup
+    # remains an additional advisory (reserved names, another command shadowing the alias).
+    destination = _wrapper_path(new_canon)
+    uninspectable = None
+    try:
+        exists = os.path.lexists(destination)
+        ours = _wrapper_is_ours_strict(destination) if exists else False
+    except _Uninspectable as exc:
+        exists, ours, uninspectable = True, False, exc
+    if uninspectable is not None:
+        failed.append(f"the command alias '{new_canon}' could not be inspected: {uninspectable}")
+    elif exists and not ours:
+        print(f"⚠ Cannot create alias '{new_canon}' — {destination} already exists and is not a Hermes alias")
+    elif collision := check_alias_collision(new_canon):
         print(f"⚠ Cannot create alias '{new_canon}' — {collision}")
     else:
         # The helper's contract: the path once written, None when it could not be (reported by it).

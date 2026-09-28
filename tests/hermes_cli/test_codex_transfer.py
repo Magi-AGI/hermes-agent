@@ -9,7 +9,6 @@ and never a row in two chains. Fake credentials only.
 
 import pytest
 
-import hermes_cli.auth as auth
 from hermes_cli import auth_codex_ops as ops
 from hermes_cli.auth_codex_profile_ops import transfer_chain
 from hermes_cli.auth_constants import AuthError

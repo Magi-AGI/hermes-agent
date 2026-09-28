@@ -31,6 +31,10 @@ from tests.hermes_cli.test_codex_profile_lifecycle import (  # noqa: F401
     _dispatch, _failing_move, _key, _only_chain, _refresh_in, _work_with_login, quiet_profiles)
 
 
+REAL_CREATE_WRAPPER = profiles.create_wrapper_script  # captured before any fixture stubs them
+REAL_REMOVE_WRAPPER = profiles.remove_wrapper_script
+
+
 class Killed(SystemExit):
     pass
 
@@ -303,3 +307,49 @@ def test_resolve_reports_a_completed_abandonment(codex_home, quiet_profiles, mon
     out = capsys.readouterr().out
     assert "cancelled as recorded" in out and "recover --op" not in out
     _assert_abandoned(root, work, cid, epoch)
+
+
+# ── round 4: the new alias's EXACT destination decides, whatever PATH reports ─────────────────
+
+@pytest.mark.parametrize("state", ["missing", "ours", "unrelated", "unreadable"])
+def test_new_alias_destination_decides_off_path(codex_home, quiet_profiles, monkeypatch, capsys, state):
+    """PATH reports nothing (the wrapper directory is off PATH): missing -> created; a Hermes
+    wrapper -> updated; someone else's file -> preserved, collision reported, rename completes; a
+    file that cannot be read -> preserved, the rename stays pending, recovery completes it."""
+    root, endpoint = codex_home
+    _work_with_login(root, endpoint)
+    monkeypatch.setattr(profiles, "create_wrapper_script", REAL_CREATE_WRAPPER)
+    monkeypatch.setattr(profiles, "remove_wrapper_script", REAL_REMOVE_WRAPPER)
+    monkeypatch.setattr(profiles, "check_alias_collision", lambda name: None)  # off PATH: no lookup hit
+    target = profiles._wrapper_path("play")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    unrelated = b"@echo off\r\necho someone else's play command\r\n"
+    if state in ("unrelated", "unreadable"):
+        target.write_bytes(unrelated)
+    elif state == "ours":
+        assert REAL_CREATE_WRAPPER("play", target="work") == target
+    read_text = Path.read_text
+
+    def read_with_fault(path, *args, **kwargs):
+        if path == target and state == "unreadable":
+            raise PermissionError(13, "unreadable destination")
+        return read_text(path, *args, **kwargs)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(Path, "read_text", read_with_fault)
+        if state == "unreadable":
+            with pytest.raises(ValueError, match="could not be inspected"):
+                profiles.rename_profile("work", "play")
+        else:
+            profiles.rename_profile("work", "play")
+    ops = registry(root)["ops"]
+    if state == "unreadable":
+        assert target.read_bytes() == unrelated and ops
+        (op_id,) = ops
+        assert pops.recover_op(op_id) == "rolled_forward"  # readable now: someone else's -> preserved
+        assert target.read_bytes() == unrelated and not registry(root)["ops"]
+    elif state == "unrelated":
+        assert target.read_bytes() == unrelated and not ops
+        assert "already exists and is not a Hermes alias" in capsys.readouterr().out
+    else:
+        assert not ops and "hermes -p play" in target.read_text(encoding="utf-8")

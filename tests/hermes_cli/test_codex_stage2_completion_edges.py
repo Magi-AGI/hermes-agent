@@ -77,16 +77,18 @@ def test_wrapper_io_failure_keeps_rename_pending(codex_home, quiet_profiles, mon
     monkeypatch.setattr(profiles, 'create_wrapper_script', REAL_CREATE_WRAPPER)
     monkeypatch.setattr(profiles, 'check_alias_collision', lambda _: None)
     target = profiles._wrapper_path('play')
-    real_write = Path.write_text
+    import os
+    real_replace = os.replace
     attempted = []
 
-    def failing_write(path, *args, **kwargs):
-        if path == target:
-            attempted.append(str(path))
+    # The wrapper is published by temp file + os.replace (round 4); the fault sits at that write.
+    def failing_replace(src, dst, *args, **kwargs):
+        if Path(dst) == target:
+            attempted.append(str(dst))
             raise PermissionError(13, 'review: wrapper inaccessible')
-        return real_write(path, *args, **kwargs)
+        return real_replace(src, dst, *args, **kwargs)
 
-    monkeypatch.setattr(Path, 'write_text', failing_write)
+    monkeypatch.setattr(os, 'replace', failing_replace)
     error = None
     try:
         profiles.rename_profile('work', 'play')
