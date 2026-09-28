@@ -175,6 +175,40 @@ def test_a_profile_login_of_another_account_is_kept(codex_home, monkeypatch):
     assert ("singleton", other[1]) in _codex_rows(work / "auth.json")
 
 
+def test_without_a_registry_logins_are_identified_by_their_tokens(codex_home):
+    """F8 round 2: no registry and no trace of the new build is NOT "nothing to prepare" when
+    Codex material exists — a singleton plus a manual alias of the same pair (and a copy in a
+    profile) are one login. --check refuses to certify it; the preparation registers the rows by
+    their token material, then applies the same keep rules (one refreshable row per login in one
+    home, aliases removed, Codex OFF elsewhere), recording every removed pair first."""
+    from hermes_cli.auth_codex_rollback import check_rollback
+    root, endpoint = codex_home
+    pair = endpoint.issue()
+    write_store(root, singleton=pair, pool=[pool_row("manual", pair, source="manual:device_code")])
+    work = make_profile(root, "work")
+    write_store(work, singleton=pair)
+    assert not (root / "auth.chains.json").exists()
+    assert not check_rollback().safe
+
+    result, report = _prepare()
+
+    assert result.safe
+    sources = [src for src, _rt in _codex_rows(root / "auth.json")]
+    assert sources.count("singleton") == 1 and "manual:device_code" not in sources
+    assert not _codex_rows(work / "auth.json")
+    assert read_json(work / "auth.json")["providers"]["openai-codex"] == {}
+    assert check_rollback().safe
+
+
+def test_without_a_registry_or_any_codex_material_nothing_is_registered(codex_home):
+    root, _endpoint = codex_home
+    (root / "auth.json").write_text(json.dumps({"version": 1, "providers": {"nous": {"access_token": "n"}}}),
+                                    encoding="utf-8")
+    result, _report = _prepare()
+    assert result.safe and not (root / "auth.chains.json").exists()
+    assert read_json(root / "auth.json")["providers"]["nous"] == {"access_token": "n"}
+
+
 def test_an_importable_codex_cli_login_blocks_the_receipt(codex_home, tmp_path):
     """The older build imports the Codex CLI file into ANY store whose login is missing,
     token-less or rejected; several stores importing one pair replay it (review blocker 3)."""

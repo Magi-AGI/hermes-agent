@@ -93,6 +93,36 @@ def test_aliases_the_old_pool_cannot_sync_are_not_kept(sb):
     assert len(ok) >= 6, "the kept login must keep refreshing under the old build"
 
 
+def test_ungoverned_default_home_cannot_be_certified_with_replaying_aliases(sb):
+    """F8 round 2: NO registry and no trace of the new build, the default home holds a singleton
+    and a ``manual:device_code`` alias of the same pair. Neither ``--check`` nor the preparation may
+    certify that as it is; after the preparation, Codex used from the default home only (the
+    runbook's most restrictive mode) never replays."""
+    pair = sb.ledger.issue("A")
+    write_store(sb.root, singleton=pair, pool=[pool_row("manual", pair, source="manual:device_code")])
+    assert not (sb.root / "auth.chains.json").exists()
+    assert sb.run("new", "check").get("outcome") != "safe", "--check certified unregistered duplicate rows"
+    prepared = sb.run("new", "prepare")
+    assert prepared.get("outcome") == "safe", prepared
+    for op in ("old-pool", "old-refresh", "old-pool", "old-pool", "old-refresh"):
+        sb.run("old", op)
+    assert sb.replays() == 0, _detail(sb)
+
+
+def test_ungoverned_copies_across_homes_are_one_login(sb):
+    """No registry: the same pair in the default home and in a profile is ONE login (identified by
+    its token material), kept once."""
+    pair = sb.ledger.issue("A")
+    write_store(sb.root, singleton=pair)
+    write_store(make_profile(sb.root, "work"), singleton=pair)
+    prepared = sb.run("new", "prepare")
+    assert prepared.get("outcome") == "safe", prepared
+    for name, op in (("work", "refresh"), ("", "refresh"), ("work", "pool"), ("", "pool"), ("", "refresh")):
+        sb.run("old", f"old-{op}", profile=name)
+    assert sb.replays() == 0, _detail(sb)
+    assert any(p[3] == "ok" for p in sb.ledger.presented), "the default home's login keeps working"
+
+
 def test_multi_profile_workload_never_replays(sb):
     """root's login; work signed in with the SAME account (the old build merges it into root, then
     borrows); side holds a copy of root's login; notes never had one; other signed in with ANOTHER

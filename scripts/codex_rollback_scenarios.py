@@ -216,6 +216,11 @@ def worker(args) -> None:
         out = {"outcome": resolve_unrecoverable(arg)}
     elif op == "prepare":
         out = _prepare(arg)
+    elif op == "check":
+        from hermes_cli.auth_codex_rollback import check_rollback
+        result = check_rollback()
+        out = {"outcome": "safe" if result.safe else "not-safe", "refusal": result.refusal,
+               "to_remove": [(v.row, v.verdict) for v in result.to_remove]}
     else:
         raise SystemExit(f"unknown op {op}")
     print(json.dumps(out, default=str))
