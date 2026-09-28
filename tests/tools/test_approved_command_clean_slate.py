@@ -18,6 +18,7 @@ during a retry backoff) must still SIGINT the command (exit 130); non-approved
 commands keep current interrupt behavior.
 """
 import json
+import shlex
 import threading
 import time
 
@@ -44,6 +45,13 @@ def _isolate(tmp_path, monkeypatch):
     yield
     with _lock:
         _interrupted_threads.clear()
+
+
+def _sh_path(path):
+    """*path* as one shell word the terminal's shell resolves to the same file. A bare Windows
+    path is mangled by bash (backslashes are escapes), so ``touch`` created a junk file named
+    after the whole path in the working directory and the sentinel never appeared."""
+    return shlex.quote(path.as_posix())
 
 
 def _wait_for_sentinel(sentinel, timeout=10.0):
@@ -94,7 +102,7 @@ def test_approved_command_genuine_interrupt_after_start_still_kills(tmp_path):
 
     def worker():
         holder["result"] = tt.terminal_tool(
-            command=f"touch {sentinel}; sleep 5; echo DONE", force=True
+            command=f"touch {_sh_path(sentinel)}; sleep 5; echo DONE", force=True
         )
 
     t = threading.Thread(target=worker, daemon=True)
@@ -125,7 +133,7 @@ def test_approved_note_enriched_not_misleading_on_interrupt(monkeypatch, tmp_pat
     holder = {}
 
     def worker():
-        holder["result"] = tt.terminal_tool(command=f"touch {sentinel}; sleep 5; echo DONE")
+        holder["result"] = tt.terminal_tool(command=f"touch {_sh_path(sentinel)}; sleep 5; echo DONE")
 
     t = threading.Thread(target=worker, daemon=True)
     t.start()
