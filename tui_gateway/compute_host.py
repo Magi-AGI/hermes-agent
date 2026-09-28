@@ -390,11 +390,11 @@ class ComputeHost:
         profile_home = str(frame.get("profile_home") or "")
         if frame.get("durable_history"):
             # The session ran in a previous host, so the parent's copy is stale: continue from the store.
-            durable = server._load_durable_truncation_history(
+            durable, why_not = server._load_host_session_history(
                 {"session_key": key, "profile_home": profile_home or None})
             if durable is None:
-                raise RuntimeError("the transcript could not be reloaded from the session store after "
-                                   "the isolated worker restarted; not continuing from a stale copy")
+                raise RuntimeError(f"{why_not or 'the transcript could not be reloaded from the session store'} "
+                                   "after the isolated worker restarted; not continuing from a stale copy")
             history = durable
         session_db = home_token = secret_token = None
         owns_db = False

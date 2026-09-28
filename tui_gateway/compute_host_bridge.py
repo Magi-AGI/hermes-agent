@@ -354,10 +354,10 @@ def _adopt_host_session_inline(rid: str, session: dict, reason: str) -> dict | N
         # (_deferred_build_agent_kwargs), so this turn waits for the host instead.
         return _err(rid, 5019, f"{reason}. This conversation can only continue in the isolated worker; "
                                "send the message again once it restarts.")
-    history = _load_durable_truncation_history(session)
+    history, why_not = _load_host_session_history(session)
     if history is None:
-        return _err(rid, 5019, f"{reason}. Its transcript could not be reloaded to continue in the main "
-                               "process; send the message again shortly.")
+        return _err(rid, 5019, f"{reason}. {why_not or 'Its transcript could not be reloaded'} to continue in "
+                               "the main process; send the message again shortly.")
     with session["history_lock"]:
         if session.get("_compute_host_turn_id") or str(session.get("session_key") or "") != key:
             return _host_turn_busy(rid)  # a host turn started, or rotated the id, while the store was read
@@ -367,6 +367,24 @@ def _adopt_host_session_inline(rid: str, session: dict, reason: str) -> dict | N
         session["history_version"] = int(session.get("history_version", 0)) + 1
         session["_compute_host_active"] = False
     return None
+
+
+def _load_host_session_history(session: dict) -> tuple[list | None, str]:
+    """``(history, "")`` or ``(None, why)``: the store's tip transcript of a session whose live copy was in a
+    compute host, under cold resume's bound (``sessions.max_resume_messages``, tip only). Loading it whole
+    past that bound is the 09-12 OOM shape every other runtime read was bounded against."""
+    from hermes_state import SessionResumeTooLargeError
+    if key := str(session.get("session_key") or ""):
+        try:
+            with _session_db(session) as db:
+                if db is not None and callable(guard := getattr(db, "assert_resume_safe", None)):
+                    guard(key, tip_only=True)
+        except SessionResumeTooLargeError as exc:
+            return None, f"Its transcript is too large to load ({exc})"
+        except Exception:  # the guard fails open, as resume's does
+            logger.debug("host session size check failed for %s", key, exc_info=True)
+    history = _load_durable_truncation_history(session)
+    return (history, "") if history is not None else (None, "")
 
 
 def _host_turn_busy(rid) -> dict:
@@ -381,9 +399,9 @@ def _host_owned_history(rid, session: dict) -> tuple[list | None, dict | None]:
     be read. ``(None, None)`` for an in-process session: its own history is current."""
     if not session.get("_compute_host_active"):
         return None, None
-    history = _load_durable_truncation_history(session)
+    history, why_not = _load_host_session_history(session)
     if history is None:
-        return None, _err(rid, 5019, "This conversation's transcript could not be read; try again shortly.")
+        return None, _err(rid, 5019, (why_not or "The transcript could not be read") + "; try again shortly.")
     return history, None
 
 

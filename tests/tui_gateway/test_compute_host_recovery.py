@@ -1240,3 +1240,32 @@ def test_a_host_busy_interrupt_never_lands_on_the_in_process_turn_after_it(tmp_p
         if (thread := session.get("_run_thread")) is not None:
             thread.join(10)
         parent.clear_interrupt()
+
+
+def test_a_host_sessions_transcript_is_read_under_the_resume_bound(tmp_path, monkeypatch):
+    """Continuing a host-owned session in this process (isolation off), answering /btw over it, and a
+    replacement host's rebuild each loaded its whole stored transcript -- the 09-12 OOM shape that every
+    other runtime read is bounded against by sessions.max_resume_messages. Past it they refuse, unread."""
+    import hermes_state
+
+    key, sid = "big-key", "big"
+    db, session = _live_host_session(tmp_path, monkeypatch, key, sid)
+    for role, text in (("user", "one"), ("assistant", "first"), ("user", "two"), ("assistant", "second")):
+        db.append_message(key, role, text)
+    session.update(running=False, _compute_host_active=True, agent=types.SimpleNamespace(session_id=key))
+    monkeypatch.setattr(hermes_state, "resolved_max_resume_messages", lambda: 2)
+    loads: list = []
+    real_load = server._load_durable_truncation_history
+    monkeypatch.setattr(server, "_load_durable_truncation_history",
+                        lambda *a, **k: loads.append(a) or real_load(*a, **k))
+
+    refusal = server._adopt_host_session_inline("adopt", session, "Turn isolation is off")
+    assert refusal["error"]["code"] == 5019 and "too large" in refusal["error"]["message"]
+    history, refusal = server._host_owned_history("btw", session)
+    assert history is None and refusal["error"]["code"] == 5019
+    with pytest.raises(RuntimeError, match="too large"):
+        ComputeHost(stdout=io.StringIO(), heartbeat_secs=0)._build_server_session(
+            server, {"session_key": key, "durable_history": True}, sid)
+    assert loads == [] and session["_compute_host_active"] is True
+    monkeypatch.setattr(hermes_state, "resolved_max_resume_messages", lambda: 4)  # at the bound: read
+    assert [m["content"] for m in server._host_owned_history("btw", session)[0]] == ["one", "first", "two", "second"]
