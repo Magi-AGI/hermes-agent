@@ -175,16 +175,18 @@ def test_an_unfinished_op_refuses_and_changes_nothing(codex_home, monkeypatch):
     assert not (root / "auth.rollback-receipt.json").exists()
 
 
-def test_no_registry_and_no_protocol_traces_means_nothing_to_prepare(codex_home):
+def test_no_registry_a_single_login_is_registered_and_kept_as_it_is(codex_home):
+    """Never governed by the new build: the login is registered by its token material first (the
+    bootstrap migration), then kept — its pair unchanged, nothing sent."""
     root, endpoint = codex_home
-    write_store(root, singleton=endpoint.issue())  # never touched by the new build
-    before = (root / "auth.json").read_bytes()
+    pair = endpoint.issue()
+    write_store(root, singleton=pair)
 
     result, report = _prepare()
 
-    assert result.safe and not report["removed"]
-    assert (root / "auth.json").read_bytes() == before
-    assert not (root / "auth.chains.json").exists(), "the preparation must not bootstrap the registry"
+    assert result.safe and not report["removed"] and not endpoint.calls
+    assert read_json(root / "auth.json")["providers"]["openai-codex"]["tokens"]["refresh_token"] == pair[1]
+    assert (root / "auth.chains.json").exists()
 
 
 def test_check_is_read_only_and_tracks_the_preparation(codex_home):

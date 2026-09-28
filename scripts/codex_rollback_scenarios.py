@@ -24,6 +24,8 @@ Scenarios (the endpoint ledger must show ZERO replays in every asserted step):
   g  REPORTED baseline, old build only (no new build involved): two stores using one root login
   h  the multi-profile workload after the preparation (borrowers, a same-account profile login, a copy,
      another account): refreshes from different homes back to back, both paths — zero replays
+  i  no registry and no trace of the new build, duplicate rows of one login: --check refuses, the
+     preparation registers the rows by token material, the old build never replays
 """
 
 from __future__ import annotations
@@ -490,6 +492,26 @@ def scenario_h(sb: Sandbox, ck: Checks) -> dict:
     return {"prepare": prep, "old_steps": outcomes}
 
 
+def scenario_i(sb: Sandbox, ck: Checks) -> dict:
+    """No registry, no trace of the new build: a singleton plus a manual alias of one pair in the
+    default home and a copy in a profile. --check refuses; the preparation registers the rows by
+    their token material, then the default home is cycled (both paths) — zero replays."""
+    pair = sb.ledger.issue("I")
+    alias = {"id": "manual", "label": "manual", "auth_type": "oauth", "priority": 0, "source": "manual:device_code",
+             "access_token": pair[0], "refresh_token": pair[1], "base_url": "https://chatgpt.com/backend-api/codex"}
+    write_store(sb.root, singleton=pair, pool=[alias])
+    write_store(make_profile(sb.root, "work"), singleton=pair)
+    check = sb.run("new", "check")
+    ck.that(check.get("outcome") != "safe", f"i: --check certified unregistered rows {check}")
+    prep = sb.run("new", "prepare")
+    ck.that(prep["outcome"] == "safe", f"i: prepare {prep}")
+    steps = [("", "pool"), ("", "refresh"), ("work", "refresh"), ("", "pool"), ("", "pool"), ("work", "pool"),
+             ("", "refresh")]
+    outcomes = [(name or "root", op, sb.run("old", f"old-{op}", profile=name).get("outcome")) for name, op in steps]
+    _no_replay(sb, ck, "i")
+    return {"check": check.get("outcome"), "prepare": prep, "old_steps": outcomes}
+
+
 def scenario_e(make_sandbox, ck: Checks, points) -> dict:
     return {point: _crash_case(make_sandbox, ck, point) for point in points}
 
@@ -525,14 +547,14 @@ def scenario_g(sb: Sandbox, ck: Checks) -> dict:
 
 
 SCENARIOS = {"a": scenario_a, "b0": scenario_b0, "b": scenario_b, "c0": scenario_c0, "c": scenario_c,
-             "d": scenario_d, "f": scenario_f, "g": scenario_g, "h": scenario_h}
+             "d": scenario_d, "f": scenario_f, "g": scenario_g, "h": scenario_h, "i": scenario_i}
 
 
 def run(args) -> int:
     old_tree = Path(args.old_tree).resolve()
     if not (old_tree / "hermes_cli" / "auth.py").is_file():
         raise SystemExit(f"--old-tree {old_tree} is not a Hermes checkout")
-    only = [s for s in (args.only or "b0,c0,a,b,c,d,e,f,g,h").split(",") if s]
+    only = [s for s in (args.only or "b0,c0,a,b,c,d,e,f,g,h,i").split(",") if s]
     points = [p for p in (args.crash_points or ",".join(CRASH_POINTS)).split(",") if p]
     ck = Checks()
     report = {"old_tree": str(old_tree), "new_tree": str(REPO)}

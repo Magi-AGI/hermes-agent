@@ -25,7 +25,7 @@ def test_no_consumed_codex_token_reaches_the_old_build(tmp_path):
     out = tmp_path / "report.json"
     proc = subprocess.run(
         [sys.executable, str(REPO / "scripts" / "codex_rollback_scenarios.py"), "--old-tree", OLD_TREE,
-         "--only", "b0,c0,a,b,c,d,e,f,h", "--crash-points", "settle-adopted,op-apply,between-ops,fixes,receipt",
+         "--only", "b0,c0,a,b,c,d,e,f,h,i", "--crash-points", "settle-adopted,op-apply,between-ops,fixes,receipt",
          "--out", str(out)],
         cwd=str(tmp_path), capture_output=True, text=True, timeout=1200)
     assert out.exists(), proc.stdout[-3000:] + proc.stderr[-3000:]

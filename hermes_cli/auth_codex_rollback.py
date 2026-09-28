@@ -10,7 +10,10 @@ lock:
 2. takes a STRICT inventory of every home (a denied listing, an unreadable or unparseable
    ``auth.json`` refuses); an unreadable registry refuses; a registry that was damaged or removed
    after use needs ``--other-homes-checked``;
-3. runs the ordinary dispatcher pass and REFUSES while an ownership op is unfinished;
+3. runs the ordinary dispatcher pass and REFUSES while an ownership op is unfinished; with no
+   registry yet but Codex material present, that pass's bootstrap migration registers every row
+   by its token material across all homes first (identical pairs are one login, ambiguous rows are
+   paused), so the same keep rules apply;
 4. settles every active chain through the real refresh transaction with the network disabled;
 5. records the token hashes of every row it will remove in the retired-token index, then removes
    them as ownership ops (a login losing every row is retired like ``hermes auth remove``; a
@@ -36,8 +39,8 @@ from hermes_cli.auth_codex_registry import (
     PROVIDER, SINGLETON, STATE_ACTIVE, CodexAuthorityRefused, RegistryView, all_store_paths, migration_lock,
     pair_fp, read_registry, root_home, store_locks, store_path_of, thread_holds_store_lock, token_sha, utc_now)
 from hermes_cli.auth_codex_rollback_plan import (
-    CODEX_OFF_SOURCE, Assessment, InventoryIncomplete, assess, codex_cli_verdict, codex_off_row, home_paths,
-    load_homes, row_material)
+    CODEX_OFF_SOURCE, UNREGISTERED_NO_REGISTRY, Assessment, InventoryIncomplete, assess, codex_cli_verdict,
+    codex_off_row, home_paths, load_homes, row_material)
 from hermes_cli.auth_credential_io import (
     encode_json, path_memo, require_committed, store_key, unlink_retrying, write_credential_file)
 
@@ -238,7 +241,6 @@ def _final_assessment(*, other_homes_checked: bool) -> Assessment:
 
 def _write_receipt(result: Assessment, report: Dict[str, Any]) -> Path:
     body = {"version": RECEIPT_VERSION, "prepared_at": utc_now(), "registry": result.registry,
-            "untouched": result.untouched,
             "kept": [{"store": v.store, "row": v.row, "chain_id": v.chain_id} for v in result.kept],
             "removed": report["removed"], "fixed": report["fixed"],
             "fenced_while_settling": report["fenced_while_settling"],
@@ -276,23 +278,29 @@ def prepare_rollback(*, other_homes_checked: bool = False) -> Tuple[Assessment, 
             first = _assessment(other_homes_checked=other_homes_checked)
         if first.refusal:
             raise InventoryIncomplete(first.refusal)
-        if not first.untouched:
-            if read_registry().ok:
-                from hermes_cli.auth_codex_authority import dispatch_locked
-                with path_memo():
-                    report["dispatch"] = dispatch_locked()
-                view = read_registry()
-                if view.ops:
-                    raise CodexAuthorityRefused(_blocking_message(list(view.ops.items())))
-                if any(e.get("lifecycle") for e in view.chains.values()):
-                    raise CodexAuthorityRefused("A Codex login is excluded by a profile move that has no op; "
-                                                "run `hermes auth migrate`.")
-                with path_memo():
-                    _settle_active_chains(report)
+        if first.registry == "ok" or any(v.verdict == UNREGISTERED_NO_REGISTRY for v in first.rows):
+            # With no registry yet, the dispatcher's bootstrap migration registers every Codex row by
+            # its token material across all homes (one login per identical pair; ambiguous rows are
+            # paused, so they are removed below): the same keep rules then apply as anywhere.
+            from hermes_cli.auth_codex_authority import dispatch_locked
             with path_memo():
-                _remove_rows(report, other_homes_checked=other_homes_checked)
+                report["dispatch"] = dispatch_locked()
+            view = read_registry()
+            if not view.ok:
+                raise CodexAuthorityRefused(
+                    "Hermes could not register the Codex logins here, so it can't tell which rows are one login "
+                    f"({view.status}); run `hermes auth migrate`, then run this again.")
+            if view.ops:
+                raise CodexAuthorityRefused(_blocking_message(list(view.ops.items())))
+            if any(e.get("lifecycle") for e in view.chains.values()):
+                raise CodexAuthorityRefused("A Codex login is excluded by a profile move that has no op; "
+                                            "run `hermes auth migrate`.")
             with path_memo():
-                _apply_fixes(report, other_homes_checked=other_homes_checked)
+                _settle_active_chains(report)
+        with path_memo():
+            _remove_rows(report, other_homes_checked=other_homes_checked)
+        with path_memo():
+            _apply_fixes(report, other_homes_checked=other_homes_checked)
         with path_memo():
             final = _final_assessment(other_homes_checked=other_homes_checked)
         if final.safe:
@@ -314,8 +322,6 @@ _CLI_TEXT = {
 
 def _describe(result: Assessment, *, done: bool) -> List[str]:
     lines = [f"Codex login registry: {result.registry}"]
-    if result.untouched:
-        lines.append("  this build never managed Codex logins here: nothing to change")
     if result.kept:
         lines.append(f"  kept {len(result.kept)} Codex row(s); the older build continues them:")
         lines += [f"    {v.store}  {v.row}  (login {str(v.chain_id or '')[:12]})" for v in result.kept]

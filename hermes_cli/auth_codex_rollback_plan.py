@@ -49,6 +49,7 @@ from hermes_cli.auth_codex_registry import (
 from hermes_cli.auth_credential_io import isdir_strict, lexists_strict, listdir_strict, read_witnessed_bytes, store_key
 
 KEEP = "keep"
+UNREGISTERED_NO_REGISTRY = "not registered yet (the preparation registers it by its token material first)"
 DEVICE_CODE, MANUAL_DEVICE_CODE = "device_code", "manual:device_code"
 CODEX_OFF_SOURCE = "manual:rollback-codex-off"
 CODEX_OFF_ID = "rbkoff"
@@ -91,7 +92,6 @@ class Assessment:
     codex_cli: Dict[str, Any] = field(default_factory=dict)
     refusal: Optional[str] = None
     codex_off: List[str] = field(default_factory=list)       # homes (by store key) left with no login
-    untouched: bool = False                                  # the new build never governed Codex here
 
     @property
     def to_remove(self) -> List[RowVerdict]:
@@ -346,10 +346,16 @@ def assess(view: RegistryView, homes: Dict[str, Home], *, other_homes_checked: b
         return out
     traces = protocol_traces(paths)
     if view.status == "absent" and not traces:
-        out.untouched = True  # never governed by the new build: the older build's own state, as it left it
-        out.rows = [RowVerdict(h.key, r, KEEP) for h in homes.values() for r in material_rows(h.store)]
-        return out
-    if (view.status == "absent" or registry_was_damaged()) and not other_homes_checked:
+        unregistered = [RowVerdict(h.key, r, UNREGISTERED_NO_REGISTRY) for h in homes.values()
+                        for r in material_rows(h.store)]
+        if unregistered:
+            # Never governed, but Codex material exists: nothing identifies which rows are one login.
+            # The preparation first registers them by their token material (the bootstrap migration:
+            # identical pairs across every home are one login, ambiguous ones are paused), then
+            # applies the same keep rules; until then nothing is certified.
+            out.rows = unregistered
+            return out
+    if ((view.status == "absent" and traces) or registry_was_damaged()) and not other_homes_checked:
         out.refusal = ("The Codex login registry was damaged or removed after this build used it, so it may not list "
                        "every Hermes home that held a Codex login (a HERMES_HOME outside profiles/ is found only "
                        "through it). Remove the Codex login from any such home yourself, then run this again with "
