@@ -122,6 +122,16 @@ def listdir_strict(directory: Union[str, Path]) -> list:
         return []
 
 
+def listdir_matching(directory: Union[str, Path], pattern: str) -> list:
+    """Paths in *directory* whose NAME matches the glob *pattern* the way the platform compares
+    names (``fnmatch.fnmatch``: case-insensitive on Windows, like ``Path.glob`` and every lookup of
+    those files by name), listed strictly (:func:`listdir_strict`: a denied listing raises).
+    The one filter every protocol listing uses: a case-sensitive ``endswith`` would skip a
+    ``.JSON`` record the runtime still reads."""
+    import fnmatch
+    return [Path(directory) / name for name in listdir_strict(directory) if fnmatch.fnmatch(name, pattern)]
+
+
 def isdir_strict(path: Union[str, Path]) -> bool:
     """``os.path.isdir`` that raises instead of answering False when *path* cannot be inspected."""
     import stat as _stat
