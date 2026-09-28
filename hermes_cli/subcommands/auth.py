@@ -110,6 +110,13 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
     auth_recover.add_argument(
         "--abandon", action="store_true",
         help="Cancel a profile move that has not happened yet: every login goes back to the original profile")
+    auth_rollback = auth_subparsers.add_parser(
+        "rollback-prepare",
+        help="Before rolling back to a Hermes build without the Codex login registry: remove every Codex "
+             "token the older build must not use (see ROLLBACK-RUNBOOK.md)")
+    auth_rollback.add_argument(
+        "--check", action="store_true",
+        help="Only check (read-only) whether this install is ready to roll back")
     auth_recovery = auth_subparsers.add_parser(
         "recovery", help="Inspect the Codex login registry, or clear ARCHIVED recovery files")
     auth_recovery.add_argument("recovery_action", nargs="?", choices=["list", "clear", "resolve"], default="list")

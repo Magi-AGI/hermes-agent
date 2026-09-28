@@ -729,6 +729,12 @@ def auth_recovery_command(args) -> None:
         print(line)
 
 
+def auth_rollback_prepare_command(args) -> None:
+    """`hermes auth rollback-prepare [--check]` (deploy gate F8)."""
+    from hermes_cli.auth_codex_rollback import rollback_prepare_command
+    rollback_prepare_command(args)
+
+
 def auth_reset_command(args) -> None:
     provider = _normalize_provider(getattr(args, "provider", ""))
     target = getattr(args, "target", None)
@@ -1036,7 +1042,7 @@ _AUTH_ACTIONS = {
     "reset": auth_reset_command, "priority": auth_priority_command, "refresh": auth_refresh_command, "status": auth_status_command,
     "logout": auth_logout_command, "upgrade": auth_upgrade_command, "codex": auth_codex_command,
     "migrate": auth_migrate_command, "recovery": auth_recovery_command, "recover": auth_recover_command,
-    "spotify": auth_spotify_command}
+    "rollback-prepare": auth_rollback_prepare_command, "spotify": auth_spotify_command}
 
 
 def auth_command(args) -> None:
