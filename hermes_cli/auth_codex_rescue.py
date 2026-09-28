@@ -169,10 +169,12 @@ def archive_rescue(rescue: Path, raw: bytes, sha: str) -> Path:
     nothing can be planted where it will be written."""
     directory = ops_dir() / "archive"
     target = None
+    import fnmatch
     import stat as _stat
 
-    from hermes_cli.auth_credential_io import isdir_strict
-    for existing in sorted(directory.glob(f"legacy-rescue.{sha[:24]}.*.untrusted.json")) if isdir_strict(directory) else ():
+    from hermes_cli.auth_credential_io import listdir_strict
+    pattern = f"legacy-rescue.{sha[:24]}.*.untrusted.json"
+    for existing in [directory / n for n in listdir_strict(directory) if fnmatch.fnmatchcase(n, pattern)]:
         try:
             if read_witnessed_bytes(existing)[1] == sha and not _stat.S_ISLNK(os.lstat(existing).st_mode):
                 target = existing

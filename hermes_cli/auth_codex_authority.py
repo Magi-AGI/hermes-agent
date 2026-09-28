@@ -153,7 +153,9 @@ def startup_dispatch() -> str:
             if not settlement_needed(view):
                 return "idle"
     except Exception:
-        return "idle"
+        # Whether there is work could not be established (a denied listing, an unreadable file):
+        # never "idle" — the dispatch pass runs and reports what it can't do (review r6).
+        logger.warning("Codex authority startup check failed; running the dispatcher", exc_info=True)
     return authority_dispatch()
 
 

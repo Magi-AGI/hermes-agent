@@ -206,10 +206,10 @@ def retain_orphan_records(stores: Iterable[Path]) -> None:
     beside a store (the old generation's live records) is folded into the index first."""
     entries: Dict[str, Dict[str, Any]] = {}
     for store in stores:
+        from hermes_cli.auth_credential_io import listdir_strict
         directory = records_dir(store)
-        if not directory.is_dir():
-            continue
-        for path in directory.glob("*.json"):
+        # A records directory that cannot be listed raises: the rebuild must not index nothing.
+        for path in [directory / n for n in listdir_strict(directory) if n.endswith(".json")]:
             view = read_record(store, path.stem)
             entries[f"rebuilt:{path.stem}"] = material_of(view, reason="registry-rebuilt")
     retain(entries)

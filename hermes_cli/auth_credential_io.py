@@ -112,6 +112,16 @@ def lexists_strict(path: Union[str, Path]) -> bool:
     return True
 
 
+def listdir_strict(directory: Union[str, Path]) -> list:
+    """Entry names of *directory*: [] ONLY when it does not exist; any failure to list it raises
+    (``Path.glob`` / ``iterdir`` users that swallow a denied listing read it as "empty")."""
+    try:
+        with os.scandir(directory) as entries:
+            return sorted(entry.name for entry in entries)
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+
+
 def isdir_strict(path: Union[str, Path]) -> bool:
     """``os.path.isdir`` that raises instead of answering False when *path* cannot be inspected."""
     import stat as _stat
