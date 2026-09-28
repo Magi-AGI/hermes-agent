@@ -33,7 +33,7 @@ from agent.credential_persistence import sanitize_borrowed_credential_payload
 from utils import atomic_json_write, atomic_yaml_write, env_float, file_signature, is_truthy_value  # noqa: F401  (env_float: agent.credential_pool reads auth_mod.env_float)
 from hermes_cli.auth_credential_io import (  # noqa: F401  (CredentialWrite*: raised by _save_auth_store)
     CredentialWriteError, CredentialWriteUncertain, Witness, WitnessedStore, WriteOutcome, attach_witness,
-    LockAcquisitionTimeout, canonical_path, encode_json, is_contended_error, read_witnessed_bytes,
+    LockAcquisitionTimeout, canonical_path, encode_json, is_contended_error, isdir_strict, read_witnessed_bytes,
     require_committed, store_key, witness_of, write_credential_file)
 from hermes_cli.auth_zai_kimi import (  # noqa: F401  re-exported
     KIMI_CODE_BASE_URL, ZAI_ENDPOINTS, _normalize_lmstudio_runtime_base_url, _resolve_kimi_base_url,
@@ -745,7 +745,7 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
         # empty profile: reading it as empty would fall back to root's (another account's)
         # credentials. Every provider's resolution fails closed here (stage-2 review r1-1).
         profile_dir = named_profile_home(auth_file.parent)
-        if profile_dir is not None and Path(profile_dir) == auth_file.parent and not auth_file.parent.is_dir():
+        if profile_dir is not None and Path(profile_dir) == auth_file.parent and not isdir_strict(auth_file.parent):
             raise ProfileStoreMissing(auth_file.parent)
         return attach_witness(WitnessedStore(_empty_auth_store()), Witness(key, None, True))
     try:

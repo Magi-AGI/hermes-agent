@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -168,9 +169,12 @@ def archive_rescue(rescue: Path, raw: bytes, sha: str) -> Path:
     nothing can be planted where it will be written."""
     directory = ops_dir() / "archive"
     target = None
-    for existing in sorted(directory.glob(f"legacy-rescue.{sha[:24]}.*.untrusted.json")) if directory.is_dir() else ():
+    import stat as _stat
+
+    from hermes_cli.auth_credential_io import isdir_strict
+    for existing in sorted(directory.glob(f"legacy-rescue.{sha[:24]}.*.untrusted.json")) if isdir_strict(directory) else ():
         try:
-            if read_witnessed_bytes(existing)[1] == sha and not existing.is_symlink():
+            if read_witnessed_bytes(existing)[1] == sha and not _stat.S_ISLNK(os.lstat(existing).st_mode):
                 target = existing
                 break
         except OSError:

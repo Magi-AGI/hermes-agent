@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from hermes_cli.archive_safe import archive_root_dirs, make_targz, normalize_archive_parts, safe_extract_targz
+from hermes_cli.auth_credential_io import isdir_strict, lexists_strict
 from hermes_constants import (
     LOCAL_RUNTIME_ROOT_DIRS, PROFILE_ID_RE, clear_named_profile_deleted, mark_named_profile_deleted,
     named_profile_has_identity, named_profile_is_deleted, named_profile_is_live,
@@ -1178,7 +1179,7 @@ def create_profile(
         # name's lifecycle lock, held through the publish.
         from hermes_cli.auth_codex_lifecycle import profile_publish_guard
         with _codex_refusals_as_value_errors(), profile_publish_guard(canon, profile_dir, "creating the profile"):
-            if profile_dir.exists():
+            if lexists_strict(profile_dir):  # an uninspectable destination raises: never published over
                 raise _profile_exists_error(canon)
             os.rename(staging, profile_dir)
     except BaseException:
@@ -2040,7 +2041,7 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
         try:
             with restore_guard(lambda: staged, "importing it with the profile"), \
                     profile_publish_guard(canon, profile_dir, "importing the profile"):
-                if profile_dir.exists():
+                if lexists_strict(profile_dir):  # shutil.move INTO an existing dir would nest it
                     raise _profile_exists_error(canon)
                 shutil.move(str(final_source), str(profile_dir))
         except CodexAuthorityRefused as exc:
@@ -2348,7 +2349,10 @@ def finalize_profile_rename(old_canon: str, new_canon: str, old_dir: Path, new_d
     destination = _wrapper_path(new_canon)
     uninspectable = None
     try:
-        exists = os.path.lexists(destination)
+        try:
+            exists = lexists_strict(destination)  # ONLY a missing path is absent (review r5)
+        except OSError as exc:
+            raise _Uninspectable(f"{destination} can't be inspected ({exc})") from exc
         ours = _wrapper_is_ours_strict(destination) if exists else False
     except _Uninspectable as exc:
         exists, ours, uninspectable = True, False, exc
@@ -2401,7 +2405,7 @@ def undo_rename_quiesce(old_canon: str, old_dir: Path) -> None:
     """A rename cancelled before its move: undo its pre-move unroute (tombstone + multiplexer
     notice) so the profile is never stranded tombstoned-but-present. Idempotent."""
     from hermes_constants import named_profile_is_deleted
-    if old_dir.is_dir() and named_profile_is_deleted(old_dir):
+    if isdir_strict(old_dir) and named_profile_is_deleted(old_dir):
         clear_named_profile_deleted(old_dir)
         _notify_multiplexer(old_canon)
 

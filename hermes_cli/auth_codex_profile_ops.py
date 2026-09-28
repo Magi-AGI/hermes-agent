@@ -779,9 +779,11 @@ def _refuse_aliased_ends(source: Path, dest: Path) -> None:
     writing the destination and then emptying the source would empty the destination too. Refused
     before anything is decided (a check that cannot be made refuses as well)."""
     try:
-        same = os.path.exists(source) and os.path.exists(dest) and os.path.samefile(source, dest)
+        same = os.path.samefile(source, dest)
+    except (FileNotFoundError, NotADirectoryError):
+        same = False  # an end that does not exist yet is not the other one
     except OSError:
-        same = True
+        same = True  # cannot be told: refused
     if same:
         raise CodexAuthorityRefused(
             "The source and destination are the same credential file under two names; nothing was moved.")

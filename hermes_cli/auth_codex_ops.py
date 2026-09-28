@@ -355,8 +355,9 @@ def _payload_is_referenced(path: Path, view: RegistryView) -> bool:
 
 
 def unreferenced_payloads(view: RegistryView) -> List[Path]:
+    from hermes_cli.auth_credential_io import isdir_strict
     directory = ops_dir()
-    if not directory.is_dir():
+    if not isdir_strict(directory):  # an unreadable auth.ops/ raises: never "no payloads"
         return []
     return [p for p in sorted(directory.glob("*.json")) if not (view.ok and _payload_is_referenced(p, view))]
 

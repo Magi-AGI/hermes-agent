@@ -100,6 +100,28 @@ def path_memo():
         _path_memo.reset(token)
 
 
+def lexists_strict(path: Union[str, Path]) -> bool:
+    """Whether a directory entry exists at *path* (links not followed). ONLY a missing path
+    (FileNotFoundError / NotADirectoryError) is False; any other failure to inspect it raises
+    (``os.path.lexists`` / ``Path.exists`` turn a permission or I/O error into False, i.e. into
+    "absent" — never acceptable for a decision that writes, deletes or skips a required step)."""
+    try:
+        os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    return True
+
+
+def isdir_strict(path: Union[str, Path]) -> bool:
+    """``os.path.isdir`` that raises instead of answering False when *path* cannot be inspected."""
+    import stat as _stat
+    try:
+        st = os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    return _stat.S_ISDIR(st.st_mode)
+
+
 def invalidate_path_memo() -> None:
     """Forget every canonical path the active pass memoized (in place, so enclosing scopes see it
     too): a store directory moved, and paths resolved before the move name the old location."""

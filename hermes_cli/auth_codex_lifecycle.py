@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, Optional, Tuple
 
 from hermes_cli.auth_constants import AUTH_LOCK_TIMEOUT_SECONDS, ProfileBeingMoved, ProfileStoreMissing
-from hermes_cli.auth_credential_io import canonical_path, store_key
+from hermes_cli.auth_credential_io import canonical_path, isdir_strict, store_key
 
 LIFECYCLE_LOCK_DIR = ".locks"
 # Phases in which an op's source directory may change under a lock or handle taken now.
@@ -189,7 +189,7 @@ def store_lock_admission(auth_path: Path, timeout_seconds: float) -> Iterator[No
         yield
         return
     with lifecycle_locks([profile], timeout_seconds):
-        if not os.path.isdir(canonical_path(auth_path).parent):
+        if not isdir_strict(canonical_path(auth_path).parent):  # uninspectable raises: fail closed
             raise ProfileStoreMissing(Path(auth_path).parent)
         found = blocking_op(profile, store_key(auth_path))
         if found is not None:
