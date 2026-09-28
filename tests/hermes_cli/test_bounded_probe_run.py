@@ -121,9 +121,9 @@ def test_posix_child_gets_own_process_group():
 #   late-raise    the Nth thread starts, then the start call raises MemoryError (CPython allocates the
 #                 returned ident after the thread exists), so a live reader must keep what it owns
 # Probes: `git` is a real `git status` (warm or cold safe.directory cache); `live` is a child that
-# never exits on its own, so the failure path itself must end it. Every thread start goes through
-# both _thread and threading's own binding, so the fault lands the same way whichever kind of reader
-# the helper uses. The child reports what it got back and what it left behind; a child still blocked
+# never exits on its own, so the failure path itself must end it. Thread starts are faulted at both
+# _thread.start_new_thread and threading's own start binding (whichever this Python has), so the fault
+# lands the same way whichever kind of reader the helper uses. The child reports what it got back and what it left behind; a child still blocked
 # when the test's timeout fires is the stranded-caller failure.
 _FAULT_CHILD = r"""
 import _thread, json, subprocess, sys, threading, time
@@ -140,7 +140,8 @@ def init(self, *args, **kwargs):
     children.append(self)
 
 def failing(real):
-    def start(fn, args=(), *rest):
+    # (fn, args_tuple) for _thread.start_new_thread; (fn, handle=, daemon=) for 3.13's joinable start.
+    def start(fn, *args, **kwargs):
         launched.append(fn)
         n = len(launched)
         if n == target and fault == "refused":
@@ -148,7 +149,7 @@ def failing(real):
         if n == target and fault == "dies" or n >= target and fault == "dies-from":
             def dies(*_):
                 raise MemoryError("thread died before running")
-            return real(dies, ())
+            return real(dies, *args, **kwargs)
         ran.add(n)
         def run(*a):
             try:
@@ -158,7 +159,7 @@ def failing(real):
                 raise
             finally:
                 finished.add(n)
-        ident = real(run, args, *rest)
+        ident = real(run, *args, **kwargs)
         if n == target and fault == "late-raise":
             raise MemoryError("thread started; allocating its ident failed")
         return ident
@@ -167,7 +168,9 @@ def failing(real):
 subprocess.Popen.__init__ = init
 before = set(threading.enumerate())
 _thread.start_new_thread = failing(_thread.start_new_thread)
-threading._start_new_thread = failing(threading._start_new_thread)
+for hook in ("_start_new_thread", "_start_joinable_thread"):  # threading's own binding: <=3.12 / 3.13+
+    if hasattr(threading, hook):
+        setattr(threading, hook, failing(getattr(threading, hook)))
 started = time.monotonic()
 if probe == "git":
     out = sc.bounded_git_probe(["git", "-C", repo, "status", "--porcelain=v2", "--branch"], timeout=5.0)
