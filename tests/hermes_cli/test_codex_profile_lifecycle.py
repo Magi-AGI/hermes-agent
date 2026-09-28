@@ -8,6 +8,7 @@ commands is stubbed, so nothing outside the temp root is touched.
 
 import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -24,7 +25,7 @@ def quiet_profiles(monkeypatch):
                         ("_stop_gateway_process", None), ("_stop_profile_backends", None),
                         ("_notify_multiplexer", None), ("_check_gateway_running", False),
                         ("_purge_identity", True), ("_live_default_multiplexer", False),
-                        ("create_wrapper_script", None), ("remove_wrapper_script", None)):
+                        ("create_wrapper_script", Path("wrapper-stub")), ("remove_wrapper_script", None)):
         monkeypatch.setattr(profiles, name, lambda *a, _v=value, **k: _v)
     import hermes_cli.profile_identity as identity
     monkeypatch.setattr(identity, "_migrate_profile_identity", lambda *a, **k: None)

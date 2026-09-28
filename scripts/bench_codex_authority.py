@@ -795,7 +795,7 @@ def _quiet_profile_commands() -> None:
                         ("_stop_gateway_process", None), ("_stop_profile_backends", None),
                         ("_notify_multiplexer", None), ("_check_gateway_running", False),
                         ("_purge_identity", True), ("_live_default_multiplexer", False),
-                        ("create_wrapper_script", None), ("remove_wrapper_script", None)):
+                        ("create_wrapper_script", Path("wrapper-stub")), ("remove_wrapper_script", None)):
         setattr(profiles, name, lambda *a, _v=value, **k: _v)
     import hermes_cli.profile_identity as identity
     identity._migrate_profile_identity = lambda *a, **k: None

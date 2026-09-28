@@ -719,9 +719,11 @@ def auth_recovery_command(args) -> None:
             outcome = resolve_unrecoverable(getattr(args, "op_id", None) or "")
         except auth_mod.AuthError as exc:
             raise SystemExit(auth_mod.format_auth_error(exc)) from exc
-        print("The interrupted Codex login update was completed." if outcome == "rolled-forward" else
-              "The interrupted Codex login update was released; its logins stay paused. Sign in again "
-              "with `hermes auth codex`.")
+        print({"rolled-forward": "The interrupted Codex login update was completed.",
+               "abandoned": "The interrupted Codex login update was cancelled as recorded; every Codex login "
+                            "is back where it was."}.get(
+            outcome, "The interrupted Codex login update was released; its logins stay paused. Sign in again "
+                     "with `hermes auth codex`."))
         return
     for line in list_recovery():
         print(line)

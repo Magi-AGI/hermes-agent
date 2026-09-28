@@ -5,7 +5,6 @@ integration use the existing quiet fixture; no live install or credentials are u
 injection leaves durable state for the actual dispatcher/recovery to process.
 """
 
-import json
 import subprocess
 from pathlib import Path
 
@@ -14,9 +13,9 @@ import pytest
 from hermes_cli import auth, profiles
 from hermes_cli import auth_codex_profile_ops as pops
 from hermes_cli.auth_constants import AuthError
-from tests.hermes_cli.codex_authority_env import (
+from tests.hermes_cli.codex_authority_env import (  # noqa: F401
     codex_home, make_profile, pool_row, read_json, registry, write_store)
-from tests.hermes_cli.test_codex_profile_lifecycle import (
+from tests.hermes_cli.test_codex_profile_lifecycle import (  # noqa: F401
     quiet_profiles, _dispatch, _failing_move, _key, _work_with_login)
 from tests.hermes_cli.test_codex_lifecycle_recovery import _stuck_rename
 
@@ -31,7 +30,7 @@ def test_recovery_finishes_the_user_visible_rename(codex_home, quiet_profiles, m
     profiles.set_active_profile('work')
     events = []
     monkeypatch.setattr(profiles, 'remove_wrapper_script', lambda name: events.append(['remove-wrapper', name]))
-    monkeypatch.setattr(profiles, 'create_wrapper_script', lambda name: events.append(['create-wrapper', name]))
+    monkeypatch.setattr(profiles, 'create_wrapper_script', lambda name: events.append(['create-wrapper', name]) or Path('wrapper-stub'))
     import hermes_cli.profile_identity as identity
     monkeypatch.setattr(identity, '_migrate_profile_identity', lambda *args: events.append(['identity', *args[:2]]))
     with monkeypatch.context() as stuck:

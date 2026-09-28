@@ -229,7 +229,8 @@ class ProfileRename:
             _move_with_budget(fn)
             invalidate_path_memo()
             self.moved = True
-            _finalize_profile_state(self.profile, self.new_profile, self.old_dir, self.new_dir, announce=True)
+            _finalize_profile_state(self.profile, self.new_profile, self.old_dir, self.new_dir, announce=True,
+                                    strict=False)
             return
         _update_op(self.op_id, phase=PHASE_MOVING)
         invalidate_path_memo()
@@ -257,9 +258,12 @@ def _move_with_budget(fn: Callable[[], Any]) -> None:
     retry_contended(fn)
 
 
-def _finalize_profile_state(old_name: str, new_name: str, old_dir: Path, new_dir: Path, *, announce: bool) -> None:
+def _finalize_profile_state(old_name: str, new_name: str, old_dir: Path, new_dir: Path, *, announce: bool,
+                            strict: bool = True) -> None:
+    """``strict``: a required step's failure raises (the op stays pending); only a rename with no
+    Codex op behind it runs non-strict (upstream's advisory warnings)."""
     from hermes_cli.profiles import finalize_profile_rename
-    finalize_profile_rename(old_name, new_name, Path(old_dir), Path(new_dir), announce=announce)
+    finalize_profile_rename(old_name, new_name, Path(old_dir), Path(new_dir), announce=announce, strict=strict)
 
 
 def _finish_forward(op_id: str, body: Dict[str, Any], *, announce: bool = False) -> None:

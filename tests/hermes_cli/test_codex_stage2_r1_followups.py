@@ -16,6 +16,7 @@ credentials only.
 """
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -181,7 +182,7 @@ def test_deleting_a_profile_linked_to_root_keeps_roots_login(codex_home, quiet_p
 def profile_state_spies(monkeypatch):
     events = []
     monkeypatch.setattr(profiles, "remove_wrapper_script", lambda name: events.append(("remove-wrapper", name)))
-    monkeypatch.setattr(profiles, "create_wrapper_script", lambda name: events.append(("create-wrapper", name)))
+    monkeypatch.setattr(profiles, "create_wrapper_script", lambda name: events.append(("create-wrapper", name)) or Path("wrapper-stub"))
     monkeypatch.setattr(profiles, "check_alias_collision", lambda name: None)
     import hermes_cli.profile_identity as identity
     monkeypatch.setattr(identity, "_migrate_profile_identity",
@@ -246,3 +247,59 @@ def test_an_uninterrupted_rename_reaches_the_same_profile_state(codex_home, quie
                      "wrappers": [("create-wrapper", "play"), ("remove-wrapper", "work")],
                      "identity": [("identity", "work", "play")], "ops": {}}, state
     assert json.dumps(state)
+
+
+# ── round 2: finalization results, resolve outcomes ────────────────────────────────────────────
+
+def test_a_finalization_failure_is_retried_and_then_completes(codex_home, quiet_profiles, monkeypatch):
+    """A required step (here: the new wrapper cannot be written) reports failure by its RESULT, not
+    an exception: the rename stays stuck, claims no alias, and ``recover --op`` completes it once the
+    step succeeds."""
+    root, endpoint = codex_home
+    _work_with_login(root, endpoint)
+    written = []
+    monkeypatch.setattr(profiles, "check_alias_collision", lambda name: None)
+    monkeypatch.setattr(profiles, "create_wrapper_script", lambda name: None)  # the helper's failure result
+    with pytest.raises(ValueError, match="could not be written"):
+        profiles.rename_profile("work", "play")
+    (op_id, op), = registry(root)["ops"].items()
+    assert op["status"] == "lifecycle-stuck" and op["phase"] == "finalizing"
+    assert _refresh_in(monkeypatch, root / "profiles" / "play"), "credentials are usable while finalizing"
+    target = profiles._wrapper_path("play")
+
+    def create(name):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("hermes -p play\n", encoding="utf-8")
+        written.append(name)
+        return target
+
+    monkeypatch.setattr(profiles, "create_wrapper_script", create)
+    assert pops.recover_op(op_id) == "rolled_forward"
+    assert written == ["play"] and not registry(root)["ops"]
+
+
+def test_a_colliding_alias_name_is_accepted_and_reported(codex_home, quiet_profiles, monkeypatch, capsys):
+    root, endpoint = codex_home
+    _work_with_login(root, endpoint)
+    monkeypatch.setattr(profiles, "check_alias_collision", lambda name: "'play' conflicts with an existing command")
+    profiles.rename_profile("work", "play")
+    assert not registry(root)["ops"]
+    out = capsys.readouterr().out
+    assert "Cannot create alias 'play'" in out and "Alias updated" not in out
+
+
+def test_resolve_reports_a_completed_abandonment(codex_home, quiet_profiles, monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    from hermes_cli.auth_commands import auth_recovery_command
+    root, endpoint = codex_home
+    work, _pair, cid, op_id, epoch = _abandon_to_decision2(root, endpoint, monkeypatch)
+    comp = root / "auth.ops" / f"{op_id}.abandon.json"
+    raw = comp.read_bytes()
+    comp.write_bytes(b"{")
+    _dispatch()
+    comp.write_bytes(raw)
+    auth_recovery_command(SimpleNamespace(recovery_action="resolve", op_id=op_id[:8]))
+    out = capsys.readouterr().out
+    assert "cancelled as recorded" in out and "recover --op" not in out
+    _assert_abandoned(root, work, cid, epoch)

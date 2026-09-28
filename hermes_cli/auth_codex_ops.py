@@ -471,11 +471,13 @@ def resolve_unrecoverable(op_id: str) -> str:
         readable = decision_body(op_id, op) if op.get("kind") in LIFECYCLE_KINDS else _read_payload(op_id, op)
         if readable is not None:
             outcome = roll_forward_one(op_id, op)
-            if outcome != "rolled_forward":
-                raise CodexAuthorityRefused(
-                    f"Codex login update {op_id[:8]} reads again but could not be completed ({outcome}); "
-                    f"`hermes auth recover --op {op_id[:8]}` shows why.")
-            return "rolled-forward"
+            if outcome in ("rolled_forward", "abandoned"):  # both are completed terminal outcomes
+                return "rolled-forward" if outcome == "rolled_forward" else "abandoned"
+            hint = (f"`hermes auth recover --op {op_id[:8]}` finishes it once that is resolved"
+                    if outcome in ("stuck", "busy") else f"`hermes auth recovery resolve {op_id[:8]}` retries it")
+            raise CodexAuthorityRefused(
+                f"Codex login update {op_id[:8]} reads again but could not be completed yet ({outcome}); {hint}.")
+
         data = json.loads(json.dumps(view.data))
         data["ops"] = {k: v for k, v in data["ops"].items() if k != op_id}
         for entry in data["chains"].values():
