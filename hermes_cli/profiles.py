@@ -2065,7 +2065,8 @@ def _migrate_honcho_profile_host(old_name: str, new_name: str, new_dir: Path) ->
         seen.add(resolved)
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"⚠ Honcho host block not migrated: could not read {path}: {exc}")
             continue
         hosts = raw.get("hosts")
         if not isinstance(hosts, dict):
@@ -2082,6 +2083,8 @@ def _migrate_honcho_profile_host(old_name: str, new_name: str, new_dir: Path) ->
         hosts[new_host] = hosts.pop(source_host)
         if _atomic_write_json(path, raw):
             print(f"✓ Honcho host updated: {source_host} → {new_host}")
+        else:
+            print(f"⚠ Honcho host block not migrated: could not write {path} ({source_host} still names it)")
 
 
 def _record_profile_rename(new_dir: Path, old_canon: str) -> None:
@@ -2231,13 +2234,46 @@ class ProfileRenameIncomplete(ValueError):
         self.failed = failed
 
 
-def _old_wrappers_left(canon: str) -> List[Path]:
-    """Hermes-generated wrappers still installed under *canon* (a file there that is not ours is
-    the user's and stays)."""
+class _Uninspectable(Exception):
+    """Required rename state that could not be READ: never mistaken for its absent / default value."""
+
+
+def _wrapper_candidates(canon: str) -> List[Path]:
     candidates = [_get_wrapper_dir() / canon]
     if sys.platform == "win32":
         candidates.insert(0, _get_wrapper_dir() / f"{canon}.bat")
-    return [p for p in candidates if p.exists() and _is_our_wrapper(p)]
+    return candidates
+
+
+def _wrapper_is_ours_strict(path: Path) -> bool:
+    """``_is_our_wrapper`` for a REQUIRED check: absent -> False, Hermes wrapper -> True, someone
+    else's file -> False, a file that cannot be read -> :class:`_Uninspectable` (the lenient
+    helper would call it someone else's)."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return False
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _Uninspectable(f"{path} can't be read ({exc})") from exc
+    return "hermes -p" in text
+
+
+def _old_wrappers_left(canon: str) -> List[Path]:
+    """Hermes-generated wrappers still installed under *canon* (a file there that is not ours is
+    the user's and stays). Raises :class:`_Uninspectable` when one cannot be read."""
+    return [p for p in _wrapper_candidates(canon) if _wrapper_is_ours_strict(p)]
+
+
+def _read_active_profile_strict() -> str:
+    """``get_active_profile`` for a REQUIRED check: a missing file is ``default`` (its meaning), a
+    file that cannot be read raises :class:`_Uninspectable` (the lenient getter says ``default``)."""
+    path = _get_active_profile_path()
+    try:
+        return path.read_text(encoding="utf-8").strip() or "default"
+    except FileNotFoundError:
+        return "default"
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _Uninspectable(f"{path} can't be read ({exc})") from exc
 
 
 def finalize_profile_rename(old_canon: str, new_canon: str, old_dir: Path, new_dir: Path, *,
@@ -2247,7 +2283,8 @@ def finalize_profile_rename(old_canon: str, new_canon: str, old_dir: Path, new_d
     recover --op`` / the dispatcher) run exactly this, in this order, and the Codex op is kept until
     it returned WITHOUT raising.
 
-    REQUIRED (verified by result, not only by exception; any failure raises
+    REQUIRED (verified by result, not only by exception, and by STRICT reads: state that cannot be
+    read is a failure, never its absent / default meaning; any failure raises
     :class:`ProfileRenameIncomplete` after every step was attempted, and nothing claims success):
     the old tombstone cleared; the old name's Hermes wrapper gone (an absent one is success); the new
     wrapper written (an alias-name COLLISION with someone else's command is an accepted, reported
@@ -2279,13 +2316,26 @@ def finalize_profile_rename(old_canon: str, new_canon: str, old_dir: Path, new_d
     # Best-effort: profile-scoped Honcho host blocks (it reports its own outcome).
     _migrate_honcho_profile_host(old_canon, new_canon, new_dir)
 
-    # Required: wrappers.
-    remove_wrapper_script(old_canon)
-    left = _old_wrappers_left(old_canon)
-    if left:
-        failed.append(f"the old command alias could not be removed ({', '.join(map(str, left))})")
+    # Required: wrappers. Every check is strict: a wrapper that cannot be READ is neither ours
+    # nor someone else's — it is left alone and the step fails (retried by recovery).
+    try:
+        _old_wrappers_left(old_canon)  # inspect BEFORE removal: never delete what can't be read
+        remove_wrapper_script(old_canon)
+        left = _old_wrappers_left(old_canon)
+        if left:
+            failed.append(f"the old command alias could not be removed ({', '.join(map(str, left))})")
+    except _Uninspectable as exc:
+        failed.append(f"the old command alias could not be inspected: {exc}")
     collision = check_alias_collision(new_canon)
-    if collision:
+    unreadable_own = None
+    if collision:  # the lenient check calls an unreadable wrapper at our own path a collision
+        try:
+            _wrapper_is_ours_strict(_wrapper_path(new_canon))
+        except _Uninspectable as exc:
+            unreadable_own = exc
+    if unreadable_own is not None:
+        failed.append(f"the command alias '{new_canon}' could not be inspected: {unreadable_own}")
+    elif collision:
         print(f"⚠ Cannot create alias '{new_canon}' — {collision}")
     else:
         # The helper's contract: the path once written, None when it could not be (reported by it).
@@ -2296,13 +2346,13 @@ def finalize_profile_rename(old_canon: str, new_canon: str, old_dir: Path, new_d
 
     # Required: active_profile, if it pointed to the old name.
     try:
-        if get_active_profile() == old_canon:
+        if _read_active_profile_strict() == old_canon:
             set_active_profile(new_canon)
-            if get_active_profile() != new_canon:
+            if _read_active_profile_strict() != new_canon:
                 raise OSError("the new value did not read back")
             say(f"✓ Active profile updated: {new_canon}")
     except Exception as exc:
-        failed.append(f"the active profile still names '{old_canon}' ({exc})")
+        failed.append(f"the active profile could not be confirmed to no longer name '{old_canon}' ({exc})")
 
     # Required: profile-name-keyed session/routing state (session keys, profile_name, heartbeats,
     # delivery + routing index). A stale ``agent:<old>:*`` routing key otherwise resolves to a
