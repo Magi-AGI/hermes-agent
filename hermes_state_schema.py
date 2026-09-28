@@ -759,33 +759,64 @@ class SessionSchemaMixin:
             "SELECT copy_key, session_id, timestamp FROM held")
 
     @staticmethod
+    def _in_write_txn(cursor: sqlite3.Cursor, body) -> None:
+        """Run *body* under the write lock: in the caller's transaction, or in one of its own."""
+        if cursor.connection.in_transaction:
+            body()
+            return
+        cursor.execute("BEGIN IMMEDIATE")
+        try:
+            body()
+        except BaseException:
+            cursor.execute("ROLLBACK")
+            raise
+        cursor.execute("COMMIT")
+
+    # A copy-timestamp row whose owning session has a compression continuation without its own row.
+    _STAMP_WITHOUT_CONTINUATION_SQL = (
+        "SELECT 1 FROM recall_copy_stamps s JOIN sessions p ON p.id = s.session_id AND p.end_reason = 'compression' "
+        "JOIN sessions c ON c.parent_session_id = p.id WHERE NOT EXISTS (SELECT 1 FROM recall_copy_stamps x "
+        "WHERE x.copy_key = s.copy_key AND x.session_id = c.id) LIMIT 1")
+
+    @staticmethod
     def _migrate_review_build_copy_stamps(cursor: sqlite3.Cursor) -> None:
-        """Rekey a review build's copy-keyed ``recall_copy_stamps`` per session, as one write transaction
-        (``_rebuild_table``); rows a previously interrupted rekey stranded in the legacy table are
-        recovered the same way."""
+        """Bring review builds' ``recall_copy_stamps`` to the per-session map, each step in one write
+        transaction and rechecked under the write lock (another process may open the store at the same
+        time): recover rows a previously interrupted rekey stranded in the legacy table, rekey a copy-keyed
+        table (``_rebuild_table``), and give compression continuations that predate per-session rows their
+        own. Reads only unless one of these is actually needed."""
         legacy = "recall_copy_stamps_review"
-        if cursor.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (legacy,)).fetchone():
-            owner = ("session_id" if any(row[1] == "session_id" for row in
-                                         cursor.execute(f'PRAGMA table_info("{legacy}")')) else "NULL")
-            own_txn = not cursor.connection.in_transaction
-            if own_txn:
-                cursor.execute("BEGIN IMMEDIATE")
-            try:
+        exists = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?"
+
+        def recover_stranded():
+            if cursor.execute(exists, (legacy,)).fetchone():
+                owner = ("session_id" if any(row[1] == "session_id" for row in
+                                             cursor.execute(f'PRAGMA table_info("{legacy}")')) else "NULL")
                 cursor.execute(SessionSchemaMixin._copy_stamps_from(legacy, owner))
                 cursor.execute(f"DROP TABLE {legacy}")
-            except BaseException:
-                if own_txn:
-                    cursor.execute("ROLLBACK")
-                raise
-            if own_txn:
-                cursor.execute("COMMIT")
+
+        if cursor.execute(exists, (legacy,)).fetchone():
+            SessionSchemaMixin._in_write_txn(cursor, recover_stranded)
+
+        def rekey():
+            stamp_pk = {row[1]: row[5] for row in cursor.execute('PRAGMA table_info("recall_copy_stamps")')}
+            if stamp_pk and not stamp_pk.get("session_id"):
+                SessionSchemaMixin._rebuild_table(
+                    cursor, "recall_copy_stamps", legacy,
+                    "CREATE TABLE recall_copy_stamps (copy_key TEXT NOT NULL, session_id TEXT, "
+                    "timestamp REAL NOT NULL, PRIMARY KEY (copy_key, session_id))",
+                    SessionSchemaMixin._copy_stamps_from(legacy, "session_id" if "session_id" in stamp_pk else "NULL"))
+
         stamp_pk = {row[1]: row[5] for row in cursor.execute('PRAGMA table_info("recall_copy_stamps")')}
         if stamp_pk and not stamp_pk.get("session_id"):
-            SessionSchemaMixin._rebuild_table(
-                cursor, "recall_copy_stamps", legacy,
-                "CREATE TABLE recall_copy_stamps (copy_key TEXT NOT NULL, session_id TEXT, "
-                "timestamp REAL NOT NULL, PRIMARY KEY (copy_key, session_id))",
-                SessionSchemaMixin._copy_stamps_from(legacy, "session_id" if "session_id" in stamp_pk else "NULL"))
+            SessionSchemaMixin._in_write_txn(cursor, rekey)
+
+        def backfill():
+            if cursor.execute(SessionSchemaMixin._STAMP_WITHOUT_CONTINUATION_SQL).fetchone():
+                cursor.execute(SessionSchemaMixin._copy_stamps_from("recall_copy_stamps", "session_id"))
+
+        if stamp_pk and cursor.execute(SessionSchemaMixin._STAMP_WITHOUT_CONTINUATION_SQL).fetchone():
+            SessionSchemaMixin._in_write_txn(cursor, backfill)
 
     @staticmethod
     def _migrate_review_build_recalls(cursor: sqlite3.Cursor) -> None:

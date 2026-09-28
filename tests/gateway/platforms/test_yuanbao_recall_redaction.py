@@ -1292,3 +1292,65 @@ def test_an_existing_continuation_gets_the_copy_map_on_upgrade(tmp_path):
     finally:
         db.close()
         target.close()
+
+
+def test_a_continuation_missing_its_copy_map_row_after_an_earlier_upgrade_gets_it(tmp_path):
+    """Round 14 (Codex): a store rekeyed by the previous build's migration, whose existing continuation
+    got no row then, was skipped by the continuation backfill, so moving that continuation still lost
+    the mapping and a replay of the copy restored the text."""
+    path = tmp_path / "state.db"
+    db = _recalled_parent_store(path, child=True)
+    db._execute_write(lambda conn: conn.executescript(  # per-session, with the parent's row only
+        "DELETE FROM recall_copy_stamps; "
+        "INSERT INTO recall_copy_stamps VALUES ('pending-copy.json', 'parent', 1700000000.0);"))
+    db.close()
+    db, target = SessionDB(db_path=path), SessionDB(db_path=tmp_path / "target.db")
+    try:
+        target.import_moved_session(db.export_session_for_move("child"), profile_name="elsewhere")
+        db.delete_moved_session("child")
+        target.append_message(session_id="child", role="user", content=SECRET, recall_copy_key="pending-copy.json")
+        rows = _rows(target, "child")
+        assert rows and not [r for r in rows if SECRET in (r[1] or "")]
+    finally:
+        db.close()
+        target.close()
+
+
+def test_a_second_opener_waiting_while_the_stranded_copy_map_is_recovered_still_opens(tmp_path):
+    """Round 14 (Codex): an opener that saw the stranded legacy copy map, then waited for the write lock
+    while another opener recovered and dropped it, failed with "no such table"."""
+    import sqlite3
+    import threading
+    import time as _time
+
+    from hermes_state_schema import SessionSchemaMixin
+
+    path = tmp_path / "state.db"
+    db = _recalled_parent_store(path)
+    db._execute_write(lambda conn: conn.executescript(
+        _OWNER_BUILD_STAMPS.format(name="recall_copy_stamps_review")))
+    db.close()
+    first = sqlite3.connect(path, isolation_level=None, timeout=30, check_same_thread=False)
+    second = sqlite3.connect(path, isolation_level=None, timeout=30)
+    errors: list = []
+    try:
+        second.execute("BEGIN IMMEDIATE")  # the other opener holds the write lock
+        waiter = threading.Thread(target=lambda: _capture(errors, SessionSchemaMixin._migrate_review_build_copy_stamps,
+                                                          first.cursor()))
+        waiter.start()
+        _time.sleep(2.0)  # the waiter has seen the legacy table and is queued on the lock
+        second.execute(SessionSchemaMixin._copy_stamps_from("recall_copy_stamps_review", "session_id"))
+        second.execute("DROP TABLE recall_copy_stamps_review")
+        second.execute("COMMIT")
+        waiter.join(30)
+        assert not errors, errors
+    finally:
+        first.close()
+        second.close()
+
+
+def _capture(errors, fn, *args):
+    try:
+        fn(*args)
+    except Exception as exc:  # reported by the test thread
+        errors.append(exc)
