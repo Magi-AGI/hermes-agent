@@ -539,7 +539,8 @@ def _teardown_popped_session(session: dict | None, *, end_reason: str = "tui_clo
 
 
 # lease_id -> REAL lease of a closed session whose isolated child turn has not settled yet. Still live
-# authority for the orphan sweep (``_own_live_lease_ids``); released by ``_release_deferred_active_session_lease``.
+# authority for the orphan sweep (``_own_live_lease_ids``); released by ``_release_deferred_lease`` once the turn
+# settles (``_on_compute_host_turn_done``).
 _deferred_active_session_leases: dict[str, Any] = {}
 
 
@@ -565,9 +566,9 @@ def _settle_isolated_turn_before_close(session: dict) -> None:
                    _TURN_SETTLE_BEFORE_CLOSE_SECONDS, session.get("session_key"))
 
 
-def _release_deferred_active_session_lease(session: dict) -> None:
-    """Settlement half of ``_settle_isolated_turn_before_close``; a no-op for sessions that never deferred."""
-    lease = session.pop("_deferred_active_session_lease", None)
+def _release_deferred_lease(lease) -> None:
+    """Settlement half of ``_settle_isolated_turn_before_close``: release the deferred lease its settling turn
+    already detached from the session (under history_lock). None (nothing was deferred) is a no-op."""
     if lease is None:
         return
     _deferred_active_session_leases.pop(str(lease.lease_id), None)
@@ -646,11 +647,17 @@ def _interrupt_session_turn(sid: str, session: dict, *, request_id: str | None =
                 if session.get("running"):
                     session["running"] = False
                     _clear_inflight_turn(session)
+    _release_turn_waits(sid, session)
+    return use_compute_host
+
+
+def _release_turn_waits(sid: str, session: dict) -> None:
+    """Withdraw what a turn may be blocked on besides the model: its open server->client requests (clarify) and its
+    pending approvals (denied). Shared by Stop and the compute host's busy-input interrupt."""
     _clear_pending(sid)
     with contextlib.suppress(Exception):
         from tools.approval import resolve_gateway_approval
         resolve_gateway_approval(session["session_key"], "deny", resolve_all=True)
-    return use_compute_host
 
 
 def _session_has_active_delegations(sid: str, session: dict | None = None) -> bool:

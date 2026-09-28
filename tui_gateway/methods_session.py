@@ -2168,10 +2168,17 @@ def _correction_method(name: str, verb: str, accepted_status: str, supported, un
             return err
         agent = session.get("agent")
         # Redirect during the turn-build window (running=True, agent None): queue for the next turn instead of
-        # a misleading 4010 the client swallows into a lost follow-up.
-        if verb == "redirect" and agent is None and session.get("running"):
-            _enqueue_prompt(session, text, current_transport() or _stdio_transport)
-            session["last_active"] = time.time()
+        # a misleading 4010 the client swallows into a lost follow-up. A host-routed turn takes no live
+        # correction (a parent agent built meanwhile is idle), so either verb queues there.
+        if session.get("running") and (_session_uses_compute_host(session) or (verb == "redirect" and agent is None)):
+            with session["history_lock"]:
+                _enqueue_prompt(session, text, current_transport() or _stdio_transport)
+                session["last_active"] = time.time()
+                settled = not session.get("running")
+            if settled:
+                # The turn it was meant to follow settled before the enqueue, and that turn's drain may have
+                # already run: start it now (a no-op if that drain still takes it).
+                _drain_queued_prompt(rid, str(params.get("session_id") or ""), session)
             return _ok(rid, {"status": "queued", "text": text})
         if not supported(agent):
             return _err(rid, 4010, unsupported)

@@ -66,8 +66,9 @@ def _refuse_to_fire_live_weapons(request):
     """Fail closed: refuse to run a canary test unless the guard is active.
 
     Tests genuinely marked ``@pytest.mark.live_system_guard_bypass`` opt out
-    (they run the raw primitive deliberately and harmlessly, e.g. a signal-0
-    liveness probe of our own PID), matching the guard's own bypass contract.
+    (they need the raw primitive deliberately), matching the guard's own bypass
+    contract. Never a "harmless" signal 0: on Windows that is a Ctrl+C for a
+    whole console process group (bpo-14484).
     """
     if request.node.get_closest_marker("live_system_guard_bypass"):
         yield
@@ -327,10 +328,36 @@ def test_bypass_marker_disables_guard():
     """The bypass marker exists for tests that genuinely need real signal delivery
     (e.g. PTY tests SIGINTing their own child). Verify it works.
 
-    We use it harmlessly here by signaling our own PID 0 (own group) so we
-    don't actually kill anything — but the call goes through real os.kill.
+    Checked by identity, not by signalling anything: on Windows even ``os.kill(os.getpid(), 0)``
+    is a Ctrl+C for this process's console group (bpo-14484), not a harmless probe.
     """
-    # With bypass, the guard yields without installing the monkeypatch,
-    # so we get the real os.kill. Calling os.kill(os.getpid(), 0) just
-    # checks that the PID exists — harmless.
-    os.kill(os.getpid(), 0)  # No exception — guard is OFF.
+    # With bypass, the guard yields without installing the monkeypatch.
+    assert getattr(os.kill, "__name__", "") != "_guarded_kill"
+
+
+
+@pytest.mark.windows_only
+@pytest.mark.parametrize("sig", [0, 1])
+@pytest.mark.parametrize("target", ["zero", "self", "parent"])
+def test_the_guard_refuses_windows_console_events_outside_the_subtree(request, sig, target):
+    """On Windows os.kill(pid, 0|1) is GenerateConsoleCtrlEvent(CTRL_C|CTRL_BREAK, pid) (bpo-14484):
+    the guard let it through as a harmless probe, and group 0 is a broadcast to the whole console
+    (review probes, Codex rounds 3-4). The real primitive is replaced by a recorder BEFORE a guard is
+    built, so nothing is ever delivered."""
+    import psutil
+
+    from tests import conftest as repo_conftest
+
+    pid = {"zero": 0, "self": os.getpid(), "parent": psutil.Process().ppid()}[target]
+    deliveries: list = []
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(os, "kill", lambda pid, sig, *a, **k: deliveries.append((pid, sig)))
+        guard = repo_conftest._live_system_guard.__wrapped__(request, patch)
+        next(guard)
+        try:
+            with pytest.raises(RuntimeError, match="console control event"):
+                os.kill(pid, sig)
+            assert deliveries == []
+        finally:
+            with pytest.raises(StopIteration):
+                next(guard)

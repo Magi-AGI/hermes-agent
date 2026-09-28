@@ -3573,9 +3573,13 @@ def _wait_for_api_server_port_free(*, timeout: float = 10.0) -> bool:
     host, port = listen_address(pconfig.extra or {})
     freed = _wait_for_tcp_port_free(host, port, timeout=timeout)
     if not freed:
+        from gateway.status import describe_port_listener
+
+        holder = describe_port_listener(port)
         print(
-            f"⚠ {host}:{port} still accepting connections — "
-            "new api_server may fail to bind"
+            f"⚠ {host}:{port} still accepting connections"
+            + (f" (held by {holder})" if holder else "")
+            + " — new api_server may fail to bind"
         )
     return freed
 

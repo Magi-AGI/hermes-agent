@@ -641,6 +641,36 @@ def _read_pipe(pipe, box: list, latch) -> None:
         latch.release()
 
 
+def launch_outside_job(command_line: str, *, cwd: "str | None" = None, timeout: float = 30.0) -> "int | None":
+    """Windows: start ``command_line`` through WMI (``Win32_Process.Create``), whose provider creates it
+    outside the Job Objects this process sits in (the provider's own job limits still apply), and return
+    that process's PID -- a receipt, which may already have exited; None when WMI refused or timed out. For a process that must outlive us when our job forbids breakaway (a shell inside a job, an
+    isolated turn's worker): a breakaway-less spawn would die with that job. The process gets the
+    user's default environment and no inherited handles, so the command must carry what it needs."""
+    if not IS_WINDOWS:
+        return None
+
+    def ps_quote(value: str) -> str:
+        return "'" + value.replace("'", "''") + "'"
+
+    arguments = "CommandLine=" + ps_quote(command_line) + ("; CurrentDirectory=" + ps_quote(cwd) if cwd else "")
+    # Concatenation, not a format string: quoted data (a path with braces) is never post-processed.
+    script = ("$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{" + arguments + "}; "
+              "if ($r.ReturnValue -eq 0) { $r.ProcessId } else { exit 1 }")
+    # From the temp dir: PowerShell 5.1 saves its module-analysis cache a few seconds after the CimCmdlets
+    # autoload, and where it cannot resolve LocalApplicationData it writes that cache relative to its cwd.
+    import tempfile
+
+    result = bounded_probe_run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                               timeout=timeout, cwd=tempfile.gettempdir())
+    if result is None or result.returncode != 0:
+        return None
+    try:
+        return int(result.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return None
+
+
 def _close_job(job) -> None:
     if job is None:
         return

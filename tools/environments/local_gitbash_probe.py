@@ -6,9 +6,8 @@ import logging
 import ntpath
 import platform
 import shutil
-import subprocess
 
-from hermes_cli._subprocess_compat import bounded_probe_run, windows_hide_flags
+from hermes_cli._subprocess_compat import bounded_probe_run
 
 _IS_WINDOWS = platform.system() == "Windows"
 
@@ -18,6 +17,7 @@ logger = logging.getLogger("tools.environments.local")
 _bash_starts_cache: dict[str, bool] = {}
 _bash_probe_details_cache: dict[str, str] = {}
 _mandatory_aslr_enabled_cache: "bool | None" = None
+_mandatory_aslr_probed = False
 _BASH_PROBE_TIMEOUT = 15.0
 
 # External ``true`` and ``cat`` are intentional: a builtin-only ``exit 0`` probe
@@ -34,19 +34,24 @@ def _looks_like_msys_spawn_failure(details: str) -> bool:
 
 
 def _mandatory_aslr_enabled() -> "bool | None":
-    """Return Windows' system-wide ForceRelocateImages state when available."""
-    global _mandatory_aslr_enabled_cache
-    if _mandatory_aslr_enabled_cache is not None:
+    """Return Windows' system-wide ForceRelocateImages state when available (None = unknown).
+
+    Asked once per process, unknown included: it only shapes the remediation message, and it runs
+    when every Git Bash candidate failed, i.e. exactly when the machine is struggling. Through
+    ``bounded_probe_run``: subprocess.run's Windows post-timeout cleanup waits without a bound for a
+    PowerShell descendant (conhost) holding the pipe, and ``_find_bash`` runs under the terminal's
+    per-task creation lock, so one such hang stalled every later terminal call of the task.
+    """
+    global _mandatory_aslr_enabled_cache, _mandatory_aslr_probed
+    if _mandatory_aslr_probed:
         return _mandatory_aslr_enabled_cache
+    _mandatory_aslr_probed = True
     cmd = [shutil.which("powershell.exe") or "powershell.exe", "-NoProfile", "-NonInteractive",
            "-Command", "(Get-ProcessMitigation -System).Aslr.ForceRelocateImages.ToString()"]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                                errors="replace", timeout=10, creationflags=windows_hide_flags(), stdin=subprocess.DEVNULL)
-    except Exception as exc:
-        logger.debug("Could not query Windows Mandatory ASLR state: %s", exc)
-        return None
-    if result.returncode != 0:
+    result = bounded_probe_run(cmd, timeout=10)
+    if result is None or result.returncode != 0:
+        logger.debug("Could not query Windows Mandatory ASLR state: %s", "timeout or spawn failure"
+                     if result is None else f"exit {result.returncode}")
         return None
     value = (result.stdout or "").strip().upper()
     _mandatory_aslr_enabled_cache = {"ON": True, "OFF": False, "NOTSET": False}.get(value)

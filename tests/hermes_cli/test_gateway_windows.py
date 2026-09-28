@@ -3,6 +3,7 @@
 import logging
 import os
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -194,6 +195,9 @@ def test_spawn_detached_warns_and_marks_no_breakaway_fallback(
     )
     monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(gateway_windows.subprocess, "Popen", fake_popen)
+    # The out-of-job launch is unavailable here: this test covers the contained last resort.
+    monkeypatch.setattr(gateway_windows, "launch_outside_job", lambda *a, **k: None)
+    monkeypatch.setattr(gateway_windows, "_write_outside_job_launcher", lambda home=None: tmp_path / "launch.vbs")
     caplog.set_level(logging.WARNING, logger=gateway_windows.__name__)
 
     assert gateway_windows._spawn_detached() == 23456
@@ -763,3 +767,112 @@ def test_wizard_install_service_asks_once_and_never_starts_after_windows_install
 
     assert installs == [{"force": False, "start_now": True, "start_on_login": True}]
     assert starts == []
+
+
+
+@pytest.mark.windows_only
+def test_a_refused_breakaway_starts_the_gateway_from_outside_the_job(monkeypatch, tmp_path):
+    """Inside a job that forbids breakaway (an isolated turn's compute host, some shells) the
+    breakaway-less retry made the gateway die with that job, against its survive-the-app design."""
+    popens = []
+
+    def fake_popen(call_argv, **kwargs):
+        popens.append(kwargs["creationflags"])
+        error = OSError(13, "Access is denied")
+        error.winerror = 5
+        raise error
+
+    launched = []
+    monkeypatch.setattr(gateway_windows, "_build_gateway_argv",
+                        lambda home=None: (["python.exe", "-m", "hermes_cli.main", "gateway", "run"], str(tmp_path), {}))
+    monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(gateway_windows.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(gateway_windows, "_launcher_settings",
+                        lambda home=None: (sys.executable, str(tmp_path), str(tmp_path), ""))
+    monkeypatch.setattr(gateway_windows, "launch_outside_job",
+                        lambda command_line, **kw: launched.append((command_line, kw)) or 4242, raising=False)
+
+    assert gateway_windows._spawn_detached() == 4242
+    assert len(popens) == 1, "no breakaway-less (job-bound) spawn after the out-of-job launch worked"
+    assert launched and str(tmp_path / "gateway-service") in launched[0][0]
+    assert gateway_windows._LAST_SPAWN_BREAKAWAY_FALLBACK["fallback"] is False
+
+
+
+@pytest.mark.windows_only
+@pytest.mark.parametrize("dirname", ["literal; $x", "{{literal}}"])
+def test_the_outside_job_launch_passes_paths_through_verbatim(monkeypatch, dirname):
+    """The PowerShell program went through a final brace replacement, which rewrote a legal
+    ``{{literal}}`` path. Real PowerShell, a stub Invoke-CimMethod: nothing is launched."""
+    import json
+
+    from hermes_cli import _subprocess_compat as compat
+
+    real_run = compat.bounded_probe_run
+    received = []
+    stub = ("function Invoke-CimMethod {param($ClassName,$MethodName,$Arguments) "
+            "[Console]::WriteLine(($Arguments | ConvertTo-Json -Compress)); "
+            "[pscustomobject]@{ReturnValue=0;ProcessId=222}}; ")
+
+    def _inspect(argv, **kwargs):
+        result = real_run([*argv[:-1], stub + argv[-1]], **kwargs)
+        received.append(json.loads(result.stdout.splitlines()[0]))
+        return result
+
+    monkeypatch.setattr(compat, "bounded_probe_run", _inspect)
+    cwd = "C:\\O'Brien\\" + dirname
+    command = subprocess.list2cmdline(["wscript.exe", "//B", cwd + "\\gateway.vbs"])
+    assert compat.launch_outside_job(command, cwd=cwd) == 222
+    assert received == [{"CommandLine": command, "CurrentDirectory": cwd}]
+
+
+@pytest.mark.windows_only
+@pytest.mark.parametrize("directory", ["ascii", "Zo\u00eb"])
+def test_the_generated_launcher_runs_from_a_non_ascii_path(tmp_path, monkeypatch, directory):
+    """WSH read the UTF-8 launcher in the ANSI code page: under ``Zoë`` it failed at
+    ``sh.CurrentDirectory`` and never started anything. The real renderer and writer, a stand-in
+    command: no gateway is started."""
+    import time
+
+    cwd = tmp_path / directory
+    cwd.mkdir()
+    marker = tmp_path / "ran.txt"
+    monkeypatch.setattr(gateway_windows, "_launcher_settings", lambda home=None: (sys.executable, str(cwd), str(cwd), ""))
+    monkeypatch.setattr(gateway_windows, "get_task_script_path", lambda: cwd / "gateway.cmd")
+    monkeypatch.setattr(gateway_windows, "_gateway_run_argv", lambda *a: [
+        sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).write_text('ok', encoding='utf-8')"])
+    script = gateway_windows._write_task_script().with_suffix(".vbs")
+    result = subprocess.run(["cscript.exe", "//Nologo", str(script)], stdin=subprocess.DEVNULL, capture_output=True,
+                            text=True, encoding="utf-8", errors="replace", creationflags=subprocess.CREATE_NO_WINDOW,
+                            timeout=20)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    deadline = time.monotonic() + 10
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert marker.exists(), ("the launcher did not run its command", result.stdout, result.stderr)
+
+
+@pytest.mark.windows_only
+def test_another_profiles_cold_start_also_launches_from_outside_the_job(monkeypatch, tmp_path):
+    """The update's per-profile cold start (home=...) skipped the out-of-job route, so from inside an
+    isolated turn that gateway still died with the compute host."""
+    other = tmp_path / "profiles" / "other"
+    other.mkdir(parents=True)
+
+    def _refused(*_a, **_k):
+        error = OSError(13, "Access is denied")
+        error.winerror = 5
+        raise error
+
+    launched = []
+    monkeypatch.setattr(gateway_windows, "_build_gateway_argv",
+                        lambda home=None: (["python.exe", "-m", "hermes_cli.main", "gateway", "run"], str(tmp_path), {}))
+    monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(gateway_windows.subprocess, "Popen", _refused)
+    monkeypatch.setattr(gateway_windows, "_launcher_settings",
+                        lambda home=None: (sys.executable, str(tmp_path), str(home or tmp_path), ""))
+    monkeypatch.setattr(gateway_windows, "launch_outside_job",
+                        lambda command_line, **kw: launched.append(command_line) or 4343)
+
+    assert gateway_windows._spawn_detached(home=other) == 4343
+    assert launched and str(other / "gateway-service") in launched[0]

@@ -16,6 +16,17 @@ hermes --tui
 TypeScript owns the screen. Python owns sessions, tools, model calls, and slash-command logic.
 Never move agent behaviour into the renderer.
 
+**Compute host (`dashboard.turn_isolation`).** Isolated turns run in one `tui_gateway.compute_host`
+child (`host_supervisor.py`). On Windows its whole tree lives in a kill-on-close job the gateway
+owns, with no breakaway (MSYS takes any breakaway a job allows): nothing a turn starts outlives the
+host, and the host dies with its gateway. So a process an isolated turn backgrounds (a dev server
+from `terminal(background=true)`) lasts as long as the host, not across a host restart. The one
+deliberate exception is the messaging gateway, which must outlive the app: `gateway_windows.
+_spawn_detached` launches it from outside the job (`_subprocess_compat.launch_outside_job`). The
+parent only mirrors a host session's metadata; a host that rebuilds a session (respawn) and every
+in-process path for a session that ran in a host (fallback, isolation switched off) continue from the
+session store, never from the parent's copy of the history.
+
 ## Transport
 
 Newline-delimited JSON-RPC over stdio, peer-to-peer: client→server method calls, server→client

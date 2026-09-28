@@ -340,7 +340,17 @@ class BaseEnvironment(ABC):
         return f"{command} << '{delimiter}'\n{stdin_data}\n{delimiter}"
 
     # --- Process lifecycle ---
-    def _wait_for_process(
+    def _wait_for_process(self, proc: ProcessHandle, timeout: int = 120, **kwargs) -> dict:
+        """See :meth:`_wait_for_process_body`. Whatever way the wait ends -- natural exit, kill, an
+        exception -- the command's per-command resource is released, except after a yield handoff,
+        whose handler owns the process from then on."""
+        try:
+            return self._wait_for_process_body(proc, timeout, **kwargs)
+        finally:
+            if getattr(proc, "_hermes_handed_off", False) is not True:
+                self._release_process(proc)
+
+    def _wait_for_process_body(
         self, proc: ProcessHandle, timeout: int = 120, *,
         bounded_capture: bool = False, watch_interrupt_tid: int | None = None,
         yield_handler: Callable[[ProcessHandle, str], dict] | None = None) -> dict:
@@ -395,6 +405,9 @@ class BaseEnvironment(ABC):
                         logger.warning("yield-to-background handoff failed; continuing to wait", exc_info=True)
                         handed = None
                     if handed is not None:
+                        # The handler now owns the process, and any per-command resource with it
+                        # (the local backend's job): releasing it would reopen the leak on its kill.
+                        proc._hermes_handed_off = True
                         output.close_spill()
                         return handed
                     drain_stop.clear()
@@ -442,6 +455,10 @@ class BaseEnvironment(ABC):
         return result
 
     _finalize_wait_result = staticmethod(_finalize_wait_result)
+
+    def _release_process(self, proc: ProcessHandle) -> None:
+        """A command's process finished (or was handed off) without a kill; backends holding a
+        per-command resource (the local backend's Windows job) release it here."""
 
     def _kill_process(self, proc: ProcessHandle):
         """Terminate a process. Subclasses may override for process-group kill."""

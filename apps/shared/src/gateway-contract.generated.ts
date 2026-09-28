@@ -4548,7 +4548,7 @@ export interface RpcMethods {
   'session.list': { params: SessionListParams; result: SessionListResult }
   /** Most recent human-facing session; errors fold into a null session_id. */
   'session.most_recent': { params: SessionMostRecentParams; result: SessionMostRecentResult }
-  /** Redirect the active turn (queued for the next turn while the agent is still building). */
+  /** Redirect the active turn (queued for the next turn while the agent is still building, or while the turn runs in an isolated worker). */
   'session.redirect': { params: SessionCorrectionParams; result: SessionCorrectionResult }
   /** Attach to a stored session: reuse it if live here, else lazy / deferred / cold / eager rebuild. */
   'session.resume': { params: SessionResumeParams; result: SessionResumeResult }
@@ -4558,7 +4558,7 @@ export interface RpcMethods {
   'session.set_hidden': { params: SessionSetHiddenParams; result: SessionSetHiddenResult }
   /** Rendered /status text for the session. */
   'session.status': { params: SessionStatusParams; result: SessionStatusResult }
-  /** Inject text into the next tool result without interrupting the turn. */
+  /** Inject text into the next tool result without interrupting the turn (queued for the next turn while the turn runs in an isolated worker, which takes no live corrections). */
   'session.steer': { params: SessionCorrectionParams; result: SessionCorrectionResult }
   /** Read or set a live session's title; a title set before the row exists is queued. */
   'session.title': { params: SessionTitleParams; result: SessionTitleResult }

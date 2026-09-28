@@ -216,13 +216,12 @@ def test_handoff_fail_marks_only_inflight_rows(monkeypatch):
 
 def test_dashboard_process_isolation_config_defaults_without_default_merge(monkeypatch):
     """tui_gateway.server::_load_cfg is raw YAML, so defaults live at read site."""
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
     monkeypatch.setattr(server, "_load_cfg", lambda: {})
 
-    assert server._load_dashboard_process_isolation_config() == {
-        "turn_isolation": False,
-        "compute_host_heartbeat_secs": 15,
-        "compute_host_respawn_max": 3,
-    }
+    loaded = server._load_dashboard_process_isolation_config()
+    assert loaded == {key: DEFAULT_CONFIG["dashboard"][key] for key in loaded}
 
 
 def test_dashboard_process_isolation_config_coerces_raw_values():
@@ -231,6 +230,7 @@ def test_dashboard_process_isolation_config_coerces_raw_values():
             "turn_isolation": "yes",
             "compute_host_heartbeat_secs": "30",
             "compute_host_respawn_max": "0",
+            "compute_host_heartbeat_timeout_secs": "0",
         }
     }
 
@@ -238,14 +238,11 @@ def test_dashboard_process_isolation_config_coerces_raw_values():
         "turn_isolation": True,
         "compute_host_heartbeat_secs": 30,
         "compute_host_respawn_max": 0,
+        "compute_host_heartbeat_timeout_secs": 0,
     }
 
     malformed = {"dashboard": "enabled"}
-    assert server._load_dashboard_process_isolation_config(malformed) == {
-        "turn_isolation": False,
-        "compute_host_heartbeat_secs": 15,
-        "compute_host_respawn_max": 3,
-    }
+    assert server._load_dashboard_process_isolation_config(malformed) == server._load_dashboard_process_isolation_config({})
 
 
 def test_default_config_seeds_dashboard_process_isolation_keys():

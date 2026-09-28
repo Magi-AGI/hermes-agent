@@ -828,7 +828,16 @@ def _kill_known_pids(proc, descendants) -> None:
 
 
 def _kill_process_windows(proc) -> None:
-    """Identity-checked terminate (start time guards against PID reuse), else kill."""
+    """End the command's job (its whole tree), else an identity-checked terminate (start time guards
+    against PID reuse), else kill."""
+    from hermes_cli.local_runtime.processes import end_command
+
+    # taskkill /T follows live parent links only; MSYS lets a command's forked parent exit, so the
+    # command itself (sleep, a build, a server) ran on after its timeout or /stop. The job has it.
+    if end_command(proc, terminate=True):
+        with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+            proc.wait(timeout=2.0)
+        return
     try:
         from gateway.status import get_process_start_time, terminate_pid
         terminate_pid(proc.pid, force=True, expected_start_time=get_process_start_time(proc.pid))
@@ -935,18 +944,29 @@ class LocalEnvironment(BaseEnvironment):
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
         self._recover_cwd()
-        proc = subprocess.Popen(
-            args, text=True, env=_make_run_env(self.env), encoding="utf-8", errors="replace",
+        popen_kwargs = dict(
+            text=True, env=_make_run_env(self.env), encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-            start_new_session=True, cwd=self.cwd,
-            **({"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}))
+            start_new_session=True, cwd=self.cwd)
+        if _IS_WINDOWS:
+            # Each command in its own job so a kill reaches the whole tree (_kill_process_windows). Not
+            # kill-on-close: a process the command deliberately backgrounds outlives a normal finish.
+            from hermes_cli.local_runtime.processes import spawn_command
+            proc = spawn_command(args, creationflags=windows_hide_flags(), **popen_kwargs)
+        else:
+            proc = subprocess.Popen(args, **popen_kwargs)
         if not _IS_WINDOWS:
             with contextlib.suppress(ProcessLookupError):
                 proc._hermes_pgid = os.getpgid(proc.pid)
         if stdin_data is not None:
             _pipe_stdin(proc, stdin_data)
         return proc
+
+    def _release_process(self, proc) -> None:
+        from hermes_cli.local_runtime.processes import end_command
+
+        end_command(proc, terminate=False)  # whatever the command left running stays
 
     def _kill_process(self, proc):
         """Kill the entire process group (all children)."""

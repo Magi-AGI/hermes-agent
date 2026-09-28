@@ -35,7 +35,7 @@ def test_get_git_banner_state_reads_origin_and_head(tmp_path):
             raise AssertionError(f"unexpected command: {cmd}")
         return results[key]
 
-    with patch("hermes_cli.banner.subprocess.run", side_effect=fake_run):
+    with patch("hermes_cli.banner.bounded_probe_run", side_effect=fake_run):
         state = banner.get_git_banner_state(repo_dir)
 
     assert state == {"upstream": "b2f477a3", "local": "af8aad31", "ahead": 3}
@@ -66,7 +66,7 @@ def test_check_via_local_git_ssh_fastpath_ahead_not_behind(tmp_path):
         patch.object(banner, "_git_stdout", side_effect=fake_git_stdout),
         patch.object(banner, "_github_branch_tip", return_value="a" * 40),
         # merge-base --is-ancestor exits 0: upstream tip IS an ancestor of HEAD
-        patch.object(banner.subprocess, "run", return_value=MagicMock(returncode=0)),
+        patch.object(banner, "bounded_probe_run", return_value=MagicMock(returncode=0)),
     ):
         behind = banner._check_via_local_git(repo_dir)
 
@@ -93,7 +93,7 @@ def test_check_via_local_git_ssh_fastpath_genuinely_behind(tmp_path):
         patch.object(banner, "_git_stdout", side_effect=fake_git_stdout),
         patch.object(banner, "_github_branch_tip", return_value="a" * 40),
         # merge-base --is-ancestor exits 1: not an ancestor -> genuinely behind
-        patch.object(banner.subprocess, "run", return_value=MagicMock(returncode=1)),
+        patch.object(banner, "bounded_probe_run", return_value=MagicMock(returncode=1)),
         patch.object(banner, "_github_compare_behind", return_value=3),
     ):
         behind = banner._check_via_local_git(repo_dir)
@@ -120,7 +120,7 @@ def test_check_via_local_git_ssh_fastpath_offline_keeps_sentinel(tmp_path):
     with (
         patch.object(banner, "_git_stdout", side_effect=fake_git_stdout),
         patch.object(banner, "_github_branch_tip", return_value="a" * 40),
-        patch.object(banner.subprocess, "run", return_value=MagicMock(returncode=1)),
+        patch.object(banner, "bounded_probe_run", return_value=MagicMock(returncode=1)),
         patch.object(banner, "_github_compare_behind", return_value=None),
     ):
         behind = banner._check_via_local_git(repo_dir)
@@ -173,7 +173,7 @@ def test_check_via_local_git_insteadof_rewrite_routes_to_ssh_fastpath(tmp_path, 
     monkeypatch.setenv("USERPROFILE", str(home))  # Git for Windows resolves global config here too
 
     calls = []
-    real_run = banner.subprocess.run
+    real_run = banner.bounded_probe_run
 
     def spy_run(args, **kwargs):
         calls.append((list(args), kwargs))
@@ -181,7 +181,7 @@ def test_check_via_local_git_insteadof_rewrite_routes_to_ssh_fastpath(tmp_path, 
             raise AssertionError(f"a GitHub origin must be probed via the API, not git {args[1]}")
         return real_run(args, **kwargs)
 
-    monkeypatch.setattr(banner.subprocess, "run", spy_run)
+    monkeypatch.setattr(banner, "bounded_probe_run", spy_run)
     monkeypatch.setattr(banner, "_github_branch_tip", lambda slug, branch: head_sha)
 
     behind = banner._check_via_local_git(repo_dir)

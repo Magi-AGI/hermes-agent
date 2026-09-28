@@ -4249,7 +4249,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 await self._runner.cleanup()
                 self._runner = None
                 self._site = None
+                holder = None
                 if getattr(exc, "errno", None) == errno.EADDRINUSE:
+                    from gateway.status import describe_port_listener
+
+                    # Name the holder: a surviving gateway (this profile's or another's) and a foreign
+                    # program need different fixes, and "already in use" alone told them apart for no one.
+                    holder = await asyncio.to_thread(describe_port_listener, self._port)
                     # Config error: non-retryable, or the reconnect watcher leaks fds forever.
                     self._set_fatal_error(
                         # A port conflict is a configuration error, not a transient blip — another process
@@ -4260,14 +4266,16 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         # fds each retry. Non-retryable drops it from the reconnect queue; the operator
                         # recovers with ``/platform resume api_server`` after changing the port.
                         "api_server_port_in_use",
-                        f"Port {self._port} already in use. Set "
-                        f"platforms.api_server.port in config.yaml to a "
+                        f"Port {self._port} already in use"
+                        + (f" by {holder}" if holder else "")
+                        + ". A stale gateway of this profile is replaced by `hermes gateway restart`; "
+                        f"otherwise set platforms.api_server.port in config.yaml to a "
                         f"different value, then `/platform resume api_server`.",
                         retryable=False)
                 logger.error(
-                    "[%s] Could not bind %s:%d: %s. Set a different port in "
+                    "[%s] Could not bind %s:%d: %s%s. Set a different port in "
                     "config.yaml: platforms.api_server.port",
-                    self.name, self._host, self._port, exc)
+                    self.name, self._host, self._port, exc, f" (held by {holder})" if holder else "")
                 return False
             from gateway.platforms.shared_ingress import listener_base_url
             self._mark_connected(listener_base=listener_base_url(self._host, self._port))

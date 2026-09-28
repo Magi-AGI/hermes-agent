@@ -4,6 +4,7 @@ Validates that is_network_accessible() correctly classifies addresses and
 that connect() refuses to start without API_SERVER_KEY.
 """
 
+import os
 import socket
 from unittest.mock import patch
 
@@ -188,6 +189,8 @@ class TestBindMechanics:
             assert second.fatal_error_retryable is False
             assert second.fatal_error_code == "api_server_port_in_use"
             assert str(port) in (second.fatal_error_message or "")
+            # The holder is named (here this very process), so a surviving gateway is not a guess.
+            assert f"PID {os.getpid()}" in (second.fatal_error_message or "")
         finally:
             await first.disconnect()
             await second.disconnect()

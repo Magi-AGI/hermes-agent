@@ -476,15 +476,19 @@ def _persist_session_row_for_submit(rid, session, text=None, display_kind=None):
                 f"Session storage could not be written, so this message was not saved. Cause: {failure.gloss}. "
                 f"{failure.action} Then send your message again.",
                 data=_storage_error_data(failure, exc))
-    # No turn thread will start, so neither resume nor the busy queue may see
-    # this rejected prompt as live. Release the slot a turn would normally own.
+    _release_rejected_submit(session)
+    return error
+
+
+def _release_rejected_submit(session: dict) -> None:
+    """No turn thread will start, so neither resume nor the busy queue may see this rejected
+    prompt as live. Release the slot a turn would normally own."""
     with session["history_lock"]:
         session["running"] = False
         session["last_active"] = time.time()
         session.pop("_hosted_room_task", None)
         _clear_inflight_turn(session)
         _release_active_session_slot(session)
-    return error
 
 
 def _run_after_agent_ready(
@@ -678,6 +682,7 @@ def _(rid, params: dict) -> dict:
             break
     if err is not None:
         return err
+    fallback_reason = "Turn isolation is off"
     if turn_isolation:
         if turn_author:
             logger.debug("isolated compute turns carry no author yet; the turn from %s runs unattributed",
@@ -696,9 +701,16 @@ def _(rid, params: dict) -> dict:
         # the cut when it doesn't. Consent is checked BEFORE target resolution: an unconfirmed
         # (leaked-state) request must refuse with 4029 without paying the durable transcript read or
         # heal-stamping live history dicts that row-id resolution performs.
-        logger.warning(
-            "compute-host dispatch failed for session %s; falling back inline: %s", sid,
-            isolated_response["error"].get("message", "unknown error"))
+        fallback_reason = str(isolated_response["error"].get("message") or "compute-host dispatch failed")
+        logger.warning("compute-host dispatch failed for session %s; falling back inline: %s", sid, fallback_reason)
+    # Inline from here. A session whose live transcript was in a compute host (dispatch just failed, or
+    # turn isolation was switched off since) continues from the store, or is refused -- never from
+    # this process's stale copy. No-op for every other session.
+    if (refusal := _adopt_host_session_inline(rid, session, fallback_reason)) is not None:
+        _release_rejected_submit(session)
+        return refusal
+    if turn_isolation:
+        _status_update(sid, "status", "The isolated turn worker is unavailable; this turn runs in the main process.")
     if (err := _persist_session_row_for_submit(rid, session, text, display_kind)) is not None:
         return err
     # A completed FAILED build must not wedge the session: rebuild, don't replay it.
@@ -1050,7 +1062,11 @@ def _(rid, params: dict) -> dict:
     if err:
         return err
     agent = session.get("agent")
-    snapshot = list(getattr(agent, "_session_messages", None) or session.get("history") or [])
+    snapshot, err = _host_owned_history(rid, session)
+    if err:
+        return err
+    if snapshot is None:
+        snapshot = list(getattr(agent, "_session_messages", None) or session.get("history") or [])
     main_runtime = {
         k: getattr(agent, k, None)
         for k in ("model", "provider", "base_url", "api_key", "api_mode", "session_id")}
@@ -1096,7 +1112,10 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4012, "url required")
     task_id = f"preview_{uuid.uuid4().hex[:6]}"
     parent = params.get("session_id", "")
-    parent_history = _preview_restart_history(session)
+    host_history, err = _host_owned_history(rid, session)
+    if err:
+        return err
+    parent_history = _preview_restart_history(session, history=host_history)
     prompt = "\n".join(
         line
         for line in [

@@ -4,12 +4,12 @@ import logging
 import os
 import re
 import shutil
-import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 from urllib.parse import urlparse
+from hermes_cli._subprocess_compat import bounded_probe_run
 from hermes_constants import get_hermes_home
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -169,31 +169,21 @@ def _is_official_ssh_remote(url: str | None) -> bool:
         _canonical_github_remote(url) == _OFFICIAL_REPO_CANONICAL)
 
 
-_GIT_TEXT_KW = {"text": True, "encoding": "utf-8", "errors": "replace"}
+def _git_run(args: list[str], *, cwd: Optional[Path] = None, timeout: int = 5, network: bool = False):
+    """Run ``git <args>``; None on timeout or spawn failure.
 
-
-def _git_run(args: list[str], *, cwd: Optional[Path] = None, timeout: int = 5, text: bool = True,
-             network: bool = False):
-    """Run ``git <args>`` with the shared subprocess boilerplate; None on any exception.
-
-    git output is UTF-8; on Windows ``text=True`` defaults to the ANSI code page and a byte like the
-    3rd of 🐛 in a commit subject crashes the stdlib reader thread (#52649), hence the explicit
-    encoding. ``network=True`` (ls-remote/fetch) detaches stdin and disables git/GCM prompts so a
-    passive update check can never hang on a ``Username for 'https://github.com':`` prompt.
+    Through ``bounded_probe_run``, never ``subprocess.run``: on Windows run()'s post-timeout cleanup
+    is an unbounded ``communicate()``, and an orphaned ``git.exe`` still holding the pipe pinned it
+    forever — every compute host leaked a hung thread and a git.exe that way (2026-09-14). The probe
+    also decodes UTF-8 explicitly (a 🐛 byte under the ANSI code page crashed the reader, #52649),
+    detaches stdin and hides the console. ``network=True`` (ls-remote/fetch) disables git/GCM
+    prompts so a passive update check can never hang on ``Username for 'https://github.com':``.
     """
-    from hermes_cli._subprocess_compat import noninteractive_git_env, windows_hide_flags
+    from hermes_cli._subprocess_compat import noninteractive_git_env
 
-    # The banner/update probes run from GUI-hosted backends too (desktop-spawned
-    # ``hermes serve``), where a bare git child flashes a console window.
-    kwargs: dict = {"creationflags": windows_hide_flags()}
-    if network:
-        kwargs.update({"stdin": subprocess.DEVNULL, "env": noninteractive_git_env()})
-    try:
-        return subprocess.run(
-            ["git", *args], capture_output=True, timeout=timeout, cwd=str(cwd) if cwd is not None else None,
-            **(_GIT_TEXT_KW if text else {}), **kwargs)
-    except Exception:
-        return None
+    return bounded_probe_run(
+        ["git", *args], timeout=timeout, cwd=str(cwd) if cwd is not None else None,
+        env=noninteractive_git_env() if network else None)
 
 
 def _git_stdout(args: list[str], *, cwd: Path, timeout: int = 5, network: bool = False) -> Optional[str]:
@@ -205,7 +195,7 @@ def _git_stdout(args: list[str], *, cwd: Path, timeout: int = 5, network: bool =
 
 def _git_ok(args: list[str], **kw) -> bool:
     """True when ``git <args>`` ran and exited 0 (output discarded)."""
-    result = _git_run(args, text=False, **kw)
+    result = _git_run(args, **kw)
     return result is not None and result.returncode == 0
 
 

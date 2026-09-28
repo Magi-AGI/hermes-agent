@@ -123,6 +123,14 @@ def _admit_prompt_turn(
             session.pop("_submit_user_row", None)  # no turn runs: the submit-time row stays as the send
         _emit("error", sid, {"message": str(ownership_refusal)})
         return None
+    # Every in-process turn source crosses here (prompt.submit, queued drain, auto-continue, wake-ups): a
+    # session whose live transcript was in a compute host continues from the store, never this copy.
+    if (host_refusal := _adopt_if_isolation_off(None, session)) is not None:
+        with session["history_lock"]:
+            session["running"] = False
+            session.pop("_submit_user_row", None)
+        _emit("error", sid, {"message": host_refusal["error"]["message"]})
+        return None
     with session["history_lock"]:
         if session.get("_closing") or (
             queued_prompt_generation is not None

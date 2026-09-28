@@ -233,3 +233,28 @@ def test_failed_setup_never_runs_child_and_releases_handles(tmp_path, monkeypatc
             proc._handle.Close()
         for job in jobs:
             job.close()
+
+
+
+def test_a_job_released_concurrently_is_never_reported_as_terminated():
+    """A natural-exit observer could close the job between the terminate caller's check and its call:
+    only CloseHandle ran, yet end_command reported the tree killed and suppressed the pid fallback."""
+    import threading
+    import types
+
+    from hermes_cli.local_runtime.processes import _WindowsJob, end_command
+
+    calls: list = []
+    job = object.__new__(_WindowsJob)  # the real methods, an API double: no OS handles or signals
+    job._handle, job._lock = 123, threading.Lock()
+    job._api = types.SimpleNamespace(TerminateJobObject=lambda *a: calls.append("terminate") or True,
+                                     CloseHandle=lambda *a: calls.append("close") or True)
+    terminate = job.terminate
+
+    def _after_the_observer_released_it(*a, **k):
+        job.close()
+        return terminate(*a, **k)
+
+    job.terminate = _after_the_observer_released_it
+    assert end_command(types.SimpleNamespace(_hermes_job=job), terminate=True) is False
+    assert calls == ["close"]

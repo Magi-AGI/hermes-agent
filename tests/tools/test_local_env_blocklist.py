@@ -45,6 +45,12 @@ def _make_fake_popen(captured: dict):
     return fake_popen
 
 
+def _spawn_without_job(cmd, kill_on_close=True, **kwargs):
+    """On Windows the terminal spawns through spawn_server (a job per command); a fake Popen has no
+    process to put in one, so hand it straight back."""
+    return subprocess.Popen(cmd, **kwargs), None
+
+
 def _run_with_env(extra_os_env=None, self_env=None):
     """Execute a command via LocalEnvironment with mocked Popen
     and return the env dict passed to the subprocess."""
@@ -60,6 +66,7 @@ def _run_with_env(extra_os_env=None, self_env=None):
     env = LocalEnvironment(cwd="/tmp", timeout=10, env=self_env)
 
     with patch("tools.environments.local._find_bash", return_value="/bin/bash"), \
+         patch("hermes_cli.local_runtime.processes.spawn_server", side_effect=_spawn_without_job), \
          patch("subprocess.Popen", side_effect=_make_fake_popen(captured)), \
          patch.dict(os.environ, test_environ, clear=True):
         env.execute("echo hello")

@@ -80,10 +80,13 @@ sys.excepthook = _panic_hook
 threading.excepthook = lambda args: _record_crash(
     "thread exception", args.exc_type, args.exc_value, args.exc_traceback, thread_name=args.thread.name)
 
-with contextlib.suppress(Exception):
-    from hermes_cli.banner import prefetch_update_check
+# Not in a compute host: a per-session turn process has no business checking for updates (the
+# gateway that spawned it already does), and every host spawn used to leak that check's git probe.
+if os.environ.get("HERMES_COMPUTE_HOST_CHILD") != "1":
+    with contextlib.suppress(Exception):
+        from hermes_cli.banner import prefetch_update_check
 
-    prefetch_update_check()
+        prefetch_update_check()
 
 from tui_gateway.render import make_stream_renderer, render_diff, render_message  # noqa: F401
 
@@ -1170,6 +1173,9 @@ def _sess_building(params, rid):
     reader thread, where waiting on a cold build stalled every RPC behind it ("text is instant, images hang")."""
     s, err = _sess_nowait(params, rid)
     if not err:
+        # An agent-requiring RPC is about to act in-process: a host session must adopt first.
+        err = _adopt_if_isolation_off(rid, s, defer_while_host_turn=True)
+    if not err:
         _start_agent_build(params.get("session_id") or "", s)
     return (None, err) if err else (s, None)
 
@@ -1180,6 +1186,7 @@ def _sess_building(params, rid):
 _DASHBOARD_TURN_ISOLATION_DEFAULT = False
 _DASHBOARD_COMPUTE_HOST_HEARTBEAT_SECS_DEFAULT = 15
 _DASHBOARD_COMPUTE_HOST_RESPAWN_MAX_DEFAULT = 3
+_DASHBOARD_COMPUTE_HOST_HEARTBEAT_TIMEOUT_SECS_DEFAULT = 120
 
 
 def _coerce_int_config_value(value: Any, default: int, *, min_value: int) -> int:
@@ -1202,6 +1209,9 @@ def _load_dashboard_process_isolation_config(cfg: dict | None = None) -> dict[st
             dash.get("compute_host_heartbeat_secs"), _DASHBOARD_COMPUTE_HOST_HEARTBEAT_SECS_DEFAULT, min_value=1),
         "compute_host_respawn_max": _coerce_int_config_value(
             dash.get("compute_host_respawn_max"), _DASHBOARD_COMPUTE_HOST_RESPAWN_MAX_DEFAULT, min_value=0),
+        "compute_host_heartbeat_timeout_secs": _coerce_int_config_value(
+            dash.get("compute_host_heartbeat_timeout_secs"), _DASHBOARD_COMPUTE_HOST_HEARTBEAT_TIMEOUT_SECS_DEFAULT,
+            min_value=0),
     }
 
 

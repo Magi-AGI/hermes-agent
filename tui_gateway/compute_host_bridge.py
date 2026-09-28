@@ -29,6 +29,10 @@ def _turn_isolation_enabled(cfg: dict | None = None) -> bool:
 def _session_uses_compute_host(session: dict, cfg: dict | None = None) -> bool:
     # Routes lazy sessions whose AIAgent was never built in-process; already-built
     # sessions keep the in-process path unless a prior isolated turn marked host ownership.
+    # A turn still in flight in a host stays routed there until it settles, whatever the config
+    # says now: switching isolation off governs future turns, never Stop/save for the running one.
+    if session.get("_compute_host_active") and session.get("_compute_host_turn_id"):
+        return True
     return _turn_isolation_enabled(cfg) and (
         bool(session.get("_compute_host_active"))
         or (session.get("agent") is None and session.get("agent_ready") is not None))
@@ -43,7 +47,8 @@ def _get_compute_host_supervisor(cfg: dict | None = None):
             _compute_host_supervisor = HostSupervisor(
                 rpc_sink=_relay_compute_host_rpc,
                 heartbeat_secs=int(isolation_cfg.get("compute_host_heartbeat_secs") or 15),
-                respawn_max=int(isolation_cfg.get("compute_host_respawn_max") or 3))
+                respawn_max=int(isolation_cfg.get("compute_host_respawn_max") or 3),
+                heartbeat_timeout_secs=float(isolation_cfg.get("compute_host_heartbeat_timeout_secs") or 0))
         return _compute_host_supervisor
 
 
@@ -70,6 +75,10 @@ def _compute_host_turn_frame(
         "source": _session_source(session), "attached_images": attached_images,
         "auth_user_id": _session_auth_user_id(session),
         "queued_prompt_generation": queued_prompt_generation,
+        # Once a turn has run in a host, the live transcript is the host's (this process only mirrors
+        # metadata), so ``history`` above is stale. A host that has to BUILD the session (it respawned)
+        # rebuilds from the session store instead of from this copy.
+        "durable_history": bool(session.get("_compute_host_active")),
         # #101416: vouch that this process already holds the registry lease for this session, so
         # the child adopts it as an inert token instead of re-claiming and being fenced out by
         # our own entry ("Session ... already has a live owner"). No lease held = no vouch, and
@@ -219,31 +228,61 @@ def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> No
         return
     with _history_lock(session):
         _compute_host_adopt_frame_meta(session, frame)
-        if frame.get("message_count") is not None:
-            with contextlib.suppress(Exception):
-                session["_metadata_message_count"] = int(frame.get("message_count") or 0)
+        _adopt_frame_message_count(session, frame)
+    _mirror_frame_session_info(session, frame)
+
+
+def _adopt_frame_message_count(session: dict, frame: dict) -> None:
+    """Caller holds history_lock."""
+    if frame.get("message_count") is not None:
+        with contextlib.suppress(Exception):
+            session["_metadata_message_count"] = int(frame.get("message_count") or 0)
+
+
+def _mirror_frame_session_info(session: dict, frame: dict) -> None:
     info = frame.get("session_info")
     if isinstance(info, dict):
         session["_metadata_mirror"] = {**_metadata_mirror(session), **info}
         session["_metadata_mirror_updated_at"] = time.time()
 
 
-def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -> None:
+def _adopt_compute_host_completion_locked(session: dict, frame: dict) -> None:
+    """What the finished host turn wrote: its identity (a rotated session_key and the lease with it), history
+    version, message count and session_info. Caller holds history_lock while the turn still owns the session."""
+    _compute_host_adopt_frame_meta(session, frame)
+    _adopt_frame_message_count(session, frame)
+    _mirror_frame_session_info(session, frame)
+    _clear_inflight_turn(session)
+    session.pop("_compute_host_open_request", None)
+
+
+def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict, turn_id: str | None = None) -> None:
+    """A host turn's completion. The turn keeps the session (its marker and ``running`` stay set, so Stop still
+    routes to the host and a new prompt queues) until its terminal events are out: a turn admitted before them
+    could have its message.start overtaken by this turn's idle session.info, its lease released, or its
+    metadata replaced. ``turn_id``: the marker ``_complete`` claimed, retired here only if still current."""
+    if turn_id is None:
+        with session["history_lock"]:
+            _adopt_compute_host_completion_locked(session, frame)
+    try:
+        if frame.get("type") == "turn.error":
+            message = str(frame.get("message") or "compute host turn failed")
+            _emit("message.complete", sid, {"text": f"Error: {message}", "status": "error"})
+        if not frame.get("session_info_emitted"):
+            _emit("session.info", sid, {**_compute_host_session_info(session), "running": False})
+    except Exception:
+        # The supervisor consumed this completion; nothing will deliver it again, so the turn settles anyway.
+        logger.warning("compute-host completion events failed for session %s; settling the turn", sid, exc_info=True)
     with session["history_lock"]:
-        _compute_host_adopt_frame_meta(session, frame)
+        if turn_id is not None and session.get("_compute_host_turn_id") != turn_id:
+            return  # a newer host turn owns the session
+        session.pop("_compute_host_turn_id", None)
+        session.pop("_compute_host_activity_ns", None)
         session["running"] = False
         session["last_active"] = time.time()
-        _clear_inflight_turn(session)
-        session.pop("_compute_host_open_request", None)
-    if frame.get("type") == "turn.error":
-        message = str(frame.get("message") or "compute host turn failed")
-        _emit("message.complete", sid, {"text": f"Error: {message}", "status": "error"})
-    _apply_compute_host_metadata_mirror(session, frame)
-    # Settlement of a turn whose session was closed mid-flight: the real lease was held for it.
-    _release_deferred_active_session_lease(session)
-    info = _compute_host_session_info(session)
-    if not frame.get("session_info_emitted"):
-        _emit("session.info", sid, info)
+        # A close while this turn ran deferred the REAL lease to its settlement (no other turn can have run).
+        deferred_lease = session.pop("_deferred_active_session_lease", None)
+    _release_deferred_lease(deferred_lease)
     _drain_queued_prompt(rid, sid, session)
 
 
@@ -261,6 +300,13 @@ def _submit_prompt_to_compute_host(
     with session["history_lock"]:
         session["_compute_host_turn_id"] = turn_id
         session.pop("_compute_host_activity_ns", None)
+        # Published before any completion is possible: a fast completion drains the next queued prompt,
+        # which may adopt the session in-process, and an old submit returning afterwards must never
+        # re-mark it host-owned. Rolled back below only for a dispatch that genuinely failed.
+        prior_active, prior_images = session.get("_compute_host_active"), session.get("attached_images")
+        session["_compute_host_active"] = True
+        if image_paths is None:
+            session["attached_images"] = []
 
     def _complete(done: dict) -> None:
         # submit_turn reports a synchronous pipe failure via the callback before re-raising;
@@ -269,9 +315,8 @@ def _submit_prompt_to_compute_host(
             with session["history_lock"]:
                 if session.get("_compute_host_turn_id") != turn_id:
                     return
-                session.pop("_compute_host_turn_id", None)
-                session.pop("_compute_host_activity_ns", None)
-            _on_compute_host_turn_done(rid, sid, session, done)
+                _adopt_compute_host_completion_locked(session, done)
+            _on_compute_host_turn_done(rid, sid, session, done, turn_id)
     try:
         _get_compute_host_supervisor(cfg).submit_turn(frame, on_complete=_complete)
     except Exception as exc:
@@ -279,12 +324,89 @@ def _submit_prompt_to_compute_host(
             if session.get("_compute_host_turn_id") == turn_id:
                 session.pop("_compute_host_turn_id", None)
                 session.pop("_compute_host_activity_ns", None)
+                if prior_active:
+                    session["_compute_host_active"] = prior_active
+                else:
+                    session.pop("_compute_host_active", None)
+                if image_paths is None:
+                    # The failed prompt's images first, then any attached while it was dispatching.
+                    session["attached_images"] = [*(prior_images or []), *(session.get("attached_images") or [])]
         return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
-    with session["history_lock"]:
-        session["_compute_host_active"] = True
-        if image_paths is None:
-            session["attached_images"] = []
     return _ok(rid, {"status": "streaming", "turn_isolation": True})
+
+
+def _adopt_host_session_inline(rid: str, session: dict, reason: str) -> dict | None:
+    """Make a session whose live state was in the compute host safe to run in-process, or return the
+    refusal. The host wrote the transcript and this process only mirrored metadata, so the history
+    reloads from the session store; the session then stays in-process (the host copy is abandoned).
+
+    Never while a host turn is in flight, for every caller: its writer has not finished, so the store
+    holds a partial transcript, and dropping the host-active mark would hide the turn from its completion."""
+    with session["history_lock"]:
+        if not session.get("_compute_host_active"):
+            return None  # never ran in a host: this process's history and ids are current
+        if session.get("_compute_host_turn_id"):
+            return _host_turn_busy(rid)
+        key = str(session.get("session_key") or "")
+        resume_id = str(session.get("resume_session_id") or "")
+    if resume_id and resume_id != key:
+        # The host compressed it onto a new id; an in-process build would reopen the old one
+        # (_deferred_build_agent_kwargs), so this turn waits for the host instead.
+        return _err(rid, 5019, f"{reason}. This conversation can only continue in the isolated worker; "
+                               "send the message again once it restarts.")
+    history = _load_durable_truncation_history(session)
+    if history is None:
+        return _err(rid, 5019, f"{reason}. Its transcript could not be reloaded to continue in the main "
+                               "process; send the message again shortly.")
+    with session["history_lock"]:
+        if session.get("_compute_host_turn_id") or str(session.get("session_key") or "") != key:
+            return _host_turn_busy(rid)  # a host turn started, or rotated the id, while the store was read
+        if not session.get("_compute_host_active"):
+            return None  # adopted concurrently
+        session["history"] = history
+        session["history_version"] = int(session.get("history_version", 0)) + 1
+        session["_compute_host_active"] = False
+    return None
+
+
+def _host_turn_busy(rid) -> dict:
+    return _err(rid, 4009, "This conversation's last turn is still finishing in the isolated worker; "
+                           "send the message again when it completes.")
+
+
+def _host_owned_history(rid, session: dict) -> tuple[list | None, dict | None]:
+    """``(history, refusal)`` for an in-process reader of a session's transcript (a side question, the
+    preview-restart context). A session whose turns run in a compute host has the store as its only
+    written copy -- this process's is a stale mirror -- so it reads the store, or refuses when that cannot
+    be read. ``(None, None)`` for an in-process session: its own history is current."""
+    if not session.get("_compute_host_active"):
+        return None, None
+    history = _load_durable_truncation_history(session)
+    if history is None:
+        return None, _err(rid, 5019, "This conversation's transcript could not be read; try again shortly.")
+    return history, None
+
+
+def _adopt_if_isolation_off(rid, session: dict, *, defer_while_host_turn: bool = False) -> dict | None:
+    """The in-process gate for a session whose turns ran in a compute host, once turn isolation is off:
+    adopt the store's transcript before anything in this process reads or writes its history, or refuse
+    (the refusal envelope). None for every other session. Isolation is read under the session's own
+    profile scope: another profile may have it on while the launch profile has it off.
+
+    Never while a host turn is still in flight (``_adopt_host_session_inline`` refuses): until it settles
+    the session stays routed to the host (``_session_uses_compute_host``). ``defer_while_host_turn`` (an
+    RPC that does not run a turn) leaves adoption to the next admission after that turn's completion; a
+    turn admission refuses instead."""
+    if not session.get("_compute_host_active"):
+        return None
+    with _session_profile_runtime_scope(session):
+        if _turn_isolation_enabled():
+            return None
+    with session["history_lock"]:
+        host_turn_live = bool(session.get("_compute_host_turn_id"))
+    if host_turn_live and defer_while_host_turn:
+        return None
+    return _adopt_host_session_inline(rid, session, "Turn isolation is off")
 
 
 def _send_compute_host_control(

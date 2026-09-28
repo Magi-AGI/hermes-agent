@@ -3014,7 +3014,7 @@
     },
     {
       "name": "session.redirect",
-      "summary": "Redirect the active turn (queued for the next turn while the agent is still building).",
+      "summary": "Redirect the active turn (queued for the next turn while the agent is still building, or while the turn runs in an isolated worker).",
       "params": [
         {
           "name": "params",
@@ -3104,7 +3104,7 @@
     },
     {
       "name": "session.steer",
-      "summary": "Inject text into the next tool result without interrupting the turn.",
+      "summary": "Inject text into the next tool result without interrupting the turn (queued for the next turn while the turn runs in an isolated worker, which takes no live corrections).",
       "params": [
         {
           "name": "params",

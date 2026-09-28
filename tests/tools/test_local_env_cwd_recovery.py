@@ -9,6 +9,7 @@ Regression coverage for https://github.com/NousResearch/hermes-agent/issues/1755
 """
 
 import os
+import subprocess
 import shutil
 import tempfile
 from unittest.mock import MagicMock, patch
@@ -17,6 +18,12 @@ from tools.environments.local import (
     LocalEnvironment,
     _resolve_safe_cwd,
 )
+
+
+def _spawn_without_job(cmd, kill_on_close=True, **kwargs):
+    """On Windows the terminal spawns through spawn_server (a job per command); a fake Popen has no
+    process to put in one, so hand it straight back."""
+    return subprocess.Popen(cmd, **kwargs), None
 
 
 class TestResolveSafeCwd:
@@ -93,6 +100,7 @@ class TestRunBashCwdRecovery:
         fds: list = []
         try:
             with patch("tools.environments.local._find_bash", return_value="/bin/bash"), \
+                 patch("hermes_cli.local_runtime.processes.spawn_server", side_effect=_spawn_without_job), \
                  patch("subprocess.Popen", side_effect=_make_fake_popen(captured, fds)), \
                  caplog.at_level("WARNING", logger="tools.environments.local"):
                 env.execute("echo hello")
@@ -117,6 +125,7 @@ class TestRunBashCwdRecovery:
         fds: list = []
         try:
             with patch("tools.environments.local._find_bash", return_value="/bin/bash"), \
+                 patch("hermes_cli.local_runtime.processes.spawn_server", side_effect=_spawn_without_job), \
                  patch("subprocess.Popen", side_effect=_make_fake_popen(captured, fds)), \
                  caplog.at_level("WARNING", logger="tools.environments.local"):
                 env.execute("echo hello")

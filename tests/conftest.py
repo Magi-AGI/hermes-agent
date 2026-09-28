@@ -174,9 +174,12 @@ if not HOST_LOCK_DIR_AT_CONFTEST_IMPORT:
             _stale_pid = int(_stale.name[len(_LOCK_DIR_PREFIX):])
         except ValueError:
             continue
-        try:
-            os.kill(_stale_pid, 0)
-        except OSError:
+        # psutil, never os.kill(pid, 0): on Windows that is GenerateConsoleCtrlEvent(CTRL_C_EVENT, pid)
+        # (bpo-14484), and every test process ran it against recycled PIDs -- a Ctrl+C sent into
+        # whatever console group now owns that id, i.e. other sessions sharing the machine.
+        import psutil
+
+        if not psutil.pid_exists(_stale_pid):
             shutil.rmtree(_stale, ignore_errors=True)
     _SESSION_LOCK_DIR = str(_LOCK_DIR_ROOT / f"{_LOCK_DIR_PREFIX}{os.getpid()}")
     shutil.rmtree(_SESSION_LOCK_DIR, ignore_errors=True)
@@ -1665,7 +1668,19 @@ def _live_system_guard(request, monkeypatch):
     real_kill = _os.kill
 
     def _guarded_kill(pid, sig, *args, **kwargs):
-        # Signal 0 is a pure liveness probe — it cannot terminate anything.
+        if _os.name == "nt" and int(sig) in (0, 1):
+            # Windows: 0 and 1 are CTRL_C_EVENT / CTRL_BREAK_EVENT. CPython sends them with
+            # GenerateConsoleCtrlEvent to the process GROUP ``pid`` (bpo-14484) -- an interrupt for
+            # every process in it, never a probe. Only a live process in the test's own subtree.
+            # Strictly positive: group 0 is every process sharing this console (a broadcast).
+            if (int(pid) > 0 and _psutil is not None and _psutil.pid_exists(int(pid))
+                    and pid != _os.getpid() and _is_own_subtree(int(pid))):
+                return real_kill(pid, sig, *args, **kwargs)
+            raise RuntimeError(
+                f"tests/conftest.py live-system guard: blocked os.kill({pid}, {sig}) on Windows — that "
+                "is a console control event (Ctrl+C / Ctrl+Break) for a whole process group, not a "
+                "liveness probe. Use psutil.pid_exists / gateway.status._pid_exists instead.")
+        # POSIX signal 0 is a pure liveness probe — it cannot terminate anything.
         # psutil.pid_exists() uses os.kill(pid, 0) on POSIX, and probing a
         # just-killed grandchild that was reparented to init (zombie with a
         # foreign parent chain) must not trip the guard. Flaked in CI on

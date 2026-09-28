@@ -207,12 +207,18 @@ def _ac_set_queue(session: dict, entries: list) -> None:
         session.pop("queued_prompts", None)
 
 
-def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
+def _interrupt_busy_session(sid: str, session: dict, agent: Any, *, host_turn: str | None = None) -> None:
     """Interrupt a busy turn on a worker thread, never under ``history_lock`` (some providers can't apply ``interrupt()``
     until a blocking call returns; inline it stalled ``session.resume``). At most one interrupt worker per session so
-    repeated steering can't leak threads."""
-    use_agent = agent is not None and hasattr(agent, "interrupt")
-    if not use_agent and not _session_uses_compute_host(session):
+    repeated steering can't leak threads. A host-routed turn is interrupted in its host, softly and by the id of the
+    turn running when the prompt was queued (``host_turn``, read in that hold): by the time this runs that turn may
+    have finished and drained that very prompt, which must not be the one interrupted, and a Stop there would cancel
+    the child's queue generation and refuse the queued prompt. A parent agent built meanwhile is idle -- or, once
+    that host turn finished and the queued prompt started in-process (isolation switched off), running that very
+    prompt: an interrupt carrying a host turn only ever goes to that host, where a finished turn ignores it."""
+    use_agent = (host_turn is None and agent is not None and hasattr(agent, "interrupt")
+                 and not _session_uses_compute_host(session))
+    if not (use_agent or host_turn):
         return
     with session["history_lock"]:
         if session.get("_busy_interrupt_pending"):
@@ -222,7 +228,7 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
     def interrupt() -> None:
         try:
             with contextlib.suppress(Exception):
-                agent.interrupt() if use_agent else _get_compute_host_supervisor().interrupt(sid)
+                agent.interrupt() if use_agent else _get_compute_host_supervisor().interrupt(sid, turn_id=host_turn)
         finally:
             with session["history_lock"]:
                 session["_busy_interrupt_pending"] = False
@@ -250,9 +256,13 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
     """Apply ``display.busy_input_mode`` to a mid-turn prompt instead of rejecting it (rejection made clients busy-retry
     and drop sends): ``interrupt`` (default) → redirect, falling back to hard interrupt + queue; ``queue`` → queue only;
     ``steer`` → inject after the current atomic action. ``queued=True`` (client queue drain) forces queue mode: a "run
-    after" message must NEVER become a live correction."""
+    after" message must NEVER become a live correction. A turn running in an isolated worker takes no live corrections,
+    so steer/redirect queue there."""
     mode = "queue" if queued else _load_busy_input_mode()
     agent = session.get("agent")
+    # A host-routed turn runs in its host, which takes no live corrections: a parent agent built meanwhile is
+    # idle, and a steer "accepted" there would never reach the turn. Such input queues instead.
+    correction_agent = None if _session_uses_compute_host(session) else agent
     with session["history_lock"]:
         if not session.get("running"):
             return None  # turn ended since prompt.submit's busy check; caller retries on the idle session
@@ -262,7 +272,7 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
     plain_text = _coerce_message_text(text).strip() if not image_paths and _is_text_only_busy_payload(text) else ""
     # Text-only corrections steer/redirect in place when supported; media payloads and older agents fall through to
     # the proven interrupt + queue path.
-    if plain_text and agent is not None:
+    if plain_text and correction_agent is not None:
         supported = {
             "steer": hasattr(agent, "steer"),
             "interrupt": getattr(agent, "_supports_active_turn_redirect", False) is True and hasattr(agent, "redirect")}
@@ -279,6 +289,7 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
             return None
         _enqueue_prompt(session, text, transport, image_paths=image_paths, turn_author=turn_author)
         session["last_active"] = time.time()
+        host_turn = session.get("_compute_host_turn_id")
     # Attachments need their own model invocation: queue without cancelling so the user gets both results in order.
     # ``steer`` must NEVER escalate to a hard interrupt: it would kill the live turn AND drop ``AIAgent._pending_steer``
     # (earlier accepted steers); steer fall-throughs stay FIFO-queued.
@@ -287,7 +298,7 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
     # rejected/raised). A hard interrupt here kills the live turn AND ``AIAgent.interrupt()`` drops the
     # pending steer buffer — silently destroying the earlier messages of the burst. See #86134.
     if mode == "interrupt" and not image_paths:
-        _interrupt_busy_session(sid, session, agent)
+        _interrupt_busy_session(sid, session, agent, host_turn=host_turn)
     return _ok(rid, {"status": "queued"})
 
 

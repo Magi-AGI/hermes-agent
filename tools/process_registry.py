@@ -564,6 +564,10 @@ class ProcessSession:
             self.completion_reason = reason
             if source:
                 self.termination_source = source
+        if self.process is not None:
+            # After ``exited``: a kill that then finds the job released knows the command ended on its own.
+            from hermes_cli.local_runtime.processes import end_command
+            end_command(self.process, terminate=False)  # what it backgrounded keeps running
 
 
 # Watcher routing fields, in event-dict key order (``watcher_<key>`` on the session).
@@ -1152,10 +1156,16 @@ class ProcessRegistry(ProcessCheckpointMixin):
         # share the foreground process group and background spawns would stop the whole
         # session (observed as dead TUIs in state T). Cgroup isolation is unaffected —
         # the scope attaches to the invoked process, not the spawning session.
-        proc = subprocess.Popen(
-            spawn_argv, text=True, cwd=session.cwd, env=spawn_env, encoding="utf-8",
+        popen_kwargs = dict(
+            text=True, cwd=session.cwd, env=spawn_env, encoding="utf-8",
             errors="replace", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
             start_new_session=True, **_popen_kwargs)
+        if _IS_WINDOWS:
+            # Its own job, so a kill ends the whole tree (see _signal_kill).
+            from hermes_cli.local_runtime.processes import spawn_command
+            proc = spawn_command(spawn_argv, **popen_kwargs)
+        else:
+            proc = subprocess.Popen(spawn_argv, **popen_kwargs)
         session.process = proc
         session.pid = proc.pid
         session.host_start_time = self._safe_host_start_time(session.pid)
@@ -2081,8 +2091,21 @@ class ProcessRegistry(ProcessCheckpointMixin):
                     os.kill(session.pid, signal.SIGTERM)
         elif session.process:
             # Tree kill: on Windows Popen.terminate() only kills the shell wrapper and
-            # leaves Git Bash descendants behind.
-            self._terminate_host_pid(session.process.pid, session.host_start_time)
+            # leaves Git Bash descendants behind; taskkill /T misses the ones whose parent
+            # already exited, so a job-spawned command (spawn_local, a yielded foreground
+            # command) is ended through its job.
+            from hermes_cli.local_runtime.processes import end_command
+            if not end_command(session.process, terminate=True):
+                with session._lock:
+                    exited_on_its_own = session.exited
+                    result = self._exit_snapshot(session, "already_exited") if exited_on_its_own else None
+                if result is not None:
+                    # Its natural exit released the job first: the command ended on its own and what it
+                    # backgrounded runs on by design. Report that, never a kill that did not happen.
+                    if consume_output:
+                        self._completion_consumed.add(session_id)
+                    return result
+                self._terminate_host_pid(session.process.pid, session.host_start_time)
         elif session.env_ref and session.pid:
             session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
         elif session.detached and session.pid_scope == "host" and session.pid:

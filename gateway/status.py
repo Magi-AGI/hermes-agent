@@ -657,6 +657,39 @@ def _host_gateway_serves_home(pid: int, profile_home: Path) -> bool:
     return owner is not None and owner.pid == pid and owner.serves(profile_name_for_home(profile_home))
 
 
+def describe_port_listener(port: int) -> Optional[str]:
+    """Who is listening on TCP ``port``, in words: PID, start time, and whether it is a Hermes gateway
+    (this profile's or which one's) or what else. None when no listener can be named (none found, or
+    the platform refuses the connection table). A port conflict used to say only "already in use",
+    which left a surviving gateway (#52132, the 2026-08 :8642 squats) indistinguishable from anything."""
+    try:
+        import psutil  # type: ignore
+
+        pids = sorted({conn.pid for conn in psutil.net_connections(kind="tcp")
+                       if conn.pid and conn.status == psutil.CONN_LISTEN and conn.laddr and conn.laddr.port == port})
+    except Exception:
+        return None
+    return "; ".join(_describe_listener_pid(pid) for pid in pids) or None
+
+
+def _describe_listener_pid(pid: int) -> str:
+    command = _read_process_cmdline(pid) or ""
+    started = ""
+    with contextlib.suppress(Exception):
+        import psutil  # type: ignore
+
+        started = ", started " + datetime.fromtimestamp(psutil.Process(pid).create_time()).strftime("%Y-%m-%d %H:%M")
+    if not command:
+        return f"PID {pid} (identity unavailable: its command line could not be read){started}"
+    # Judged from the command line alone: a profile chosen through the environment is invisible here.
+    if looks_like_gateway_runtime_command_line(command):
+        if _command_line_belongs_to_profile(command, get_hermes_home()):
+            return f"PID {pid}, a Hermes gateway of this profile by its command line{started}"
+        return (f"PID {pid}, a Hermes gateway of profile '{profile_flag_value(command) or 'default'}' "
+                f"by its command line{started}")
+    return f"PID {pid} ({command[:160]}){started}, not a Hermes gateway"
+
+
 def _record_matches_live_gateway_pid(
     record: dict[str, Any], pid: int, *, expected_home: Optional[Path] = None
 ) -> bool:

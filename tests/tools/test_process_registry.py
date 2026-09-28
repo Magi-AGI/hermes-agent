@@ -64,6 +64,12 @@ def _make_session(
     return s
 
 
+def _spawn_without_job(cmd, **kwargs):
+    """On Windows spawn_local puts each command in its own job; a fake Popen has no process to put
+    in one, so hand it straight back."""
+    return subprocess.Popen(cmd, **kwargs)
+
+
 def _spawn_python_sleep(seconds: float) -> subprocess.Popen:
     """Spawn a portable short-lived Python sleep process."""
     return subprocess.Popen(
@@ -908,6 +914,7 @@ class TestSpawnEnvSanitization:
             "FIRECRAWL_API_KEY": "fc-secret",
         }, clear=True), \
             patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
+            patch("hermes_cli.local_runtime.processes.spawn_command", side_effect=_spawn_without_job), \
             patch("subprocess.Popen", side_effect=fake_popen), \
             patch("threading.Thread", return_value=fake_thread), \
             patch.object(registry, "_write_checkpoint"):
@@ -1228,6 +1235,7 @@ class TestSpawnRewriteCompoundBackground:
         fake_thread.daemon = False
 
         with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
+             patch("hermes_cli.local_runtime.processes.spawn_command", side_effect=_spawn_without_job), \
              patch("subprocess.Popen", side_effect=fake_popen), \
              patch("threading.Thread", return_value=fake_thread), \
              patch.object(registry, "_write_checkpoint"):
@@ -1253,6 +1261,7 @@ class TestSpawnRewriteCompoundBackground:
         fake_thread.daemon = False
 
         with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
+             patch("hermes_cli.local_runtime.processes.spawn_command", side_effect=_spawn_without_job), \
              patch("subprocess.Popen", side_effect=fake_popen), \
              patch("threading.Thread", return_value=fake_thread), \
              patch.object(registry, "_write_checkpoint"):

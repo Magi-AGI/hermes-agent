@@ -979,6 +979,9 @@ DEFAULT_CONFIG = {
         "turn_isolation": False,
         "compute_host_heartbeat_secs": 15,
         "compute_host_respawn_max": 3,
+        # A host that stops heart-beating this long is killed (its whole process tree) and respawned,
+        # failing its turn instead of leaving the session dead. 0 disables. Floor: 3x the heartbeat.
+        "compute_host_heartbeat_timeout_secs": 120,
         # Token/cost analytics surfaces are hidden by default: the numbers are a local LOWER-BOUND
         # estimate, not billing — only successful main-agent responses with a response.usage count;
         # auxiliary calls, retries, fallbacks and cache writes are missed, so the total can be

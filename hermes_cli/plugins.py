@@ -1520,10 +1520,9 @@ _plugin_managers_lock = threading.RLock()
 def _plugin_home_key() -> Path:
     """Resolved active Hermes home — the key for per-profile plugin managers (plugins capture the
     home at registration, so a process serving several profiles cannot share one manager)."""
-    try:
-        return get_hermes_home().expanduser().resolve()
-    except Exception:
-        return get_hermes_home().expanduser()
+    # Cached (hermes_home_key): this runs on every tool call through the post_tool_call gate, and a
+    # resolve() is a filesystem call on the tool worker's path to returning its result.
+    return Path(hermes_home_key())
 
 
 def _clear_plugin_submodules(manager: Optional[PluginManager]) -> None:

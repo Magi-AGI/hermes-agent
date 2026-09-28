@@ -549,9 +549,11 @@ class SessionCorrectionResult(Result):
 
 
 method("session.steer", params=SessionCorrectionParams, result=SessionCorrectionResult,
-       doc="Inject text into the next tool result without interrupting the turn.")
+       doc="Inject text into the next tool result without interrupting the turn (queued for the next turn "
+           "while the turn runs in an isolated worker, which takes no live corrections).")
 method("session.redirect", params=SessionCorrectionParams, result=SessionCorrectionResult,
-       doc="Redirect the active turn (queued for the next turn while the agent is still building).")
+       doc="Redirect the active turn (queued for the next turn while the agent is still building, or while "
+           "the turn runs in an isolated worker).")
 
 
 # ── spawn trees ───────────────────────────────────────────────────────────────────────────────

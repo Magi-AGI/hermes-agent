@@ -6,6 +6,8 @@ import sys
 import threading
 from pathlib import Path
 
+import psutil
+
 
 def _stdout_queue(proc: subprocess.Popen) -> queue.Queue[dict]:
     out: queue.Queue[dict] = queue.Queue()
@@ -19,7 +21,8 @@ def _stdout_queue(proc: subprocess.Popen) -> queue.Queue[dict]:
     return out
 
 
-def _read_json_line(out: queue.Queue[dict], timeout: float = 2.0) -> dict:
+def _read_json_line(out: queue.Queue[dict], timeout: float = 15.0) -> dict:
+    # A bound for a cold interpreter start under a parallel run, not an expected latency (~1 s idle).
     try:
         return out.get(timeout=timeout)
     except queue.Empty as exc:
@@ -45,7 +48,9 @@ def test_compute_host_line_json_hello_and_shutdown():
     try:
         hello = _read_json_line(out)
         assert hello["type"] == "hello"
-        assert hello["host_pid"] == proc.pid
+        # A venv interpreter on Windows is a launcher shim: the host speaking is its child.
+        tree = {proc.pid, *(p.pid for p in psutil.Process(proc.pid).children(recursive=True))}
+        assert hello["host_pid"] in tree
 
         proc.stdin.write(json.dumps({"type": "bogus", "request_id": "b"}) + "\n")
         proc.stdin.flush()

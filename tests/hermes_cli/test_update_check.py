@@ -47,7 +47,7 @@ def _stub_git(monkeypatch, *, head=SHA_A, origin="https://github.com/NousResearc
             return MagicMock(returncode=1, stdout="")
         raise AssertionError(f"passive check must not run git {sub}: {args}")
 
-    monkeypatch.setattr(banner.subprocess, "run", fake_run)
+    monkeypatch.setattr(banner, "bounded_probe_run", fake_run)
     return calls
 
 
@@ -151,10 +151,10 @@ def test_upstream_main_sha_ls_remote_fallback_disables_git_prompts(monkeypatch):
     monkeypatch.setattr(banner, "_github_branch_tip", lambda slug, branch: None)
     completed = MagicMock(returncode=1, stdout="", stderr="auth required")
     run = MagicMock(return_value=completed)
-    monkeypatch.setattr(banner.subprocess, "run", run)
+    monkeypatch.setattr(banner, "bounded_probe_run", run)
 
     assert banner._upstream_main_sha() is None
     kwargs = run.call_args.kwargs
-    assert kwargs["stdin"] is banner.subprocess.DEVNULL
+    # bounded_probe_run always detaches stdin; the env below is what keeps prompts off.
     assert kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
     assert kwargs["env"]["GCM_INTERACTIVE"] == "Never"

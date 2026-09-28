@@ -26,6 +26,7 @@ from xml.sax.saxutils import escape
 
 from hermes_cli._subprocess_compat import (
     _WINDOWS_GATEWAY_BREAKAWAY_ENV,
+    launch_outside_job,
     windows_detach_flags,
     windows_detach_flags_without_breakaway,
     windows_hide_flags,
@@ -470,11 +471,29 @@ def _write_task_script() -> Path:
     # Also render the console-less .vbs launcher used by Scheduled Task and the Startup-folder fallback via
     # wscript.exe (issue #45599 fix A). The .cmd wrapper stays as a generated helper/compatibility artifact.
     vbs_path = script_path.with_suffix(".vbs")
-    _atomic_write(vbs_path, _build_gateway_vbs_script(*settings), vbs_path.with_name(vbs_path.name + ".tmp"))
+    _atomic_write(vbs_path, _build_gateway_vbs_script(*settings), vbs_path.with_name(vbs_path.name + ".tmp"),
+                  encoding=_VBS_ENCODING)
     return script_path
 
 
-def _atomic_write(path: Path, content: str, tmp: Path) -> None:
+# WSH reads a script without a BOM in the ANSI code page: every non-ASCII path in a UTF-8 .vbs turned
+# into mojibake (``sh.CurrentDirectory`` failed for a home under ``Zoë``). UTF-16 with a BOM is what it
+# reads as Unicode.
+_VBS_ENCODING = "utf-16"
+
+
+def _write_outside_job_launcher(home: Path | None = None) -> Path:
+    """Render the gateway launcher for ``home`` (default: this profile) for a start from outside every
+    Job Object. Its own file under that home, so a start never rewrites the Scheduled Task's launcher."""
+    settings = _launcher_settings(home)
+    launcher = Path(settings[2]) / "gateway-service" / "outside-job-launch.vbs"
+    launcher.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write(launcher, _build_gateway_vbs_script(*settings), launcher.with_name(launcher.name + ".tmp"),
+                  encoding=_VBS_ENCODING)
+    return launcher
+
+
+def _atomic_write(path: Path, content: str, tmp: Path, *, encoding: str = "utf-8") -> None:
     """Write ``content`` verbatim (no newline translation) via ``tmp`` then rename over ``path``.
 
     The staging file is removed even when the rename fails: the Startup-folder caller stages
@@ -482,7 +501,7 @@ def _atomic_write(path: Path, content: str, tmp: Path) -> None:
     ``Hermes_Gateway.tmp`` pops up in Notepad after every sign-in (#114093).
     """
     try:
-        tmp.write_text(content, encoding="utf-8", newline="")
+        tmp.write_text(content, encoding=encoding, newline="")
         tmp.replace(path)
     finally:
         try:
@@ -599,7 +618,7 @@ def _install_startup_entry(script_path: Path) -> Path:
     """Write the Startup-folder fallback launcher. Returns its path."""
     entry = get_startup_entry_path()
     entry.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write(entry, _build_startup_launcher(script_path), _startup_staging_path())
+    _atomic_write(entry, _build_startup_launcher(script_path), _startup_staging_path(), encoding=_VBS_ENCODING)
     legacy_entry = _legacy_startup_entry_path()
     try:
         if legacy_entry.exists():
@@ -743,6 +762,19 @@ def _spawn_detached(script_path: Path | None = None, home: Path | None = None) -
         if error_code is None:
             error_code = exc.errno
         logger.warning("Gateway breakaway spawn failed (error=%s); retrying without CREATE_BREAKAWAY_FROM_JOB", error_code)
+        # The gateway survives what started it by design (gateway/AGENTS.md). Inside a job that forbids
+        # breakaway (a shell's, or an isolated turn's compute host: MSYS forces that) a breakaway-less
+        # spawn would die with that job, so start the gateway launcher -- rendered for the requested
+        # profile, carrying its environment itself -- from outside every job instead. The PID returned
+        # is the launcher's (wscript, gone once it starts python): callers rediscover the gateway.
+        launcher = _write_outside_job_launcher(home)
+        pid = launch_outside_job(subprocess.list2cmdline(["wscript.exe", "//B", "//Nologo", str(launcher)]),
+                                 cwd=working_dir)
+        if pid:
+            _LAST_SPAWN_BREAKAWAY_FALLBACK["fallback"] = False
+            return pid
+        # _report_gateway_start warns the user (the fallback flag below); this is the log trail.
+        logger.info("Gateway launch outside the Job Object failed; the gateway lives inside this job")
         proc = _popen("0", windows_detach_flags_without_breakaway())
         _LAST_SPAWN_BREAKAWAY_FALLBACK["fallback"] = True
     return proc.pid

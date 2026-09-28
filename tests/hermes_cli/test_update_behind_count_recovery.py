@@ -161,7 +161,7 @@ def test_local_checkout_recovers_exact_count(tmp_path):
     repo_dir = tmp_path / "hermes-agent"
     repo_dir.mkdir()
 
-    with patch("hermes_cli.banner.subprocess.run", side_effect=_local_git(SHA_A)), \
+    with patch("hermes_cli.banner.bounded_probe_run", side_effect=_local_git(SHA_A)), \
             patch.object(banner, "_github_branch_tip", return_value=SHA_B), \
             patch.object(banner, "_github_compare_behind", return_value=61):
         assert banner._check_via_local_git(repo_dir) == 61
@@ -171,7 +171,7 @@ def test_local_checkout_offline_compare_keeps_honest_sentinel(tmp_path):
     repo_dir = tmp_path / "hermes-agent"
     repo_dir.mkdir()
 
-    with patch("hermes_cli.banner.subprocess.run", side_effect=_local_git(SHA_A)), \
+    with patch("hermes_cli.banner.bounded_probe_run", side_effect=_local_git(SHA_A)), \
             patch.object(banner, "_github_branch_tip", return_value=SHA_B), \
             patch.object(banner, "_github_compare_behind", return_value=None):
         assert banner._check_via_local_git(repo_dir) == banner.UPDATE_AVAILABLE_NO_COUNT
@@ -181,7 +181,7 @@ def test_local_checkout_equal_tips_up_to_date_without_compare(tmp_path):
     repo_dir = tmp_path / "hermes-agent"
     repo_dir.mkdir()
 
-    with patch("hermes_cli.banner.subprocess.run", side_effect=_local_git(SHA_A)), \
+    with patch("hermes_cli.banner.bounded_probe_run", side_effect=_local_git(SHA_A)), \
             patch.object(banner, "_github_branch_tip", return_value=SHA_A), \
             patch.object(banner, "_github_compare_behind") as compare:
         assert banner._check_via_local_git(repo_dir) == 0

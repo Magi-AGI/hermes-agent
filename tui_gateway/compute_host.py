@@ -11,7 +11,6 @@ import json
 import logging
 import os
 import signal
-import subprocess
 import sys
 import threading
 import time
@@ -19,7 +18,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Collection
 
-from tui_gateway.host_supervisor import MUTATOR_ROUTE_TABLE, _build_sha
+from tui_gateway.host_supervisor import MUTATOR_ROUTE_TABLE, OWNER_PID_ENV as _OWNER_PID_ENV, _build_sha
 
 
 def now_ns() -> int:
@@ -52,6 +51,7 @@ _CONTROL_FAILURES = {
     "session.save": "session save failed", "session.compress": "session compression failed"}
 
 _ORPHAN_EXIT_CODE = 18          # parent (gateway) gone — vs clean 0 / pipe-break 17-reserved
+_STDIN_LOST_EXIT_CODE = 19      # control pipe ended while the gateway is still alive
 _PARENT_DEAD_CONFIRMATIONS = 3  # consecutive dead readings before orphan-exit
 
 if sys.platform == "win32":
@@ -61,6 +61,10 @@ if sys.platform == "win32":
     _kernel32.GetExitCodeProcess.restype = ctypes.c_int
     _kernel32.GetExitCodeProcess.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong))
     _kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    _kernel32.PeekNamedPipe.restype = ctypes.c_int
+    _kernel32.PeekNamedPipe.argtypes = (
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_ulong), ctypes.c_void_p)
 else:
     _kernel32 = None
 
@@ -82,7 +86,9 @@ class ComputeHost:
         self._closed = threading.Event()
         self._exit_code = 0            # shared, race-free process exit code
         self._guard_poll_secs = 1.0    # parent-guard poll interval (test override)
-        self._parent_pid = os.getppid()
+        # The gateway that owns this host. On Windows os.getppid() is the venv launcher shim, which
+        # outlives the gateway (it waits on us), so the guard would never see the gateway die.
+        self._parent_pid = int(os.environ.get(_OWNER_PID_ENV) or 0) or os.getppid()
         self._boot_id = uuid.uuid4().hex
         self._progress_counter = 0
         self._progress_lock = threading.Lock()
@@ -123,10 +129,15 @@ class ComputeHost:
         recoverable; atexit ``server._shutdown_sessions`` may re-finalize them).
         """
         self._closed.set()
+        if reason == "orphan":
+            # Nobody will read this work: stop the tools now instead of letting them run out the
+            # drain window (a tool honouring the interrupt kills its own process tree).
+            self._interrupt_live_turns()
         budget = max(0.0, wait)
-        deadline = time.monotonic() + budget - min(_FLUSH_RESERVE_SECS, budget / 2.0)
+        # perf_counter: monotonic() ticks every 15.6 ms on Windows, so the drain overslept its last tick.
+        deadline = time.perf_counter() + budget - min(_FLUSH_RESERVE_SECS, budget / 2.0)
         while True:
-            remaining = deadline - time.monotonic()
+            remaining = deadline - time.perf_counter()
             if remaining <= 0 or not self._live_turns():
                 break
             # Bounded by ``remaining``: a flat sleep would eat the reserve it protects.
@@ -135,6 +146,20 @@ class ComputeHost:
             live_sids = {sid for f, sid in self._turn_futures.items() if sid and not f.done()}
         self.flush_all_sessions(reason=reason, skip_sids=live_sids)
         self.close()
+
+    def _interrupt_live_turns(self) -> None:
+        with self._turn_futures_lock:
+            sids = {sid for f, sid in self._turn_futures.items() if sid and not f.done()}
+        if not sids:
+            return
+        try:
+            from tui_gateway import server
+        except Exception:
+            return
+        for sid in sids:
+            if (session := server._sessions.get(sid)) is not None:
+                with contextlib.suppress(Exception):
+                    server._interrupt_session_turn(sid, session)
 
     def flush_all_sessions(
         self, *, reason: str = "shutdown", skip_sids: Collection[str] | None = None) -> None:
@@ -157,8 +182,19 @@ class ComputeHost:
             self.emit({
                 "type": "error", "request_id": frame.get("request_id"),
                 "message": f"unknown frame type: {kind}"})
-        else:
+            return
+        try:
             getattr(self, handler)(frame)
+        except Exception as exc:
+            # Answer on the channel the sender waits on: a turn.start's pending turn settles only on
+            # turn.error (a bare error reaches control waiters alone and left the session busy).
+            self._emit_stderr_diag(f"frame handler failed (type={kind}): {exc!r}")
+            if kind == "turn.start":
+                self._reply("turn.error", str(frame.get("sid") or ""), frame.get("request_id"),
+                            reason="exception", message=f"the isolated worker could not start the turn: {exc}")
+            else:
+                self.emit({"type": "error", "request_id": frame.get("request_id"),
+                           "message": f"frame handler failed: {exc}"})
 
     def _handle_shutdown(self, frame: dict[str, Any]) -> None:
         self.emit({"type": "shutdown.ack", "request_id": frame.get("request_id")})
@@ -198,6 +234,18 @@ class ComputeHost:
             session = server._sessions.get(sid)
             if session is None:
                 self._reply("interrupt.ack", sid, request_id, applied=False)
+                return
+            if turn_id := frame.get("turn_id"):
+                # Busy input: interrupt that turn only if it still runs -- its agent and the waits it may be
+                # blocked in (clarify, approval) -- but not the queue: the follow-up is already queued in the
+                # parent and must pass the generation check.
+                with session["history_lock"]:
+                    agent = session.get("agent") if (
+                        session.get("running") and session.get("_host_turn_request_id") == turn_id) else None
+                if agent is not None:
+                    agent.interrupt()
+                    server._release_turn_waits(sid, session)
+                self._reply("interrupt.ack", sid, request_id, applied=agent is not None, applied_ns=now_ns())
                 return
             # In the child the shared helper interrupts the local agent and releases this
             # process's pending clarify Event (the parent only has a metadata mirror).
@@ -252,7 +300,8 @@ class ComputeHost:
                 if session.get("running"):
                     self._reply("turn.error", sid, request_id, message="session busy")
                     return
-                session.update(running=True, _turn_cancel_requested=False, last_active=time.time())
+                session.update(running=True, _turn_cancel_requested=False, last_active=time.time(),
+                               _host_turn_request_id=request_id)
                 server._start_inflight_turn(session, inflight)
                 turn_started_at = time.time()
             self._reply("turn.started", sid, request_id, started_ns=now_ns())
@@ -303,7 +352,9 @@ class ComputeHost:
             summary = session["agent"].get_activity_summary()
             stamped_at = summary.get("last_activity_at")
             elapsed = summary.get("seconds_since_activity")
-            if stamped_at is not None and stamped_at >= started_at and elapsed is not None and elapsed >= 0:
+            # Strictly after: time.time() ticks every 15.6 ms on Windows, so an earlier turn's stamp can
+            # equal this turn's start; an ambiguous stamp is not this turn's progress (not fresh).
+            if stamped_at is not None and stamped_at > started_at and elapsed is not None and elapsed >= 0:
                 activity_ns = now_ns() - int(elapsed * 1_000_000_000)
         except Exception:
             logging.getLogger(__name__).debug("compute host activity unavailable sid=%s", sid, exc_info=True)
@@ -337,6 +388,14 @@ class ComputeHost:
         key = str(frame.get("session_key") or sid)
         history = frame.get("history") if isinstance(frame.get("history"), list) else []
         profile_home = str(frame.get("profile_home") or "")
+        if frame.get("durable_history"):
+            # The session ran in a previous host, so the parent's copy is stale: continue from the store.
+            durable = server._load_durable_truncation_history(
+                {"session_key": key, "profile_home": profile_home or None})
+            if durable is None:
+                raise RuntimeError("the transcript could not be reloaded from the session store after "
+                                   "the isolated worker restarted; not continuing from a stale copy")
+            history = durable
         session_db = home_token = secret_token = None
         owns_db = False
         try:
@@ -384,7 +443,12 @@ class ComputeHost:
                 reset_transport(token)
             built_at_zero = True
         except Exception:
-            built_at_zero = False
+            logging.getLogger(__name__).exception(
+                "compute host: session setup failed after the agent build (sid=%s); continuing", sid)
+            # _init_session registers the full record first; a later side step failing must not
+            # replace it (and orphan whatever that step already started) with the minimal one.
+            built_at_zero = sid in server._sessions
+        if not built_at_zero:
             # _init_session's side machinery (slash worker, approval notify) unavailable: keep a
             # minimal host-owned session rather than failing after the expensive agent build.
             server._sessions[sid] = {
@@ -399,6 +463,11 @@ class ComputeHost:
                 "tool_started_at": {}, "model_override": frame.get("model_override"),
                 "source": server._resolve_session_source(frame.get("source")),
                 "transport": self._transport}
+            try:
+                # Without the approval notify a dangerous command can never reach the user.
+                server._wire_session_agent(sid, key, agent)
+            except Exception:
+                logging.getLogger(__name__).exception("compute host: agent wiring failed (sid=%s)", sid)
         session = server._sessions[sid]
         if built_at_zero:
             # _init_session starts at version 0, but the parent is at the frame's version and adopts
@@ -537,7 +606,7 @@ class ComputeHost:
                 _kernel32.CloseHandle(handle)
         # POSIX: signal 0 probes existence without delivering a signal.
         try:
-            os.kill(parent, 0)
+            os.kill(parent, 0)  # windows-footgun: ok — POSIX-only branch (Windows returned above)
             return True
         except ProcessLookupError:
             return False
@@ -571,6 +640,24 @@ class ComputeHost:
             os._exit(_ORPHAN_EXIT_CODE)
 
 
+def _stdin_pipe_state(stdin: Any) -> str:
+    """Windows: is the control pipe's writer (the gateway's end) still there? ERROR_BROKEN_PIPE (109)
+    means that end was closed; ERROR_INVALID_HANDLE (6) means OUR read end was closed in this process."""
+    if _kernel32 is None:
+        return "n/a"
+    try:
+        import msvcrt
+        handle = msvcrt.get_osfhandle(stdin.fileno())
+    except Exception as exc:
+        return f"read end unusable in this process ({exc!r})"
+    available = ctypes.c_ulong()
+    if _kernel32.PeekNamedPipe(handle, None, 0, None, ctypes.byref(available), None):
+        return f"open ({available.value} bytes waiting)"
+    err = ctypes.get_last_error()
+    return {109: "writer closed (ERROR_BROKEN_PIPE)",
+            6: "read end closed in this process (ERROR_INVALID_HANDLE)"}.get(err, f"error {err}")
+
+
 def _history_meta(session: dict) -> dict[str, Any]:
     """Transcript identity for turn.end / control.ack frames; caller holds history_lock."""
     return {
@@ -580,11 +667,11 @@ def _history_meta(session: dict) -> dict[str, Any]:
 
 
 def _rss_mb(pid: int) -> float:
+    # psutil, not `ps`: this runs every heartbeat, and on Windows `ps` is MSYS ps (when Git's usr/bin is
+    # on PATH), which neither understands the pid nor dies cleanly on the probe's timeout.
     try:
-        out = subprocess.check_output(
-            ["ps", "-o", "rss=", "-p", str(pid)], text=True, encoding="utf-8", errors="replace",
-            stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2).strip()
-        return int(out.splitlines()[-1].strip()) / 1024.0 if out else 0.0
+        import psutil
+        return psutil.Process(pid).memory_info().rss / (1024.0 * 1024.0)
     except Exception:
         return 0.0
 
@@ -622,33 +709,51 @@ def run_host(stdin: Any = None, stdout: Any = None) -> None:
         "build_sha": _build_sha(), "cwd": os.getcwd(),
         "hermes_home": os.environ.get("HERMES_HOME", "")})
 
+    stats = {"frames": 0, "last_type": "", "last_at": time.monotonic()}
+
     def _reader() -> None:
-        for raw in stdin:
-            if host._closed.is_set():
-                break
-            try:
-                frame = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                host.emit({"type": "error", "message": f"invalid json: {exc}"})
-                continue
-            if not isinstance(frame, dict):
-                host.emit({"type": "error", "message": "frame must be an object"})
-                continue
-            host.handle_frame(frame)
-            if frame.get("type") == "shutdown":
-                os._exit(0)  # graceful frame → clean 0
-            if host._closed.is_set():
-                break
-        # EOF without a shutdown frame and not otherwise shutting down → the
-        # parent closed our stdin → the gateway is gone → orphan exit 18,
-        # consistent with the handle-poll guard (which the EOF usually beats).
-        if not shutting_down.is_set() and not host._closed.is_set():
-            host._exit_code = _ORPHAN_EXIT_CODE          # BEFORE shutdown() sets _closed
-            host._emit_stderr_diag(
-                f"stdin EOF without shutdown frame; parent gone; exiting code={_ORPHAN_EXIT_CODE}")
-            with contextlib.suppress(Exception):
-                host.shutdown(reason="orphan")
-            os._exit(_ORPHAN_EXIT_CODE)
+        read_error = None
+        try:
+            for raw in stdin:
+                if host._closed.is_set():
+                    break
+                try:
+                    frame = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    host.emit({"type": "error", "message": f"invalid json: {exc}"})
+                    continue
+                if not isinstance(frame, dict):
+                    host.emit({"type": "error", "message": "frame must be an object"})
+                    continue
+                stats.update(frames=stats["frames"] + 1, last_type=str(frame.get("type") or ""),
+                             last_at=time.monotonic())
+                try:
+                    host.handle_frame(frame)  # answers its own handler failures
+                except Exception as exc:
+                    # Replying itself failed; a dead reader used to end the host with a silent code 0.
+                    host._emit_stderr_diag(f"frame dispatch failed (type={frame.get('type')}): {exc!r}")
+                if frame.get("type") == "shutdown":
+                    os._exit(0)  # graceful frame → clean 0
+                if host._closed.is_set():
+                    break
+        except Exception as exc:
+            read_error = exc  # a failed read ends the pipe like EOF does; classified the same way
+        if shutting_down.is_set() or host._closed.is_set():
+            return
+        # The pipe ended without a shutdown frame. The gateway's liveness decides what that means:
+        # gone → orphan (18); alive → the control pipe itself was lost (19), which must never be
+        # reported as "parent gone" (2026-09-15: five such exits latched the host off).
+        ended = f"stdin read failed ({read_error!r})" if read_error else "stdin EOF without shutdown frame"
+        detail = (f"frames_read={stats['frames']} last_frame={stats['last_type'] or '-'} "
+                  f"idle={time.monotonic() - stats['last_at']:.1f}s pipe={_stdin_pipe_state(stdin)}")
+        alive = host._parent_alive()
+        code, reason = (_STDIN_LOST_EXIT_CODE, "stdin_lost") if alive else (_ORPHAN_EXIT_CODE, "orphan")
+        host._exit_code = code                           # BEFORE shutdown() sets _closed
+        host._emit_stderr_diag(
+            f"{ended}; gateway pid={host._parent_pid} {'alive' if alive else 'gone'}; {detail}; exiting code={code}")
+        with contextlib.suppress(Exception):
+            host.shutdown(reason=reason)
+        os._exit(code)
     reader = threading.Thread(target=_reader, name="compute-host-control-reader", daemon=True)
     reader.start()
     try:
@@ -660,7 +765,8 @@ def run_host(stdin: Any = None, stdout: Any = None) -> None:
         # label the finalize reason to match and converge on 18. A clean /
         # SIGTERM / stdin_closed exit (_exit_code == 0) RETURNS normally so
         # atexit (server._shutdown_sessions) still runs — upstream lifecycle intact.
-        reason = "orphan" if host._exit_code == _ORPHAN_EXIT_CODE else "stdin_closed"
+        reason = {_ORPHAN_EXIT_CODE: "orphan", _STDIN_LOST_EXIT_CODE: "stdin_lost"}.get(
+            host._exit_code, "stdin_closed")
         host.shutdown(reason=reason, wait=2.0)
         if host._exit_code:
             os._exit(host._exit_code)

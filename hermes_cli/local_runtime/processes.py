@@ -53,6 +53,7 @@ class _WindowsJob:
             ("SetInformationJobObject", [wintypes.HANDLE, ctypes.c_int,
                                          ctypes.c_void_p, wintypes.DWORD], wintypes.BOOL),
             ("AssignProcessToJobObject", [wintypes.HANDLE, wintypes.HANDLE], wintypes.BOOL),
+            ("TerminateJobObject", [wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
             ("CloseHandle", [wintypes.HANDLE], wintypes.BOOL),
         ):
             fn = getattr(self._api, name)
@@ -78,13 +79,67 @@ class _WindowsJob:
         if not self._api.AssignProcessToJobObject(self._handle, int(proc._handle)):
             raise ctypes.WinError(ctypes.get_last_error())
 
+    def keep_tree_on_close(self) -> None:
+        """Drop KILL_ON_JOB_CLOSE: the job then only groups the tree, so ``terminate()`` can end all of
+        it (descendants whose parent already exited included, which ``taskkill /T`` cannot reach)
+        while ``close()`` lets it run on. SetInformationJobObject replaces the WHOLE limit set, so the
+        zeroed flags clear the KILL_ON_JOB_CLOSE set at construction (and still grant no breakaway:
+        MSYS takes any breakaway a job allows)."""
+        limits = _ExtendedLimits()
+        if not self._api.SetInformationJobObject(self._handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    @property
+    def closed(self) -> bool:
+        return self._handle is None
+
+    def terminate(self, exit_code: int = 1) -> bool:
+        """End every process in the job now. True when this call terminated it; False when the job was
+        already closed (decided and done under the job lock, so a concurrent close cannot slip between)."""
+        with self._lock:
+            if self._handle is None:
+                return False
+            if not self._api.TerminateJobObject(self._handle, exit_code):
+                raise ctypes.WinError(ctypes.get_last_error())
+            return True
+
     def close(self) -> None:
-        """Terminate the contained tree; repeated closes are harmless."""
+        """Release the job (a kill-on-close job terminates its tree); repeated closes are harmless."""
         with self._lock:
             if self._handle is not None:
                 if not self._api.CloseHandle(self._handle):
                     raise ctypes.WinError(ctypes.get_last_error())
                 self._handle = None
+
+
+def spawn_command(cmd, **kwargs) -> subprocess.Popen:
+    """Start a command whose WHOLE tree ``end_command`` can end later. Windows: its own job, not
+    kill-on-close, so a normal finish leaves what the command deliberately backgrounded running. The
+    job rides on the Popen (``_hermes_job``) so whoever owns the process next (a yield handoff to the
+    process registry) owns the job with it."""
+    proc, job = spawn_server(cmd, kill_on_close=False, **kwargs)
+    proc._hermes_job = job
+    return proc
+
+
+def end_command(proc, *, terminate: bool) -> bool:
+    """``terminate``: end the command's whole tree, including descendants whose parent already exited
+    (MSYS lets a command's forked parent exit, and ``taskkill /T`` follows live parent links only).
+    Otherwise release the job and let the tree run on. Either way the job is closed; repeat calls are
+    harmless. True only when a tree was terminated here; False means the caller must kill by pid (no
+    job: POSIX, a process spawned elsewhere, already released, or the terminate failed)."""
+    job = getattr(proc, "_hermes_job", None)
+    if job is None:
+        return False
+    try:
+        return job.terminate() if terminate else False
+    except OSError:
+        return False
+    finally:
+        try:
+            job.close()
+        except OSError:
+            pass
 
 
 _CREDENTIAL_ENV_MARKERS = ("_API_KEY", "_TOKEN", "_SECRET", "PASSWORD", "_CREDENTIALS")
@@ -107,7 +162,7 @@ def server_child_env(base_env: Mapping[str, str]) -> dict[str, str]:
     }
 
 
-def spawn_server(cmd, **kwargs) -> tuple[subprocess.Popen, _WindowsJob | None]:
+def spawn_server(cmd, *, kill_on_close: bool = True, **kwargs) -> tuple[subprocess.Popen, _WindowsJob | None]:
     """Start a router, returning its process and an owner-held containment handle.
 
     Keep the job until shutdown and call close() to terminate the entire tree.
@@ -119,6 +174,8 @@ def spawn_server(cmd, **kwargs) -> tuple[subprocess.Popen, _WindowsJob | None]:
     job = _WindowsJob()
     proc = None
     try:
+        if not kill_on_close:
+            job.keep_tree_on_close()
         kwargs["creationflags"] = kwargs.get("creationflags", 0) | 0x00000004  # CREATE_SUSPENDED
         proc = subprocess.Popen(cmd, **kwargs)
         job.assign(proc)
