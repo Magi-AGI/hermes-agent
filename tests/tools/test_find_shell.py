@@ -32,8 +32,14 @@ def _pid_alive(pid: int) -> bool:
         return True
 
 
+@pytest.mark.linux_only
 class TestFindShellPrefersUserShell:
-    """_find_shell should prefer $SHELL over bash on POSIX."""
+    """_find_shell should prefer $SHELL over bash on POSIX.
+
+    ``linux_only``: native Windows ignores ``$SHELL`` by design (``TestFindShellWindowsBehavior``),
+    so there these assertions either fail or pass without exercising the preference. Unmarked, the
+    class already ran only on the Linux CI lane; the marker keeps that selection.
+    """
 
     def test_returns_shell_env_when_set_and_exists(self, tmp_path):
         """When $SHELL points to an existing allowlisted executable, _find_shell returns it."""

@@ -88,3 +88,24 @@ into the checkout on every Windows run, WSL treating `C:\...` as a relative file
 | `tests/test_live_system_guard_self_test.py::test_pty_spawn_systemctl_blocked` | `pty` needs `termios` (POSIX-only module) | mark `linux_only` (pty is POSIX) |
 | `tests/test_live_system_guard_self_test.py::test_os_kill_blocks_foreign_pid` | `FOREIGN_PID = 1` is init on POSIX but does not exist on Windows; the guard rightly treats a missing PID as stale and lets the call through, and `os.kill(1, …)` then raises WinError 87. **Not a guard hole**: a live foreign PID is still blocked | test: a per-host foreign PID that exists and cannot be harmed (PID 4, System, on Windows) |
 | `tests/test_live_system_guard.py::test_gateway_start_inside_a_container_exec_is_not_blocked` | the guard's `_first_token_basename` splits with POSIX `shlex` and on `/` only, so `C:\...\stub-bin\docker` is not recognised as `docker` and the call is blocked (a Windows false positive of the guard, tests only); and the `#!/bin/sh` stub cannot execute on Windows anyway | guard: basename on both separators (and `.exe`) with non-POSIX `shlex` on Windows; test: a `.cmd` stub on Windows, or mark POSIX |
+
+# Test-hygiene cluster: A22, A26, A27, A28a, A28c (track test-hygiene-6)
+
+Host: Windows 11, Python 3.11 venv, isolated runner only. Every item below is a **test-harness defect; no
+product code changed**. Each was reproduced first (on the sync tip `8ecdcf48e7` under 24 CPU burners, or as a
+checkout write) and then fixed in the test; none is left as a marker-only skip, except `test_find_shell`,
+whose subject is POSIX behaviour. Evidence: `test-evidence/t5-test-hygiene-2026-09-24/cluster/`.
+
+| Item | Test | Cause | Fix |
+|---|---|---|---|
+| A22 | `test_minimax_oauth.py::test_refresh_error_body_bounded_and_readable_with_real_client` | The stub server answered the POST without reading the request body. Closing a socket with unread received bytes sends RST, not FIN, and the RST discards the 64 KB error body the client has not read yet (WinError 10054). A loopback probe measured 37/400 resets with the body unread and 0/400 once it is read | the handler reads `Content-Length` bytes first |
+| A26 | `test_turn_lease.py::test_full_dispatch_rejects_lease_timeout_without_running_goal_hook` | a 1 s outer bound also had to cover cold plugin discovery (~0.65 s) before the lease wait | agent timeout 60 s, outer bound 20 s: still between the 0.02 s lease clock and the agent clock, with room on both sides |
+| A26 | `test_external_drain_control.py::TestDrainWatcher::test_watcher_enters_then_exits_with_marker` (the intermittent one) | fixed 60 ms sleeps for three 20 ms ticks; each tick reads the marker on a worker thread and persists the active-agent aggregate | waits on `_external_drain_active` with a 10 s deadline |
+| A27 | `test_approved_command_clean_slate.py`: `…genuine_interrupt_after_start_still_kills`, `…note_enriched_not_misleading_on_interrupt` | `touch {sentinel}` with a raw Windows path: bash ate the backslashes, created a junk file named after the whole path in the working directory, and the sentinel never appeared, so both tests **failed** on Windows | `shlex.quote(path.as_posix())` |
+| A28a | `tests/tui_gateway/test_protocol.py` (`server` fixture) | `hermes_constants` was a MagicMock during the server-import window; a module first imported there bound `get_process_hermes_home` and later opened a real `state.db` at MagicMock's `__fspath__` (`MagicMock/mock.get_process_hermes_home()/<id>/`) in the working directory | `hermes_constants` stays real (the suite already isolates `HERMES_HOME`). The same edit went into the six fixtures that copy this window. `test_slash_worker_profile_home` / `test_subprocess_encoding` keep their mocks: they test `get_hermes_home` resolution on purpose |
+| A28c | `test_noninteractive_git.py::…test_safe_directory_reset_still_revokes_wildcard_for_real_git` | the test wrote `directory = C:\…\trusted` into a gitconfig; a config value treats backslash as an escape, so git rejected the file ("bad config line 3") and read no safe.directory | `trusted.as_posix()` |
+| A28c | `test_find_shell.py::TestFindShellPrefersUserShell` (2 of 5 failed) | asserts the POSIX `$SHELL` preference; native Windows ignores `$SHELL` by design (`TestFindShellWindowsBehavior`) | class marked `linux_only`. Selection-neutral: unmarked, it already ran only on the Linux lane |
+
+Under load (24 burners, the three load-sensitive files, `-j 3`): at the sync tip, turn-lease failed 14/15 rounds,
+drain watcher 11/15 and minimax 3/15. With the fixes, 20/20 rounds were clean. Negative controls: a 60 s lease clock
+fails the turn-lease test at its 20 s bound, and a no-op `_exit_external_drain` fails the drain test.

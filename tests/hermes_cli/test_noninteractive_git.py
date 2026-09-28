@@ -177,7 +177,9 @@ class TestNoninteractiveGitEnv:
         system_config.write_text("[safe]\n\tdirectory = *\n", encoding="utf-8")
         global_config = tmp_path / "gitconfig"
         global_config.write_text(
-            f"[safe]\n\tdirectory = \n\tdirectory = {trusted}\n", encoding="utf-8"
+            # as_posix: a gitconfig value treats backslash as an escape, so a raw Windows path is a
+            # parse error ("bad config line") and git reads no safe.directory at all.
+            f"[safe]\n\tdirectory = \n\tdirectory = {trusted.as_posix()}\n", encoding="utf-8"
         )
 
         env = noninteractive_git_env(
