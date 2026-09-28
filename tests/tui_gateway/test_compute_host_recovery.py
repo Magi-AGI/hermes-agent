@@ -1269,3 +1269,64 @@ def test_a_host_sessions_transcript_is_read_under_the_resume_bound(tmp_path, mon
     assert loads == [] and session["_compute_host_active"] is True
     monkeypatch.setattr(hermes_state, "resolved_max_resume_messages", lambda: 4)  # at the bound: read
     assert [m["content"] for m in server._host_owned_history("btw", session)[0]] == ["one", "first", "two", "second"]
+
+
+@pytest.mark.parametrize("limits", [(4, 2), (2, 4)], ids=["other_profile_stricter", "other_profile_larger"])
+@pytest.mark.parametrize("path", ["isolation_off_adoption", "replacement_host"])
+def test_the_resume_bound_on_a_host_transcript_is_its_own_profiles(tmp_path, monkeypatch, limits, path):
+    """The bound check opened the session's store but read sessions.max_resume_messages from the caller's
+    profile: a replacement host's rebuild and isolation-off adoption run before the session's profile is
+    bound, so a stricter bound there was bypassed and a larger one refused (review probe, Codex rebase
+    review; two real profile homes, A -> B -> A under multiplexing)."""
+    from agent import secret_scope
+    from hermes_constants import get_hermes_home, reset_hermes_home_override, set_hermes_home_override
+    from pathlib import Path
+
+    homes = [tmp_path / "a", tmp_path / "b"]
+    for home, limit in zip(homes, limits):
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            f"sessions:\n  max_resume_messages: {limit}\ndashboard:\n  turn_isolation: false\n", encoding="utf-8")
+        (home / ".env").write_text("", encoding="utf-8")
+        db = SessionDB(home / "state.db")
+        try:
+            db.create_session("stored", source="desktop")
+            for role, text in (("user", "one"), ("assistant", "first"), ("user", "two"), ("assistant", "second")):
+                db.append_message("stored", role, text)
+        finally:
+            db.close()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(homes[0]))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(server, "_hermes_home", str(homes[0]))
+    monkeypatch.setattr(server, "_sessions", {})
+    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+    monkeypatch.setattr(server, "_make_agent", lambda sid, key, **kw: types.SimpleNamespace(session_id=key))
+    monkeypatch.setattr(server, "_transfer_db_to_agent", lambda *args: False)
+
+    def _register(sid, key, agent, history, **_k):
+        server._sessions[sid] = dict(agent=agent, session_key=key, history=history,
+                                    history_lock=threading.Lock(), history_version=0)
+
+    monkeypatch.setattr(server, "_init_session", _register)
+    token = set_hermes_home_override(homes[0])
+    compute_host = ComputeHost(stdout=io.StringIO(), heartbeat_secs=0)
+    try:
+        for index in (0, 1, 0):
+            home, limit = homes[index], limits[index]
+            if path == "isolation_off_adoption":
+                session = dict(profile_home=str(home), session_key="stored", history=[], history_lock=threading.Lock(),
+                               history_version=0, running=False, _compute_host_active=True)
+                allowed = server._adopt_if_isolation_off("r", session) is None
+            else:
+                try:
+                    compute_host._build_server_session(server, {"session_key": "stored", "durable_history": True,
+                                                                "profile_home": str(home)}, "runtime")
+                    allowed = True
+                except RuntimeError:
+                    allowed = False
+            assert allowed is (limit >= 4), (home.name, limit, path)
+            assert get_hermes_home() == homes[0]  # the caller's scope is restored
+    finally:
+        compute_host.close()
+        reset_hermes_home_override(token)

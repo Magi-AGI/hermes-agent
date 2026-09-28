@@ -372,18 +372,21 @@ def _adopt_host_session_inline(rid: str, session: dict, reason: str) -> dict | N
 def _load_host_session_history(session: dict) -> tuple[list | None, str]:
     """``(history, "")`` or ``(None, why)``: the store's tip transcript of a session whose live copy was in a
     compute host, under cold resume's bound (``sessions.max_resume_messages``, tip only). Loading it whole
-    past that bound is the 09-12 OOM shape every other runtime read was bounded against."""
+    past that bound is the 09-12 OOM shape every other runtime read was bounded against. The bound is the
+    session's own profile's (its store is): callers such as a replacement host's rebuild and isolation-off
+    adoption run before that profile is bound, so it is bound here."""
     from hermes_state import SessionResumeTooLargeError
-    if key := str(session.get("session_key") or ""):
-        try:
-            with _session_db(session) as db:
-                if db is not None and callable(guard := getattr(db, "assert_resume_safe", None)):
-                    guard(key, tip_only=True)
-        except SessionResumeTooLargeError as exc:
-            return None, f"Its transcript is too large to load ({exc})"
-        except Exception:  # the guard fails open, as resume's does
-            logger.debug("host session size check failed for %s", key, exc_info=True)
-    history = _load_durable_truncation_history(session)
+    with _session_profile_runtime_scope(session, hydrate_secrets=False):
+        if key := str(session.get("session_key") or ""):
+            try:
+                with _session_db(session) as db:
+                    if db is not None and callable(guard := getattr(db, "assert_resume_safe", None)):
+                        guard(key, tip_only=True)
+            except SessionResumeTooLargeError as exc:
+                return None, f"Its transcript is too large to load ({exc})"
+            except Exception:  # the guard fails open, as resume's does
+                logger.debug("host session size check failed for %s", key, exc_info=True)
+        history = _load_durable_truncation_history(session)
     return (history, "") if history is not None else (None, "")
 
 
