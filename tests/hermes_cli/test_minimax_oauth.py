@@ -513,6 +513,10 @@ def test_refresh_error_body_bounded_and_readable_with_real_client():
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_POST(self):
+            # Consume the refresh form first: closing a socket with unread request bytes sends
+            # RST, not FIN, and an RST discards the error body the client has yet to read
+            # (WinError 10054 under load).
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
             self.send_response(400)
             self.send_header("Content-Length", str(len(big_body)))
             self.end_headers()
