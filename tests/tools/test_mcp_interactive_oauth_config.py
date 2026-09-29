@@ -146,6 +146,139 @@ def test_config_repaired_after_failure_restores_default(console):
     assert mod._is_interactive() is True
 
 
+# --- an interrupted read (stat succeeds, then open/read fails) fails closed ------------------
+
+def _config_path():
+    from hermes_cli.config import get_config_path
+
+    return Path(get_config_path())
+
+
+def _inject_open_fault(monkeypatch, *, vanish: bool, fail_at: str):
+    """Make the loader's ``open(config.yaml)`` fail after its stat succeeded.
+
+    ``vanish`` deletes the file first, so the loader's own follow-up stat fails as well (the
+    stat -> open race: an editor's delete-then-write, a sync tool). ``fail_at`` is ``"open"``
+    (open raises) or ``"read"`` (open succeeds, the read breaks partway)."""
+    import builtins
+    import hermes_cli.config as config_mod
+
+    target = _config_path()
+    real_open = builtins.open
+
+    def faulty_open(file, *args, **kwargs):
+        if Path(file) != target:
+            return real_open(file, *args, **kwargs)
+        if fail_at == "open":
+            if vanish:
+                target.unlink()
+                raise FileNotFoundError(2, "No such file or directory", str(target))
+            raise PermissionError(13, "Permission denied", str(target))
+
+        handle = real_open(file, *args, **kwargs)
+
+        class _Broken:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                handle.close()
+                return False
+
+            def read(self, *a, **k):
+                handle.read(8)
+                if vanish:
+                    handle.close()
+                    target.unlink()
+                raise OSError(5, "Input/output error", str(target))
+
+            def __getattr__(self, name):
+                return getattr(handle, name)
+
+        return _Broken()
+
+    monkeypatch.setattr(config_mod, "open", faulty_open, raising=False)
+
+
+@pytest.mark.parametrize("fail_at", ["open", "read"])
+@pytest.mark.parametrize("vanish", [True, False], ids=["vanished", "present"])
+def test_interrupted_read_fresh_process_fails_closed(console, monkeypatch, fail_at, vanish):
+    """No earlier good config in this process: the loader serves DEFAULT_CONFIG
+    (``interactive_oauth: true``) for a file that said ``false``."""
+    import hermes_cli.config as config_mod
+    import tools.mcp_oauth as mod
+
+    _write_config("mcp:\n  interactive_oauth: false\n")
+    _inject_open_fault(monkeypatch, vanish=vanish, fail_at=fail_at)
+    assert config_mod.load_config_readonly()["mcp"]["interactive_oauth"] is True, \
+        "precondition: the interrupted read served a true value"
+    assert mod._config_allows_unattended_oauth() is False
+    assert mod._is_interactive() is False
+
+
+@pytest.mark.parametrize("fail_at", ["open", "read"])
+def test_interrupted_read_after_earlier_true_fails_closed(console, monkeypatch, fail_at):
+    """An earlier ``true`` in this process: the loader serves it as last-known-good for the file
+    that now says ``false`` and vanished mid-read."""
+    import tools.mcp_oauth as mod
+
+    _write_config("mcp:\n  interactive_oauth: true\n")
+    assert mod._config_allows_unattended_oauth() is True
+    _write_config("mcp:\n  interactive_oauth: false\n  discovery_concurrency: 3\n")
+    _inject_open_fault(monkeypatch, vanish=True, fail_at=fail_at)
+    assert mod._config_allows_unattended_oauth() is False
+
+
+def test_interrupted_read_stays_closed_until_the_file_is_back(console, monkeypatch):
+    """After the race the file is simply missing; that is still the failed read, not a config
+    the user never had. Writing the file again ends it."""
+    import tools.mcp_oauth as mod
+
+    _write_config("mcp:\n  interactive_oauth: false\n")
+    _inject_open_fault(monkeypatch, vanish=True, fail_at="open")
+    assert mod._config_allows_unattended_oauth() is False
+    import builtins
+    import hermes_cli.config as config_mod
+
+    # Only the fault goes away (monkeypatch.undo would also revert the sandboxed HERMES_HOME).
+    monkeypatch.setattr(config_mod, "open", builtins.open, raising=False)
+    assert not _config_path().exists()
+    assert mod._config_allows_unattended_oauth() is False
+    _write_config("mcp:\n  discovery_concurrency: 4\n")
+    assert mod._config_allows_unattended_oauth() is True
+
+
+# --- unchanged: empty config, absent key, a config file that does not exist ------------------
+
+def test_config_file_never_existed_keeps_default(console):
+    """No config.yaml at all (a fresh install): nothing was configured, so today's default."""
+    import tools.mcp_oauth as mod
+
+    path = _config_path()
+    if path.exists():
+        path.unlink()
+    assert mod._config_allows_unattended_oauth() is True
+    assert mod._is_interactive() is True
+
+
+def test_config_deleted_between_loads_keeps_default(console):
+    """A config the user deleted (seen as absent at stat, no read interrupted): the same as no
+    file. Only a read that the deletion interrupted fails closed."""
+    import tools.mcp_oauth as mod
+
+    _write_config("mcp:\n  interactive_oauth: false\n")
+    assert mod._config_allows_unattended_oauth() is False
+    _config_path().unlink()
+    assert mod._config_allows_unattended_oauth() is True
+
+
+def test_intentionally_empty_config_keeps_default(console):
+    import tools.mcp_oauth as mod
+
+    _write_config("")
+    assert mod._config_allows_unattended_oauth() is True
+
+
 # --- explicit user-started login still works -----------------------------------------------
 
 def test_key_off_explicit_login_still_opens_browser(console):

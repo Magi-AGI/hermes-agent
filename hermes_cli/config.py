@@ -58,6 +58,10 @@ _CONFIG_PARSE_WARNED: set = set()
 # probed by get_active_config_parse_failure() so provider auto-resolution can refuse to
 # adopt a paid provider from env keys while the user's REAL config is unreadable.
 _CONFIG_PARSE_FAILURES: dict = {}
+# Signature recorded for a failure on a file that could not even be stat'd afterwards: it existed
+# when the loader checked, then vanished or became unreadable before the read finished (stat ->
+# open race). Stays active while the file still cannot be stat'd; any real file ends it.
+_UNSTATTABLE_SIG = (-1, -1, -1, -1)
 
 
 class InvalidUserConfigError(RuntimeError):
@@ -113,6 +117,9 @@ def _warn_config_parse_failure(
         _CONFIG_PARSE_FAILURES[str(config_path)] = (*sig, str(exc))
     except OSError:
         key = (str(config_path), 0, 0, 0, 0)
+        # Every caller saw the file exist before its read failed, so this is an interrupted read,
+        # not an absent config: record it, or the fallback it returns would pass as a clean read.
+        _CONFIG_PARSE_FAILURES[str(config_path)] = (*_UNSTATTABLE_SIG, str(exc))
     if key in _CONFIG_PARSE_WARNED:
         return
     _CONFIG_PARSE_WARNED.add(key)
@@ -131,10 +138,16 @@ def _warn_config_parse_failure(
 
 def get_active_config_parse_failure() -> Optional[str]:
     """Return the recorded parse error while the ACTIVE config.yaml is still byte-identical
-    (mtime_ns + size + ino + ctime_ns) to the file that failed to parse; else None."""
+    (mtime_ns + size + ino + ctime_ns) to the file that failed to parse; else None. A read
+    interrupted because the file vanished or became unreadable after its existence check stays
+    active while the file still cannot be stat'd; a config that was never there has no record."""
     try:
         record = _CONFIG_PARSE_FAILURES[str(path := get_config_path())]
-        st = path.stat()
+        try:
+            st = path.stat()
+        except OSError:
+            # Still missing/unreadable: active only if the failure itself was on an unstat-able file.
+            return record[4] if tuple(record[:4]) == _UNSTATTABLE_SIG else None
         return record[4] if file_signature(st) == record[:4] else None
     except Exception:
         return None
