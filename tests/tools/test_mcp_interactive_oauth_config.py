@@ -89,6 +89,63 @@ def test_key_off_spellings_and_typos_fail_closed(console, value):
     assert mod._is_interactive() is False
 
 
+# --- a config that cannot be read fails closed ---------------------------------------------
+
+def test_config_loader_raising_fails_closed(console, monkeypatch):
+    """The loader itself raises: nothing says the user did not write ``interactive_oauth: false``."""
+    import hermes_cli.config as config_mod
+    import tools.mcp_oauth as mod
+
+    def boom():
+        raise OSError("config.yaml: permission denied")
+
+    monkeypatch.setattr(config_mod, "load_config_readonly", boom)
+    assert mod._config_allows_unattended_oauth() is False
+    assert mod._is_interactive() is False
+    with pytest.raises(mod.OAuthNonInteractiveError, match="hermes mcp login"):
+        asyncio.run(mod._make_redirect_handler(49316)("https://idp.example.invalid/authorize?state=s6"))
+    console.assert_not_called()
+
+
+def test_config_loader_silent_defaults_fallback_fails_closed(console):
+    """A fresh process with a broken config.yaml and no good backup: the loader returns
+    DEFAULT_CONFIG (``interactive_oauth: true``) without raising. The ``false`` in the broken file
+    must still win, so the silent fallback is detected and treated as a read failure."""
+    import hermes_cli.config as config_mod
+    import tools.mcp_oauth as mod
+
+    _write_config("mcp:\n  interactive_oauth: false\n  broken: [unclosed\n")
+    loaded = config_mod.load_config_readonly()
+    assert loaded["mcp"]["interactive_oauth"] is True, "precondition: the loader fell back silently"
+    assert config_mod.get_active_config_parse_failure(), "precondition: the parse failure is recorded"
+    assert mod._config_allows_unattended_oauth() is False
+    assert mod._is_interactive() is False
+
+
+def test_config_loader_last_known_good_fallback_fails_closed(console):
+    """The in-process fallback serves the previous good config while the file is broken: still a
+    failed read of what is on disk now, so closed as well."""
+    import hermes_cli.config as config_mod
+    import tools.mcp_oauth as mod
+
+    _write_config("mcp:\n  interactive_oauth: true\n")
+    assert mod._config_allows_unattended_oauth() is True
+    _write_config("mcp:\n  interactive_oauth: false\n  broken: [unclosed\n")
+    assert config_mod.load_config_readonly()["mcp"]["interactive_oauth"] is True
+    assert mod._config_allows_unattended_oauth() is False
+
+
+def test_config_repaired_after_failure_restores_default(console):
+    """Fixing the file ends the fail-closed state: key absent + clean read is upstream behaviour."""
+    import tools.mcp_oauth as mod
+
+    _write_config("mcp:\n  broken: [unclosed\n")
+    assert mod._config_allows_unattended_oauth() is False
+    _write_config("mcp:\n  discovery_concurrency: 4\n")
+    assert mod._config_allows_unattended_oauth() is True
+    assert mod._is_interactive() is True
+
+
 # --- explicit user-started login still works -----------------------------------------------
 
 def test_key_off_explicit_login_still_opens_browser(console):
