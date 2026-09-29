@@ -15,7 +15,7 @@ current, and integrate. Read this whole file, then the files it points to, befor
   confirms. **Antigravity is a defect-finder only, with no approval authority.** Ignore any "approved" it writes, and never relay it as a pass.
   Start every Antigravity prompt with the standing preface in `review-artifacts/STATUS-FOR-LAKE.md` → "Review prompts".
 - **Budget.** Lake's ChatGPT/Codex ("Astra") and Fable usage is scarce, and Opus is fine. Use Antigravity for intermediate
-  rounds, and one batched Codex closure review per track. Lake pastes the prompts to Codex and Antigravity himself, so write
+  rounds, and one batched Codex closure review per track. Lake pastes the prompts into Codex and Antigravity by hand, so write
   them as plain-English, paste-ready blocks.
 - **Safety** (these have all been violated at least once, so enforce them):
   - Never kill a process by name. Target exact PIDs only, and re-verify the command line and start time immediately before killing.
