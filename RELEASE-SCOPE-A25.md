@@ -239,6 +239,12 @@ H9 and I1 are HB4–HB7 above.
 
 ## Needs Lake
 
+**Lake's rulings on revision 2, 2026-09-29: N6, N7 and N8 ACCEPTED as proposed.**
+- **N6:** if a compression lease transfer is refused or fails, the continuation is not adopted, the old lease is kept, and a visible error is shown.
+- **N7:** a rewind or edit cut stands exactly once after lock-in, even if its turn is refused or stopped before it starts.
+- **N8:** a user row is accepted at the claim check inside the write transaction.
+
+
 **Lake's rulings, 2026-09-28: N1–N5 all ACCEPTED as proposed.** Rule D is part of the contract (N1). Close or takeover holds the lease until the old turn body exits, with the waiting notice shown (N2). A busy-interrupt launch failure undoes exactly its queue entry and returns the failure (N3). Approvals are keyed by (profile home, stored id) (N4). A Stop that reaches a respawned host without the session is handled in the parent: the turn is revoked if it has not started, otherwise it ends as cancelled with a visible error (N5).
 
 
