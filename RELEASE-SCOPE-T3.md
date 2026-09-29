@@ -1,11 +1,17 @@
 # T3 release scope: the desktop runtime-identity contract, its path inventory, and the disposition of every T3 finding
 
-**Revision 2, for freezing (not yet frozen).** Drafted 2026-09-28 at `magi/track-desktop` `44e26582a2`, while round 29 is under review. Model: `RELEASE-SCOPE-A28.md`.
+**Revision 3, for freezing (not yet frozen).** Drafted 2026-09-28 at `magi/track-desktop` `44e26582a2`, while round 29 is under review. Model: `RELEASE-SCOPE-A28.md`.
 
 **What revision 2 changes.** It answers Codex's scope review (`E:\GitHub\Magi-AGI\review-artifacts\t3-release-scope\codex\REVIEW.md`, F01–F12). Antigravity said "freeze as-is".
 - Each change is tagged `[CX-S01]`…`[CX-S12]`, matching the review's findings F01–F12.
 - Lake's eleven rulings (under "Lake's rulings") are the governing text. They are applied to the rows, the work list and the dispositions [CX-S12].
 - Added rows state behaviour properties with pass/fail acceptance. They add no mechanisms, and no new framework.
+
+**What revision 3 changes.** It is bookkeeping and the round-29 mapping only; it makes no substantive scope change.
+- **Codex's closure check** (`review-artifacts\t3-release-scope\codex\ADDENDUM.md`) accepts every revision-2 scope change. Its two corrections are applied:
+  - **[CX-A1]** the Part 3 disposition-row recount;
+  - **[CX-A2]** the census evidence label.
+- **Codex's round-29 code review** (`.t3-review-r29-20260928/review.md`, F01–F11: 5 P1, 5 P2, 1 P3) is mapped row by row. Each finding is tagged `[r29-F..]`, and its mapping is in "Round-29 findings". New rows state properties and acceptance only. Round 30 fixes them together with the rest of the frozen work list.
 
 **Sources:**
 - `.t3-fix-r24-20260928/PATHS.md` (per-round finding→fix→test tables);
@@ -27,7 +33,7 @@ All paths are in the worktree `E:\GitHub\Magi-AGI\hermes-worktrees\desktop`. Sou
   - a behavioural test that passes at the stated commit;
   - the commit that made it pass.
 - **Evidence classes [CX-S11].** Every done row and every FIXED finding names its evidence class. The classes are not interchangeable:
-  - **U: a current-head UI test.** A `vitest --project ui` test that passed at `44e26582a2` in the implementer's full run (992 files, 8,868 tests; `.t3-fix-r29-20260928/ui-final2.log`). Codex independently re-ran a 29-file, 137-test selection of these at the same head: `review-artifacts/t3-release-scope/codex/named-regressions.log`.
+  - **U: a current-head UI test.** A `vitest --project ui` test that passed at `44e26582a2` in the implementer's full ui-project run. It does not include the electron-project census, whose separate evidence is stated in Part 3 [CX-A2]. The ui run (992 files, 8,868 tests; `.t3-fix-r29-20260928/ui-final2.log`). Codex independently re-ran a 29-file, 137-test selection of these at the same head: `review-artifacts/t3-release-scope/codex/named-regressions.log`.
   - **H: fix-commit or history evidence.**
     - Python tests (`tests/agent`, `tests/hermes_state`, `tests/tui_gateway`, `tests/hermes_cli`, `tests/plugins`), `web/` tests and `electron/` tests. They passed at their fix commits per those commits' messages and the reviews that re-ran them. They were **not** re-run at this head. The full electron rerun is still pending (ruling 10).
     - Findings verified by reviewer inspection or scratch probes, with no repo test.
@@ -195,7 +201,13 @@ The properties apply to an operation's entire lifetime, not only to its request 
 - **The Property column** names P1–P9 from Part 1.
 - **Test file paths** are relative to `apps/desktop/src/`.
 
-**Totals (revision 2): 105 rows: 45 done, 3 partial, 57 OPEN.**
+**Totals (revision 3): 110 rows: 42 done, 6 partial, 62 OPEN.**
+- **Revision 3 [r29]:**
+  - adds 5 rows: C16, G13, G14, H8, H9;
+  - moves 3 done rows to partial: A18, C10, G6;
+  - corrects H1's evidence (r29-F11).
+
+**Revision 2 (unchanged):**
 - **8 rows added:** A25, A26, B13, F7, K1–K4. [CX-S02][CX-S04][CX-S05][CX-S06]
 - **3 done rows reclassified partial:** C12, G9, H1. [CX-S01][CX-S03][CX-S09]
 - **Done properties narrowed** to what their tests establish: A1, A7, B2, B6, G5. [CX-S04][CX-S06][CX-S09]
@@ -230,7 +242,7 @@ The OPEN rows are the concrete work list (see "Work list"). They close gaps in t
 | A15 | Submit direct resume acceptance, `use-prompt-actions/submit.ts:855-876` | Owner-keyed acceptance by stamp | P1 P2 P3 | done (U). T=`submit-gateway-epoch.test.ts:15`, `recovery-boundary.test.ts:56`. F=r25/r28 |
 | A16 | Submit direct resume, first dispatch, `submit.ts:801-821` | A switch during `resolveSessionProfile` sends no `session.resume` for the retired send. Today only the hint is gated (verified at `:801-803`) | P6 P2 | **OPEN** |
 | A17 | Submit routed resume, `submit.ts:727-783` | Inherits A3; the drift hint is registered after an async lookup | P2 P3 | **OPEN** |
-| A18 | Recovery helper `withSessionNotFoundResume`, `use-prompt-actions/utils.ts:200-318` | Stamped at entry; no recovery, hint retry or replay after a switch; hints owner-keyed | P2 P3 P6 | done (U). T=`recovery-boundary.test.ts:35`, `:56`, `gateway-epoch.test.ts:143`, `single-flight-resume.test.ts:70`, `:101`. F=r28/r29 |
+| A18 | Recovery helper `withSessionNotFoundResume`, `use-prompt-actions/utils.ts:200-318` | Stamped at entry; no recovery, hint retry or replay after a switch; hints owner-keyed. **Also required [r29-F05]:** the recovery keeps the resume reply's continuation identity (`stored_session_id` / `session_key` / `resumed`). Today `resumeStoredRuntimeSessionStamped` (`utils.ts:147-173`) reduces the reply to `{runtimeId, since}`, so `onRecovered` binds R2 to the requested S when the backend serves C. Audit every caller of the wrapper; this is an S→C partition of A19's adoption | P1 P2 P3 P6 | **partial** (U). The switch cases are done: T=`recovery-boundary.test.ts:35`, `:56`, `gateway-epoch.test.ts:143`, `single-flight-resume.test.ts:70`, `:101`, F=r28/r29. The continuation case fails (Codex `stop-view-review.test.ts` "shared not-found recovery binds the continuation named by its resume reply") |
 | A19 | Recovery adoptions in every `onRecovered` without evidence: `use-prompt-actions/index.ts:385`, `:792`, `:1008`; `slash.ts:579`, `:719`; `steering-session.ts:84`; `submit.ts:640`; `use-session-tile-delegate.ts:170`, `:560` | The recovered binding lands under the same owner as the recovery flight and hint, with the flight's stamp | P3 P4 | **OPEN** |
 | A20 | Onboarding resume `handoff-leg.ts:83-107` | Routed to the receipt owner; binds the reply's continuation | P2 P3 | done (U). T=`contrib/onboarding-handoff-owner.test.ts:92`, `onboarding-handoff-epoch.test.ts:38`, `onboarding-handoff-ownership.test.ts:59`. F=r25/r29 |
 | A21 | Handoff receipt saved before the transport check, `handoff-leg.ts:106` then `:107` | A receipt is persisted only for a snapshot that passes the fence | P2 P5 | **OPEN** |
@@ -271,12 +283,13 @@ The OPEN rows are the concrete work list (see "Work list"). They close gaps in t
 | C7 | Failure card, `submit.ts:1145-1168` | Card on the operation's runtime; no settle of a newer turn | P2 | done (U). T=`submit-handoff.test.ts:43`, `:106`, `:196`, `submit-lifetime.test.ts:19`. F=r19/r29 |
 | C8 | Submit failure and create toasts, `submit.ts:905`, `:929`, `:1170-1186` | Shown only while the send's ticket holds (today: view drift only) | P9 | **OPEN** |
 | C9 | Foreground `releaseBusy` / `dropOptimistic`, `submit.ts:497-511`, `:590-617` | Only for the send's own turn | P2 | done (U). T=`submit-ownership.test.ts:215`. F=r20/r29 |
-| C10 | Primary Stop tail, `use-prompt-actions/index.ts:774-798` | Releases foreground busy only for its own turn | P2 | done (U). T=`submit-lifetime.test.ts:121`. F=r29 |
+| C10 | Primary Stop tail, `use-prompt-actions/index.ts:774-800` | Releases foreground busy only for its own turn **and only while the view still shows the stopped owner/runtime [r29-F06]**. A's acknowledgement after the user views an already-running B must leave `$busy` as B's state | P2 P4 | **partial** (U). The same-runtime successor case is done: T=`submit-lifetime.test.ts:121`, F=r29. The foreground-drift case fails (Codex `stop-view-review.test.ts` "Stop for A does not release foreground busy after the user views running B") |
 | C11 | Primary Stop failure toast, `index.ts:801` | Ticketed | P9 | **OPEN** |
 | C12 | Tile submit (shared `useSubmitPrompt`), `app/chat/session-tile-actions.ts:338-366` | As C1–C3, C5–C7 and C9 for the tile's own owner and stamp inputs | P2 | **partial [CX-S09]** (U). Done for recovery and handoff: T=`app/chat/session-tile-recovery.test.ts:33`, `session-tile-attachment-recovery.test.ts:61`, F=r18/r19. It depends on C4 (attachment stamp) and C8 (toasts), which are open, and there is no tile-side switch/reclaim case |
 | C13 | Tile attachment upload, `session-tile-actions.ts:273-330` | The recovery flight and hint use the tile's composite owner key (today: the profile key) | P3 | **OPEN** |
 | C14 | Tile `cancelRun`, `session-tile-actions.ts:392-429` | Toast ticketed | P9 | **OPEN** |
 | C15 | Delegate `submitToSession` / `interruptSession`, `use-session-tile-delegate.ts:240-268`, `:530-557` | The first-dispatch check runs after the owner-probe await inside `routedRequest` | P6 | **OPEN** |
+| C16 | Primary Stop's not-found recovery, `use-prompt-actions/index.ts:785-794`; helper `utils.ts:293`, `:304` [r29-F04] | Recovery may complete A's cancellation against its captured owner and target. It never selects the recovered runtime after foreground drift: the active-view check comes before publishing foreground state, and the recovered identity is kept under its own owner, only if adoption was accepted | P1 P2 P4 | **OPEN** (Codex `stop-view-review.test.ts` "not-found recovery for Stop on A does not steal the selected B foreground" fails) |
 
 ### D. Slash commands
 
@@ -315,7 +328,7 @@ The OPEN rows are the concrete work list (see "Work list"). They close gaps in t
 | F4 | Error card and catch, `:359-418` | A superseded handoff writes no runtime state; a switch shows the error; a reconnect retries once | P2 P9 | done (U). T=`onboarding-handoff-epoch.test.ts:38`. F=r25 |
 | F5 | Check-in hidden `prompt.submit`, `:436-444` | Ticketed, and sent to the session's owner | P2 P6 | **OPEN** |
 | F6 | Receipt persistence, `:181-184` → `handoff-receipt.ts:66` | A receipt is never read back under a retired gateway epoch | P5 | **OPEN** (Lake ruling 2) [CX-S12] |
-| F7 | Onboarding **kickoff**, `app/contrib/onboarding-kickoff.ts:59-196` (called from `wiring.tsx:722`) [CX-S02] | One operation stamp, taken before preparation. It is checked at every await: `ensureSetupProfile` `:103`, `setup.status` `:107`, `ensureGatewayProfile` `:116`, `loadMachineProfile` `:121`, `session.list` `:128`, `readOnboardingCapabilities` `:142`. Also after existing-guide adoption (`adoptGuideSession` `:59-78`, which reads `$activeSessionId` after `resumeSession`), fresh creation (`:159-160`), `$setupSession` publication (`:65`, `:169`), the title (`:177`), and the failure rollback (`:181-196`), which must not restore profile, route, setup state or the gateway over a newer user selection. The handoff tests (F1–F4) do not cover this | P2 P6 P9 | **OPEN** (Codex `review-scope-kickoff.test.ts` fails) |
+| F7 | Onboarding **kickoff**, `app/contrib/onboarding-kickoff.ts:59-196` (called from `wiring.tsx:722`) [CX-S02] | One operation stamp, taken before preparation. It is checked at every await: `ensureSetupProfile` `:103`, `setup.status` `:107`, `ensureGatewayProfile` `:116`, `loadMachineProfile` `:121`, `session.list` `:128`, `readOnboardingCapabilities` `:142`. Also after existing-guide adoption (`adoptGuideSession` `:59-78`, which reads `$activeSessionId` after `resumeSession`), fresh creation (`:159-160`), `$setupSession` publication (`:65`, `:169`), the title (`:177`), and the failure rollback (`:181-196`), which must not restore profile, route, setup state or the gateway over a newer user selection. The handoff tests (F1–F4) do not cover this | P2 P6 P9 | **OPEN** (Codex `review-scope-kickoff.test.ts` and r29 `scope-kickoff-review.test.ts` fail) [r29-F02] |
 
 ### G. Stream events, reconnect, switch, readers
 
@@ -326,25 +339,29 @@ The OPEN rows are the concrete work list (see "Work list"). They close gaps in t
 | G3 | Primary reconnect fence, `app/gateway/hooks/use-gateway-boot.ts:457-464` | Fenced before the open socket is published | P9 | done (U). T=`use-gateway-boot.test.tsx:2701`. F=r28 |
 | G4 | Secondary reopen, `store/gateway.ts:711-718` | Advances the fence for its scope | P9 | done (U). T=`gateway-connection-lifecycle.test.ts:324`, `runtime-authority.test.ts:121`, `:147`. F=r25 |
 | G5 | Gateway switch wipe, `store/gateway-switch.ts:183-275` | Retires the authority's bindings, the registry, hints, flights, the cache and the tail cache synchronously. **Narrowed [CX-S09]:** the G7/G12 records and the H3–H6/F6 stores are exceptions until their rows are done | P5 P9 | done (U) for the listed stores. T=`gateway-switch.test.ts:149`, `gateway-epoch.test.ts:191`, `runtime-boundary.test.ts:178`. F=r25/r27 |
-| G6 | Reconnect binding retention, `use-session-tile-delegate.ts:223` | A preserved tile keeps only its own owner's binding | P3 | done (U). T=`owner-keyed-bindings.test.ts:118`. F=r28b |
+| G6 | Reconnect binding retention, `use-session-tile-delegate.ts:221-224`; reset `store/session-states.ts:1527-1551` | A preserved tile keeps only its own owner's binding. **Also required [r29-F08]:** the reset's preservation set and the delegate's `retainOnly` input are exact owner/session pairs, not stored ids. Given tiles `(A, S, R-A)` and `(B, S, R-B)`, reconnecting A keeps B's pair and retires A's. Both tile orderings are tested, against the real delegate's bindings as well as the tile atoms | P3 | **partial** (U). The single-owner case is done: T=`owner-keyed-bindings.test.ts:118`, F=r28b. The two-owner reset case fails (Codex `retirement-owner-review.test.ts` "a preserved same-id tile on B cannot preserve the retired runtime of A") |
 | G7 | Live-status poll, `contrib/hooks/use-background-sync.ts:757` → `:460`, `:508` | Identity never enters `$sessionStates` outside the authority, and a poll answered for a retired gateway recreates nothing. Today it publishes `{storedSessionId}` directly (verified at `:460`) | P1 P2 | **OPEN** (Lake ruling 1: through the authority) [CX-S12] |
 | G8 | Background transcript reconcile, `use-background-sync.ts:191-230`, `:265-300` | Ticketed across a switch | P2 | **OPEN** (tests cover supersession only) |
-| G9 | RPC dispatcher owner, `contrib/session-rpc-dispatcher.ts:69-100`; decode `owner-key.ts:76-87` [CX-S01] | A runtime is routed to its exact owner. Routing matrix, each case both round-tripped and dispatched: explicit remote; explicit local in a local window; **explicit local in a remote window**; ambient local; ambient remote; a route with `targetProfile`. The same keys are used for bindings, hints, flights and recorded owners | P3 | **partial** (U). Explicit remote passes: T=`ownership-boundary-r29.test.ts:46`, `session-rpc-dispatcher.test.ts:154`, F=r29. Explicit local in a remote window fails (Codex `review-scope-owner.test.ts` ×2) |
+| G9 | RPC dispatcher owner, `contrib/session-rpc-dispatcher.ts:69-100`; decode `owner-key.ts:76-87` [CX-S01] | A runtime is routed to its exact owner. Routing matrix, each case both round-tripped and dispatched: explicit remote; explicit local in a local window; **explicit local in a remote window**; ambient local; ambient remote; a route with `targetProfile`. The same keys are used for bindings, hints, flights and recorded owners [r29-F01: re-confirmed at the dispatcher] | P3 | **partial** (U). Explicit remote passes: T=`ownership-boundary-r29.test.ts:46`, `session-rpc-dispatcher.test.ts:154`, F=r29. Explicit local in a remote window fails (Codex `review-scope-owner.test.ts` ×2) |
 | G10 | Dispatcher owner probe → dispatch, `:106-118` | No dispatch after a switch during the probe | P6 | **OPEN** |
 | G11 | Desktop notifications, `contrib/hooks/use-desktop-integrations.ts:321`, `:413` | Identity is resolved through the authority | P1 | **OPEN** (Lake ruling 4: through the authority) [CX-S12] |
 | G12 | Tile `runtimeId` records (`patchSessionTile`, `storedSessionIdForRuntimeId` at `store/session-states.ts:1317`) | No second stored↔runtime record survives a switch or answers outside the authority | P1 | **OPEN** (Lake ruling 1: through the authority) [CX-S12] |
+| G13 | Transport retirement scope matching, `store/runtime-identity.ts:122` (`ownerRetiredSince`), reset `store/session-states.ts:1527`, secondary reopen `store/gateway.ts:713-718`; consumers `use-session-tile-delegate.ts:281`, `:463` [r29-F07] | Retirement matches the connection plus the concrete socket-selecting profile, never `targetProfile`. Reopening `desktop-A` retires an owner `(remote-A, desktop-A, target=shared)`. Reopening a different socket named `shared` does not. The registry predicate, the tile reset and the pane hand-back use the same rule. The global reply fence is unaffected | P2 P3 | **OPEN** (Codex `retirement-owner-review.test.ts`: two cases fail, in opposite directions) |
+| G14 | Tile opening and scope updates by owner, `store/session-states.ts:1415`, `:1439`, `:1705`, `:1769`; hydration concatenation `:1088`, `:1131` [r29-F08] | Opening S under owner B while a tile holds `(A, S, R-A)` never relabels R-A as B's: a change of tile owner drops the old owner's runtime, or opens B's own tile. Tile records carry exact owner/session pairs | P1 P3 | **OPEN** (Codex `tile-owner-open-review.test.ts` "opening the same stored id under B never relabels As live runtime as B" fails through the public API) |
 
 ### H. Persisted state (the whole effect lifetime, P5/P9)
 
 | # | Store | Property | P | Test / status |
 |---|---|---|---|---|
-| H1 | In-flight journal, `hooks/use-session-state-cache.ts:402` → `lib/inflight-turn-journal.ts:973` | Owner slot and epoch; epoch-less entries only until the first switch; a settle clears only its own turn. Also required [CX-S03]: a failed switch-marker write (read/write asymmetry) cannot re-authorize an epoch-less entry; a failed epoch-id publication; a restart; two windows sharing storage. Each with an explicit expected outcome | P5 | **partial** (U). Done: T=`inflight-turn-journal-owner.test.ts:35`, `:66`, `:75`, `inflight-turn-journal-scope.test.ts:18`, F=r28/r29. The failure partitions are missing; Codex's marker-write probe fails |
+| H1 | In-flight journal, `hooks/use-session-state-cache.ts:402` → `lib/inflight-turn-journal.ts:973` | Owner slot and epoch; epoch-less entries only until the first switch. Also required [CX-S03], with each outcome fail-closed and explicit:<br>- **[r29-F03] a failed switch-marker write** (read/write asymmetry) cannot re-authorize an epoch-less entry. Known in-memory retirement is kept even when persisting it fails.<br>- **[r29-F03] a failed epoch-id publication followed by a restart** cannot re-authorize an E0 journal.<br>- two windows sharing storage.<br>**Evidence correction [r29-F11]:** the two adopted `inflight-turn-journal-owner.test.ts` tests (`:35-64`, `:75-80`) do not exercise the owners in their names. The first reads the local-default slot; the second passes no owner. They are replaced by owner-bearing tests with positive recovery under each owner (Codex's `journal-owner-control.test.ts` shape) | P5 | **partial** (U). Done: T=`inflight-turn-journal-scope.test.ts:18` (epoch after a switch), F=r28. The owner-separation claim is **not** established by the cited owner tests (r29-F11). Failing: Codex `scope-owner-review.test.ts` (marker write) and `journal-lifetime-review.test.ts` (epoch publication + restart) |
 | H2 | Journal epoch at write time, `inflight-turn-journal.ts:997` | No retired-gateway content is journaled under the new epoch. This follows once E3, E5, E7, E11 and G8 are ticketed | P5 | **OPEN** |
 | H3 | Transcript tail cache, `store/transcript-tail-cache.ts:166` (writers `index.ts:1706`, `:1887`, `:2234`) | A save that crosses a switch persists nothing; the key distinguishes owners the way owner keys do (today: REST scope, no `targetProfile`, no epoch) | P5 | **OPEN** (scope and wipe tested: `transcript-tail-cache.test.ts:72`, `:137`, `:145`) (Lake ruling 2: owner- and epoch-scoped) [CX-S12] |
 | H4 | Owner hints, `store/session.ts:1074` (writers `index.ts:683`, `:968`, `:2586`; `sdk/index.ts:986`, `:997`; `session-import/index.tsx:95`; `session.ts:1403`) | Two owners of one id do not collide; no hint from a retired operation | P3 P5 | **OPEN** (Lake ruling 2) [CX-S12] |
 | H5 | Read-only latch, `store/read-only-transcript.ts:28` (primary writer `index.ts:2324`) | Owner- and epoch-scoped; the writer is ticketed | P2 P5 | **OPEN** (the tile writer is tested: `runtime-boundary.test.ts:123`) (Lake ruling 2) [CX-S12] |
 | H6 | Composer queue, `store/composer-queue.ts:31` | Owner- and epoch-scoped | P5 | **OPEN** (Lake ruling 2) [CX-S12] |
 | H7 | Transcript backfill, `app/chat/transcript-backfill.ts` | Stamped; owner-keyed | P2 P3 | done (U). T=`transcript-backfill.test.ts:184`, `:249`. F=r25b |
+| H8 | Journal settle identity, `lib/inflight-turn-journal.ts:556-562`, `:973-990` [r29-F09] | A settle clears a journal only when it settles **that** turn, by the journaled turn's claim/generation/identity (message or row id, turn id). Identical prompt text in an older settled copy never erases a newer turn's journal. An explicit legacy policy applies when the evidence is absent. This replaces the text heuristic that H1's "a settle clears only its own turn" relied on | P5 P4 | **OPEN** (Codex `journal-lifetime-review.test.ts` "settling an older identical prompt does not erase the later turns journal" fails; the different-prompt control passes) |
+| H9 | Journal in profile rename and delete, `store/session-states.ts:2102`, `:2209-2264`; callers `app/profiles/rename-profile-dialog.tsx:104`, `delete-profile-dialog.tsx:77`; contract `AGENTS.md:67-69` [r29-F10] | Profile rename moves, and profile delete drops, the owner-slotted journal. Pending throttled writes are handled too, so no later timer recreates the old key. Unrelated remote owners are kept | P5 | **OPEN** (Codex `journal-lifetime-review.test.ts` rename and delete cases fail) |
 
 ### K. Bot-plugin identity pipelines (boundary classification) [CX-S05]
 
@@ -383,13 +400,14 @@ A row closes only when its test covers every partition below that applies to it,
 
 | Partition | Applies to |
 |---|---|
-| **M1: two owners sharing a stored id** (different connections, or explicit vs ambient) | all A, B, G, H and K rows; J2 and J3 |
+| **M1: two owners sharing a stored id** (different connections, or explicit vs ambient) | all A, B, G, H and K rows; C16; J2 and J3 |
 | **M2: suspension between owner resolution and dispatch** (switch injected there) | A3, A11, A16, A17, C4, C15, D3, D6, E8, F5, F7, G10, K1–K4 |
 | **M3: switch and reconnect as separate cases** (and runtime reclaim where the row names a runtime) | every row with P2; the table in P2 |
 | **M4: success, refusal and error completions** | every row with a late completion |
-| **M5: an old completion against a newer turn on the same runtime** (a successor send, or `message.start` with a new turn id) | every rollback, settle and snapshot row (A4, A8, A25, A26, E3, E5, E7, E11, G8, I1) |
-| **M6: failed persistence or close** (write throws, read works; a close that errors or never answers) | B13, H1–H6, F6 |
-| **M7: scoped stores** (read, write, delete and rollback, each under both owners; two windows sharing storage) | H1–H6, F6 |
+| **M5: an old completion against a newer turn on the same runtime** (a successor send, or `message.start` with a new turn id) | every rollback, settle and snapshot row (A4, A8, A25, A26, E3, E5, E7, E11, G8, I1, H8) |
+| **M5b: an old completion after the view moved to another session** [r29-F04][r29-F06] | C10, C16, and every row that publishes foreground state (`$busy`, `$activeSessionId`, the selection) |
+| **M6: failed persistence or close** (write throws, read works; a close that errors or never answers; a failed publication followed by a restart) | B13, H1–H6, H8, H9, F6 |
+| **M7: scoped stores** (read, write, delete and rollback, each under both owners; two windows sharing storage; profile rename and delete) | H1–H6, H8, H9, F6 |
 | **Sinks that must stay unchanged** | the bindings and registry, `$sessionStates` and the cache, the view (`$messages`, `$busy`), persisted stores, toasts, the dispatched-request log |
 
 **Per-family deterministic steps (the minimum for rows that name no test yet):**
@@ -478,8 +496,14 @@ Each item extends the existing boundary to more sites. None adds a new mechanism
    - K1–K4: plugin boundary [CX-S05];
    - the partial rows C12, G9 and H1 [CX-S01][CX-S03][CX-S09];
    - reconnect cases for the P2 table [CX-S10].
+8. **Added in revision 3 from the round-29 code review:**
+   - new rows C16, G13, G14, H8 and H9;
+   - A18, C10 and G6 moved to partial;
+   - H1's evidence corrected.
 
-**Counts (revision 2):** 57 OPEN and 3 partial rows. Rows A4, A23, B5, D6 and I1 appear in two groups, so the group counts below sum to more than 60:
+   The review's other three findings are existing rows: F01 is G9, F02 is F7, F03 is H1. Round 30 fixes all of these with the rest of the frozen list.
+
+**Counts (revision 3):** 62 OPEN and 6 partial rows (68 work rows). Rows A4, A23, B5, D6 and I1 appear in two groups, so the group counts below sum to more than 68:
 
 | Group | Rows |
 |---|---|
@@ -490,6 +514,34 @@ Each item extends the existing boundary to more sites. None adds a new mechanism
 | 5 | 3 |
 | 6 | 9 |
 | 7 | 11 (8 new + 3 partial) |
+| 8 | 8 (r29: 5 new + 3 partial) |
+
+## Round-29 findings: mapping to rows [r29]
+
+Codex's round-29 review of `44e26582a2` (`.t3-review-r29-20260928/review.md`) has 11 findings: 5 P1, 5 P2 and 1 P3.
+- **Its new probes:** 15 failing assertions and 3 passing controls (`review-probes-verified.log`).
+- **Its repo ui run:** 8,868 / 8,868.
+- **Other results:** the prior-83 corpus is unchanged at 82/83; the census re-run passes; the 8 r28 lint-only assertions remain red by design (accepted limit).
+
+Every finding maps to one row. Round 30 fixes them with the rest of the frozen list.
+
+| r29 finding | sev | what it is | row | row change |
+|---|---|---|---|---|
+| F01 | P1 | An explicit local runtime is dispatched through the ambient remote connection | **G9** (partial) | none: already recorded as CX-S01; re-confirmed |
+| F02 | P1 | Onboarding kickoff crosses a switch before its first post-preparation request | **F7** (OPEN) | none: already CX-S02; r29 probe cited |
+| F03 | P1 | A failed switch-marker write, or a failed epoch publication followed by a restart, re-authorizes an old journal | **H1** (partial) | adds the restart partition explicitly |
+| F04 | P1 | Stop's not-found recovery takes the foreground from another session | **C16** | new row |
+| F05 | P1 | Shared recovery discards the continuation id in the resume reply | **A18** | done → partial; S→C partition added |
+| F06 | P2 | Stop's same-turn ticket clears another session's foreground busy | **C10** | done → partial |
+| F07 | P2 | Retirement matches the backend target profile instead of the socket profile | **G13** | new row |
+| F08 | P2 | Tile opening and reset identify a session without its owner | **G14** (opening); **G6** (reset) | G14 new; G6 done → partial |
+| F09 | P2 | Identical prompt text lets an old settled copy erase a newer turn's journal | **H8** | new row |
+| F10 | P2 | The journal is omitted from profile rename and delete | **H9** | new row |
+| F11 | P3 | Two adopted journal-owner tests do not exercise their owners | **H1** (evidence) | the done evidence is corrected; owner-bearing tests are required |
+
+**Also recorded from the review:**
+- Codex again approves omitting the ambient orphan close after a switch. That ruling stands, and B13 remains the captured-owner cleanup work.
+- The PATHS round-29 claims contradicted by F01, F06 and F09 (group A's exact round-trip, group C's Stop tail, group D's settle rule) are superseded by rows G9, C10 and H8.
 
 ## Stopping rule (like A28) [CX-S07]
 
@@ -670,7 +722,7 @@ The T3 track covered more than identity. Every area is dispositioned here; only 
 Antigravity approved rounds 11–18 with no findings. On the same heads, Codex found P1/P2 blockers that later fixes addressed. Those approvals are therefore not relied on as evidence.
 
 **Counts, rounds 1–18:**
-- **Codex:** 69 rows: 57 FIXED, 1 DISPROVED, 4 ACCEPTED, 6 DEFERRED, 1 OPEN. [CX-S12]
+- **Codex:** 69 rows: 57 FIXED, 1 DISPROVED, 4 ACCEPTED, 7 DEFERRED, 0 OPEN. CX-r13-#7 is DEFERRED under ruling 10. [CX-S12][CX-A1]
 - **Antigravity:** 11 rows: 10 FIXED (2 are class H, with no repo test), 1 NO RECORD.
 - **Round-0 items:** 16 rows: 15 FIXED, 1 DEFERRED.
 
@@ -684,7 +736,13 @@ About the reviews in this range:
 
 Every Antigravity finding here restates a Codex finding from the same round.
 
-A test cited here is a path under `apps/desktop/src/` unless shown otherwise. All of them are class U: tracked at `44e26582a2` and passing in the implementer's full ui run. The census test (electron project, 33/33) is also class U. Rows whose final fix is round 29 await its review.
+A test cited here is a path under `apps/desktop/src/` unless shown otherwise. Each `src/` test is class U: tracked at `44e26582a2`, and passing in the implementer's full ui-project run (992 files, 8,868 tests; `.t3-fix-r29-20260928/ui-final2.log`). Rows whose final fix is round 29 await its review.
+
+**The census is separate evidence [CX-A2].** `apps/desktop/scripts/runtime-identity-census.test.ts` is in the **electron** project, which the ui run does not execute. Its evidence is its own current-head run:
+- the implementer's run at `44e26582a2`: 33/33 (`--project electron scripts/runtime-identity-census.test.ts`, round-29 report);
+- Codex's independent re-run in the round-29 review: `.t3-review-r29-20260928/census.log`.
+
+Neither run is a run of the full electron suite, which stays DEFERRED under ruling 10.
 
 "Superseded" means a later round reopened the same area. The chain ends at the named final fix and test.
 
@@ -790,25 +848,29 @@ A test cited here is a path under `apps/desktop/src/` unless shown otherwise. Al
 
 **Counts, rounds 19–28:**
 
-| Reviewer | findings | FIXED | ACCEPTED |
+| Reviewer | disposition rows | FIXED | ACCEPTED |
 |---|---|---|---|
-| Codex | 65 | 64 (F18a fixed by the runtime guard) | 1 (F18b, ruling 5) |
+| Codex | 66 (65 original findings; CX-r28-F18 is split into F18a and F18b) [CX-A1] | 65 | 1 (F18b, ruling 5) |
 | Antigravity | 22 | 22 | 0 |
 
 **The status of round 29 itself.** Every r28 FIXED row rests on the implementer's red-first run: 29 of 31 new tests fail on `4ba5f4131e`, and the 2 that pass are controls. Round 29 is now under review.
 
-### Totals, rounds 1–28 [CX-S12]
+### Totals, rounds 1–28 [CX-S12][CX-A1]
 
-Exactly one outcome per finding:
+**183 original finding groups are represented by 184 disposition rows**, with exactly one outcome per row:
+- CX-r28-F18 is one original finding split into two disposition rows (F18a FIXED, F18b ACCEPTED).
+- The NO RECORD row is an explicit non-finding placeholder. It is not a recovered finding and not an approval.
 
-| Source | rows | FIXED | DISPROVED | ACCEPTED | DEFERRED | OPEN | NO RECORD |
-|---|---|---|---|---|---|---|---|
+| Source | disposition rows | FIXED | DISPROVED | ACCEPTED | DEFERRED | OPEN | NO RECORD |
+|---|---:|---:|---:|---:|---:|---:|---:|
 | Round-0 track items | 16 | 15 | 0 | 0 | 1 | 0 | 0 |
-| Codex r1–r18 | 69 | 57 | 1 | 4 | 6 | 1 | 0 |
+| Codex r1–r18 | 69 | 57 | 1 | 4 | 7 | 0 | 0 |
 | Antigravity r1–r18 | 11 | 10 | 0 | 0 | 0 | 0 | 1 |
-| Codex r19–r28 | 65 | 64 | 0 | 1 | 0 | 0 | 0 |
+| Codex r19–r28 | 66 | 65 | 0 | 1 | 0 | 0 | 0 |
 | Antigravity r19–r28 | 22 | 22 | 0 | 0 | 0 | 0 | 0 |
-| **Total** | **183** | **168** | **1** | **5** | **7** | **1** | **1** |
+| **Total** | **184** | **169** | **1** | **5** | **8** | **0** | **1** |
+
+Part 3's historical totals and Part 2's implementation inventory (the OPEN and partial rows) are different lists.
 
 **Evidence behind the FIXED rows:**
 - **Class U** (current-head UI tests): every identity, transcript-paging and submit row with a `src/` test.

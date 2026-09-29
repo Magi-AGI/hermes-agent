@@ -1,6 +1,6 @@
 # A25 release scope: the turn and cancellation ownership contract, its inventory, and the disposition of every A25 finding
 
-**DRAFT for review (not frozen).** Drafted 2026-09-28 by the A25 agent on branch `magi/track-a25-a19b`, tip `9f133723bd`. Round-10 code starts only after Codex and Antigravity review this list and Lake freezes it. After the freeze, a new discovery is classified by Part 3's outcomes and is not added to scope automatically; a demonstrated production bug is still fixed, disproved, or explicitly deferred by Lake. Format model: `RELEASE-SCOPE-A28.md` frozen at `adc7255836`.
+**FROZEN 2026-09-29 by Lake** at commit 7ef7d45738 (Codex closure corrections C1–C4 applied). From here on, new discoveries are classified by Part 3's outcomes and are not added to scope automatically; a demonstrated production bug is still fixed, disproved or explicitly deferred by Lake. Round 10 fixes the OPEN and partly-done rows.
 
 **Revision 2.** This revision answers both scope reviews of `4392f1cc6a` in one edit:
 - Antigravity (`review-artifacts/a25-release-scope/antigravity/REVIEW.md`, F01–F04, "freeze as-is with a minor T7 clarification"), tagged `[AG-F..]`;
