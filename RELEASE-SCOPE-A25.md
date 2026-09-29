@@ -6,7 +6,7 @@
 - Antigravity (`review-artifacts/a25-release-scope/antigravity/REVIEW.md`, F01–F04, "freeze as-is with a minor T7 clarification"), tagged `[AG-F..]`;
 - Codex (`review-artifacts/a25-release-scope/codex/REVIEW.md`, F01–F12, "revise before freezing"), tagged `[CX-S..]` (S01–S12 are Codex's scope findings F01–F12).
 
-Every changed or added row names the finding it answers. Rows added here state behaviour properties and tests; they add no mechanism. Codex's scope probes are in `review-artifacts/a25-release-scope/codex/tree/tests/tui_gateway/test_review_scope_edges.py` (3 failing, 2 passing controls).
+Codex's closure check of `a927b8a3f1` (`review-artifacts/a25-release-scope/codex/ADDENDUM.md`, C1–C4) is applied in this revision, tagged `[CX-C1]`..`[CX-C4]`; it adds no row and no ruling. Every changed or added row names the finding it answers. Rows added here state behaviour properties and tests; they add no mechanism. Codex's scope probes are in `review-artifacts/a25-release-scope/codex/tree/tests/tui_gateway/test_review_scope_edges.py` (3 failing, 2 passing controls).
 
 ## Baseline and rules
 
@@ -20,7 +20,7 @@ Every changed or added row names the finding it answers. Rows added here state b
   - `done @<commit>: <test>`: the row's property is met and the named test guards it.
   - `partly done`: the named test guards part of the property; the named OPEN part remains.
   - `OPEN (<findings>)`: work for round 10, with the test that must pass. A test that does not exist yet is either the reviewer's probe to adopt (named as in `review-artifacts/a25-9f133723bd/test_a25_round9_edges.py`) or a new test named here.
-  - `BASELINE`: behaviour that predates A25, has no A25 finding and gains no A25 property; listed so the inventory is complete.
+  - `BASELINE`: behaviour that predates A25, has no A25 finding and gains no A25 property; listed so the inventory is complete. **Closure of a BASELINE row [CX-C4]:** its specified baseline behaviour or classification is retained, and its named regression or acceptance evidence passes on the closing candidate (P21's new test is a requirement, not yet a pass). A BASELINE label never excuses a demonstrated ownership failure and never bypasses the combined-release gate.
   - `excluded`: out of A25 with the reason given.
 - **Finding ids.** `R<round>-<reviewer>-<id>`, reviewer `CX` (Codex) or `AG` (Antigravity). A28 rows are `A28-H9` and `A28-I1`.
 
@@ -28,7 +28,7 @@ Every changed or added row names the finding it answers. Rows added here state b
 
 Each rule is a behaviour property. Each Part 2 row lists the rules it must satisfy.
 
-- **(A) One claim per turn.** Every turn, whatever started it, holds exactly one claim from acceptance until it settles. Every effect of that turn happens only while that claim is still the session's, compared by identity at the moment of the effect. That covers its start, its dispatch to the compute host, every durable write, every event it publishes and every release. No effect is decided by a bare `running` flag, by the absence of a claim, or by an observation taken before the effect. A claim that has not started is revoked by the Stop that observed it. A started claim is released only by its own turn's settlement.
+- **(A) One claim per turn.** Every turn, whatever started it, holds exactly one claim from acceptance until it settles. Every effect of that turn happens only while that claim is still the session's, compared by identity at the moment of the effect. That covers its start, its dispatch to the compute host, every durable write, every event it publishes and every release. No effect is decided by a bare `running` flag, by the absence of a claim, or by an observation taken before the effect. **[CX-C2]** A durable effect whose row names an explicit acceptance boundary is checked at that boundary: the submit-time user row at the claim check inside its write transaction (N8, P5), and a rewind/edit cut at lock-in (N7, P19). Before its boundary, a revocation suppresses the effect; after it, the accepted effect happens exactly once, in the stated order, and the turn still ends cancelled. A claim that has not started is revoked by the Stop that observed it. A started claim is released only by its own turn's settlement.
 - **(B) Every cancellation is registered and bound to its target.** A cancellation (Stop, interrupt, redirect, barge-in, takeover, reset) is registered before it publishes anything and stays registered until its last effect has run. Its target is chosen and its registration made in one step. Every effect it has applies only to that target: flags, generations, queue changes, claim revocation, markers, and the waits it releases. A turn admitted while a registered cancellation is still running waits for it, visibly and without a deadline (Lake's decision), and a Stop aimed at the waiting turn ends it.
 - **(C) Only the current owner acts on the conversation.** An effect on the whole stored conversation needs positive, current, per-profile ownership at the moment of the effect. Such effects are the delegation selectors, the approval queue and callback, the end of the durable row, and the lease itself. The lease is released last: after every such effect, after the owner's own and adopted cancellations settle, and after the owner's turn body has exited. A lease that cannot be released keeps an owner and a retry path.
 - **(D) Exactly-once, correctly attributed outcomes.** Every turn ends in exactly one terminal outcome, attributed to that turn and never observable as the outcome of a successor. A turn cancelled before it starts runs nothing: no input preparation and no model call. Every durable effect (user row, branch seed, crash marker, delivery acknowledgement, loop tick, mailbox receipt, row end) is applied exactly once and stays correct under transaction retry, partial commit and failure. A retried or failed write never publishes success it did not commit and never duplicates what it did commit.
@@ -96,7 +96,7 @@ Enumerated from the source at `9f133723bd`. Paths without a directory are under 
 | P2 | start hand-off (turn thread) | `prompt_turn.py:1128-1153` | A | a revoked claim starts nothing; a failed start releases its claim | done @9f133723bd: census `start_handoff`, `test_drain_revoked_after_admission_cannot_start_after_successor`, `test_submit_worker_start_failure_releases_its_claim` |
 | P3 | host dispatch | `compute_host_bridge.py:303-317` | A | see T2 | done @9f133723bd: as T2 |
 | P4 | in-flight record | start `methods_prompt.py:585`, `prompt_turn.py:162`, `compute_host.py:315`; clear on release | A | written and cleared only under the owner's claim | done @9f133723bd: census `test_no_path_clears_or_enters_another_owners_turn_claim` (asserts the successor's record is untouched on every row) |
-| P5 | submit-time user row | `_persist_submit_user_row` `session_workdir.py:376`, called `methods_prompt.py:462`; the claim is checked by the precondition inside the write transaction, before the insert (`hermes_state_messages.py:326`) | A, D | **[CX-S09] Linearization point: the in-transaction claim check.** A submit revoked before that check never writes its row, in either order with its successor. A submit revoked after the check keeps its row as a sent-then-cancelled message; that row precedes any successor's row (transactions serialize), and the turn still ends cancelled. The row is staged only for the current claim. Commit-time exclusion is not claimed (Stop does not wait on the database, Lake's round-8 decision) | partly done @16e9c1dcb3 / @9f133723bd (revoked before the check): `test_a_revoked_submit_never_leaves_its_user_row_in_the_stored_transcript[successor-writes-first|revoked-resumes-first]`, census `branch_seed_and_user_row`. OPEN [CX-S09]: `test_stop_after_the_row_check_keeps_one_row_before_the_successors` (Stop between check and commit); retry and rollback: E4. Needs Lake N8 |
+| P5 | submit-time user row | `_persist_submit_user_row` `session_workdir.py:376`, called `methods_prompt.py:462`; the claim is checked by the precondition inside the write transaction, before the insert (`hermes_state_messages.py:326`) | A, D | **[CX-S09] Linearization point: the in-transaction claim check.** A submit revoked before that check never writes its row, in either order with its successor. A submit revoked after the check keeps its row as a sent-then-cancelled message; that row precedes any successor's row (transactions serialize), and the turn still ends cancelled. The row is staged only for the current claim. Commit-time exclusion is not claimed (Stop does not wait on the database, Lake's round-8 decision) | partly done @16e9c1dcb3 / @9f133723bd (revoked before the check): `test_a_revoked_submit_never_leaves_its_user_row_in_the_stored_transcript[successor-writes-first|revoked-resumes-first]`, census `branch_seed_and_user_row`. OPEN [CX-S09]: `test_stop_after_the_row_check_keeps_one_row_before_the_successors` (Stop between check and commit); retry and rollback: E4. Ruling N8 (accepted) sets the boundary [CX-C3] |
 | P6 | branch seed | `_persist_branch_seed` `session_workdir.py:319`; callers `methods_prompt.py:461`, `compute_host.py:324`, `methods_session.py:291` | A, D | written once; never after a revoked submit | partly done @9f133723bd: `test_a_revoked_branch_submit_cannot_append_its_seed_after_the_successor`. OPEN: E1, E2 |
 | P7 | crash marker record | `_record_turn_marker` `prompt_turn.py:200`, called :1040 | A, D | the marker belongs to its turn | BASELINE: `test_auto_continue.py::test_interrupt_racing_marker_write_cannot_leave_recovery_state` |
 | P8 | crash marker retire | turn tail `prompt_turn.py:1104-1110`; Stop RPC tail `methods_session.py:2140-2145`; terminal error `session_auto_continue.py:745`; recovery path `prompt_turn.py:871` | A, D | only the turn's own marker is retired, never after a successor wrote one for the same stored key | partly done @9f133723bd (Stop tail): `test_stop_rpc_tail_cannot_remove_a_successors_crash_marker`. OPEN (R9-CX-F14, F16): `test_terminal_error_cannot_publish_after_its_owner_is_replaced`, `test_old_turns_post_release_tail_preserves_new_turns_crash_marker` |
@@ -158,7 +158,7 @@ Enumerated from the source at `9f133723bd`. Paths without a directory are under 
 | row | item | code | rules | test | status |
 |---|---|---|---|---|---|
 | HB1 | `turn.start` admission in the child | `_handle_turn_start` `compute_host.py:214-216`; `_run_real_turn` :286-360 | A | claimed by identity; releases only its own claim | done @9f133723bd: `test_a_compute_host_stop_frame_still_propagating_holds_the_hosts_next_turn` |
-| HB2 | soft interrupt | `compute_host.py:240-257` | B | as X11 | done: as X11 |
+| HB2 | soft interrupt | `compute_host.py:240-257` | B | as X11, including a refused target's absence of any effect: no intent advance, no wait left registered, no approval or queue change [CX-C1] | partly done: as X11; rejected-target partition OPEN (CX-S04 / HB6) [CX-C1] |
 | HB3 | hard Stop frame | `compute_host.py:259-262` | B | as X10 | done: as X10 |
 | HB4 | **A28-H9** control head-of-line blocking | the reader handles every frame inline (`compute_host.py:725-745`); `_handle_control` :508-530 runs compress inline via `methods_session.py:1952-1974`; `_handle_reload_mcp` :500 | B | a long control for session A does not delay `interrupt`, `respond` or `turn.start` for other sessions, or Stop for A, beyond a bound; two controls for the same conversation keep their arrival order; a control refused at shutdown or on a worker-start refusal fails visibly and blocks nothing | OPEN (A28-H9). Acceptance [CX-S10]: a control (compress, then reload) blocked on an Event, released in `finally`; before release, each of these is asserted done: (1) `interrupt` for another session applied; (2) `respond` for another session delivered; (3) `turn.start` for another session admitted; (4) Stop for session A applied to A's turn; (5) `turn.start` for A queued behind A's control or refused visibly, as H9 specifies, never silently lost; (6) a second control for A starts only after the first. Plus: shutdown while a control is blocked; worker-start refusal for the offloaded control. Timeouts are safety bounds only (no real 30 s sleep). Tests: `test_long_control_does_not_block_other_frames[interrupt|respond|turn-start|same-session-stop|same-session-turn-start]`, `test_two_controls_for_one_conversation_keep_their_order`, `test_blocked_control_at_shutdown_or_refused_start_blocks_nothing` |
 | HB5 | **A28-I1** a Stop overtakes a queued `turn.start` | `turn.start` goes onto the executor (`compute_host.py:215`); `interrupt` runs inline on the reader (:232-262); the claim resets the cancel flag (:313-314) | A, B | a Stop delivered between the host's receipt of `turn.start` and its claim ends that turn `interrupted` without calling the model | OPEN (A28-I1). New test: `test_stop_between_turn_start_receipt_and_claim_cancels_that_turn` |
@@ -217,8 +217,12 @@ Enumerated from the source at `9f133723bd`. Paths without a directory are under 
   - **What it checks [CX-S08].**
     - For each observed effect it records the sink, the calling function, **the effect's identity within that caller** (which branch or which of several effects), **the owner token it acted under** (claim, cancellation, lease holder) and **the final observable write** (the event sent, the row committed, the key changed). It fails on any observed effect not mapped to a row id.
     - **Coverage:** it also fails unless every in-scope row and each of its outcome partitions (success, refusal, revocation, failure, partial commit, retry) was driven at least once.
-    - **Two passes per row.** Owner current: the effect happens. Owner revoked or replaced **between the ownership check and the final write** (the pause is placed there, not at function entry): the effect does not happen, **except** the old operation's settlement of its own record (its terminal outcome, its receipt, its tick), which must happen exactly once and be attributed to it (rule D). Failed and partial outcomes are asserted the same way.
-    - **Mutation controls.** For each row, one control moves or revokes ownership between the check and the effect, and one alters the effect itself; each must make the census fail.
+    - **Two passes per row, with row-specific expected outcomes [CX-C2].** Owner current: the effect happens. Owner revoked or replaced **between the ownership check and the final write** (the pause is placed there, not at function entry): the expected outcome is the row's own:
+      - **Before an acceptance boundary** (every row without one, and N7/N8 rows before theirs): the effect does not happen.
+      - **After an accepted boundary** (N8: P5's in-transaction claim check; N7: P19's lock-in): the accepted durable effect happens exactly once, in the stated order (P5's row precedes any successor's row), and the turn ends cancelled.
+      - **In every case**, the old operation's settlement of its own record (its terminal outcome, its receipt, its tick) happens exactly once and is attributed to it (rule D).
+      - **Failed or rolled-back transactions** publish no success; retries meet E1 and E4. Failed and partial outcomes are asserted per row the same way.
+    - **Mutation controls.** For each row, one control moves or revokes ownership between the check and the effect, and one alters the effect itself; each must make the census fail. **[CX-C2]** For P5 and P19 two more: one that wrongly suppresses an accepted row or cut after its boundary, and one that wrongly lets a write revoked before its boundary through; each must make the census fail.
     - It stays a small behavioural test matrix; no source-reading test and no general model checker.
 - **Round-10 extension of the existing census:** rows for P1 (start emit), P8 (turn-tail marker), P9 (each terminal emitter), P10 (tail pops, and the tail's `session.info` [AG-F02]), P11, P12, E1 and E4 (retry callback), O7 (foreign-backend lease), L4 (holder registration versus completion), and X14 (agent replacement and queues).
 - **Two named obligations of `test_every_observed_effect_maps_to_an_inventory_row`:**
@@ -237,7 +241,7 @@ Rows H1–H8 and H10–H12 of `RELEASE-SCOPE-A28.md` @`adc7255836` were read aga
 
 H9 and I1 are HB4–HB7 above.
 
-## Needs Lake
+## Accepted rulings and the work they require [CX-C3]
 
 **Lake's rulings on revision 2, 2026-09-29: N6, N7 and N8 ACCEPTED as proposed.**
 - **N6:** if a compression lease transfer is refused or fails, the continuation is not adopted, the old lease is kept, and a visible error is shown.
@@ -255,16 +259,11 @@ H9 and I1 are HB4–HB7 above.
 - **N4 (accepted): approvals keyed by (profile home, stored id).** Work: O3, O4, O8, O9, P16.
 - **N5 (accepted): a Stop reaching a respawned host without the session** is handled in the parent (revoked if not started, else ended as cancelled with a visible error). Work: HB7, X15.
 
-**New for Lake in revision 2** (from Codex's scope review; the rows are OPEN either way, the ruling fixes their expected outcome):
-- **N6. Compression transfer refused or failed (L6, CX-S03).**
-  - **Proposed:** the runtime does not adopt the continuation. It keeps its old lease if that is still valid, sends the client a visible "this conversation continued elsewhere" error, and refuses further turns and conversation-wide effects on the continuation key until it holds its lease; approvals are not migrated. A failed release of the old lease stays owned with a retry (as E5).
-  - **Alternative:** keep today's behaviour (adopt the key and continue unowned), stated as an accepted residual.
-- **N7. A truncating (rewind/edit) submit whose start is later refused or revoked (P19, CX-S05).**
-  - **Proposed:** the cut belongs to the accepted submit. Once lock-in succeeded the cut stands, exactly once, even if the turn is refused or stopped before it starts; the client is told the edit was applied and the turn did not run, and a retry resubmits without truncation.
-  - **Alternative:** defer the cut until the turn starts, so a refused or stopped edit leaves the transcript untouched (larger change to `_lock_in_submit_turn`).
-- **N8. The user row's linearization point (P5, CX-S09).**
-  - **Proposed:** the in-transaction claim check is the acceptance point. A Stop after it leaves the row as a sent-then-cancelled message that precedes any successor's row; the turn still ends cancelled. This satisfies (A) and (D) and keeps Lake's round-8 rule that Stop never waits on the database.
-  - **Alternative (stronger):** commit-time exclusion, which requires a Stop to wait for, or roll back, an in-flight row write.
+- **N6 (accepted 2026-09-29): compression transfer refused or failed.** The runtime does not adopt the continuation. It keeps its old lease if that is still valid, sends the client a visible "this conversation continued elsewhere" error, and refuses further turns and conversation-wide effects on the continuation key until it holds its lease; approvals are not migrated. A failed release of the old lease stays owned with a retry (as E5). Work: L6.
+- **N7 (accepted 2026-09-29): a truncating (rewind/edit) submit whose start is later refused or revoked.** The cut belongs to the accepted submit: once lock-in succeeded it stands, exactly once, even if the turn is refused or stopped before it starts; the client is told the edit was applied and the turn did not run, and a retry resubmits without truncation. Work: P19, and the census (2.8).
+- **N8 (accepted 2026-09-29): the user row's acceptance point** is the claim check inside the write transaction. A Stop after it leaves the row as a sent-then-cancelled message that precedes any successor's row; the turn still ends cancelled. Stop never waits on the database. Work: P5, E4, and the census (2.8).
+
+**Unselected alternatives (history only, non-governing).** N6: adopt the key and continue unowned. N7: defer the cut until the turn starts. N8: commit-time exclusion (a Stop waits for or rolls back an in-flight row write).
 
 ## Part 3: disposition of every A25 finding (rounds 1–9)
 
@@ -341,16 +340,16 @@ Antigravity entries that repeat a same-round Codex finding with the same probe t
 | A28-I1 | a Stop overtakes a queued `turn.start`; an old `turn_id`; a respawned host | OPEN (HB5, HB6, HB7, X15); ruling N5 |
 | Scope review CX-S01 | reaper flushes persist without ownership | OPEN (P15b, P15c) |
 | Scope review CX-S02 | orphan sweep can reclaim a lease mid-handoff; startup row sweep | OPEN (L13, O10, O11) |
-| Scope review CX-S03 | compression transfer refusal/error adopts the key unowned | OPEN (L6); ruling N6 needed |
+| Scope review CX-S03 | compression transfer refusal/error adopts the key unowned | OPEN (L6); ruling N6 (accepted) sets the outcome [CX-C3] |
 | Scope review CX-S04 | a refused target still advances interrupt intent | OPEN (X11, HB6) |
-| Scope review CX-S05 | truncation and row rewrite missing from the inventory | OPEN (P19, P20); P21 classified BASELINE; ruling N7 needed |
+| Scope review CX-S05 | truncation and row rewrite missing from the inventory | OPEN (P19, P20); P21 classified BASELINE; ruling N7 (accepted) sets the outcome [CX-C3] |
 | Scope review CX-S06 | host relay, open-request mirror, clarify lock, late child frames | OPEN (HB9–HB12); split with A28 H11 stated in HB10 |
 | Scope review CX-S07 | agent callbacks beyond terminal events | OPEN (P14b, P14c, P14d) |
 | Scope review CX-S08 | census validates the wrong effect / misses guard-to-effect races | OPEN (2.8) |
-| Scope review CX-S09 | P5 promised commit-time exclusion | OPEN (P5, E4); ruling N8 needed |
+| Scope review CX-S09 | P5 promised commit-time exclusion | OPEN (P5, E4); ruling N8 (accepted) sets the boundary [CX-C3] |
 | Scope review CX-S10 | HB4 acceptance incomplete | OPEN (HB4) |
 | Scope review CX-S11 | A19b has no retained row | done (G1) |
-| Scope review CX-S12 | obsolete decision prompts; closure gate | done in this revision (baseline "Closure", Needs Lake, Part 3 outcomes) |
+| Scope review CX-S12 | obsolete decision prompts; closure gate | done in this revision (baseline "Closure", accepted-rulings section, Part 3 outcomes; decision prompts removed per CX-C3) |
 | Scope review AG-F01 | T7 attribution | done in this revision (T7) |
 | Scope review AG-F02 | tail `session.info` over a successor's running state | OPEN (P10, census obligation) |
 | Scope review AG-F03 | late callback UI deltas under N2 | OPEN (P14b, census obligation) |
@@ -359,11 +358,12 @@ Antigravity entries that repeat a same-round Codex finding with the same probe t
 ## Counts
 
 - **Inventory rows: 108** (107 table rows — T 17, X 18, P 26, O 11, L 13, HB 12, G 1, E 9 — plus the census in 2.8). 3 are excluded (T17, X17, X18), leaving **105 in scope**:
-  - **done: 22**
-  - **partly done** (a named test guards part; a named OPEN part remains): **29** (L2 and L8 follow X5 and X1)
-  - **OPEN: 49** (plus the census, 2.8)
+  - **done: 21**
+  - **partly done** (a named test guards part; a named OPEN part remains): **30** (L2 and L8 follow X5 and X1; HB2 follows X11 [CX-C1])
+  - **OPEN: 50** (49 table rows plus the census, 2.8) [CX-C4]
   - **BASELINE** (pre-A25, no A25 property): **4** (P7, P21, L1, L7)
-  - Changes from `4392f1cc6a` (92 rows): +16 rows [P14 split into P14a–P14d; P15 split into P15a–P15c; P19, P20, P21; O10, O11; L13; HB9–HB12; G1]; status changes [X11, HB6: done → partly done (CX-S04); P5: done → partly done (CX-S09); L6: BASELINE → partly done (CX-S03)].
+  - **Check:** 21 + 30 + 50 + 4 = 105 in scope, plus 3 excluded = 108 [CX-C4].
+  - Changes from `4392f1cc6a` (92 rows): +16 rows [P14 split into P14a–P14d; P15 split into P15a–P15c; P19, P20, P21; O10, O11; L13; HB9–HB12; G1]; status changes [X11, HB6: done → partly done (CX-S04); HB2: done → partly done (CX-C1); P5: done → partly done (CX-S09); L6: BASELINE → partly done (CX-S03)].
 - **Findings: 58 unique Codex findings** over rounds 1–9, plus 1 unnumbered R8 note. By round: R1 5, R2 2, R3 2, R4 1, R5 2, R6 1, R7 8, R8 15, R9 22.
   - **11 Antigravity entries**, all same-round duplicates of Codex (R5 2, R6 1, R7 8).
   - Plus **A28-H9** and **A28-I1**.
@@ -373,4 +373,5 @@ Antigravity entries that repeat a same-round Codex finding with the same probe t
   - **OPEN: 26 findings plus H9 and I1 = 28.** These are R8-CX-F5, F8, F11, F15 and all 22 of R9.
   - **Scope-review findings:** resolved in this revision 4 (CX-S11 as row G1, CX-S12, AG-F01, AG-F04); OPEN 12 (CX-S01–S10, AG-F02, AG-F03), each mapped to its rows.
   - **DISPROVED: 0.**
-  - **Rulings:** N1–N5 accepted (they set required behaviour; they close nothing). **N6–N8 are new and need Lake.**
+  - **Rulings:** N1–N8 accepted (they set required behaviour; they close nothing) [CX-C3]. Nothing is pending with Lake except the freeze.
+  - **Closure-check corrections C1–C4** are residual requirements on the existing scope findings (CX-S04, S08, S09, S12), applied in this revision; they are not new finding ids.
