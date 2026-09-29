@@ -1,6 +1,6 @@
 # A28 release scope: A28-Core (before deploy) and the disposition of every A28b finding
 
-Draft for Lake's approval to freeze scope. Written 2026-09-28.
+**FROZEN 2026-09-28 by Lake** at commit d8a4c0143b (Codex approved; Antigravity folded in). From here on, new discoveries are classified per Part 2's outcomes and are not added to scope automatically; a demonstrated production bug is still fixed, disproved or explicitly deferred by Lake.
 
 **Revision 2 (2026-09-28).** This revision answers Codex's scope review (`review-artifacts/a28-release-scope/codex/REVIEW.md`, F01–F23). Each changed row names the finding it answers, as `[F..]`. Rows added in this revision state behaviour properties with pass/fail tests; they do not add mechanisms. Lake's rulings are the governing text. The original proposals are kept, marked historical, under "Needs Lake".
 
