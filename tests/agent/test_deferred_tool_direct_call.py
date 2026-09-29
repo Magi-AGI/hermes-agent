@@ -176,3 +176,53 @@ def test_registered_but_out_of_scope_tool_is_not_advertised(deferred_mcp_agent):
         registry.deregister(foreign)
     content = _tool_result(result["messages"], "f1")["content"]
     assert content.startswith(f"Tool '{foreign}' does not exist."), content
+
+
+# ---------------------------------------------------------------------------
+# Sibling: name auto-repair must not rewrite an exact deferred name into a
+# DIFFERENT visible tool. ``read_terminal`` / ``close_terminal`` are on the default
+# deferral list and fuzzy-match ``terminal`` (difflib ratio >= 0.7), so a direct
+# call used to be rewritten to ``terminal`` and dispatched there.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def deferred_gui_agent():
+    from tools.registry import registry
+
+    gui = "read_terminal"
+    registry.register(name=gui, toolset="desktop_ui", schema=_td(gui)["function"],
+                      handler=lambda args, **kw: json.dumps({"ok": True}))
+    visible = [_td("terminal")]
+    full = visible + [_td(gui)]
+    assembled = visible + bridge_tool_schemas(1)
+
+    def _defs(*_a, **kw):
+        return list(full if kw.get("skip_tool_search_assembly") else assembled)
+
+    with (
+        patch("model_tools.get_tool_definitions", side_effect=_defs),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        agent = AIAgent(api_key="test-key-1234567890", base_url="https://openrouter.ai/api/v1",
+                        quiet_mode=True, skip_context_files=True, skip_memory=True)
+        agent.client = MagicMock()
+        agent._cached_system_prompt = "You are helpful."
+        agent._use_prompt_caching = False
+        agent.compression_enabled = False
+        agent.save_trajectories = False
+        try:
+            yield agent, gui
+        finally:
+            registry.deregister(gui)
+
+
+def test_exact_deferred_name_is_not_auto_repaired_into_another_tool(deferred_gui_agent):
+    agent, gui = deferred_gui_agent
+    assert agent._repair_tool_call(gui) == "terminal", "precondition: fuzzy repair collides"
+    with patch("model_tools.handle_function_call", return_value=json.dumps({"ok": True})) as dispatch:
+        result = _run(agent, [_resp([_tc(gui, {"pane_id": "p1"}, "g1")]), _resp(content="done")])
+    dispatched = [c.args[0] if c.args else c.kwargs.get("function_name") for c in dispatch.call_args_list]
+    assert "terminal" not in dispatched, f"deferred {gui} was rewritten and dispatched as terminal"
+    content = _tool_result(result["messages"], "g1")["content"]
+    assert "tool_call" in content and gui in content, content

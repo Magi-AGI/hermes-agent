@@ -67,6 +67,20 @@ def _partial_exit(agent, messages, conversation_history, api_call_count, final_r
     }, "truncated", True)
 
 
+def _deferred_reachable_names(agent: Any, valid_names, tool_calls) -> frozenset:
+    """Scoped deferred names (``tool_call``-reachable) — computed only when the bridge is
+    visible and some call name is not directly valid, so the common path pays nothing."""
+    try:
+        from tools import tool_search as _ts
+        if _ts.TOOL_CALL_NAME not in valid_names or all(tc.function.name in valid_names for tc in tool_calls):
+            return frozenset()
+        from agent.tool_executor import _tool_search_scoped_names
+        return _tool_search_scoped_names(agent)
+    except Exception:
+        logger.debug("deferred-name scope lookup failed; repair proceeds unguarded", exc_info=True)
+        return frozenset()
+
+
 def validate_tool_calls(
     agent: Any, assistant_message: Any, finish_reason: str, *, messages: List[Dict[str, Any]],
     conversation_history: Any, api_call_count: int, effective_task_id: Any,
@@ -88,9 +102,13 @@ def validate_tool_calls(
     # pre-API sanitizer keeps only the first call/result per id.
     agent._uniquify_tool_call_ids(tool_calls)
 
-    # Repair mismatched tool names before validating (model hallucinations).
+    # Repair mismatched tool names before validating (model hallucinations). An EXACT
+    # deferred name the bridge can reach is not a typo: fuzzy repair would rewrite e.g.
+    # ``read_terminal`` into ``terminal`` and run a different tool. Leave it invalid so it
+    # gets the tool_call correction from _invalid_tool_name_error_content.
+    deferred_reachable = _deferred_reachable_names(agent, valid_names, tool_calls)
     for tc in tool_calls:
-        if tc.function.name not in valid_names:
+        if tc.function.name not in valid_names and tc.function.name not in deferred_reachable:
             repaired = agent._repair_tool_call(tc.function.name)
             if repaired:
                 agent._vprint(f"{agent.log_prefix}🔧 Auto-repaired tool name: '{tc.function.name}' -> '{repaired}'",
