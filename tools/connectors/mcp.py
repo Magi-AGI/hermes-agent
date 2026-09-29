@@ -48,6 +48,29 @@ OFF_DESKTOP_NOTE = (
 )
 
 
+def model_oauth_refusal(names: List[str]) -> Optional[str]:
+    """The refusal for OAuth a tool call would start with no user click, or None when allowed.
+
+    Under ``mcp.interactive_oauth: false`` only a user-started login may run an authorization flow.
+    A model's ``authorize`` starts one before anyone clicks: the card's prepare binds the loopback
+    listener and runs the worker as a forced login (forced beats the key), and off the desktop the
+    link is minted at once. So the call is refused before any of that, and returns at once. A card
+    ``install`` is not refused: its OAuth starts on the user's approval click. The same predicate as
+    every other OAuth sink, so an unreadable config refuses too."""
+    from tools.mcp_oauth import _config_allows_unattended_oauth
+
+    if _config_allows_unattended_oauth():
+        return None
+    listed = ", ".join(names)
+    first = names[0] if names else "<server>"
+    return (
+        f"mcp.interactive_oauth is false, so authorization of {listed} is never started from a tool "
+        f"call. Ask the user to sign in themselves: `hermes mcp login {first}` in a terminal, or the "
+        "Login button on that server in the desktop/dashboard MCP settings. Its tools are available "
+        "after that. Do not retry this action."
+    )
+
+
 def _catalog_names() -> List[str]:
     from hermes_cli.mcp_catalog import list_catalog
 
@@ -600,6 +623,11 @@ def _install_now(runner: _Runner, operation: ConnectionOperation, target: Target
         return
     actor = _actor(target)
     if _installs_with_oauth(runner, target):
+        # No card, so no click would gate the flow: refused under ``mcp.interactive_oauth: false``.
+        refusal = model_oauth_refusal([target.name])
+        if refusal:
+            _fail(operation, target, refusal)
+            return
         # No card here, so the result carries the link; the flow's own worker commits the install.
         try:
             attempt = runner.backend.start_install_oauth(target.name, {})
@@ -793,6 +821,10 @@ def run_mcp_operation(
     error = validate_mcp_names(action, names)
     if error:
         return tool_error(error)
+    if action == "authorize":
+        refusal = model_oauth_refusal(names)
+        if refusal:
+            return tool_error(refusal)
     runner = open_runner(action, backend)
     session_key = operation_session_key(session_id)
     # Every interactive surface that renders the card attaches this callback. Registry dispatch and

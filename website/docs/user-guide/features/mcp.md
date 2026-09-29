@@ -767,6 +767,16 @@ A connect that needs authorization then fails with the usual "run `hermes mcp lo
 Explicit logins are unaffected: `hermes mcp login <server>` and the desktop/dashboard Login button still
 open the flow.
 
+With the key false, the agent cannot start an authorization either. A `manage_connections` call with
+`authorize` would otherwise start the flow before you click anything (it registers the client and
+listens for the callback while the connection card is still being drawn). Instead it returns at once,
+with no card, telling you to use `hermes mcp login <server>` or the Login button. An agent-started
+`install` of an OAuth catalog entry still works in the desktop card, because its authorization only
+starts when you approve the card. Where there is no card, that install is refused the same way.
+
+If `config.yaml` can't be read or doesn't parse, Hermes treats the key as false until the file is
+fixed, because the broken file may be the one that says `false`.
+
 ### Lazy start
 
 A server with `lazy: true` is registered from the on-disk schema cache instead: its tools appear in the registry immediately, and the process is spawned (or the HTTP endpoint connected) on the first tool call. The cache is written on every live connect, so the first run of a new or changed server is always eager. The banner and the TUI session panel show such a server as **lazy** with its cached tool count (`3 tool(s) (lazy, starts on first use)`) — it is a working server, not a failed one — and the startup discovery summary counts it as `N lazy, not spawned yet`.

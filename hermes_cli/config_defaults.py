@@ -530,6 +530,8 @@ DEFAULT_CONFIG = {
         # (`hermes mcp login <server>`, the desktop/dashboard login button) may; every other connect
         # needing authorization fails with the "run `hermes mcp login <server>`" error. Background
         # paths (startup discovery, gateway, keepalive reconnects) are non-interactive either way.
+        # false also refuses a model's manage_connections authorize (it starts OAuth before any
+        # click); an unreadable or unparseable config.yaml counts as false.
         "interactive_oauth": True,
     },
     # Tool-output truncation. max_bytes: terminal_tool output cap in chars (head+tail kept; 50_000 ≈
