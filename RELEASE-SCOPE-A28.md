@@ -39,7 +39,7 @@ Draft for Lake's approval to freeze scope. Written 2026-09-28.
   - Popen with the site's own `Thread.start`.
   
   `Thread.start()` waits for the new thread with no bound. After a timeout, cleanup calls `communicate()` again with no bound. Under commit pressure, either wait can hang the caller or raise `RuntimeError`, and that error escapes handlers written for `OSError`.
-- **Property (every live-session site).** All four must hold:
+- **Property (every live-session site).** All five must hold:
   1. **Containment before execution.** On Windows the child is in a job before it runs: `spawn_command` or `spawn_server`, `hermes_cli/local_runtime/processes.py:115-199`.
   2. **Safe capture startup.** Pipe readers and stdin writers start through a start primitive that cannot wait unbounded, the A23 `_PipeReaders` raw-thread pattern at `hermes_cli/_subprocess_compat.py:563-641`. If a start is refused, the site sees an `OSError` subclass and gives its existing error outcome.
   3. **Bounded, app-controlled wait and cleanup.** The call returns within the caller's finite wait budget plus a fixed cleanup constant of 2 s. Every included call has a finite budget; see (h). The whole child tree is either disposed of or held by a named C9 retained owner.
@@ -101,7 +101,7 @@ Draft for Lake's approval to freeze scope. Written 2026-09-28.
       | C28 | `main_web_build.py:365` (capture branch) | the idle budget of C27's `_run_with_idle_timeout` |
       | B39 | `update_cmd.py:189-193` (non-network branch) | local-git budget |
 
-    - **Needs Lake:** the values; see New item N1.
+    - **Budgets:** as accepted by Lake in ruling N1 (the table under "Needs Lake").
 - **C1.0 shared primitive.** Extend the existing A23 helpers in `hermes_cli/_subprocess_compat.py` to cover stdin input, streaming readers and own-thread starts:
   - `bounded_probe_run` :497-560;
   - `_PipeReaders` :563-641;
@@ -297,7 +297,7 @@ Slices. There are 21: S1–S14, S15a–e, S16 and S17. Every slice depends on C1
     
     This holds across TTL expiry and concurrent checks. The stale caller still receives its own verdict, with a crash mapped through its fail policy (CX-d17-F23).
   - **Per binary (Lake ruling 6) [F20].** Breaker state is keyed by the resolved tirith binary path. The fail policy is read per profile, at the time of the check. One binary's crashes never open another binary's breaker. Two profiles that share one binary share its breaker state, but each gets its own fail policy.
-  - **Policy that cannot be read [F20].** Today `_load_security_config` (`tirith_security.py:44-56`) replaces an unreadable config with `{}`, so `tirith_fail_open` defaults to True. A profile configured fail-closed can then allow commands through an unavailable scanner. The property: when the policy cannot be established, only an explicit override (the `TIRITH_FAIL_OPEN` env) or a verified policy may choose fail-open. Otherwise the check reports "security policy could not be read" and does not silently fail open. The policy values are Needs Lake New item N2.
+  - **Policy that cannot be read [F20].** Today `_load_security_config` (`tirith_security.py:44-56`) replaces an unreadable config with `{}`, so `tirith_fail_open` defaults to True. A profile configured fail-closed can then allow commands through an unavailable scanner. The property: when the policy cannot be established, only an explicit `TIRITH_FAIL_OPEN` env override may choose fail-open (Lake ruling N2). Otherwise the check reports "security policy could not be read" and does not silently fail open.
   - **Owner split with A24.** The strict config loader belongs to A24 (`_load_yaml_dict_strict`). Core owns how Tirith uses its result. One integration test covers both.
 - **Code:** `tools/tirith_security.py`:
   - `_record_tirith_crash` :97-103 (re-arms on every crash while open);
@@ -450,7 +450,7 @@ Slices. There are 21: S1–S14, S15a–e, S16 and S17. Every slice depends on C1
 - **Acceptance:**
   - Contained real-process integration test: a fake stdio MCP server spawns a grandchild. (1) After a normal session close, both processes are gone within 5 s. (2) After the backend is killed with `TerminateProcess`, both are gone within 5 s. (3) After a connect failure following the spawn, both are gone.
   - Record which guarantee comes from the SDK and which from Hermes.
-  - If any of (1)–(3) fails, the row does not convert the SDK. It narrows the exclusion to the passing cases and takes the remainder to Lake as New item N3.
+  - If any of (1)–(3) fails, the row does not convert the SDK. It adds contained spawning for Hermes-launched MCP stdio servers, as authorized by Lake ruling N3.
 - **Depends on:** C1.0. **Status:** OPEN.
 
 ### H: compute host (`tui_gateway/host_supervisor.py`, `tui_gateway/compute_host_bridge.py`)
@@ -740,7 +740,7 @@ Before scope is frozen, Codex and Antigravity each do one exhaustive review of t
   - *seams* = `hermes_cli/_sm.py` guarded containers;
   - *design machinery* = r18's scope, slot, ledger, lease, outbox, writer-queue, attempt and transfer state machines.
 - **DIS**: disproved or unreachable at the tip, with evidence.
-- **LAKE**: needs Lake.
+- **LAKE**: decided by Lake; both remaining LAKE rows carry an accepted deferral.
 
 **Line numbers** without a file are `tui_gateway/host_supervisor.py` at the tip.
 
@@ -768,7 +768,7 @@ Before scope is frozen, Codex and Antigravity each do one exhaustive review of t
 | CX-d4-F4 | transfer must carry incremental decoder state | CORE | C1.S5 acceptance 3 (split multibyte) |
 | CX-d5-F1 | an attempt leaving STARTING is not final | DIS | No attempt state at the tip: start is synchronous under the lock and returns only after hello or cleanup (:247-257, :461-469). Re-proved by H7 [F18] |
 | CX-d5-F2 | cancellation can win after validation | FW | runner (cancellation token) |
-| CX-d5-F3 | a raising cleanup callback is marked done | CORE | C9 acceptance 3 |
+| CX-d5-F3 | a raising cleanup callback is marked done | CORE | C9 acceptance 7 |
 | CX-d6-F1 | per-sweep bound does not bound total retained cleanup | CORE | C9 |
 | CX-d7-F1 | security guards' OSError paths miss the refusal policy (Tirith, self-repo) | CORE | C6 |
 | CX-d7-F2 | CLI doctor healthy while cleanup failed | FW | diagnostics; C9 logs at warning instead |
@@ -910,7 +910,7 @@ Before scope is frozen, Codex and Antigravity each do one exhaustive review of t
 | AG-d4-R1 | defer A35 on_owner_death | CORE | Superseded by the Codex d4 ruling and gate A35; C4 |
 | AG-d7-R1 | doctor scans all profiles' capacity files | FW | diagnostics |
 | AG-d7-R2 | add `SubprocessCapacityError` to `_POPEN_ERRORS` | FW | runner error type (reversed by AG-d8); C1.S2 uses OSError |
-| AG-d7-R3 | terminal_tool structured capacity message | CORE | C9 acceptance 4 |
+| AG-d7-R3 | terminal_tool structured capacity message | CORE | C9 acceptance 8 |
 | AG-d8-R1 | `acp_adapter/entry.py` diagnostic owner | FW | diagnostics |
 | AG-d8-O1 | Tirith OSError opens breaker; self-repo guard OSError allows | CORE | C5, C6 |
 | AG-d11-F1 | shutdown disposition misses revoked/join timeouts; except returns silently | CORE | H2, H3 |
