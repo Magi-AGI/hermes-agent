@@ -194,6 +194,9 @@ H9 and I1 are HB4–HB7 above.
 
 ## Needs Lake
 
+**Lake's rulings, 2026-09-28: N1–N5 all ACCEPTED as proposed.** Rule D is part of the contract (N1). Close or takeover holds the lease until the old turn body exits, with the waiting notice shown (N2). A busy-interrupt launch failure undoes exactly its queue entry and returns the failure (N3). Approvals are keyed by (profile home, stored id) (N4). A Stop that reaches a respawned host without the session is handled in the parent: the turn is revoked if it has not started, otherwise it ends as cancelled with a visible error (N5).
+
+
 - **N1. Rule D.** Confirm rule (D) as part of the contract. It formalises Stop-to-skip and exactly-once durable effects, which the reviews have enforced since round 7.
 - **N2. Old body fence (L12, R9-CX-F09).**
   - **Proposed:** a close or takeover does not give the lease away while the old turn body can still act.
