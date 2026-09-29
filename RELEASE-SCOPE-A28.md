@@ -309,6 +309,15 @@ Slices. Every slice depends on C1.0 and must pass tests (a)–(g). The slice-spe
 
 ### H: compute host (`tui_gateway/host_supervisor.py`, `tui_gateway/compute_host_bridge.py`)
 
+**The A25 ownership contract.** Every H row must conform to it (stated by the A25 agent, 2026-09-28; branch `magi/track-a25-a19b` at `9f133723bd`):
+- **(A) One claim per turn.** A turn holds one claim from acceptance to settlement, and every start, dispatch or release checks that claim by identity.
+  - On the host, `turn.start` counts as the start hand-off (`_start_turn_claim`).
+  - Host completion releases only the claim that turn was dispatched under.
+- **(B) Every cancellation is registered.** Each in-process cancellation stays registered until it has fully propagated, and is tied to the turn it was chosen for (`_open_cancellation(turn_epoch=...)`). A Stop revokes only the claim it observed, and only if that claim has not started.
+- **(C) Only the current owner acts on the conversation.** Anything that affects the whole stored conversation needs positive, current, per-profile ownership. It happens while the lease is held, and the lease is released last.
+
+A25 will check rows H1–H12 against this contract at the start of its round 10. H9 and I1 moved to A25.
+
 A25 owns the turn-ownership contract, and these rows conform to it. None of the H rows changes the turn token: `turn_id = request_id = uuid4` at `compute_host_bridge.py:299`.
 
 **Reachability note.** `HostSupervisor.shutdown()` has no production caller today; only tests call it. The server's atexit (`server.py:351-359, :384`) does not touch the supervisor. H1 and H2 are therefore latent code-shape defects (Needs Lake item 1).
