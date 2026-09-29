@@ -1,6 +1,6 @@
 # T3 release scope: the desktop runtime-identity contract, its path inventory, and the disposition of every T3 finding
 
-**Revision 3, for freezing (not yet frozen).** Drafted 2026-09-28 at `magi/track-desktop` `44e26582a2`, while round 29 is under review. Model: `RELEASE-SCOPE-A28.md`.
+**FROZEN 2026-09-29 by Lake** at commit a536a4f4ee (revision 3). New discoveries are classified by Part 3's outcomes, not added to scope automatically; a demonstrated production bug is still fixed, disproved or explicitly deferred by Lake. Round 30 fixes the open and partial rows. Drafted 2026-09-28 at `magi/track-desktop` `44e26582a2`, while round 29 is under review. Model: `RELEASE-SCOPE-A28.md`.
 
 **What revision 2 changes.** It answers Codex's scope review (`E:\GitHub\Magi-AGI\review-artifacts\t3-release-scope\codex\REVIEW.md`, F01–F12). Antigravity said "freeze as-is".
 - Each change is tagged `[CX-S01]`…`[CX-S12]`, matching the review's findings F01–F12.
