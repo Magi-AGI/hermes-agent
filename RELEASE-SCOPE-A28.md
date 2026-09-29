@@ -78,7 +78,7 @@ Draft for Lake's approval to freeze scope. Written 2026-09-28.
       - the owner holds the exact resources left over;
       - it is counted against its kind's cap;
       - no false "released" signal is given to a profile fence, registry or session.
-  - **(a) Definite refusal.** Thread creation raises `RuntimeError` or `MemoryError` before any thread exists. The site returns its documented failure outcome within budget + 2 s. The exception is an `OSError` subclass where the site catches `OSError`.
+  - **(a) Definite refusal.** Thread creation raises `RuntimeError` or `MemoryError` before any thread exists. The site returns its documented failure outcome within budget + 2 s. The exception is an `OSError` subclass where the site catches `OSError`. The helper itself must raise the `OSError` subclass. A site that catches `Exception` does not satisfy (a) by also catching a raw `RuntimeError`: the test asserts the exception type at the helper boundary, not only the site outcome [AG-SCOPE-P2-04].
   - **(b) Created, but entry stalls.** Creation returns, but the worker never reaches its entry. The call still returns within budget + 2 s.
   - **(b2) Worker may have begun.** Startup raises after the worker may already exist (the ambiguous case that `_PipeReaders` supports). The outcome is (ii), never a double read or a lost read.
   - **(b3) Late entry after abort.** A worker enters after the call has already returned its failure. It does nothing visible and releases its retained record.
@@ -664,6 +664,13 @@ A25 owns the turn-ownership contract, and these rows conform to it. None of the 
     5. `git diff --check` is clean (AG-d1-G4).
     6. Contained real-process tests are run, not mocked kernel handles (AG-d13-O4).
   - **Depends on:** all rows. **Status:** OPEN.
+
+### C3 addendum (Antigravity scope review) [AG-SCOPE-P2-06]
+
+- **`cron/scheduler_detached_worker.py:49-53`** `reap_terminal_worker_in_background` starts an unguarded daemon `Thread(target=process.wait)`. It is in C3's scope as a thread start:
+  - a refused start must not leave the worker unreaped with no owner (it falls back to a synchronous bounded reap, or a C9-owned reap record);
+  - the wait itself is intentionally unbounded, because it waits for the worker's own exit (a service lifetime, not an operation).
+- **Acceptance:** make the reap thread's start refuse. The worker is still reaped, with no zombie, or it is held by a named C9 owner.
 
 ## Needs Lake
 
