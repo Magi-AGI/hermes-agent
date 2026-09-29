@@ -524,7 +524,7 @@ Each item extends the existing boundary to more sites. None adds a new mechanism
 
 **No question is re-asked here.**
 
-**Items that still need Lake:** none new. One finding (CX-r13-#7, outbound network lookups in tests) has no owner inside T3. It is shown as the only OPEN finding, so that Lake can place it: test hygiene, or the combined failure inventory under ruling 10.
+**Items that still need Lake:** none. CX-r13-#7 (outbound network lookups in tests) is placed under ruling 10, in the combined failure inventory the coordinator owns.
 
 ## Part 3: disposition of every T3 finding, rounds 1–28
 
@@ -633,7 +633,7 @@ The T3 track covered more than identity. Every area is dispositioned here; only 
 | CX-r13-#4 | 13 | tp | A transient anchored-read error fell back to offsets | FIXED | `a232a2368d`; `transcript-lifecycle.test.ts` "one failed anchored read" |
 | CX-r13-#5 | 13 | tp | `persisted` was not in the event contract | FIXED | `b2a87098b6`; `test_message_complete_persisted_rows.py::test_the_completion_frame_carries_persisted_rows_through_the_event_contract` |
 | CX-r13-#6 | 13 | tp | An unknown anchor returned 200 in the default projection | FIXED | `b2a87098b6`; `tests/hermes_state/test_get_messages_before_anchor.py`, `tests/hermes_cli/test_session_messages_before_row.py` |
-| CX-r13-#7 | 13, 15 | oth | The stall test and `test_tui_gateway_server` attempt outbound network lookups | OPEN | DISPOSITIONS §6e. No T3 row owns it; Lake to place it (see "Lake's rulings") |
+| CX-r13-#7 | 13, 15 | oth | The stall test and `test_tui_gateway_server` attempt outbound network lookups | DEFERRED | DISPOSITIONS §6e. Placed by the coordinator under ruling 10: owned by the combined failure inventory (coordinator), not a T3 row |
 | CX-r13-OB | 13 | tp | An old backend without `before_row_id`: the offset path keeps the r12 1b/1c skips | ACCEPTED (ruling 8) [CX-S12] | DISPOSITIONS §2 "Limit"; accepted (ruling 8) |
 | CX-r14-#1 | 14 | tp | A stale turn anchor after an error, settle, adopted turn or reconnect gap | FIXED, superseded | `ff2820a77a`, `b259be24d2`, then CX-r15-#1. `persisted-row-identity.test.tsx`; `test_message_complete_persisted_rows.py::test_message_start_names_its_turn_within_the_event_contract` |
 | CX-r14-#2 | 14 | tp | The refresh signature ignored row ids, so "Show earlier" stuck | FIXED | `b259be24d2`; `contrib/hooks/background-refresh-row-identity.test.ts`; `transcript-lifecycle.test.ts` "replaces a store whose ids the backend rewrote…" |
@@ -815,7 +815,7 @@ Exactly one outcome per finding:
 - **Class H:** the compaction-summary, Python, web and electron rows, and AG-r1-G6b and AG-r1-D8 (no repo test).
 - **Superseded chains** end at the final fix. That fix's evidence class is the one stated on the row. [CX-S11]
 - **Round 29 (`44e26582a2`) is under review.** FIXED rows whose final fix is in round 29 rest on the implementer's red-first run (`.t3-fix-r29-20260928/red-on-4ba5f4131e.log`) until then.
-- **The one OPEN finding** is CX-r13-#7 (outbound lookups in tests); it has no T3 owner.
+- **CX-r13-#7** (outbound lookups in tests) is DEFERRED to the coordinator's combined failure inventory under ruling 10. No finding remains OPEN.
 - **NO RECORD:** the Antigravity reports for rounds 1–9 do not exist, so the recovered set cannot be shown to be complete.
 
 **Paperwork corrections found while compiling:**
