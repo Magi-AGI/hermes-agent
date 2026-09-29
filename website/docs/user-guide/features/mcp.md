@@ -751,6 +751,22 @@ mcp:
 A pass with more servers than the cap runs in waves; each wave keeps the usual 120 s budget (whole
 pass capped at 300 s), so a slow fleet finishes later rather than timing out.
 
+### No unattended OAuth browser flows
+
+By default, any MCP connect that runs on a real console (CLI startup, the config-watcher reload, a
+lazy server's first tool call, a mid-session re-authorization) may open a browser authorization flow
+when a server has no usable token. Background paths (desktop/gateway startup discovery, keepalive
+reconnects) never do. To guarantee Hermes never opens one on its own:
+
+```yaml
+mcp:
+  interactive_oauth: false
+```
+
+A connect that needs authorization then fails with the usual "run `hermes mcp login <server>`" error.
+Explicit logins are unaffected: `hermes mcp login <server>` and the desktop/dashboard Login button still
+open the flow.
+
 ### Lazy start
 
 A server with `lazy: true` is registered from the on-disk schema cache instead: its tools appear in the registry immediately, and the process is spawned (or the HTTP endpoint connected) on the first tool call. The cache is written on every live connect, so the first run of a new or changed server is always eager. The banner and the TUI session panel show such a server as **lazy** with its cached tool count (`3 tool(s) (lazy, starts on first use)`) — it is a working server, not a failed one — and the startup discovery summary counts it as `N lazy, not spawned yet`.

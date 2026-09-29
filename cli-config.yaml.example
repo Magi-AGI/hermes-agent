@@ -1509,6 +1509,9 @@ platform_toolsets:
 # Each server's tools are automatically discovered and registered.
 # See website/docs/user-guide/features/mcp.md for full documentation.
 #
+# mcp:
+#   interactive_oauth: true   # false = MCP OAuth never opens a browser on its own; only `hermes mcp login <server>` / the desktop Login button may
+#
 # Stdio servers (spawn a subprocess):
 #   command: the executable to run
 #   args: command-line arguments

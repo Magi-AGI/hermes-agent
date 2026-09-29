@@ -330,12 +330,43 @@ def _stdin_is_console() -> bool:
         return False
 
 
+def _config_allows_unattended_oauth() -> bool:
+    """``mcp.interactive_oauth`` from the active profile's config (default true = upstream
+    behaviour). False means only an explicit, user-started login (``force_interactive_oauth``)
+    may run a browser / loopback authorization flow. Missing key or unreadable config keeps the
+    default; a present but unrecognised value fails CLOSED — the key exists to guarantee no
+    unattended browser, so a typo must not silently re-enable it."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        mcp_cfg = load_config_readonly().get("mcp") or {}
+        raw = mcp_cfg.get("interactive_oauth") if isinstance(mcp_cfg, dict) else None
+    except Exception:
+        return True
+    if raw is None or isinstance(raw, bool):
+        return raw is not False
+    lowered = str(raw).strip().lower()
+    if lowered in {"true", "1", "yes", "on"}:
+        return True
+    if lowered not in {"false", "0", "no", "off"}:
+        logger.warning("mcp.interactive_oauth=%r is not a boolean; treating it as false "
+                       "(no unattended OAuth browser flows)", raw)
+    return False
+
+
 def _is_interactive() -> bool:
-    """True if we can reasonably expect to interact with a user."""
+    """True if we can reasonably expect to interact with a user.
+
+    Precedence: context suppression (background work) > explicit user login
+    (``force_interactive_oauth``) > ``mcp.interactive_oauth: false`` > console heuristic.
+    Forced beats the config key on purpose: every non-interactive error tells the user to run
+    ``hermes mcp login <server>``, which is exactly the forced path, so letting the key win
+    would leave no way to authorize at all short of editing config."""
     if not _oauth_interactive_enabled.get():
         return False
     if _oauth_interactive_forced.get():
         return True
+    if not _config_allows_unattended_oauth():
+        return False
     return _stdin_is_console()
 
 

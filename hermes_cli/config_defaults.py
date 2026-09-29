@@ -524,6 +524,13 @@ DEFAULT_CONFIG = {
         # with N servers spawns N process trees in the same instant (RAM/CPU spike, 429 fan-out on
         # multi-profile fleets). 0 = unlimited.
         "discovery_concurrency": 4,
+        # Unattended MCP OAuth. true (upstream behaviour) = any connect on a real console may open a
+        # browser authorization flow (CLI startup, config-watcher reload, a lazy first-use connect
+        # inside a tool call, a mid-session re-auth). false = only an explicit, user-started login
+        # (`hermes mcp login <server>`, the desktop/dashboard login button) may; every other connect
+        # needing authorization fails with the "run `hermes mcp login <server>`" error. Background
+        # paths (startup discovery, gateway, keepalive reconnects) are non-interactive either way.
+        "interactive_oauth": True,
     },
     # Tool-output truncation. max_bytes: terminal_tool output cap in chars (head+tail kept; 50_000 ≈
     # 12-15K tokens). max_lines: max `limit` one read_file call may request before clamping.
