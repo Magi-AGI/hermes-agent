@@ -444,6 +444,20 @@ A25 owns the turn-ownership contract, and these rows conform to it. None of the 
 
 ## Needs Lake
 
+**Lake's rulings, 2026-09-28:**
+- **1. Accepted:** fix H1/H2 even though they are latent.
+- **2. Accepted:** the proposed A34 scope, with per-site evidence for each exclusion.
+- **3.** H9 and I1 move to **A25** as new sub-items. A25 owns turn and cancellation ownership. A28-Core conforms to A25 and does not fix them itself.
+- **4. Accepted:** the self-repo guard fails closed with a visible reason.
+- **5. Accepted:** a cap of 64 per kind, with a structured capacity error.
+- **6. Accepted:** the Tirith breaker is keyed by resolved binary path.
+- **7. Deferred by Lake:** keep today's inline fallback when the host is latched or unavailable. Remaining behaviour: during the 300 s latch cooldown, turns run in the gateway process without isolation. This becomes a post-deploy item.
+- **8. Accepted:** reachability is re-traced at the tip as part of each slice's acceptance.
+
+Before scope is frozen, Codex and Antigravity each do one exhaustive review of this list.
+
+The proposals as originally drafted follow.
+
 1. **H1/H2 are latent.** `HostSupervisor.shutdown()` has no production caller. Proposed: fix them anyway (both are small, and H2's classification is shared with H6). The alternative is to defer H1/H2 and state that the remaining behaviour is "shutdown() is test-only; if it is ever called, a concurrent submit can be lost and `start()` reopens the supervisor".
 2. **A34 scale (C3).** There are 338 hot-path hits.
    - **Proposed:** fix the named hot-path pools and thread starts plus every partial-start leak; exclude `to_thread` sites whose awaiting request fails cleanly, with per-site evidence.
