@@ -391,6 +391,20 @@ Each item extends the existing boundary to more sites. None adds a new mechanism
 
 ## Needs Lake
 
+**Lake's rulings, 2026-09-28 (all accepted):**
+- **1. G7/G12:** the background poll and the tiles' runtime↔stored record go through the authority. They are not kept as mirrors.
+- **2. H3–H6, F6:** the tail cache, owner hints, read-only latch, composer queue and handoff receipts are all scoped by owner and gateway epoch.
+- **3. J3:** the owner is required on adopt, forget, acceptResumeReply, the hint methods and the hook lookup, with no default-owner fallback.
+- **4. G11:** notifications resolve identity through the authority.
+- **5. Accepted limit:** variable `import()`, `import.meta.glob` and `require` are a documented census limit.
+- **6. Accepted:** an async-owner binding costs other callers one extra resume, and the single-lineage-owner rule stands.
+- **7. Confirmed:** DISPOSITIONS residuals 1, 3 and 5 were accepted by Lake earlier. Update their wording.
+- **8. Accepted limit:** older backends keep the offset-paging skips.
+- **9.** The live evidence (G2, D8, D9, G5–G7, memory thresholds) runs at deploy acceptance, F4/F5.
+- **10.** The coordinator integrates the release candidate, resolves cross-track overlaps, and owns the combined failure inventory and the electron rerun.
+- **11.** Round-25 choice (b), the global in-flight fence, stays a known limit (decided earlier).
+
+
 1. **G7 and G12: identity records outside the authority.**
    - **G7:** the background live-status poll publishes `{storedSessionId}` straight into `$sessionStates` (`use-background-sync.ts:460`, `:508`).
    - **G12:** `$sessionTiles` keeps a second runtime↔stored record, which survives the switch wipe.
