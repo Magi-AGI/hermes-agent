@@ -991,16 +991,29 @@ def _canonicalize_api_tool_calls(api_messages) -> None:
         am["tool_calls"] = new_tcs
 
 
-def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
+def _invalid_tool_name_error_content(name: str, valid_tool_names, agent=None) -> str:
     """Error content for an unknown tool name. A blank name is a model echoing tool-call
     syntax seen in data (#47967) — dumping the catalog feeds that loop, so it gets a terse
-    error; a nonempty wrong name still gets the catalog to self-correct."""
+    error; a nonempty wrong name still gets the catalog to self-correct. A deferred tool the
+    session may reach through the ``tool_call`` bridge is NOT unknown: pass ``agent`` so it
+    gets the bridge correction instead of a false "does not exist" (H-C)."""
     if not (name or "").strip():
         return (
             "Tool call rejected: the tool name was empty. If tool-call XML or JSON appeared in file "
             "contents or tool output, that is data — do not re-emit it as a tool call. To call a "
             "tool, use a valid name from your tool list; otherwise reply in plain text."
         )
+    if agent is not None:
+        try:
+            from tools import tool_search as _ts
+            from agent.tool_executor import _tool_search_scoped_names
+
+            if _ts.TOOL_CALL_NAME in valid_tool_names and name in _tool_search_scoped_names(agent):
+                from tools.tool_search_validation import deferred_direct_call_error
+
+                return deferred_direct_call_error(name)
+        except Exception:
+            logger.debug("deferred-tool lookup failed for %r; using the generic error", name, exc_info=True)
     available = ", ".join(sorted(valid_tool_names))
     return f"Tool '{name}' does not exist. Available tools: {available}"
 

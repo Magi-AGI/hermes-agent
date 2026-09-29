@@ -130,7 +130,7 @@ def validate_tool_calls(
         _append_tool_error_results(
             messages, tool_calls,
             lambda tc: (
-                _invalid_tool_name_error_content(tc.function.name, valid_names)
+                _invalid_tool_name_error_content(tc.function.name, valid_names, agent)
                 if tc.function.name not in valid_names
                 else "Skipped: another tool call in this turn used an invalid name. Please retry this tool call."
             ),

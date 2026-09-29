@@ -106,7 +106,7 @@ def run_tool_round(
                 "name": tc.function.name,
                 "tool_call_id": coalesce_tool_call_id(tc),
                 "content": _invalid_tool_name_error_content(
-                    tc.function.name, agent.valid_tool_names
+                    tc.function.name, agent.valid_tool_names, agent
                 ),
             })
         assistant_message.tool_calls = [
