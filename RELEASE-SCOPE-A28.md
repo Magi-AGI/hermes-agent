@@ -681,7 +681,13 @@ A25 owns the turn-ownership contract, and these rows conform to it. None of the 
 
 Before scope is frozen, Codex and Antigravity each do one exhaustive review of this list.
 
-**New for Lake in revision 2 (from Codex's scope review):**
+**Lake's rulings on revision 2, 2026-09-28:**
+- **N1. Accepted:** the wait budgets as proposed in the table below.
+- **N2. Accepted:** only an explicit `TIRITH_FAIL_OPEN` may fail open. Otherwise the check blocks with "security policy could not be read" (retryable).
+- **N3. Accepted:** add contained spawning for Hermes-launched MCP stdio servers only if C11's integration test fails. If C11 passes, nothing more is needed.
+- **N4. Accepted:** all bundled plugins are in scope (C1.S17).
+
+**New for Lake in revision 2 (from Codex's scope review; ruled above):**
 - **N1. Wait budgets for the included calls that have no timeout today [F12].** Proposed values:
 
   | site | call | proposed budget |
