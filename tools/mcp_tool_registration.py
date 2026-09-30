@@ -118,13 +118,14 @@ def _restore_server_toolset_alias(key) -> None:
 
     server_name = _key_name(key)
     with _core._lock:
-        owned = [(server, set(_core._server_tool_scopes.get(k, ())))
-                 for k, server in _core._servers.items() if _key_name(k) == server_name]
-    if any(
-        registry.snapshot_registration(tool_name, scope=scope) is not None
-        for server, scopes in owned for scope in scopes
-        for tool_name in getattr(server, "_registered_tool_names", ())
-    ):
+        scopes = {None}
+        for k in list(_core._servers) + list(_core._lazy_server_configs):
+            if _key_name(k) == server_name:
+                scopes.add(_key_scope(k))
+                scopes.update(_core._server_tool_scopes.get(k, ()))
+        scopes.update(scope for (k, scope) in _core._server_scope_configs if _key_name(k) == server_name)
+    # Any profile's slot (owner, adopter-only, or lazy stubs), not only the owner's names.
+    if any(registry.get_tool_names_for_toolset_in_scope(f"mcp-{server_name}", scope) for scope in scopes):
         registry.register_toolset_alias(server_name, f"mcp-{server_name}")
 
 
@@ -490,8 +491,9 @@ def _set_profile_policy(key, scope: Optional[str], config: Optional[dict], *, se
             _sync_membership_locked(key)
             if config is None:
                 _core._server_trust_levels.pop(_server_key(name, scope, current=False), None)
-        if config is not None and scope is not None and scope != owner:
-            # ``trust`` is the CONSUMING profile's policy (the owner's is recorded with its tool hints).
+        if config is not None:
+            # ``trust`` is part of the profile's policy, the owner's included: the call-time gate reads
+            # it by the profile's own key, so a policy-only ``full`` -> ``untrusted`` edit takes effect now.
             _record_scope_trust(name, config, scope)
         if not reconcile:
             return []
@@ -650,6 +652,15 @@ def _connection_identity(config: dict) -> tuple:
             _auth_type(config), _frozen(config.get("client_cert")), _frozen(config.get("client_key")))
 
 
+def _without_visibility_filter(config: dict) -> dict:
+    """*config* without ``tools.include`` / ``tools.exclude``: which tools a profile SEES is policy
+    (the reconcile applies it), not part of which connection it is."""
+    tools = config.get("tools")
+    if not isinstance(tools, dict) or not ({"include", "exclude"} & set(tools)):
+        return config
+    return {**config, "tools": {k: v for k, v in tools.items() if k not in ("include", "exclude")}}
+
+
 def _auth_type(config: dict) -> str:
     return (config.get("auth") or "").lower().strip()
 
@@ -699,9 +710,12 @@ def _register_connected_into_current_scope(servers: dict) -> int:
             server = _core._servers.get(key)
         config = servers.get(_key_name(key))
         cross_profile = _key_scope(key) != scope
+        route_config = config if cross_profile or not isinstance(config, dict) else _without_visibility_filter(config)
+        route_server = server if cross_profile or server is None else SimpleNamespace(
+            _config=_without_visibility_filter(getattr(server, "_config", {}) or {}))
         if (config is None or not _server_enabled(config) or server is None
                 or getattr(server, "session", None) is None
-                or not _same_server_route(server, config, cross_profile=cross_profile)):
+                or not _same_server_route(route_server, route_config, cross_profile=cross_profile)):
             _remove_server_scope(key, scope)
         elif dict(config) != recorded:
             _set_profile_policy(key, scope, config)
