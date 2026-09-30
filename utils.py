@@ -382,7 +382,8 @@ def rmtree_readonly(path: Union[str, Path], *, ignore_errors: bool = False) -> N
 
 
 def _atomic_write(path: Path, write, *, prefix: str, encoding: str = "utf-8", mode: "int | None" = None,
-                  preserve_owner: bool = True, binary: bool = False, fsync_dir: bool = False) -> None:
+                  preserve_owner: bool = True, binary: bool = False, fsync_dir: bool = False,
+                  before_replace=None) -> None:
     """Temp file + fsync + :func:`atomic_replace`, then re-apply owner/mode.
 
     *write(f)* emits the payload into the open handle (text, or bytes when *binary*). The temp file
@@ -393,7 +394,8 @@ def _atomic_write(path: Path, write, *, prefix: str, encoding: str = "utf-8", mo
     gets what ``open(path, "w")`` would have given it (process umask) — the callers this replaced
     wrote at umask, and silently tightening every fresh cache/state file to 0600 breaks shared
     volume mounts; an existing target with no *mode* keeps mkstemp's bits, as before. *fsync_dir*
-    also fsyncs the resolved target's parent so the rename itself is durable. The temp file is
+    also fsyncs the resolved target's parent so the rename itself is durable. *before_replace()* runs
+    right before the rename (a compare-and-swap recheck may raise there). The temp file is
     removed on any failure — ``BaseException`` on purpose, so KeyboardInterrupt / SystemExit still
     clean up.
     """
@@ -414,6 +416,8 @@ def _atomic_write(path: Path, write, *, prefix: str, encoding: str = "utf-8", mo
             write(f)
             f.flush()
             os.fsync(f.fileno())
+        if before_replace is not None:
+            before_replace()
         replaced = Path(atomic_replace(tmp_path, path))  # symlink-preserving actual destination
         _restore_file_metadata(replaced, original_owner, mode)
         if fsync_dir:
@@ -583,8 +587,20 @@ def _roundtrip_load(path: Path, expected_signature: Any = None):
     return yaml_rt, data if isinstance(data, CommentedMap) else CommentedMap(data or {})
 
 
-def _roundtrip_dump(path: Path, yaml_rt, config) -> None:
-    _atomic_write(path, lambda f: yaml_rt.dump(config, f), prefix=f".{path.stem}_", mode=_preserve_file_mode(path))
+def _roundtrip_dump(path: Path, yaml_rt, config, expected_signature: Any = None) -> None:
+    def _recheck() -> None:
+        # Compare-and-swap, second look: the merge + dump took time, so re-verify the target still holds
+        # the bytes the merge was based on right before the rename. What remains unprotected is the
+        # rename syscall itself (no conditional replace / shared lock with external editors).
+        try:
+            current = file_content_signature(path)
+        except FileNotFoundError:
+            current = "absent"
+        if current != expected_signature:
+            raise ConfigChangedDuringWrite(f"{path} changed while it was being saved; not overwriting it")
+
+    _atomic_write(path, lambda f: yaml_rt.dump(config, f), prefix=f".{path.stem}_", mode=_preserve_file_mode(path),
+                  before_replace=_recheck if expected_signature is not None else None)
 
 
 def atomic_roundtrip_yaml_update(path: Union[str, Path], key_path: str, value: Any) -> None:
@@ -676,7 +692,7 @@ def atomic_roundtrip_yaml_save(path: Union[str, Path], new_state: dict, *, expec
             del dst[key]
 
     _merge(existing, new_state)
-    _roundtrip_dump(path, yaml_rt, existing)
+    _roundtrip_dump(path, yaml_rt, existing, expected_signature)
 
 
 def safe_json_loads(text: str, default: Any = None) -> Any:
