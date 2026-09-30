@@ -46,7 +46,7 @@ from hermes_constants import (  # noqa: F401
 # Re-export from hermes_constants — canonical definition lives there.
 from hermes_constants import get_hermes_home, get_process_hermes_home  # noqa: F401
 from utils import (
-    atomic_replace, atomic_yaml_write, content_signature, fast_safe_load, file_content_signature, file_signature)
+    atomic_replace, atomic_yaml_write, content_signature, fast_safe_load, file_signature)
 
 logger = logging.getLogger(__name__)
 
@@ -2061,6 +2061,36 @@ def _clear_parse_failure_after_clean_read(config_path: Path, user_sig: Tuple[Any
         _CONFIG_PARSE_FAILURES.pop(key, None)
 
 
+class ConfigReadFailure(str):
+    """Why a config observation was not a clean read (the text), plus ``kind``: ``"read"`` when the
+    bytes could not be read or were still changing (usually a save in progress: retry), ``"parse"``
+    when complete, stable bytes failed to parse (the file needs fixing). A ``str`` so existing
+    truthiness checks and messages keep working."""
+
+    kind: str
+
+    def __new__(cls, text: str, kind: str) -> "ConfigReadFailure":
+        obj = super().__new__(cls, text)
+        obj.kind = kind
+        return obj
+
+
+def _user_config_failure(config_path: Path, exc: BaseException, parsed_bytes: Optional[bytes]) -> ConfigReadFailure:
+    """Classify a failed user-config observation. A parse error counts as a formatting error only
+    when the file still holds the bytes that failed; bytes that changed underneath are a save in
+    progress, which the next read resolves."""
+    detail = str(exc) or type(exc).__name__
+    if isinstance(exc, OSError) or parsed_bytes is None:
+        return ConfigReadFailure(f"{config_path} could not be read ({detail})", "read")
+    try:
+        still_same = _read_config_bytes(config_path) == parsed_bytes
+    except OSError:
+        still_same = False
+    if not still_same:
+        return ConfigReadFailure(f"{config_path} changed while it was being read ({detail})", "read")
+    return ConfigReadFailure(f"{config_path} has a formatting error ({detail})", "parse")
+
+
 class _ConfigSnapshot(NamedTuple):
     """ONE observation of config.yaml (+ the managed config.yaml) for the load caches.
 
@@ -2069,11 +2099,15 @@ class _ConfigSnapshot(NamedTuple):
     caller parses what it keys the cache on. A file seen at stat whose read then fails is
     ``user_error``, with a signature whose digest is None and no ``cache_sig``: nothing may hit or be
     cached on a read that did not happen. ``cache_sig`` folds in the managed file (``_NO_FILE_SIG``
-    when absent) and is None when neither file exists or the user read failed."""
+    when absent) and is None when neither file exists or either read failed. ``managed_value`` is the
+    managed mapping parsed from exactly the bytes in ``cache_sig``; ``managed_error`` is why an
+    existing managed file could not be read or parsed (its policy is then missing from the value)."""
     user_sig: Optional[Tuple[Any, ...]]
     cache_sig: Optional[Tuple[Any, ...]]
     user_bytes: Optional[bytes]
     user_error: Optional[Exception]
+    managed_value: Dict[str, Any] = {}
+    managed_error: Optional[str] = None
 
 
 def _read_raw_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
@@ -2242,13 +2276,28 @@ def config_read_failure_notice() -> Optional[str]:
     try:
         failure = load_config_with_status()[1]
     except Exception as exc:
-        failure = str(exc) or type(exc).__name__
+        failure = ConfigReadFailure(f"{get_config_path()} could not be read ({exc})", "read")
     if not failure:
         return None
-    return (
-        f"Your settings file ({get_config_path()}) could not be read ({failure}), so the providers "
-        f"and other settings defined in it are not loaded. Fix it with `hermes config edit` and check "
-        f"it with `hermes config check`, then try again.")
+    return (f"Your settings could not be loaded: {failure}, so the providers and other settings "
+            f"defined there are not available. {config_failure_advice(failure)}")
+
+
+def current_config_read_failure() -> Optional["ConfigReadFailure"]:
+    """One fresh observation: why the authoritative config (user or managed) does not read cleanly
+    right now, or None. For provider choices that fall back to something outside the config."""
+    try:
+        return load_config_with_status()[1]
+    except Exception as exc:  # the loader itself failing is a failed read too
+        return ConfigReadFailure(f"{get_config_path()} could not be loaded ({exc})", "read")
+
+
+def config_failure_advice(failure: Any) -> str:
+    """What to do about a failed config observation, by kind (see :class:`ConfigReadFailure`)."""
+    if getattr(failure, "kind", "parse") == "read":
+        return ("This is usually a save in progress: try again in a moment. If it keeps happening, "
+                "check the file's permissions and run `hermes config check`.")
+    return "Fix it with `hermes config edit` and check it with `hermes config check`, then try again."
 
 
 def _ensure_dict(parent: Dict[str, Any], key: str) -> Dict[str, Any]:
@@ -2380,17 +2429,20 @@ def _load_config_cache_sig(config_path: Path) -> _ConfigSnapshot:
             user_sig = content_signature(st, user_bytes)
         except Exception as exc:  # seen at stat, then unreadable: an interrupted read
             user_error, user_sig = exc, (*file_signature(st), None)
-    managed_dir = managed_scope.get_managed_dir()
-    try:
-        managed_sig = file_content_signature(managed_dir / "config.yaml") if managed_dir else _NO_FILE_SIG
-    except OSError:
-        managed_sig = _NO_FILE_SIG
-    if user_error is not None or (user_sig is None and managed_sig == _NO_FILE_SIG):
-        return _ConfigSnapshot(user_sig, None, user_bytes, user_error)
-    return _ConfigSnapshot(user_sig, (*(user_sig or _NO_FILE_SIG), *managed_sig), user_bytes, None)
+    # ONE managed observation: its signature, the mapping overlaid and its error (A43/A44). A
+    # managed file that exists but cannot be read is a failed read, never "no managed policy".
+    managed = managed_scope.read_managed_config()
+    managed_sig = managed.signature
+    managed_error = ConfigReadFailure(managed.error, "read") if managed.error else None
+    if user_error is not None or managed_error is not None or (user_sig is None and managed_sig == _NO_FILE_SIG):
+        return _ConfigSnapshot(user_sig, None, user_bytes, user_error, managed.value, managed_error)
+    return _ConfigSnapshot(
+        user_sig, (*(user_sig or _NO_FILE_SIG), *managed_sig), user_bytes, None, managed.value, None)
 
 
-def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: Exception) -> Optional[Dict[str, Any]]:
+def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: Exception,
+                              failure: Optional[str] = None,
+                              managed: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     """Warn about a parse failure and return the last-known-good config, or None (-> defaults).
     A parse failure must not silently replace the effective config with defaults — that drops
     EVERY user override, including security-critical ``approvals.deny`` rules, when a gateway
@@ -2411,7 +2463,7 @@ def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: 
         if raw_good is not None:
             normalized = _canonicalize_config(_deep_merge(copy.deepcopy(DEFAULT_CONFIG), raw_good))
             expanded_good: Dict[str, Any] = _expand_env_vars(normalized)  # type: ignore[assignment]
-            lkg, _ = _merge_managed_overlay(expanded_good)
+            lkg, _ = _merge_managed_overlay(expanded_good, managed)
             fallback = "last-known-good-backup"
     _warn_config_parse_failure(
         config_path, exc, fallback=fallback if lkg is not None else "defaults")
@@ -2424,17 +2476,20 @@ def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: 
         # Cache under the corrupt file's signature (empty env snapshot: always valid) so repeated
         # loads don't re-parse; fixing the file changes the signature and reloads normally. The
         # failure travels with the entry, so a later hit still reports the read as failed.
-        _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, lkg_copy, {}, str(exc) or type(exc).__name__)
+        _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, lkg_copy, {}, failure or str(exc) or type(exc).__name__)
     return lkg_copy
 
 
-def _merge_managed_overlay(expanded: Dict[str, Any]) -> Tuple[Dict[str, Any], Any]:
+def _merge_managed_overlay(expanded: Dict[str, Any], managed_config: Optional[Dict[str, Any]] = None
+                           ) -> Tuple[Dict[str, Any], Any]:
     """Apply the managed-scope overlay; returns ``(merged, managed_config_or_falsy)``.
     Managed wins at the leaf and is applied AFTER user expansion so a user ``${VAR}`` cannot shadow
     a managed literal: managed values expand only against the process environment. This
     deliberately inverts the usual env-over-config precedence for the keys the managed layer pins
-    (docs/design/managed-scope.md §4.1)."""
-    managed_config = managed_scope.load_managed_config()
+    (docs/design/managed-scope.md §4.1). ``managed_config``: the mapping a snapshot already observed
+    (so the overlay is exactly what the cache key signed); None reads it here."""
+    if managed_config is None:
+        managed_config = managed_scope.load_managed_config()
     if not managed_config:
         return expanded, managed_config
     # Same canonicalization as the user config BEFORE merging (parity with
@@ -2528,13 +2583,23 @@ def _load_config_impl(*, want_deepcopy: bool, with_status: bool = False) -> Any:
                 from hermes_cli.config_backups import backup_config
                 backup_config(config_path, "good")
             except Exception as e:
-                failure = str(e) or type(e).__name__
-                lkg_copy = _last_known_good_fallback(config_path, path_key, cache_sig, e)
+                failure = _user_config_failure(config_path, e, snap.user_bytes)
+                lkg_copy = _last_known_good_fallback(
+                    config_path, path_key, cache_sig, e, failure, snap.managed_value)
                 if lkg_copy is not None:
                     return _served_config(lkg_copy, failure, want_deepcopy=want_deepcopy, with_status=with_status)
 
+        if snap.managed_error is not None:
+            # The admin layer did not read: never cached (cache_sig is None) and reported. Keep the
+            # last good merged config (which carries the policy last seen) rather than drop it.
+            failure = failure or snap.managed_error
+            lkg = _LAST_EXPANDED_CONFIG_BY_PATH.get(path_key)
+            if lkg is not None:
+                return _served_config(_expand_env_vars(copy.deepcopy(lkg)), failure,
+                                      want_deepcopy=False, with_status=with_status)
+
         normalized = _canonicalize_config(config)
-        expanded, managed_config = _merge_managed_overlay(_expand_env_vars(normalized))
+        expanded, managed_config = _merge_managed_overlay(_expand_env_vars(normalized), snap.managed_value)
         if failure is None:
             # Defaults served for a failed read are not a "last known good" config.
             _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)

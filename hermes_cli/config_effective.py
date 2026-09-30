@@ -28,9 +28,9 @@ _LAST_GOOD_USER_RAW: Dict[str, Dict[str, Any]] = {}
 _EFFECTIVE_CACHE: Dict[str, Tuple[Any, ...]] = {}
 
 
-def _effective(raw: Dict[str, Any]) -> Dict[str, Any]:
+def _effective(raw: Dict[str, Any], managed: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     expanded = _config._expand_env_vars(raw)
-    merged = managed_scope.apply_managed_overlay(expanded if isinstance(expanded, dict) else {})
+    merged = managed_scope.apply_managed_overlay(expanded if isinstance(expanded, dict) else {}, managed)
     return _config._normalize_root_model_keys(merged if isinstance(merged, dict) else {})
 
 
@@ -100,10 +100,10 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
                     backup_config(config_path, "good")
 
         env_snapshot = _config._env_ref_snapshot(raw)
-        managed = managed_scope.load_managed_config()
+        managed = snap.managed_value  # the managed bytes cache_sig signed (A43)
         if managed:
             _config._env_ref_snapshot(managed, env_snapshot)
-        effective = _effective(raw)
+        effective = _effective(raw, managed)
         # A recovered result is never cached under the corrupt file's signature: a later
         # ``fail_closed`` caller must still see the parse error, not a cache hit.
         if cache_sig is not None and not recovered:

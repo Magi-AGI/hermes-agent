@@ -44,7 +44,7 @@ def pre_handoff_purge():
 @pytest.mark.parametrize("consumer, bound", [
     ("hermes_cli.config", "file_signature"),
     ("hermes_cli.config", "content_signature"),
-    ("hermes_cli.managed_scope", "file_content_signature"),
+    ("hermes_cli.managed_scope", "content_signature"),
 ])
 def test_fresh_hermes_cli_import_heals_stale_utils_missing_file_signature(
     monkeypatch, pre_handoff_purge, consumer, bound, missing

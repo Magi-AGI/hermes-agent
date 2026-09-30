@@ -13,18 +13,18 @@ import logging
 import os
 import threading
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, NamedTuple, Optional
 
 import yaml
 
-# Stale-module bridge: this module binds ``utils.file_content_signature`` at import time, so a fresh
+# Stale-module bridge: this module binds ``utils.content_signature`` at import time, so a fresh
 # import in a post-pull updater process (pre-handoff purge keeps root modules cached) dies
 # unless the stale ``utils`` is dropped first. See hermes_cli.stale_modules.
 from hermes_cli.stale_modules import drop_stale_root_modules
 
 drop_stale_root_modules()
 
-from utils import file_content_signature
+from utils import content_signature
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MANAGED_DIR = Path("/etc/hermes")
 
 _CACHE_LOCK = threading.Lock()
-# path_key -> (*utils.file_content_signature, parsed)
+# path_key -> (*utils.content_signature, parsed)
 _CONFIG_CACHE: Dict[str, tuple] = {}
 _ENV_CACHE: Dict[str, tuple] = {}
 
@@ -67,62 +67,99 @@ def invalidate_managed_cache() -> None:
         _ENV_CACHE.clear()
 
 
-def _cached_read(path: Path, cache: Dict[str, tuple], parse):
-    """Shared content-signature-keyed read; returns a deepcopy of the parsed value.
+class ManagedRead(NamedTuple):
+    """One observation of a managed file. ``signature`` is ``utils.content_signature`` of the bytes that
+    ``value`` was parsed from (``ABSENT_SIGNATURE`` when there is no file). ``error`` is set when the file
+    exists but could not be read or parsed; ``value`` is then ``{}`` (fail-open for loading) and the
+    caller decides whether a failed authoritative read may drive a decision (A44)."""
+    signature: tuple
+    value: dict
+    error: Optional[str]
 
-    ``None`` when the file is absent or fails to parse (fail-open). A parse failure is logged
-    LOUDLY — the admin needs to know their policy isn't applied — but never raises, so a malformed
-    managed file can't brick startup.
-    """
+
+ABSENT_SIGNATURE = (0, 0, 0, 0, b"")
+_ABSENT = ManagedRead(ABSENT_SIGNATURE, {}, None)
+
+
+def _read_managed_bytes(path: Path) -> tuple:
+    """``(content_signature, bytes)`` from ONE open: the cache key and the parse cover the same bytes."""
+    with open(path, "rb") as handle:
+        st = os.fstat(handle.fileno())
+        data = handle.read()
+    return content_signature(st, data), data
+
+
+def _cached_read(path: Path, cache: Dict[str, tuple], parse) -> ManagedRead:
+    """Shared content-keyed read of one managed file; ``value`` is a deepcopy of the parse.
+
+    Absent -> ``_ABSENT``. Unreadable or unparseable -> ``error`` set, never cached, logged LOUDLY
+    (the admin needs to know their policy isn't applied) but never raised, so a malformed managed
+    file can't brick startup."""
     try:
-        # Content-keyed (A43): an admin's same-size in-place edit keeps the Windows metadata.
-        key = file_content_signature(path)
-    except OSError:
-        return None  # absent
+        key, data = _read_managed_bytes(path)
+    except FileNotFoundError:
+        return _ABSENT
+    except OSError as exc:
+        return _managed_failure(path, "read", exc)
     path_key = str(path)
     with _CACHE_LOCK:
         hit = cache.get(path_key)
         if hit is not None and hit[:len(key)] == key:
-            return copy.deepcopy(hit[len(key)])
+            return ManagedRead(key, copy.deepcopy(hit[len(key)]), None)
     try:
-        parsed = parse(path)
+        parsed = parse(data)
     except Exception as exc:  # noqa: BLE001 — fail-open, but LOUD
-        logger.warning(
-            "managed scope: failed to parse %s: %s — IGNORING this managed file. "
-            "Admin policy from this file is NOT being applied. Fix and restart.",
-            path, exc)
-        return None
+        return _managed_failure(path, "parse", exc)
+    parsed = parsed if isinstance(parsed, dict) else {}
     with _CACHE_LOCK:
         cache[path_key] = (*key, copy.deepcopy(parsed))
-    return parsed
+    return ManagedRead(key, parsed, None)
 
 
-def _load_managed_file(name: str, cache: Dict[str, tuple], parse) -> dict:
+def _managed_failure(path: Path, what: str, exc: Exception) -> ManagedRead:
+    logger.warning(
+        "managed scope: failed to %s %s: %s — IGNORING this managed file. "
+        "Admin policy from this file is NOT being applied. Fix and restart.",
+        what, path, exc)
+    return ManagedRead(ABSENT_SIGNATURE, {}, f"managed file {path} could not be {what} ({exc})".replace(
+        "could not be parse", "could not be parsed"))
+
+
+def _read_managed_file(name: str, cache: Dict[str, tuple], parse) -> ManagedRead:
     managed_dir = get_managed_dir()
     if managed_dir is None:
-        return {}
-    parsed = _cached_read(managed_dir / name, cache, parse)
-    return parsed if isinstance(parsed, dict) else {}
+        return _ABSENT
+    return _cached_read(managed_dir / name, cache, parse)
+
+
+def _parse_managed_yaml(data: bytes) -> dict:
+    return yaml.safe_load(data.decode("utf-8")) or {}
+
+
+def read_managed_config() -> ManagedRead:
+    """The managed config.yaml as one observation (signature, mapping, read/parse error)."""
+    return _read_managed_file("config.yaml", _CONFIG_CACHE, _parse_managed_yaml)
 
 
 def load_managed_config() -> dict:
     """Parsed managed config.yaml, or {} when absent/malformed (fail-open)."""
-    return _load_managed_file("config.yaml", _CONFIG_CACHE, lambda p: yaml.safe_load(p.read_text(encoding="utf-8")) or {})
+    return read_managed_config().value
 
 
 def load_managed_env() -> Dict[str, str]:
     """Parsed managed .env (KEY=VALUE), or {} when absent (fail-open)."""
-    return _load_managed_file(".env", _ENV_CACHE, _parse_managed_env)
+    return _read_managed_file(".env", _ENV_CACHE, _parse_managed_env).value
 
 
-def _parse_managed_env(path: Path) -> Dict[str, str]:
-    from agent.secret_scope import load_env_file
+def _parse_managed_env(data: bytes) -> Dict[str, str]:
+    from agent.secret_scope import _parse_env_text
 
-    path.read_text(encoding="utf-8-sig")  # load_env_file swallows decode errors; an admin file must fail LOUD
-    return load_env_file(path)
+    # utf-8-sig: strips a BOM; strict, because an admin file must fail LOUD (load_env_file would
+    # silently fall back to latin-1).
+    return _parse_env_text(data.decode("utf-8-sig"))
 
 
-def apply_managed_overlay(config: dict) -> dict:
+def apply_managed_overlay(config: dict, managed: Optional[dict] = None) -> dict:
     """Overlay administrator-pinned config values on top of an already-built dict.
 
     ``${VAR}`` refs in the managed config expand against the PROCESS env only, so a user cannot
@@ -130,9 +167,12 @@ def apply_managed_overlay(config: dict) -> dict:
     to ``model.default`` so it can't clobber the dict shape callers expect; managed values
     deep-merge ON TOP per leaf while sibling keys stay user-controlled. Fail-open: returns
     ``config`` unchanged when no scope is present or on any error. Mutates and returns ``config``.
+    ``managed``: an already-observed managed mapping (from :func:`read_managed_config`), so a caller
+    that signed the managed file overlays exactly what it signed; None reads it here.
     """
     try:
-        managed = load_managed_config()
+        if managed is None:
+            managed = load_managed_config()
         if not managed:
             return config
         # Imported lazily to avoid an import cycle (config imports managed_scope).
