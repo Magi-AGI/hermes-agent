@@ -329,7 +329,7 @@ class MCPServerTask(MCPServerRunMixin, MCPServerTransportMixin, MCPServerHealthM
         "_reconnect_retries", "_session_proven", "_was_parked", "_inflight_tasks", "_reconnecting",
         "_suspect_reason", "_teardown_race", "_permanent_grace_used", "_stdio_child_pids",
         "_ever_connected", "_sse_fallback", "_park_reason", "_last_park_line", "_park_probes",
-        "_list_published")
+        "_list_published", "_published_before")
 
     def __init__(self, name: str):
         self.name = name
@@ -415,6 +415,9 @@ class MCPServerTask(MCPServerRunMixin, MCPServerTransportMixin, MCPServerHealthM
         # True while ``_tools`` is this connection's published list (set by publication, cleared
         # at teardown): the per-profile reconcile publishes ``_tools`` only while it is.
         self._list_published: bool = False
+        # True once this task has published a list: later publications are REPUBLICATIONS, which keep
+        # the owner's current (possibly edited) policy instead of the connect-time config.
+        self._published_before: bool = False
         # Latched when ``ping`` returns -32601; keepalives then use list_tools. Reset per connect.
         self._ping_unsupported: bool = False
 

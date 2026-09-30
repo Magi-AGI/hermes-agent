@@ -417,10 +417,25 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
     Returns the owner's names. Lossy normalization collisions fail closed; a name another toolset
     owns is never overwritten."""
     key = _server_key_for_task(server)
-    _record_tool_trust_metadata(name, config, server._tools, key)
+    owner_scope = _core._server_registry_scope(key)
+    with _core._lock:
+        recorded = _core._server_scope_configs.get((key, owner_scope))
+    # A REPUBLICATION by the same connection task (list_changed, reconnect, revival) passes its
+    # connect-time config. If the owner's recorded policy is for the same route, it is the current
+    # policy (a config-only edit applied by the registration pass: trust, include/exclude): keep it,
+    # never revert it to the connect-time snapshot. A task's FIRST publication, or a different route,
+    # takes the passed config (a record from an earlier connection is not this task's policy).
+    policy = config
+    if (getattr(server, "_published_before", False) is True
+            and isinstance(recorded, dict) and isinstance(config, dict)
+            and _connection_identity(_without_visibility_filter(recorded))
+            == _connection_identity(_without_visibility_filter(config))):
+        policy = recorded
+    _record_tool_trust_metadata(name, policy, server._tools, key)
     server._list_published = True
+    server._published_before = True
     with _connection_lock(key):
-        _set_profile_policy(key, _core._server_registry_scope(key), config, server=server, reconcile=False)
+        _set_profile_policy(key, owner_scope, policy, server=server, reconcile=False)
         return _reconcile_connection(key, server)
 
 
