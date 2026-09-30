@@ -594,11 +594,12 @@ class MCPServerTransportMixin:
         if not self._advertises_tools():
             logger.info("MCP server '%s': does not advertise 'tools' capability — "
                         "skipping tools/list (prompts/resources remain available)", self.name)
+            # A session without the capability has published an EMPTY list with NO hints: whatever
+            # the previous connection had (tools, ttl, cache scope) does not describe this session.
             if self._registered_tool_names:
-                # A successor that dropped the capability publishes an EMPTY list: the previous
-                # connection's tools are not callable on this session (registry, names, cache).
                 self._publish_tool_list([], {})
                 return
+            self._list_cache_meta = {}
             self._tools = []
         else:
             async with self._rpc_lock:

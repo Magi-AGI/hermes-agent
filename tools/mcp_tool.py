@@ -495,6 +495,10 @@ _CIRCUIT_BREAKER_THRESHOLD, _CIRCUIT_BREAKER_COOLDOWN_SEC = 3, 60.0
 # ``_tool_read_only_hints`` by the connection key (the server's own tool annotations).
 _server_trust_levels: Dict[Any, str] = {}
 _tool_read_only_hints: Dict[Any, Dict[str, bool]] = {}
+# (connection key, adopting scope) -> that profile's own server config. A shared live connection is
+# published into every adopter's overlay and cache under the ADOPTER's policy (tool filter,
+# tools.resources / tools.prompts), never the owner's.
+_server_scope_configs: Dict[Any, dict] = {}
 
 _TRUST_FULL, _TRUST_UNTRUSTED = "full", "untrusted"
 

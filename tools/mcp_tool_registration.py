@@ -143,6 +143,7 @@ def _remove_server_scope(key, scope: str) -> None:
         else:
             _core._server_tool_scopes.pop(key, None)
         _core._server_trust_levels.pop(_server_key(server_name, scope, current=False), None)
+        _core._server_scope_configs.pop((key, scope), None)
     _restore_server_toolset_alias(key)
 
 
@@ -380,7 +381,7 @@ def _tools_payload(server: "MCPServerTask", should_register) -> List[dict]:
     return rows
 
 
-def _write_schema_cache(name: str, server: "MCPServerTask", config: dict, should_register, key=None) -> None:
+def _write_schema_cache(name: str, server: "MCPServerTask", config: dict, should_register) -> None:
     """Write-through (#56832): persist the list just published so the next startup registers this
     server lazily (no spawn). Never raises.
 
@@ -388,8 +389,8 @@ def _write_schema_cache(name: str, server: "MCPServerTask", config: dict, should
     fingerprint and that response's own hints. An empty entry is still a lazy hit (the next startup
     registers nothing and connects nothing: servers such as the Unity bridge list zero tools while
     their host app is closed, and each live connect spawns a costly relay process), and it stops
-    removed tools from being resurrected. Profiles that ADOPTED this connection keep their own
-    cache under their own home; their matching entries are reconciled too (_reconcile_adopter_caches).
+    removed tools from being resurrected. Profiles that ADOPTED this connection are published by
+    _register_server_tools (_publish_to_adopters) under their own policy.
 
     A failed write is logged at WARNING: until a later successful write, the next startup may
     register the previous manifest."""
@@ -399,44 +400,78 @@ def _write_schema_cache(name: str, server: "MCPServerTask", config: dict, should
         fingerprint = config_fingerprint(config)
         utility_payload = [{"schema": e["schema"], "handler_key": e["handler_key"]}
                            for e in _select_utility_schemas(name, server, config)]
-        cache_meta = getattr(server, "_list_cache_meta", None) or {}
+        hints = _list_hints(server)
     except Exception as exc:
         logger.warning("MCP schema cache for '%s' not updated (%s); the next startup may use the previous manifest",
                        name, exc)
         return
-    hints = {"ttl_ms": cache_meta.get("ttl_ms"), "cache_scope": cache_meta.get("cache_scope")}
     try:
         write_cache_entry(name, fingerprint, tools=_tools_payload(server, should_register),
                           utility_tools=utility_payload, **hints)
     except Exception as exc:
         logger.warning("MCP schema cache write failed for '%s' (%s); the next startup may use the previous "
                        "manifest until a live connect rewrites it", name, exc)
-    _reconcile_adopter_caches(name, server, fingerprint, utility_payload, hints,
-                              key if key is not None else _server_key_for_task(server))
 
 
-def _reconcile_adopter_caches(name: str, server: "MCPServerTask", fingerprint: str,
-                              utility_payload: List[dict], hints: dict, key) -> None:
-    """Rewrite the schema-cache entry of every OTHER profile that adopted this live connection,
-    when that profile's entry is for the same route (same fingerprint). A same-named entry for a
-    different route is left alone. The rows are unfiltered: an adopter's lazy startup applies its
-    own tool filter when it registers from cache. Never raises."""
-    from hermes_constants import hermes_home_key, reset_hermes_home_override, set_hermes_home_override
+def _list_hints(server: "MCPServerTask") -> dict:
+    cache_meta = getattr(server, "_list_cache_meta", None) or {}
+    return {"ttl_ms": cache_meta.get("ttl_ms"), "cache_scope": cache_meta.get("cache_scope")}
+
+
+def _policy_allows_utility(config: dict, handler_key: str) -> bool:
+    """``tools.resources`` / ``tools.prompts`` of *config* for one cached utility row (an unknown
+    handler key is dropped: a cache row must not widen what the reading profile allows)."""
+    family = _UTILITY_CAPABILITY_ATTRS.get(handler_key)
+    if family is None:
+        return False
+    return _parse_boolish(((config or {}).get("tools") or {}).get(family), default=True)
+
+
+def _publish_to_adopters(name: str, server: "MCPServerTask", key, hints: dict) -> None:
+    """Publish the current list into every OTHER profile that adopted this live connection: its
+    live overlay AND its schema cache, each under that profile's OWN config (tool filter and
+    ``tools.resources`` / ``tools.prompts``), never the owner's. Never raises.
+
+    Cache: only that profile's existing entry for the same route (same fingerprint) is rewritten;
+    a same-named entry for a different route is left alone."""
     from pathlib import Path
-    from tools.mcp_schema_cache import get_cached_entry, write_cache_entry
+    from hermes_constants import hermes_home_key, reset_hermes_home_override, set_hermes_home_override
+    from tools.mcp_schema_cache import config_fingerprint, get_cached_entry, write_cache_entry
+    from tools.registry import registry
 
     with _core._lock:
         scopes = set(_core._server_tool_scopes.get(key, ()))
+        configs = {scope: _core._server_scope_configs.get((key, scope)) for scope in scopes}
     try:
         current = hermes_home_key()
     except Exception:
         current = None
+    owner_names = set(getattr(server, "_registered_tool_names", []) or ())
     for scope in sorted(s for s in scopes if s and s != current):
+        adopter_config = configs.get(scope)
+        if not isinstance(adopter_config, dict):
+            continue  # adopted before configs were recorded; its own next registration pass heals it
+        try:
+            should_register = _make_tool_filter(name, adopter_config)
+            utilities = _select_utility_schemas(name, server, adopter_config)
+            candidates = _tool_candidates(name, server._tools, should_register, server.tool_timeout)
+            candidates += _utility_candidates(name, utilities, server.tool_timeout)
+            names = set(_register_candidates(
+                name, _resolve_name_collisions(name, candidates), check_fn=_make_check_fn(name),
+                scope=lambda scope=scope: scope, lazy=False, key=key))
+            for tool_name in owner_names - names:
+                registry.deregister(tool_name, scope=scope)
+        except Exception as exc:
+            logger.warning("MCP server '%s': live tools for adopting profile %s not updated (%s)", name, scope, exc)
         token = set_hermes_home_override(Path(scope))
         try:
+            fingerprint = config_fingerprint(adopter_config)
             if get_cached_entry(name, fingerprint) is not None:
-                write_cache_entry(name, fingerprint, tools=_tools_payload(server, lambda _n: True),
-                                  utility_tools=utility_payload, **hints)
+                write_cache_entry(
+                    name, fingerprint, tools=_tools_payload(server, _make_tool_filter(name, adopter_config)),
+                    utility_tools=[{"schema": e["schema"], "handler_key": e["handler_key"]}
+                                   for e in _select_utility_schemas(name, server, adopter_config)],
+                    **hints)
         except Exception as exc:
             logger.warning("MCP schema cache for '%s' in adopting profile %s not updated (%s)", name, scope, exc)
         finally:
@@ -456,7 +491,9 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
         name, _resolve_name_collisions(name, candidates),
         check_fn=_make_check_fn(name), scope=lambda: _core._server_registry_scope(key), lazy=False, key=key)
     # The cache mirrors every published list, empty ones included (see _write_schema_cache).
-    _write_schema_cache(name, server, config, should_register, key)
+    _write_schema_cache(name, server, config, should_register)
+    # Every profile that adopted the connection gets the same list, live and cached, under its own policy.
+    _publish_to_adopters(name, server, key, _list_hints(server))
     return registered
 
 
@@ -550,6 +587,7 @@ def _register_connected_into_current_scope(servers: dict) -> int:
         # Visibility for this profile: the owner keeps teardown, this scope sees the connection.
         with _core._lock:
             _core._server_tool_scopes.setdefault(key, set()).add(scope)
+            _core._server_scope_configs[(key, scope)] = dict(config)
         _record_scope_trust(name, config, scope)
         if registry.get_tool_names_for_toolset(f"mcp-{name}"):
             continue
@@ -580,7 +618,11 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
     cached_tools = _cached_tools(tools_from_cache_entry(entry))
     _record_tool_trust_metadata(name, config, cached_tools)
     candidates = _tool_candidates(name, cached_tools, _make_tool_filter(name, config), tool_timeout)
-    candidates += _utility_candidates(name, utility_tools_from_cache_entry(entry), tool_timeout)
+    # A cache row may have been written under another profile's policy (a shared connection's
+    # owner): only the families THIS config enables are registered.
+    utility_rows = [row for row in utility_tools_from_cache_entry(entry)
+                    if isinstance(row, dict) and _policy_allows_utility(config, str(row.get("handler_key") or ""))]
+    candidates += _utility_candidates(name, utility_rows, tool_timeout)
     registered = _register_candidates(
         name, candidates, check_fn=_make_check_fn(name), scope=_core._mcp_registry_scope, lazy=True)
     if registered:
