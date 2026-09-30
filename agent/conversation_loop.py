@@ -1004,24 +1004,36 @@ def _invalid_tool_name_error_content(name: str, valid_tool_names, agent=None) ->
             "tool, use a valid name from your tool list; otherwise reply in plain text."
         )
     hint = ""
+    bridge_visible = False
     if agent is not None:
         try:
             from tools import tool_search as _ts
-            from tools.connectors import is_connector_name
+            from tools.connectors.gateway.names import parse_connector_name
             from tools import tool_search_validation as _tsv
             from agent.tool_executor import _tool_search_scope
 
-            if _ts.TOOL_CALL_NAME in valid_tool_names:
+            bridge_visible = _ts.TOOL_CALL_NAME in valid_tool_names
+            if bridge_visible:
                 scope = _tool_search_scope(agent)
                 if scope is not None and name in scope:
                     return _tsv.deferred_direct_call_error(name)
-                if is_connector_name(name) and "manage_connections" in valid_tool_names:
-                    # tool_call admits connector batches when manage_connections is in scope.
+                if "manage_connections" in valid_tool_names and parse_connector_name(name) is not None:
+                    # tool_call admits connector batches when manage_connections is in scope. A bare
+                    # or malformed prefix (``connectors__``) is not a connector name: generic error.
                     return _tsv.connector_direct_call_error(name)
                 if scope is None:
                     hint = _tsv.SCOPE_UNKNOWN_HINT
         except Exception:
             logger.debug("deferred-tool lookup failed for %r; using the generic error", name, exc_info=True)
+    if bridge_visible and not hint:
+        # The name is not a tool this session can reach through the bridge either, so the answer
+        # must not point at tool_call for it: list the directly callable tools and name the
+        # search door for anything loaded on demand.
+        from tools.tool_search_catalog import BRIDGE_TOOL_NAMES
+
+        direct = ", ".join(sorted(set(valid_tool_names) - set(BRIDGE_TOOL_NAMES)))
+        return (f"Tool '{name}' does not exist. Available tools: {direct}. "
+                "Tools that load on demand are found with tool_search.")
     available = ", ".join(sorted(valid_tool_names))
     return f"Tool '{name}' does not exist. Available tools: {available}.{hint}" if hint else \
         f"Tool '{name}' does not exist. Available tools: {available}"
