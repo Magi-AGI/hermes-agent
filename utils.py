@@ -1,6 +1,7 @@
 """Shared utility functions for hermes-agent."""
 
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -141,8 +142,30 @@ def file_signature(st: os.stat_result) -> "tuple[int, int, int, int]":
     replace and ctime cannot be backdated from user space, so the pair catches those writers.
     On Windows ``st_ino`` may be 0 and ``st_ctime_ns`` is the creation time — both stable across
     an in-place rewrite, so the key degrades to mtime + size there rather than misfiring.
+
+    Metadata alone is NOT enough for a cache of settings: on Windows a same-size in-place edit
+    inside the mtime tick (or with the mtime restored) keeps all four fields. Settings caches key
+    on :func:`content_signature` instead.
     """
     return (st.st_mtime_ns, st.st_size, st.st_ino, st.st_ctime_ns)
+
+
+def content_signature(st: os.stat_result, data: bytes) -> "tuple[int, int, int, int, bytes]":
+    """:func:`file_signature` plus a SHA-256 of the bytes that were read: the change-detection key
+    for caches of parsed settings files (config.yaml, .env). The digest catches the edit metadata
+    cannot see (same size, same mtime, Windows' stable ino/ctime). Callers parse the SAME ``data``
+    they sign, so the cached value and its key come from one read."""
+    return (*file_signature(st), hashlib.sha256(data).digest())
+
+
+def file_content_signature(path: Union[str, os.PathLike]) -> "tuple[int, int, int, int, bytes]":
+    """:func:`content_signature` of *path* from one open (fstat + read on the same handle).
+    Raises ``OSError`` when the file is absent or unreadable. One open + read + hash of a
+    config-sized file (~0.1 ms on Windows); used where a cache must not trust metadata."""
+    with open(path, "rb") as handle:
+        st = os.fstat(handle.fileno())
+        data = handle.read()
+    return content_signature(st, data)
 
 
 def _preserve_file_mode(path: Path) -> "int | None":

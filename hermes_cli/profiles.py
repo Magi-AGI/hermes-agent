@@ -592,13 +592,14 @@ _PROFILE_FILE_CACHE_MAX = 512
 
 
 def _profile_file_signature(path: Path) -> Optional[tuple]:
-    """``(mtime_ns, size, inode)``, or None when the file is absent. The atomic writers rename a
-    temp file into place, so a rewrite always lands a new inode even within one mtime tick."""
+    """``utils.file_content_signature`` of *path*, or None when the file is absent. Hermes's atomic
+    writers land a new inode, but a user's in-place same-size edit keeps every metadata field on
+    Windows, so the digest of the bytes is part of the key (A43)."""
+    from utils import file_content_signature
     try:
-        stat = path.stat()
+        return file_content_signature(path)
     except OSError:
         return None
-    return (stat.st_mtime_ns, stat.st_size, stat.st_ino)
 
 
 def _cached_profile_read(path: Path, kind: str, compute):

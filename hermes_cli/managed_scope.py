@@ -17,14 +17,14 @@ from typing import Dict, Optional
 
 import yaml
 
-# Stale-module bridge: this module binds ``utils.file_signature`` at import time, so a fresh
+# Stale-module bridge: this module binds ``utils.file_content_signature`` at import time, so a fresh
 # import in a post-pull updater process (pre-handoff purge keeps root modules cached) dies
 # unless the stale ``utils`` is dropped first. See hermes_cli.stale_modules.
 from hermes_cli.stale_modules import drop_stale_root_modules
 
 drop_stale_root_modules()
 
-from utils import file_signature
+from utils import file_content_signature
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MANAGED_DIR = Path("/etc/hermes")
 
 _CACHE_LOCK = threading.Lock()
-# path_key -> (*file_signature, parsed)
+# path_key -> (*utils.file_content_signature, parsed)
 _CONFIG_CACHE: Dict[str, tuple] = {}
 _ENV_CACHE: Dict[str, tuple] = {}
 
@@ -68,17 +68,17 @@ def invalidate_managed_cache() -> None:
 
 
 def _cached_read(path: Path, cache: Dict[str, tuple], parse):
-    """Shared stat-signature-keyed read; returns a deepcopy of the parsed value.
+    """Shared content-signature-keyed read; returns a deepcopy of the parsed value.
 
     ``None`` when the file is absent or fails to parse (fail-open). A parse failure is logged
     LOUDLY — the admin needs to know their policy isn't applied — but never raises, so a malformed
     managed file can't brick startup.
     """
     try:
-        st = path.stat()
+        # Content-keyed (A43): an admin's same-size in-place edit keeps the Windows metadata.
+        key = file_content_signature(path)
     except OSError:
         return None  # absent
-    key = file_signature(st)
     path_key = str(path)
     with _CACHE_LOCK:
         hit = cache.get(path_key)

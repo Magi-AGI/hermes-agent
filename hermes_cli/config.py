@@ -28,7 +28,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple, Set
+from typing import Dict, Any, NamedTuple, Optional, List, Tuple, Set
 
 import yaml
 
@@ -45,7 +45,8 @@ from hermes_constants import (  # noqa: F401
     apply_secure_dir_policy, get_managed_system)
 # Re-export from hermes_constants — canonical definition lives there.
 from hermes_constants import get_hermes_home, get_process_hermes_home  # noqa: F401
-from utils import atomic_replace, atomic_yaml_write, fast_safe_load, file_signature
+from utils import (
+    atomic_replace, atomic_yaml_write, content_signature, fast_safe_load, file_content_signature, file_signature)
 
 logger = logging.getLogger(__name__)
 
@@ -2036,18 +2037,60 @@ def _raw_config_cache_hit(path_key: str, cache_key: Tuple[Any, ...]) -> Optional
     return None
 
 
+_NO_FILE_SIG = (0, 0, 0, 0, b"")
+
+
+def _read_config_bytes(path: Path) -> bytes:
+    """The file's bytes, read through this module's ``open`` (the seam tests use to interrupt a read)."""
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
+def _parse_config_bytes(data: bytes) -> Any:
+    """YAML from the exact bytes a cache signature was computed over (strict UTF-8, as before)."""
+    return fast_safe_load(data.decode("utf-8"))
+
+
+def _clear_parse_failure_after_clean_read(config_path: Path, user_sig: Tuple[Any, ...]) -> None:
+    """The bytes at this stat identity just parsed, so a failure recorded for the same identity is
+    over. Needed because the content-keyed caches re-read a same-metadata fix that the metadata-keyed
+    ``get_active_config_parse_failure`` cannot tell from the broken file."""
+    key = _parse_failure_key(config_path)
+    record = _CONFIG_PARSE_FAILURES.get(key)
+    if record is not None and tuple(record[:4]) == tuple(user_sig[:4]):
+        _CONFIG_PARSE_FAILURES.pop(key, None)
+
+
+class _ConfigSnapshot(NamedTuple):
+    """ONE observation of config.yaml (+ the managed config.yaml) for the load caches.
+
+    ``user_sig``: the user file's content signature (``utils.content_signature`` of the bytes read),
+    None when it is absent at stat. ``user_bytes``: exactly the bytes that signature covers, so the
+    caller parses what it keys the cache on. A file seen at stat whose read then fails is
+    ``user_error``, with a signature whose digest is None and no ``cache_sig``: nothing may hit or be
+    cached on a read that did not happen. ``cache_sig`` folds in the managed file (``_NO_FILE_SIG``
+    when absent) and is None when neither file exists or the user read failed."""
+    user_sig: Optional[Tuple[Any, ...]]
+    cache_sig: Optional[Tuple[Any, ...]]
+    user_bytes: Optional[bytes]
+    user_error: Optional[Exception]
+
+
 def _read_raw_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
     # Lock-free fast path for cache hits — same shape as `_load_config_impl`. `_RAW_CONFIG_CACHE`
     # publishes each entry as ONE `(*sig, data)` tuple replaced wholesale, so a reader sees either
     # the complete old entry or the complete new one; `_CONFIG_LOCK` only serializes the re-parse
     # and the writers (`save_config()` holds it across an atomic YAML write, which used to stall
     # every cached read for the duration). A lost race just falls through to the locked re-check.
+    # The key is the CONTENT signature: metadata alone misses a same-size Windows edit (A43).
     try:
         config_path = get_config_path()
-        cache_key = file_signature(config_path.stat())
-        hit = _raw_config_cache_hit(str(config_path), cache_key)
-        if hit is not None:
-            return copy.deepcopy(hit) if want_deepcopy else hit
+        path_key = str(config_path)
+        if path_key in _RAW_CONFIG_CACHE:
+            st = config_path.stat()
+            hit = _raw_config_cache_hit(path_key, content_signature(st, _read_config_bytes(config_path)))
+            if hit is not None:
+                return copy.deepcopy(hit) if want_deepcopy else hit
     except Exception:
         pass
 
@@ -2055,24 +2098,24 @@ def _read_raw_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         try:
             config_path = get_config_path()
             st = config_path.stat()
-            cache_key = file_signature(st)
         except (FileNotFoundError, OSError):
             return {}
 
         path_key = str(config_path)
-        hit = _raw_config_cache_hit(path_key, cache_key)
-        if hit is not None:
-            return copy.deepcopy(hit) if want_deepcopy else hit
-
         try:
-            with open(config_path, encoding="utf-8") as f:
-                data = fast_safe_load(f) or {}
+            raw_bytes = _read_config_bytes(config_path)
+            cache_key = content_signature(st, raw_bytes)
+            hit = _raw_config_cache_hit(path_key, cache_key)
+            if hit is not None:
+                return copy.deepcopy(hit) if want_deepcopy else hit
+            data = _parse_config_bytes(raw_bytes) or {}
         except Exception as e:
             _warn_config_parse_failure(config_path, e)
             return {}
 
         if not isinstance(data, dict):
             data = {}
+        _clear_parse_failure_after_clean_read(config_path, cache_key)
         # The cache stores its own deepcopy. The readonly path returns THAT object (identity
         # invariant: later cache hits return the same dict); the mutable path returns the parse.
         cached_copy = copy.deepcopy(data)
@@ -2180,6 +2223,7 @@ def load_config_readonly() -> Dict[str, Any]:
     **Mutating the returned dict (or any nested structure) corrupts the in-process cache for
     every subsequent caller** — only for code paths that never write to the result."""
     return _load_config_impl(want_deepcopy=False)
+
 
 
 def _ensure_dict(parent: Dict[str, Any], key: str) -> Dict[str, Any]:
@@ -2293,24 +2337,32 @@ def apply_terminal_config_to_env(
     return target
 
 
-def _load_config_cache_sig(config_path: Path) -> Tuple[Optional[Tuple[int, int, int, int]], Optional[Tuple[int, ...]]]:
-    """Return ``(user_sig, cache_sig)`` for ``_LOAD_CONFIG_CACHE``.
-    The managed config file's signature is folded in ((0, 0, 0, 0) = none) so editing it invalidates
-    the merged result. ``cache_sig`` is None only when neither file exists (nothing to cache on)."""
+def _load_config_cache_sig(config_path: Path) -> _ConfigSnapshot:
+    """One :class:`_ConfigSnapshot` of the user + managed config.yaml for ``_LOAD_CONFIG_CACHE``
+    (index 1 stays ``cache_sig`` for callers that only key on it). Content-keyed: an in-place edit
+    that keeps size, mtime and Windows' stable ino/ctime still changes the key (A43). A stat error
+    other than "absent" propagates, as before."""
+    user_sig: Optional[Tuple[Any, ...]] = None
+    user_bytes: Optional[bytes] = None
+    user_error: Optional[Exception] = None
     try:
-        st = config_path.stat()
-        user_sig: Optional[Tuple[int, int, int, int]] = file_signature(st)
+        st: Optional[os.stat_result] = config_path.stat()
     except FileNotFoundError:
-        user_sig = None
+        st = None
+    if st is not None:
+        try:
+            user_bytes = _read_config_bytes(config_path)
+            user_sig = content_signature(st, user_bytes)
+        except Exception as exc:  # seen at stat, then unreadable: an interrupted read
+            user_error, user_sig = exc, (*file_signature(st), None)
     managed_dir = managed_scope.get_managed_dir()
     try:
-        mst = (managed_dir / "config.yaml").stat() if managed_dir else None
-        managed_sig = file_signature(mst) if mst else (0, 0, 0, 0)
+        managed_sig = file_content_signature(managed_dir / "config.yaml") if managed_dir else _NO_FILE_SIG
     except OSError:
-        managed_sig = (0, 0, 0, 0)
-    if user_sig is None and managed_sig == (0, 0, 0, 0):
-        return None, None
-    return user_sig, (*(user_sig or (0, 0, 0, 0)), *managed_sig)
+        managed_sig = _NO_FILE_SIG
+    if user_error is not None or (user_sig is None and managed_sig == _NO_FILE_SIG):
+        return _ConfigSnapshot(user_sig, None, user_bytes, user_error)
+    return _ConfigSnapshot(user_sig, (*(user_sig or _NO_FILE_SIG), *managed_sig), user_bytes, None)
 
 
 def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: Exception) -> Optional[Dict[str, Any]]:
@@ -2373,27 +2425,31 @@ def _load_config_cache_hit(path_key: str, cache_sig: Any) -> Optional[Dict[str, 
     ``cache_sig`` AND every ``${VAR}`` it was expanded against still has the same value, else
     ``None``. Signatures matching is not enough: a load before load_hermes_dotenv() would otherwise
     pin unexpanded literals (e.g. auxiliary.<task>.api_key) for the process lifetime (#58514).
-    Shared by the lock-free fast path and the locked re-check of ``_load_config_impl``."""
+    Shared by the lock-free fast path and the locked re-check of ``_load_config_impl``.
+    Entry layout: ``(*cache_sig, value, env_snapshot)``."""
     cached = _LOAD_CONFIG_CACHE.get(path_key)
-    if cached is None or cache_sig is None or cached[:8] != cache_sig:
+    if cached is None or cache_sig is None:
         return None
-    env_snapshot = cached[9] if len(cached) > 9 else {}
+    n = len(cache_sig)
+    if tuple(cached[:n]) != tuple(cache_sig) or len(cached) < n + 2:
+        return None
+    value, env_snapshot = cached[n:n + 2]
     if all(_env_ref_lookup(k) == v for k, v in env_snapshot.items()):
-        return cached[8]
+        return value
     return None
 
 
 def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
     # Lock-free fast path for cache hits — same publication contract as `_read_raw_config_impl`
     # above (whole-tuple replace, `_CONFIG_LOCK` only serializes rebuilds and writers). A hit costs
-    # ~0.024ms; behind a lock held by `save_config()` the same read measured 10010ms, and on a
-    # gateway that stalls every inbound message's hook path. A lost race falls through to the lock.
+    # one stat + one read + a SHA-256 of the file (content-keyed, A43); behind a lock held by
+    # `save_config()` the same read measured 10010ms, and on a gateway that stalls every inbound
+    # message's hook path. A lost race falls through to the lock.
     try:
         config_path = get_config_path()
         path_key = str(config_path)
         if path_key in _LOAD_CONFIG_CACHE:
-            _, fast_sig = _load_config_cache_sig(config_path)
-            hit = _load_config_cache_hit(path_key, fast_sig)
+            hit = _load_config_cache_hit(path_key, _load_config_cache_sig(config_path).cache_sig)
             if hit is not None:
                 return copy.deepcopy(hit) if want_deepcopy else hit
     except Exception:
@@ -2406,7 +2462,8 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         config_path = get_config_path()
         path_key = str(config_path)
 
-        user_sig, cache_sig = _load_config_cache_sig(config_path)
+        snap = _load_config_cache_sig(config_path)
+        cache_sig = snap.cache_sig
 
         hit = _load_config_cache_hit(path_key, cache_sig)
         if hit is not None:
@@ -2414,12 +2471,13 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
 
         config = copy.deepcopy(DEFAULT_CONFIG)
 
-        if user_sig is None:
+        if snap.user_sig is None:
             _clear_interrupted_read_failure(config_path)
-        if user_sig is not None:
+        else:
             try:
-                with open(config_path, encoding="utf-8") as f:
-                    user_config = fast_safe_load(f) or {}
+                if snap.user_error is not None:
+                    raise snap.user_error
+                user_config = _parse_config_bytes(snap.user_bytes) or {}
 
                 if "max_turns" in user_config:
                     agent_user_config = dict(user_config.get("agent") or {})
@@ -2429,6 +2487,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                     user_config.pop("max_turns", None)
 
                 config = _deep_merge(config, user_config)
+                _clear_parse_failure_after_clean_read(config_path, snap.user_sig)
                 # A copy of the file that just parsed is what a FRESH process falls back to when the
                 # next edit breaks the YAML (see _last_known_good_fallback). backup_config() skips
                 # byte-identical repeats and keeps a bounded count, so steady-state loads cost one stat.
