@@ -777,8 +777,9 @@ starts when you approve the card. Where there is no card, that install is refuse
 Hermes reads this key straight from the file each time it decides, not from its settings cache.
 If `config.yaml` can't be read or doesn't parse, Hermes treats the key as false until the file is
 fixed, because the broken file may be the one that says `false`. An administrator's managed
-`config.yaml` wins over yours, and it fails closed the same way. With no `config.yaml` at all,
-the default applies.
+`config.yaml` wins over yours, and it fails closed the same way. A value Hermes doesn't recognise
+as true or false, including `interactive_oauth:` with nothing after it, also counts as false. Only
+leaving the key out (or having no `config.yaml` at all) keeps the default.
 
 ### Lazy start
 

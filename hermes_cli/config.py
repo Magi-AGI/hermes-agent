@@ -182,16 +182,38 @@ def _read_yaml_mapping_fresh(path: Path) -> Optional[Dict[str, Any]]:
     return data
 
 
+class _ConfigKeyAbsent:
+    """``read_config_value_fresh``'s answer when neither file sets the key. Distinct from a
+    present ``null``, which a caller must be able to treat as an invalid value."""
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self) -> str:
+        return "CONFIG_KEY_ABSENT"
+
+
+CONFIG_KEY_ABSENT = _ConfigKeyAbsent()
+
+
 def read_config_value_fresh(*keys: str) -> Any:
     """One uncached read of a security-relevant value, for decisions that must not trust the
     metadata-keyed load cache (Windows keeps the same size+mtime+ino+ctime signature across an
     in-place same-size edit) or a fallback served for a read that failed.
 
-    The value and the success of the read come from the SAME observation: an unreadable or
-    unparseable user or managed config.yaml raises ``ConfigReadError``, so no stale or default
-    value can pass for a clean read. Precedence matches ``load_config``: the managed (admin)
-    file wins at the leaf. Returns None when the key is absent (including no config at all).
-    Values are raw YAML: ``${VAR}`` references are not expanded."""
+    The value and the success of the read come from the SAME observation. BOTH files are read
+    and validated before either is consulted: an unreadable or unparseable user OR managed
+    config.yaml raises ``ConfigReadError``, so no stale or default value can pass for a clean
+    read and a managed value cannot mask a broken user file. Precedence then matches
+    ``load_config``: the managed (admin) file wins at the leaf. Returns ``CONFIG_KEY_ABSENT`` when
+    neither file sets the key (including no config at all); a present ``null`` is returned as
+    ``None``. Values are raw YAML: ``${VAR}`` references are not expanded.
+
+    Additive: this does not read or change the general load cache (``_LOAD_CONFIG_CACHE``)."""
     def _dig(mapping: Optional[Dict[str, Any]]) -> tuple:
         node: Any = mapping
         for key in keys:
@@ -201,11 +223,13 @@ def read_config_value_fresh(*keys: str) -> Any:
         return True, node
 
     managed_dir = managed_scope.get_managed_dir()
-    if managed_dir:
-        found, value = _dig(_read_yaml_mapping_fresh(Path(managed_dir) / "config.yaml"))
+    managed = _read_yaml_mapping_fresh(Path(managed_dir) / "config.yaml") if managed_dir else None
+    user = _read_yaml_mapping_fresh(get_config_path())
+    for mapping in (managed, user):
+        found, value = _dig(mapping)
         if found:
             return value
-    return _dig(_read_yaml_mapping_fresh(get_config_path()))[1]
+    return CONFIG_KEY_ABSENT
 
 
 def get_active_config_parse_failure() -> Optional[str]:

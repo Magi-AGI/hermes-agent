@@ -341,18 +341,26 @@ def _config_allows_unattended_oauth() -> bool:
     across a same-size in-place edit that keeps the Windows file signature), and a separate
     failure check afterwards can look at a different file than the one that failed.
 
-    No config file, an empty file, or a clean read without the key keeps the default. Everything
+    No config file, an empty file, or a clean read WITHOUT the key keeps the default. Everything
     else fails CLOSED, because the key exists to guarantee no unattended browser: an unreadable
-    or unparseable user or managed config.yaml (including one that vanishes mid-read) and a
-    present but unrecognised value (a typo)."""
+    or unparseable user or managed config.yaml (including one that vanishes mid-read, and a
+    broken user file under a managed value), and a present value that is not a recognised
+    boolean. That includes an explicit ``null`` (``interactive_oauth:`` with no value): the key
+    is there, so someone meant to set it, and "no value" is not evidence that they meant true."""
     try:
-        from hermes_cli.config import read_config_value_fresh
+        from hermes_cli.config import CONFIG_KEY_ABSENT, read_config_value_fresh
         raw = read_config_value_fresh("mcp", "interactive_oauth")
     except Exception:
         logger.debug("config could not be read; no unattended MCP OAuth", exc_info=True)
         return False
-    if raw is None or isinstance(raw, bool):
-        return raw is not False
+    if raw is CONFIG_KEY_ABSENT:
+        return True
+    if isinstance(raw, bool):
+        return raw
+    if raw is None:
+        logger.warning("mcp.interactive_oauth is present but empty (null); treating it as false "
+                       "(no unattended OAuth browser flows)")
+        return False
     lowered = str(raw).strip().lower()
     if lowered in {"true", "1", "yes", "on"}:
         return True
