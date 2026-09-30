@@ -196,7 +196,21 @@ def _cfg_get_mtime(params):
         return {"mtime": 0}
     # mcp_rev: hash of the MCP-relevant sections so the poller reloads MCP servers only when
     # their config changed — a /skin write bumps mtime but must not cost an MCP reconnect.
-    return {"mtime": mtime, "mcp_rev": _compute_mcp_rev()}
+    # rev: content revision of the user + managed config. A same-size edit inside one mtime tick
+    # (or with the mtime restored) keeps mtime, so the poller also re-hydrates on rev (A43).
+    return {"mtime": mtime, "mcp_rev": _compute_mcp_rev(), "rev": _config_content_rev(cfg_path)}
+
+
+def _config_content_rev(cfg_path) -> str:
+    """Short digest of the config content signature; "" when it cannot be observed (unknown)."""
+    import hashlib
+
+    from hermes_cli.config import _load_config_cache_sig
+    try:
+        sig = _load_config_cache_sig(cfg_path).cache_sig
+    except Exception:
+        return ""
+    return hashlib.sha256(repr(sig).encode()).hexdigest()[:16] if sig else ""
 
 
 # key -> getter(params); bind_module rebinds the table's functions onto server.py's globals.

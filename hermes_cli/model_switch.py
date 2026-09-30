@@ -19,7 +19,7 @@ from hermes_cli.providers import (
 from hermes_cli.model_normalize import normalize_model_for_provider
 from agent.models_dev import (
     ModelCapabilities, ModelInfo, get_model_capabilities, get_model_info, list_provider_models)
-from utils import base_url_host_matches, base_url_hostname, base_url_origin, file_signature
+from utils import base_url_host_matches, base_url_hostname, base_url_origin
 # Re-exported: callers/tests patch hermes_cli.model_switch.<name>.
 from hermes_cli.model_switch_providers import list_authenticated_providers
 
@@ -270,13 +270,16 @@ def _direct_alias_source_identity() -> Optional[tuple]:
     except Exception:
         return None
     try:
-        stat = path.stat()
-    except OSError:
-        # A missing config is still a definite identity for this profile.
-        return (str(path), None)
+        # The loader's own content-keyed observation (user + managed): a same-size edit with the
+        # mtime restored must not keep a stale alias (A43). A missing config is still a definite
+        # identity for this profile; a failed read is not (never reuse on it).
+        from hermes_cli.config import _load_config_cache_sig
+        snap = _load_config_cache_sig(path)
     except Exception:
         return None
-    return (str(path), file_signature(stat))
+    if snap.user_error is not None or snap.managed_error is not None:
+        return None
+    return (str(path), snap.cache_sig)
 
 
 def _ensure_direct_aliases() -> None:

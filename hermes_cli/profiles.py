@@ -613,6 +613,10 @@ def _cached_profile_read(path: Path, kind: str, compute):
     if cached is not None and cached[0] == signature:
         return cached[1]
     value = compute()
+    # compute() reads the file again; cache only when the bytes it saw are the bytes signed (the file
+    # is unchanged across the compute), so an edit landing in between is never filed under the old key.
+    if _profile_file_signature(path) != signature:
+        return value
     if len(_PROFILE_FILE_CACHE) >= _PROFILE_FILE_CACHE_MAX:
         _PROFILE_FILE_CACHE.clear()
     _PROFILE_FILE_CACHE[key] = (signature, value)

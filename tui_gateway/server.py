@@ -26,7 +26,7 @@ from hermes_constants import (
     get_hermes_home, get_hermes_home_override, get_process_hermes_home, profile_name_for_home,
     reset_hermes_home_override, set_hermes_home_override)
 from hermes_cli.env_loader import load_hermes_dotenv
-from utils import file_signature, is_truthy_value
+from utils import content_signature, fast_safe_load, is_truthy_value
 from hermes_state_ids import new_session_id
 from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import canonicalize_replay_history
@@ -1225,16 +1225,24 @@ def _load_cfg_raw() -> dict:
     """The active profile's config.yaml EXACTLY as written — the write-back primitive, ONLY for
     read→mutate→``_save_cfg`` round-trips and raw inspection (defaults / managed overlay / ``${VAR}``
     expansion applied here would be persisted on the next save). Behavioral reads use :func:`_load_cfg`.
-    Cache keyed on the resolved path so profiles don't clobber."""
+    Cache keyed on the resolved path so profiles don't clobber, and on the CONTENT of the bytes it
+    parsed: a metadata-only key let a same-size external edit hit, and the next ``_save_cfg`` wrote the
+    stale state back over it (A43)."""
     global _cfg_cache, _cfg_sig, _cfg_path
     with contextlib.suppress(Exception):
         p = _active_config_path()
-        sig = file_signature(p.stat()) if p.exists() else None
+        try:
+            with open(p, "rb") as handle:
+                st = os.fstat(handle.fileno())
+                raw = handle.read()
+        except FileNotFoundError:
+            return {}
+        sig = content_signature(st, raw)
         with _cfg_lock:
             if _cfg_cache is not None and _cfg_sig == sig and _cfg_path == p:
                 return copy.deepcopy(_cfg_cache)
-        from hermes_cli.config import read_user_config_raw
-        data = read_user_config_raw(p) if p.exists() else {}
+        loaded = fast_safe_load(raw.decode("utf-8")) or {}
+        data = loaded if isinstance(loaded, dict) else {}
         with _cfg_lock:  # cache the RAW config: _save_cfg writes _cfg_cache back to disk
             _cfg_cache, _cfg_sig, _cfg_path = copy.deepcopy(data), sig, p
         return data
@@ -1260,11 +1268,9 @@ def _save_cfg(cfg: dict):
     # fails closed on an unreadable existing config.yaml like atomic_config_write.
     atomic_roundtrip_yaml_save(path, cfg)
     with _cfg_lock:
-        _cfg_cache, _cfg_path = copy.deepcopy(cfg), path
-        try:
-            _cfg_sig = file_signature(path.stat())
-        except Exception:
-            _cfg_sig = None
+        # Re-read on next use: signing the file after the write could file a concurrent edit's bytes
+        # under this dict (A43).
+        _cfg_cache, _cfg_sig, _cfg_path = None, None, None
 
 
 def _session_for_key(session_key: str) -> dict | None:

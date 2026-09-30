@@ -324,6 +324,7 @@ export function useConfigSync({
   sid
 }: UseConfigSyncOptions) {
   const mtimeRef = useRef(0)
+  const revRef = useRef('')
   const mcpRevRef = useRef<McpRevState>({ accepted: '', inFlight: false })
 
   useEffect(() => {
@@ -338,6 +339,7 @@ export function useConfigSync({
     setVoiceEnabled(process.env.HERMES_VOICE === '1')
     quietRpc<ConfigMtimeResponse>(gw, 'config.get', { key: 'mtime' }).then(r => {
       mtimeRef.current = Number(r?.mtime ?? 0)
+      revRef.current = String(r?.rev ?? '')
       // Seed the MCP revision baseline too: after a normal boot mtime is
       // already non-zero, so the poller's baseline branch never runs, and an
       // unset baseline would make the FIRST cosmetic write (mtime bump, same
@@ -356,10 +358,12 @@ export function useConfigSync({
       quietRpc<ConfigMtimeResponse>(gw, 'config.get', { key: 'mtime' }).then(r => {
         const next = Number(r?.mtime ?? 0)
         const nextMcpRev = String(r?.mcp_rev ?? '')
+        const nextRev = String(r?.rev ?? '')
 
         if (!mtimeRef.current) {
           if (next) {
             mtimeRef.current = next
+            revRef.current = nextRev
             mcpRevRef.current.accepted = nextMcpRev
           }
 
@@ -378,11 +382,22 @@ export function useConfigSync({
           )
         }
 
-        if (!next || next === mtimeRef.current) {
+        // A same-size edit can keep the mtime (Windows tick, restored mtime); the content
+        // revision still moves, so either one changing re-hydrates.
+        const mtimeChanged = !!next && next !== mtimeRef.current
+        const revChanged = !!nextRev && nextRev !== revRef.current
+
+        if (!mtimeChanged && !revChanged) {
           return
         }
 
-        mtimeRef.current = next
+        if (next) {
+          mtimeRef.current = next
+        }
+
+        if (nextRev) {
+          revRef.current = nextRev
+        }
 
         // Older gateways don't send mcp_rev — fall back to
         // reload-on-any-change there (no ack tracking possible).
