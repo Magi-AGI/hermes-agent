@@ -71,7 +71,8 @@ def test_case_variant_of_deferred_name_is_not_dispatched_as_terminal():
         p1, p2, p3 = _agent_for(full, assembled)
         with p1, p2, p3:
             agent = _build_agent()
-            assert agent._repair_tool_call("Read_Terminal") == "terminal"
+            # Round 6: repair is case-only into a VISIBLE name; read_terminal is not visible.
+            assert agent._repair_tool_call("Read_Terminal") is None
             with patch("model_tools.handle_function_call", return_value="{}") as dispatch:
                 out = _run(agent, [_resp([_tc("Read_Terminal", {"pane_id": "p1"}, "x1")]),
                                    _resp(content="done")])

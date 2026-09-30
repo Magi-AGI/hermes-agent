@@ -80,7 +80,7 @@ def test_registered_but_restricted_deferred_name_must_not_dispatch_different_vis
                     disabled_toolsets=["desktop_ui"]) as agent:
             assert deferred not in _tool_search_scoped_names(agent)
             assert other in _tool_search_scoped_names(agent)
-            assert agent._repair_tool_call(deferred) == "terminal"
+            assert agent._repair_tool_call(deferred) is None  # round 6: no fuzzy repair
             with patch("model_tools.handle_function_call", return_value="{}") as dispatch:
                 out = _run(agent, [_resp([_tc(deferred, "restricted")]), _resp()])
             dispatched = [c.args[0] for c in dispatch.call_args_list if c.args]
@@ -122,7 +122,7 @@ def test_exact_deferred_hyphen_name_must_not_be_repaired_to_visible_underscore_n
     try:
         with _agent([visible, deferred], [visible]) as agent:
             assert deferred in _tool_search_scoped_names(agent)
-            assert agent._repair_tool_call(deferred) == visible
+            assert agent._repair_tool_call(deferred) is None  # round 6: no separator repair
             with patch("model_tools.handle_function_call", return_value="{}") as dispatch:
                 out = _run(agent, [_resp([_tc(deferred, "collision")]), _resp()])
             dispatched = [c.args[0] for c in dispatch.call_args_list if c.args]
@@ -155,10 +155,12 @@ def test_registry_generation_refreshes_scope_after_add_and_remove():
 
 
 def test_unknown_scope_preserves_legitimate_visible_name_repair():
+    """Round 6: the only legitimate repair left is case-only (``Write_File`` -> ``write_file``);
+    it still works with the scope lookup failing. ``write file`` is no longer repaired."""
     with _agent(["write_file", "read_terminal"], ["write_file"]) as agent:
         with (patch("model_tools.get_tool_definitions", side_effect=OSError("scope read failed")),
               patch("model_tools.handle_function_call", return_value="{}") as dispatch):
-            _run(agent, [_resp([_tc("write file", "visible")]), _resp()])
+            _run(agent, [_resp([_tc("Write_File", "visible"), _tc("write file", "spaced")]), _resp()])
         dispatched = [c.args[0] for c in dispatch.call_args_list if c.args]
         assert dispatched == ["write_file"]
 

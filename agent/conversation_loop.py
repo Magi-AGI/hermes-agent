@@ -1017,6 +1017,14 @@ def _invalid_tool_name_error_content(name: str, valid_tool_names, agent=None) ->
                 scope = _tool_search_scope(agent)
                 if scope is not None and name in scope:
                     return _tsv.deferred_direct_call_error(name)
+                if scope is not None:
+                    # ``Read_Terminal`` for a reachable ``read_terminal``: the same case-only rule
+                    # as repair (one match across every profile), named exactly in the correction.
+                    from agent.agent_runtime_helpers import case_only_registered_name
+
+                    target = case_only_registered_name(name)
+                    if target is not None and target in scope:
+                        return _tsv.deferred_direct_call_error(target)
                 if "manage_connections" in valid_tool_names and parse_connector_name(name) is not None:
                     # tool_call admits connector batches when manage_connections is in scope. A bare
                     # or malformed prefix (``connectors__``) is not a connector name: generic error.

@@ -933,6 +933,16 @@ class ToolRegistry:
     def get_all_tool_names(self) -> List[str]:
         return sorted(entry.name for entry in self._snapshot_entries())
 
+    def get_tool_names_all_scopes(self) -> frozenset:
+        """Every registered name: the global map plus EVERY profile overlay, not only the current
+        profile's. For decisions that must know whether a name could belong to some other tool
+        anywhere in the process (tool-name repair); never for listing tools to a model."""
+        with self._lock:
+            names = set(self._tools)
+            for overlay in self._scoped_tools.values():
+                names.update(overlay)
+        return frozenset(names)
+
     def get_schema(self, name: str) -> Optional[dict]:
         """Raw schema dict, bypassing check_fn filtering (token estimates, introspection)."""
         return self._attr(name, "schema")

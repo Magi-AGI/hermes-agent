@@ -219,7 +219,7 @@ def deferred_gui_agent():
 
 def test_exact_deferred_name_is_not_auto_repaired_into_another_tool(deferred_gui_agent):
     agent, gui = deferred_gui_agent
-    assert agent._repair_tool_call(gui) == "terminal", "precondition: fuzzy repair collides"
+    assert agent._repair_tool_call(gui) is None, "round 6: no fuzzy repair at all"
     with patch("model_tools.handle_function_call", return_value=json.dumps({"ok": True})) as dispatch:
         result = _run(agent, [_resp([_tc(gui, {"pane_id": "p1"}, "g1")]), _resp(content="done")])
     dispatched = [c.args[0] if c.args else c.kwargs.get("function_name") for c in dispatch.call_args_list]
@@ -268,12 +268,15 @@ def deferred_variants_agent():
                 registry.deregister(name)
 
 
+# Round 6 (fuzzy repair removed): a CASE-ONLY spelling of a reachable deferred tool gets the
+# tool_call correction under its exact name; every other spelling gets the generic error. None
+# of them is ever dispatched as another tool.
 @pytest.mark.parametrize("variant,exact", [
-    ("read-terminal", "read_terminal"),
-    ("close-terminal", "close_terminal"),
+    ("read-terminal", None),
+    ("close-terminal", None),
     ("Read_Terminal", "read_terminal"),
-    ("readTerminal", "read_terminal"),
-    ("read terminal", "read_terminal"),
+    ("readTerminal", None),
+    ("read terminal", None),
     ("READ_TERMINAL", "read_terminal"),
 ])
 def test_deferred_name_variants_get_the_correction_not_a_different_tool(deferred_variants_agent, variant, exact):
@@ -281,17 +284,64 @@ def test_deferred_name_variants_get_the_correction_not_a_different_tool(deferred
     with patch("model_tools.handle_function_call", return_value=json.dumps({"ok": True})) as dispatch:
         result = _run(agent, [_resp([_tc(variant, {"pane_id": "p1"}, "v1")]), _resp(content="done")])
     dispatched = [c.args[0] if c.args else c.kwargs.get("function_name") for c in dispatch.call_args_list]
-    assert "terminal" not in dispatched, f"{variant!r} was rewritten and dispatched as terminal"
+    assert dispatched == [], f"{variant!r} was dispatched as {dispatched}"
     content = _tool_result(result["messages"], "v1")["content"]
-    assert "tool_call" in content and f"'{exact}'" in content, content
+    if exact:
+        assert "tool_call" in content and f"'{exact}'" in content, content
+    else:
+        assert content.startswith(f"Tool '{variant}' does not exist."), content
+        assert "tool_call" not in content, content
 
 
-def test_legitimate_visible_repair_still_works_next_to_deferred_names(deferred_variants_agent):
+def test_separator_variant_of_a_visible_tool_is_not_repaired(deferred_variants_agent):
+    """Round 6: ``write file`` used to be repaired to ``write_file``; it now gets an error
+    listing the callable tools, and nothing runs."""
     agent = deferred_variants_agent
     with patch("model_tools.handle_function_call", return_value=json.dumps({"ok": True})) as dispatch:
-        _run(agent, [_resp([_tc("write file", {"path": "a"}, "w1")]), _resp(content="done")])
+        result = _run(agent, [_resp([_tc("write file", {"path": "a"}, "w1")]), _resp(content="done")])
+    dispatched = [c.args[0] if c.args else c.kwargs.get("function_name") for c in dispatch.call_args_list]
+    assert dispatched == [], dispatched
+    content = _tool_result(result["messages"], "w1")["content"]
+    assert content.startswith("Tool 'write file' does not exist.") and "write_file" in content, content
+
+
+def test_case_only_spelling_of_a_visible_tool_is_repaired(deferred_variants_agent):
+    agent = deferred_variants_agent
+    with patch("model_tools.handle_function_call", return_value=json.dumps({"ok": True})) as dispatch:
+        _run(agent, [_resp([_tc("Write_File", {"path": "a"}, "w2")]), _resp(content="done")])
     dispatched = [c.args[0] if c.args else c.kwargs.get("function_name") for c in dispatch.call_args_list]
     assert dispatched == ["write_file"], dispatched
+
+
+def test_cross_profile_case_collision_blocks_the_case_only_fix(deferred_variants_agent):
+    """Another profile registers ``Write_File``: ``WRITE_FILE`` now matches two registered names
+    case-insensitively, so it is not renamed to this session's ``write_file``."""
+    from tools.registry import registry
+
+    agent = deferred_variants_agent
+    other_scope = "pytest-r6-other-profile"
+    registry.register(name="Write_File", toolset="pytest_r6_other", schema=_td("Write_File")["function"],
+                      handler=lambda args, **kw: "{}", scope=other_scope)
+    try:
+        assert "Write_File" not in registry.get_all_tool_names(), "precondition: only in the other profile"
+        with patch("model_tools.handle_function_call", return_value=json.dumps({"ok": True})) as dispatch:
+            result = _run(agent, [_resp([_tc("WRITE_FILE", {"path": "a"}, "x1")]), _resp(content="done")])
+        dispatched = [c.args[0] if c.args else c.kwargs.get("function_name") for c in dispatch.call_args_list]
+        assert dispatched == [], dispatched
+        content = _tool_result(result["messages"], "x1")["content"]
+        assert "Write_File" not in content, "another profile's tool must not be advertised"
+    finally:
+        registry.deregister("Write_File", scope=other_scope)
+
+
+def test_registry_read_failure_renames_nothing(deferred_variants_agent):
+    from tools.registry import registry
+
+    agent = deferred_variants_agent
+    with patch.object(registry, "get_tool_names_all_scopes", side_effect=OSError("registry read failed")), \
+            patch("model_tools.handle_function_call", return_value=json.dumps({"ok": True})) as dispatch:
+        _run(agent, [_resp([_tc("Write_File", {"path": "a"}, "r1")]), _resp(content="done")])
+    assert [c.args[0] if c.args else c.kwargs.get("function_name") for c in dispatch.call_args_list] == []
 
 
 # ---------------------------------------------------------------------------
