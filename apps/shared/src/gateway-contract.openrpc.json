@@ -22532,7 +22532,7 @@
       },
       "ReloadMcpParams": {
         "additionalProperties": false,
-        "description": "Without ``confirm`` the handler may answer ``confirm_required`` (per ``approvals.mcp_reload_confirm``);\n``always`` persists the opt-out; ``rev`` is the config revision the caller wants loaded (coalescing).",
+        "description": "Without ``confirm`` the handler may answer ``confirm_required`` (per ``approvals.mcp_reload_confirm``);\n``always`` persists the opt-out; ``rev`` is the config revision the caller wants loaded (coalescing).\n``explicit`` marks a reload the USER asked for (the typed ``/reload-mcp``): ``lazy: true`` servers are\nthen live-connected instead of registered from the schema cache, and the request never coalesces\ninto an automatic reload. Config-sync and write-through reloads leave it false.",
         "properties": {
           "session_id": {
             "anyOf": [
@@ -22567,6 +22567,11 @@
             ],
             "default": null,
             "title": "Rev"
+          },
+          "explicit": {
+            "default": false,
+            "title": "Explicit",
+            "type": "boolean"
           }
         },
         "title": "ReloadMcpParams",

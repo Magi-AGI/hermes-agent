@@ -281,10 +281,12 @@ def _(rid, params: dict) -> dict:
             "Reply `/reload-mcp now` to proceed, or `/reload-mcp always` to proceed and "
             "silence this prompt permanently.")
         return _ok(rid, {"status": "confirm_required", "message": message})
+    # A user-requested reload (typed /reload-mcp) live-connects lazy servers; automatic ones don't.
+    explicit = bool(params.get("explicit", False))
     if session and _session_uses_compute_host(session):
         try:
             ack = _get_compute_host_supervisor().reload_mcp(
-                str(params.get("session_id") or ""), request_id=f"reload-mcp-{rid}")
+                str(params.get("session_id") or ""), request_id=f"reload-mcp-{rid}", explicit=explicit)
         except Exception as exc:
             return _err(rid, 5019, f"compute-host reload_mcp failed: {exc}")
         return _ok(rid, {"status": "reloaded", "turn_isolation": True, "host_ack": ack})
@@ -313,6 +315,13 @@ def _(rid, params: dict) -> dict:
                 logger.warning("Failed to refresh cached agent tools after /reload-mcp (session %s): %s", sid, _exc)
             _emit("session.info", sid, _session_info(agent, sess))
 
+    def _discover() -> None:
+        # Only a user-requested reload bypasses the lazy cache; automatic calls stay as they were.
+        if explicit:
+            _mcp_discovery.discover_mcp_tools(bypass_lazy_cache=True)
+        else:
+            _mcp_discovery.discover_mcp_tools()
+
     def _do_full_reload() -> None:
         """shutdown+discover+refresh under the lock, then mark a completed generation. Config
         can change WHILE discover connects: re-hash and repeat until stable so the marked
@@ -327,7 +336,7 @@ def _(rid, params: dict) -> dict:
             for _ in range(_MCP_RELOAD_MAX_PASSES):
                 _mcp_lifecycle.shutdown_mcp_servers()
                 _mcp_agent.reprobe_tool_availability()
-                _mcp_discovery.discover_mcp_tools()
+                _discover()
                 after = _compute_mcp_rev()
                 if after == loaded:
                     break
@@ -340,7 +349,7 @@ def _(rid, params: dict) -> dict:
         for home in sorted(homes - {None}):
             try:
                 with _session_profile_runtime_scope({"profile_home": home}):
-                    _mcp_discovery.discover_mcp_tools()
+                    _discover()
             except Exception as _exc:
                 logger.warning("MCP rediscovery failed for profile %s: %s", home, _exc)
         _refresh_session_agent()
@@ -358,7 +367,9 @@ def _(rid, params: dict) -> dict:
         return _finish_reload(rid, params, coalesced=False)
     gen_before = _mcp_reload_gen
     with _mcp_reload_lock:
-        coalesced = _mcp_reload_gen > gen_before and (not req_rev or req_rev == _mcp_reload_loaded_rev)
+        # An explicit reload never rides on an automatic one: that pass kept the lazy cache.
+        coalesced = (not explicit and _mcp_reload_gen > gen_before
+                     and (not req_rev or req_rev == _mcp_reload_loaded_rev))
         _refresh_session_agent() if coalesced else _do_full_reload()
     return _finish_reload(rid, params, coalesced=coalesced)
 

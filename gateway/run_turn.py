@@ -2527,6 +2527,10 @@ class GatewayTurnMixin:
     async def _execute_mcp_reload(self, event: MessageEvent) -> str:
         """Disconnect, reconnect, and notify MCP tool changes (shared by button / text / no-confirm paths).
 
+        Only the user's ``/reload-mcp`` reaches this, so it is an explicit reload: ``lazy: true``
+        servers are live-connected instead of registered from the schema cache
+        (``bypass_lazy_cache=True``); interactive OAuth stays suppressed below.
+
         Under multiplex the reload runs inside the requesting profile's runtime scope (entered here
         when the caller did not) and only that profile's servers are torn down and rediscovered.
 
@@ -2563,7 +2567,8 @@ class GatewayTurnMixin:
             # a browser OAuth flow either: an expired token parks with a `hermes mcp login` hint.
             from tools.mcp_oauth import suppress_interactive_oauth
             with suppress_interactive_oauth():
-                new_tools = await self._run_in_executor_with_context(discover_mcp_tools)
+                new_tools = await self._run_in_executor_with_context(
+                    lambda: discover_mcp_tools(bypass_lazy_cache=True))
 
             connected_servers = _scoped_server_names()
             if reload_scope is not None:

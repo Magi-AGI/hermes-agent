@@ -44,7 +44,7 @@ class TestCLILoadingIndicator:
         cli_obj = self._make_cli()
         seen = {}
 
-        def fake_reload():
+        def fake_reload(**_kw):  # R9: the confirmed /reload-mcp calls _reload_mcp(explicit=True)
             seen["running"] = cli_obj._command_running
             seen["status"] = cli_obj._command_status
             print("reload done")

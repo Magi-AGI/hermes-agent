@@ -3376,12 +3376,13 @@ export type ReloadEnvParams = Record<string, never>
 export interface ReloadEnvResult {
   updated: number
 }
-/** Without ``confirm`` the handler may answer ``confirm_required`` (per ``approvals.mcp_reload_confirm``); ``always`` persists the opt-out; ``rev`` is the config revision the caller wants loaded (coalescing). */
+/** Without ``confirm`` the handler may answer ``confirm_required`` (per ``approvals.mcp_reload_confirm``); ``always`` persists the opt-out; ``rev`` is the config revision the caller wants loaded (coalescing). ``explicit`` marks a reload the USER asked for (the typed ``/reload-mcp``): ``lazy: true`` servers are then live-connected instead of registered from the schema cache, and the request never coalesces into an automatic reload. Config-sync and write-through reloads leave it false. */
 export interface ReloadMcpParams {
   session_id?: string | null
   confirm?: boolean
   always?: boolean
   rev?: string | null
+  explicit?: boolean
 }
 export interface ReloadMcpResult {
   status: ReloadMcpStatus

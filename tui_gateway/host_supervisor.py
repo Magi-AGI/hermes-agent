@@ -366,8 +366,9 @@ class HostSupervisor:
         frame = {"type": "respond", "sid": sid, "request_id": request_id, "params": dict(params)}
         return self._await_reply(frame, request_id, timeout)
 
-    def reload_mcp(self, sid: str, *, request_id: str | None = None) -> dict:
-        payload = {"type": "reload_mcp", "sid": sid, "request_id": request_id or uuid.uuid4().hex}
+    def reload_mcp(self, sid: str, *, request_id: str | None = None, explicit: bool = False) -> dict:
+        payload = {"type": "reload_mcp", "sid": sid, "request_id": request_id or uuid.uuid4().hex,
+                   "explicit": bool(explicit)}
         return self.control(sid, route_name="reload.mcp", wait=True, payload=payload)
 
     def control(
