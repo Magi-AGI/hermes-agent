@@ -527,6 +527,17 @@ class ToolRegistry:
     def get_tool_names_for_toolset(self, toolset: str) -> List[str]:
         return sorted(e.name for e in self._grouped(self._snapshot_entries()).get(toolset, []))
 
+    def get_tool_names_for_toolset_in_scope(self, toolset: str, scope: Optional[str]) -> List[str]:
+        """Names registered under *toolset* in exactly one slot (``None`` = the process-global map),
+        with no merging of the other: what one profile's overlay itself holds."""
+        with self._lock:
+            return sorted(n for n, e in self._slot(scope).items() if e.toolset == toolset)
+
+    def is_registered_anywhere(self, name: str) -> bool:
+        """Whether *name* is registered in the global map or in ANY profile overlay."""
+        with self._lock:
+            return name in self._tools or any(name in overlay for overlay in self._scoped_tools.values())
+
     def register_toolset_alias(self, alias: str, toolset: str) -> None:
         """Register an explicit alias for a canonical toolset name."""
         with self._lock:

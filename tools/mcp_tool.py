@@ -328,7 +328,8 @@ class MCPServerTask(MCPServerRunMixin, MCPServerTransportMixin, MCPServerHealthM
         "_recycled_reason", "initialize_result", "_ping_unsupported", "_list_cache_meta",
         "_reconnect_retries", "_session_proven", "_was_parked", "_inflight_tasks", "_reconnecting",
         "_suspect_reason", "_teardown_race", "_permanent_grace_used", "_stdio_child_pids",
-        "_ever_connected", "_sse_fallback", "_park_reason", "_last_park_line", "_park_probes")
+        "_ever_connected", "_sse_fallback", "_park_reason", "_last_park_line", "_park_probes",
+        "_list_published")
 
     def __init__(self, name: str):
         self.name = name
@@ -411,6 +412,9 @@ class MCPServerTask(MCPServerRunMixin, MCPServerTransportMixin, MCPServerHealthM
         self.initialize_result: Optional[Any] = None
         # SEP-2549 cache hints from the last tools/list (ttl_ms, cache_scope).
         self._list_cache_meta: dict = {}
+        # True while ``_tools`` is this connection's published list (set by publication, cleared
+        # at teardown): the per-profile reconcile publishes ``_tools`` only while it is.
+        self._list_published: bool = False
         # Latched when ``ping`` returns -32601; keepalives then use list_tools. Reset per connect.
         self._ping_unsupported: bool = False
 
@@ -495,10 +499,14 @@ _CIRCUIT_BREAKER_THRESHOLD, _CIRCUIT_BREAKER_COOLDOWN_SEC = 3, 60.0
 # ``_tool_read_only_hints`` by the connection key (the server's own tool annotations).
 _server_trust_levels: Dict[Any, str] = {}
 _tool_read_only_hints: Dict[Any, Dict[str, bool]] = {}
-# (connection key, adopting scope) -> that profile's own server config. A shared live connection is
-# published into every adopter's overlay and cache under the ADOPTER's policy (tool filter,
-# tools.resources / tools.prompts), never the owner's.
+# (connection key, scope) -> that profile's own server config, for EVERY profile using the connection
+# (the owner, under its own scope, which is None outside a multiplexer; and each adopter). Together
+# with the connection's published list it is the whole input of the per-profile reconcile
+# (mcp_tool_registration._reconcile_profile). Written only by _set_profile_policy.
 _server_scope_configs: Dict[Any, dict] = {}
+# (connection key, scope) -> policy epoch, bumped on every policy write so an in-flight reconcile
+# whose input changed under it recomputes instead of publishing a stale result.
+_server_scope_epochs: Dict[Any, int] = {}
 
 _TRUST_FULL, _TRUST_UNTRUSTED = "full", "untrusted"
 
