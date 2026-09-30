@@ -333,21 +333,21 @@ def _stdin_is_console() -> bool:
 def _config_allows_unattended_oauth() -> bool:
     """``mcp.interactive_oauth`` from the active profile's config (default true = upstream
     behaviour). False means only an explicit, user-started login (``force_interactive_oauth``)
-    may run a browser / loopback authorization flow. A missing key on a clean read keeps the
-    default. Everything else fails CLOSED, because the key exists to guarantee no unattended
-    browser: a present but unrecognised value (a typo), a loader that raises, and a config.yaml
-    that does not parse. The loader does not raise on a parse failure: it serves the last good
-    config or, in a fresh process with no good backup, DEFAULT_CONFIG (``interactive_oauth: true``),
-    either of which can hide a ``false`` in the broken file. ``get_active_config_parse_failure``
-    reports that state while the file on disk is still the one that failed."""
+    may run a browser / loopback authorization flow.
+
+    Read with ``read_config_value_fresh``, not the general loader: one uncached read of the
+    current bytes whose value and success are a single observation. The loader can serve a value
+    that is not on disk (last-known-good or DEFAULT_CONFIG after a failed read, or a cached value
+    across a same-size in-place edit that keeps the Windows file signature), and a separate
+    failure check afterwards can look at a different file than the one that failed.
+
+    No config file, an empty file, or a clean read without the key keeps the default. Everything
+    else fails CLOSED, because the key exists to guarantee no unattended browser: an unreadable
+    or unparseable user or managed config.yaml (including one that vanishes mid-read) and a
+    present but unrecognised value (a typo)."""
     try:
-        from hermes_cli.config import get_active_config_parse_failure, load_config_readonly
-        loaded = load_config_readonly()
-        if get_active_config_parse_failure():
-            logger.debug("config.yaml does not parse; no unattended MCP OAuth until it is fixed")
-            return False
-        mcp_cfg = loaded.get("mcp") or {}
-        raw = mcp_cfg.get("interactive_oauth") if isinstance(mcp_cfg, dict) else None
+        from hermes_cli.config import read_config_value_fresh
+        raw = read_config_value_fresh("mcp", "interactive_oauth")
     except Exception:
         logger.debug("config could not be read; no unattended MCP OAuth", exc_info=True)
         return False
@@ -411,6 +411,24 @@ def suppress_interactive_oauth():
     callback actually runs (#35927). A threading.local would not cross that thread boundary.
     """
     return _contextvar_set(_oauth_interactive_enabled, False)
+
+
+@contextlib.contextmanager
+def outside_login_context():
+    """Run the block as if no explicit login were in progress: ``forced`` off and no dashboard
+    flow, while suppression and the config key still apply as usual. For code that creates a
+    LONG-LIVED server task (session registration): the task copies this context, its first
+    transport can serve for hours, and a 401 on it must not run a login's browser flow. A login's
+    own probe connect does not use this."""
+    from tools.mcp_dashboard_oauth import _current_dashboard_flow
+
+    forced_token = _oauth_interactive_forced.set(False)
+    flow_token = _current_dashboard_flow.set(None)
+    try:
+        yield
+    finally:
+        _current_dashboard_flow.reset(flow_token)
+        _oauth_interactive_forced.reset(forced_token)
 
 
 def enter_background_oauth_mode() -> None:

@@ -285,14 +285,27 @@ def _get_connected_server_for_call(server_name: str) -> Optional[_core.MCPServer
         return _core._servers.get(key)
 
 
+def _outside_login_context():
+    """``tools.mcp_oauth.outside_login_context`` when OAuth support is importable, else a no-op."""
+    try:
+        from tools.mcp_oauth import outside_login_context
+    except Exception:  # pragma: no cover - OAuth support unavailable
+        import contextlib
+        return contextlib.nullcontext()
+    return outside_login_context()
+
+
 async def _discover_and_register_server(name: str, config: dict) -> List[str]:
     """Connect one server, register its tools; return the registered names."""
     # The claim fires inside _connect_server while this frame is suspended (list, not nonlocal).
     claimed: List[_core.MCPServerTask] = []
     claim_token = _core._connect_server_claim.set(claimed.append)
     try:
-        server = await asyncio.wait_for(_connect_server(name, config),
-                                        timeout=config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT))
+        # A session registration is long-lived: its run task must never carry a caller's login
+        # context (forced / dashboard flow) into later re-auths on its first transport.
+        with _outside_login_context():
+            server = await asyncio.wait_for(_connect_server(name, config),
+                                            timeout=config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT))
     except BaseException:
         server = claimed[0] if claimed else None
         task = server._task if server is not None else None

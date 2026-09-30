@@ -166,10 +166,10 @@ def test_key_off_unreadable_config_also_refuses(oauth_world, monkeypatch):
     """A config that cannot be read fails closed here too (same predicate as ``_is_interactive``)."""
     import hermes_cli.config as config_mod
 
-    def boom():
+    def boom(*_a, **_k):
         raise OSError("config unreadable")
 
-    monkeypatch.setattr(config_mod, "load_config_readonly", boom)
+    monkeypatch.setattr(config_mod, "read_config_value_fresh", boom)
     thread, box, _ = _call_in_thread(AUTHORIZE, session_id="broken-off", callback=None)
     assert not thread.is_alive()
     assert "hermes mcp login" in json.loads(box["out"])["error"]

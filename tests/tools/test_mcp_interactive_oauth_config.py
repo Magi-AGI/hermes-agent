@@ -96,10 +96,10 @@ def test_config_loader_raising_fails_closed(console, monkeypatch):
     import hermes_cli.config as config_mod
     import tools.mcp_oauth as mod
 
-    def boom():
+    def boom(*_a, **_k):
         raise OSError("config.yaml: permission denied")
 
-    monkeypatch.setattr(config_mod, "load_config_readonly", boom)
+    monkeypatch.setattr(config_mod, "read_config_value_fresh", boom)
     assert mod._config_allows_unattended_oauth() is False
     assert mod._is_interactive() is False
     with pytest.raises(mod.OAuthNonInteractiveError, match="hermes mcp login"):
@@ -211,9 +211,13 @@ def test_interrupted_read_fresh_process_fails_closed(console, monkeypatch, fail_
     _write_config("mcp:\n  interactive_oauth: false\n")
     _inject_open_fault(monkeypatch, vanish=vanish, fail_at=fail_at)
     assert config_mod.load_config_readonly()["mcp"]["interactive_oauth"] is True, \
-        "precondition: the interrupted read served a true value"
+        "precondition: the general loader serves a true value for this interrupted read"
+    if vanish:
+        # The file is gone now; put the fault back on a file that exists again, so the decision's
+        # own read is the interrupted one (the decision reads the file itself, see R4 Codex-a).
+        _write_config("mcp:\n  interactive_oauth: false\n")
+        _inject_open_fault(monkeypatch, vanish=vanish, fail_at=fail_at)
     assert mod._config_allows_unattended_oauth() is False
-    assert mod._is_interactive() is False
 
 
 @pytest.mark.parametrize("fail_at", ["open", "read"])
@@ -229,23 +233,197 @@ def test_interrupted_read_after_earlier_true_fails_closed(console, monkeypatch, 
     assert mod._config_allows_unattended_oauth() is False
 
 
-def test_interrupted_read_stays_closed_until_the_file_is_back(console, monkeypatch):
-    """After the race the file is simply missing; that is still the failed read, not a config
-    the user never had. Writing the file again ends it."""
-    import tools.mcp_oauth as mod
-
-    _write_config("mcp:\n  interactive_oauth: false\n")
-    _inject_open_fault(monkeypatch, vanish=True, fail_at="open")
-    assert mod._config_allows_unattended_oauth() is False
+def _clear_fault(monkeypatch):
     import builtins
     import hermes_cli.config as config_mod
 
     # Only the fault goes away (monkeypatch.undo would also revert the sandboxed HERMES_HOME).
     monkeypatch.setattr(config_mod, "open", builtins.open, raising=False)
-    assert not _config_path().exists()
+
+
+def test_interrupted_read_lock_ends_when_a_later_load_finds_no_file(console, monkeypatch):
+    """R4 AG-2b: the interrupted read fails closed, but the lock is not permanent. A later look
+    that finds the file cleanly absent at stat is "no config" (today's default), for the OAuth
+    decision and for the loader's parse-failure record (provider env-key adoption) alike."""
+    import hermes_cli.config as config_mod
+    import tools.mcp_oauth as mod
+
+    _write_config("mcp:\n  interactive_oauth: false\n")
+    _inject_open_fault(monkeypatch, vanish=True, fail_at="open")
     assert mod._config_allows_unattended_oauth() is False
-    _write_config("mcp:\n  discovery_concurrency: 4\n")
+    _clear_fault(monkeypatch)
+    assert not _config_path().exists()
+    config_mod.load_config_readonly()
+    assert config_mod.get_active_config_parse_failure() is None, "provider adoption stays locked"
     assert mod._config_allows_unattended_oauth() is True
+    _write_config("mcp:\n  interactive_oauth: false\n")
+    assert mod._config_allows_unattended_oauth() is False
+
+
+def test_ongoing_read_error_keeps_the_lock(console, monkeypatch):
+    """A file that is there but keeps failing to read stays closed on every check."""
+    import tools.mcp_oauth as mod
+
+    _write_config("mcp:\n  interactive_oauth: false\n")
+    _inject_open_fault(monkeypatch, vanish=False, fail_at="open")
+    for _ in range(3):
+        assert mod._config_allows_unattended_oauth() is False
+
+
+def test_broken_config_then_deleted_is_no_config(console):
+    """R4 AG-2a (ACCEPTED-LIMIT, pinned): a config that failed to parse and was then deleted by
+    the user reads as "no config", i.e. today's default. Deleting config.yaml is deliberate."""
+    import tools.mcp_oauth as mod
+
+    _write_config("mcp:\n  interactive_oauth: false\n  broken: [unclosed\n")
+    assert mod._config_allows_unattended_oauth() is False
+    _config_path().unlink()
+    assert mod._config_allows_unattended_oauth() is True
+
+
+def test_parse_failure_recorded_under_another_spelling_of_the_path_still_matches(console):
+    """R4 AG-4: callers of the funnel build their own paths (auth.py, gateway_migrate, the write
+    guard). The same file under another spelling must be the same record."""
+    import hermes_cli.config as config_mod
+
+    _write_config("mcp:\n  interactive_oauth: false\n")
+    path = _config_path()
+    (path.parent / "sub").mkdir(exist_ok=True)
+    other = path.parent / "sub" / ".." / path.name
+    assert str(other) != str(path)
+    config_mod._warn_config_parse_failure(other, ValueError("bad yaml"))
+    assert config_mod.get_active_config_parse_failure() == "bad yaml"
+
+
+def test_zero_byte_config_reads_as_empty_config(console):
+    """R4 AG-8 (ACCEPTED-LIMIT, pinned): a 0-byte file cannot be told apart from an
+    intentionally empty config, so it keeps today's default."""
+    import tools.mcp_oauth as mod
+
+    _config_path().write_bytes(b"")
+    assert mod._config_allows_unattended_oauth() is True
+
+
+# --- R4 Codex-a / Codex-b: the decision is one read of the current bytes --------------------
+
+def test_codex_a_file_reappears_after_interrupted_read_before_failure_check(console, monkeypatch):
+    """Codex P1-a (adopted from codex-prelim-hb-race.py): stat -> open fails (file replaced) ->
+    the replacement lands before a separate failure check. The value and its read status must
+    come from the same observation."""
+    import builtins
+    import hermes_cli.config as config_mod
+    import tools.mcp_oauth as mod
+
+    path = _config_path()
+    restricted = "mcp:\n  interactive_oauth: false\n"
+    path.write_text(restricted, encoding="utf-8")
+    actual_open, interrupted = builtins.open, []
+
+    def open_during_replacement(file, *args, **kwargs):
+        if Path(file) == path and not interrupted:
+            interrupted.append(1)
+            path.unlink()
+            raise FileNotFoundError(2, "interrupted replacement", str(path))
+        return actual_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(config_mod, "open", open_during_replacement, raising=False)
+    monkeypatch.setattr(mod, "open", open_during_replacement, raising=False)
+    actual_check = config_mod.get_active_config_parse_failure
+
+    def replacement_finishes_before_failure_check():
+        if interrupted and not path.exists():
+            path.write_text(restricted, encoding="utf-8")
+        return actual_check()
+
+    monkeypatch.setattr(config_mod, "get_active_config_parse_failure",
+                        replacement_finishes_before_failure_check)
+    assert mod._config_allows_unattended_oauth() is False
+
+
+def test_codex_b_same_signature_policy_flip_is_seen(console):
+    """Codex P1-b (adopted): true -> false rewritten in place with the same size and mtime keeps
+    the four-field file signature on Windows; the decision must still see false."""
+    import os
+
+    from hermes_cli.config import file_signature
+    import tools.mcp_oauth as mod
+
+    path = _config_path()
+    allowed = b"mcp:\n  interactive_oauth: true \n"
+    restricted = b"mcp:\n  interactive_oauth: false\n"
+    assert len(allowed) == len(restricted)
+    path.write_bytes(allowed)
+    assert mod._config_allows_unattended_oauth() is True
+    original = path.stat()
+    original_sig = file_signature(original)
+    with path.open("r+b") as handle:
+        handle.write(restricted)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
+    if file_signature(path.stat()) != original_sig:
+        pytest.skip("this filesystem changes the signature on an in-place write (POSIX ctime)")
+    assert mod._config_allows_unattended_oauth() is False
+
+
+def test_managed_scope_pin_wins_and_its_read_failure_fails_closed(console, monkeypatch, tmp_path):
+    """The general loader lets the managed (admin) config win at the leaf; the decision's own
+    read must keep that, and an unreadable managed file fails closed."""
+    import hermes_cli.managed_scope as managed_scope
+    import tools.mcp_oauth as mod
+
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    monkeypatch.setattr(managed_scope, "get_managed_dir", lambda: managed)
+    _write_config("mcp:\n  interactive_oauth: true\n")
+    (managed / "config.yaml").write_text("mcp:\n  interactive_oauth: false\n", encoding="utf-8")
+    assert mod._config_allows_unattended_oauth() is False
+    (managed / "config.yaml").write_text("mcp: [unclosed\n", encoding="utf-8")
+    assert mod._config_allows_unattended_oauth() is False
+    (managed / "config.yaml").write_text("other: 1\n", encoding="utf-8")
+    assert mod._config_allows_unattended_oauth() is True
+
+
+# --- R4 AG-9: the key is honoured on the real MCP loop thread (ContextVar propagation) -------
+
+@pytest.fixture()
+def mcp_loop():
+    from tools import mcp_tool_loop
+
+    mcp_tool_loop._ensure_mcp_loop()
+    yield mcp_tool_loop
+    mcp_tool_loop._stop_mcp_loop()
+
+
+def test_key_off_refused_on_the_real_mcp_loop_thread(console, mcp_loop):
+    import threading
+
+    import tools.mcp_oauth as mod
+
+    _write_config("mcp:\n  interactive_oauth: false\n")
+    caller, seen = threading.get_ident(), {}
+
+    async def _handler():
+        seen["thread"] = threading.get_ident()
+        await mod._make_redirect_handler(49317)("https://idp.example.invalid/authorize?state=l1")
+
+    with pytest.raises(mod.OAuthNonInteractiveError, match="hermes mcp login"):
+        mcp_loop._run_on_mcp_loop(_handler, timeout=10)
+    assert seen["thread"] != caller, "ran on the caller's thread, not the MCP loop thread"
+    console.assert_not_called()
+
+
+def test_forced_login_crosses_to_the_real_mcp_loop_thread_with_key_off(console, mcp_loop):
+    import tools.mcp_oauth as mod
+
+    _write_config("mcp:\n  interactive_oauth: false\n")
+
+    async def _handler():
+        await mod._make_redirect_handler(49318)("https://idp.example.invalid/authorize?state=l2")
+
+    with mod.force_interactive_oauth():
+        mcp_loop._run_on_mcp_loop(_handler, timeout=10)
+    console.assert_called_once_with("https://idp.example.invalid/authorize?state=l2")
 
 
 # --- unchanged: empty config, absent key, a config file that does not exist ------------------

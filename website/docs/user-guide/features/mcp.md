@@ -774,8 +774,11 @@ with no card, telling you to use `hermes mcp login <server>` or the Login button
 `install` of an OAuth catalog entry still works in the desktop card, because its authorization only
 starts when you approve the card. Where there is no card, that install is refused the same way.
 
+Hermes reads this key straight from the file each time it decides, not from its settings cache.
 If `config.yaml` can't be read or doesn't parse, Hermes treats the key as false until the file is
-fixed, because the broken file may be the one that says `false`.
+fixed, because the broken file may be the one that says `false`. An administrator's managed
+`config.yaml` wins over yours, and it fails closed the same way. With no `config.yaml` at all,
+the default applies.
 
 ### Lazy start
 

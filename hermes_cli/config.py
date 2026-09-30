@@ -64,6 +64,15 @@ _CONFIG_PARSE_FAILURES: dict = {}
 _UNSTATTABLE_SIG = (-1, -1, -1, -1)
 
 
+def _parse_failure_key(path: Any) -> str:
+    """One key per FILE, not per spelling: funnel callers build their own paths (auth.py, the write
+    guard, gateway_migrate) while the lookup uses ``get_config_path()``."""
+    try:
+        return os.path.normcase(os.path.realpath(os.fspath(path)))
+    except Exception:
+        return str(path)
+
+
 class InvalidUserConfigError(RuntimeError):
     """Raised when a run that cannot repair config finds invalid user YAML."""
 
@@ -114,12 +123,13 @@ def _warn_config_parse_failure(
         st = config_path.stat()
         sig = file_signature(st)
         key = (str(config_path), *sig)
-        _CONFIG_PARSE_FAILURES[str(config_path)] = (*sig, str(exc))
+        _CONFIG_PARSE_FAILURES[_parse_failure_key(config_path)] = (*sig, str(exc))
     except OSError:
         key = (str(config_path), 0, 0, 0, 0)
         # Every caller saw the file exist before its read failed, so this is an interrupted read,
         # not an absent config: record it, or the fallback it returns would pass as a clean read.
-        _CONFIG_PARSE_FAILURES[str(config_path)] = (*_UNSTATTABLE_SIG, str(exc))
+        # A later load that finds the file cleanly absent ends it (_clear_interrupted_read_failure).
+        _CONFIG_PARSE_FAILURES[_parse_failure_key(config_path)] = (*_UNSTATTABLE_SIG, str(exc))
     if key in _CONFIG_PARSE_WARNED:
         return
     _CONFIG_PARSE_WARNED.add(key)
@@ -136,13 +146,75 @@ def _warn_config_parse_failure(
         pass
 
 
+def _clear_interrupted_read_failure(config_path: Path) -> None:
+    """A load found config.yaml cleanly absent at stat: that is "no config" (today's default), so an
+    interrupted-read record for it ends here instead of locking env-key adoption forever."""
+    key = _parse_failure_key(config_path)
+    record = _CONFIG_PARSE_FAILURES.get(key)
+    if record is not None and tuple(record[:4]) == _UNSTATTABLE_SIG:
+        _CONFIG_PARSE_FAILURES.pop(key, None)
+
+
+class ConfigReadError(RuntimeError):
+    """``read_config_value_fresh`` could not read or parse a config file that exists."""
+
+
+def _read_yaml_mapping_fresh(path: Path) -> Optional[Dict[str, Any]]:
+    """Parse *path* from its CURRENT bytes: no cache, no last-known-good. None when the file is
+    cleanly absent at stat; ``ConfigReadError`` for any failure after that (including the file
+    vanishing between stat and read) and for a non-mapping root. Empty file -> ``{}``."""
+    try:
+        os.stat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ConfigReadError(f"{path}: cannot be accessed ({exc})") from exc
+    try:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        data = fast_safe_load(text)
+    except Exception as exc:
+        raise ConfigReadError(f"{path}: could not be read ({exc})") from exc
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ConfigReadError(f"{path}: top level is a {type(data).__name__}, not a mapping")
+    return data
+
+
+def read_config_value_fresh(*keys: str) -> Any:
+    """One uncached read of a security-relevant value, for decisions that must not trust the
+    metadata-keyed load cache (Windows keeps the same size+mtime+ino+ctime signature across an
+    in-place same-size edit) or a fallback served for a read that failed.
+
+    The value and the success of the read come from the SAME observation: an unreadable or
+    unparseable user or managed config.yaml raises ``ConfigReadError``, so no stale or default
+    value can pass for a clean read. Precedence matches ``load_config``: the managed (admin)
+    file wins at the leaf. Returns None when the key is absent (including no config at all).
+    Values are raw YAML: ``${VAR}`` references are not expanded."""
+    def _dig(mapping: Optional[Dict[str, Any]]) -> tuple:
+        node: Any = mapping
+        for key in keys:
+            if not isinstance(node, dict) or key not in node:
+                return False, None
+            node = node[key]
+        return True, node
+
+    managed_dir = managed_scope.get_managed_dir()
+    if managed_dir:
+        found, value = _dig(_read_yaml_mapping_fresh(Path(managed_dir) / "config.yaml"))
+        if found:
+            return value
+    return _dig(_read_yaml_mapping_fresh(get_config_path()))[1]
+
+
 def get_active_config_parse_failure() -> Optional[str]:
     """Return the recorded parse error while the ACTIVE config.yaml is still byte-identical
     (mtime_ns + size + ino + ctime_ns) to the file that failed to parse; else None. A read
     interrupted because the file vanished or became unreadable after its existence check stays
-    active while the file still cannot be stat'd; a config that was never there has no record."""
+    active until a load finds the file cleanly absent; a config that was never there has no record."""
     try:
-        record = _CONFIG_PARSE_FAILURES[str(path := get_config_path())]
+        record = _CONFIG_PARSE_FAILURES[_parse_failure_key(path := get_config_path())]
         try:
             st = path.stat()
         except OSError:
@@ -2318,6 +2390,8 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
 
         config = copy.deepcopy(DEFAULT_CONFIG)
 
+        if user_sig is None:
+            _clear_interrupted_read_failure(config_path)
         if user_sig is not None:
             try:
                 with open(config_path, encoding="utf-8") as f:
