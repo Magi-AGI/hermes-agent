@@ -146,13 +146,19 @@ class MCPServerHealthMixin:
                 if session is None:
                     logger.debug("MCP server '%s': skipping dynamic tool refresh; session not connected", self.name)
                     return
-                new_mcp_tools = await _core._paginate_full_list(session.list_tools, "tools", self.name)
+                # This response's own SEP-2549 hints (first page) replace the connect-time ones:
+                # the cache write below reads ``_list_cache_meta``, and reusing the old meta kept a
+                # stale TTL (a new ``ttlMs=0`` was lost and the next startup took a cache hit).
+                list_meta: dict = {}
+                new_mcp_tools = await _core._paginate_full_list(session.list_tools, "tools", self.name,
+                                                                cache_meta_out=list_meta)
             # Remove only stale names first — no nuke-and-repave: live turns may hold tool-call
             # IDs pointing at existing handlers; in-place replacement avoids "not connected" races.
             self._deregister_owned(old_tool_names - {mcp_prefixed_tool_name(self.name, tool.name) for tool in new_mcp_tools})
             # Re-register; a raw name can become ambiguous after normalization without changing
             # its normalized name, so also drop old entries the final registration no longer owns.
             self._tools = new_mcp_tools
+            self._list_cache_meta = list_meta
             registered_names = _registration._register_server_tools(self.name, self, self._config)
             self._deregister_owned(old_tool_names - set(registered_names))
             self._registered_tool_names = registered_names
