@@ -180,6 +180,9 @@ async def test_reload_mcp_reports_a_shared_server_to_a_non_owner_profile(
     monkeypatch.setattr(mcp_tool, "_servers", {"shared": live_server})
     monkeypatch.setattr(mcp_tool, "_server_scope_keys", {"shared": launch_scope})
     monkeypatch.setattr(mcp_tool, "_server_tool_scopes", {"shared": {launch_scope}}, raising=False)
+    # R10: per-profile policy records are connection state like the scope map above; isolate them too.
+    monkeypatch.setattr(mcp_tool, "_server_scope_configs", {}, raising=False)
+    monkeypatch.setattr(mcp_tool, "_server_scope_epochs", {}, raising=False)
     monkeypatch.setattr(mcp_tool, "_server_connecting", set())
     monkeypatch.setattr(mcp_tool, "_server_connect_errors", {})
     monkeypatch.setattr(mcp_tool, "_lazy_server_configs", {})
@@ -286,7 +289,12 @@ def test_shared_server_tools_are_callable_and_removed_on_non_owner_reload(
             "_server_scope_keys": dict(mcp_tool._server_scope_keys),
             "_server_tool_scopes": dict(mcp_tool._server_tool_scopes),
             "_mcp_tool_server_names": dict(mcp_tool._mcp_tool_server_names),
+            # R10: per-profile policy records are connection state; isolate them like the rest.
+            "_server_scope_configs": dict(mcp_tool._server_scope_configs),
+            "_server_scope_epochs": dict(mcp_tool._server_scope_epochs),
         }
+        mcp_tool._server_scope_configs.clear()
+        mcp_tool._server_scope_epochs.clear()
         mcp_tool._servers.clear()
         mcp_tool._server_scope_keys.clear()
         mcp_tool._server_tool_scopes.clear()

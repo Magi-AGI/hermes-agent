@@ -253,11 +253,15 @@ def shutdown_mcp_servers(*, scope: Optional[str] = None, names: Optional[set] = 
                         _core._orphaned_adopters.setdefault(adopter, set()).add(_key_name(key))
 
     def clear_selected_status():
+        from tools import mcp_tool_registration as _registration
+
         _core._server_connecting.difference_update(selected_status)
         for key in selected_status:
             _core._server_connect_errors.pop(key, None)
             _core._server_scope_keys.pop(key, None)
-            _core._server_tool_scopes.pop(key, None)
+            # Every profile's policy for the destroyed connection (live state was emptied by the
+            # task's own teardown reconcile); a surviving adopter re-adopts via the orphan path.
+            _registration._forget_connection_profiles_locked(key)
 
     # Fast path: nothing to shut down. The connect-cooldown maps can still be populated here — a server that
     # failed to connect is never recorded in ``_servers`` (that is the very premise of the #50394 cooldown),

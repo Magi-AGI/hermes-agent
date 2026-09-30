@@ -129,22 +129,9 @@ def _restore_server_toolset_alias(key) -> None:
 
 
 def _remove_server_scope(key, scope: str) -> None:
-    """Remove one profile's MCP overlay for a shared live connection."""
-    from tools.registry import registry
-
-    server_name = _key_name(key)
-    for tool_name in registry.get_tool_names_for_toolset(f"mcp-{server_name}"):
-        registry.deregister(tool_name, scope=scope)
-    with _core._lock:
-        scopes = set(_core._server_tool_scopes.get(key, ()))
-        scopes.discard(scope)
-        if scopes:
-            _core._server_tool_scopes[key] = scopes
-        else:
-            _core._server_tool_scopes.pop(key, None)
-        _core._server_trust_levels.pop(_server_key(server_name, scope, current=False), None)
-        _core._server_scope_configs.pop((key, scope), None)
-    _restore_server_toolset_alias(key)
+    """One profile stops using a shared live connection: a policy LOSS, recomputed (its live entries
+    go; its membership, policy and trust record go)."""
+    _set_profile_policy(key, scope, None)
 
 
 def _select_utility_schemas(server_name: str, server: "MCPServerTask", config: dict) -> List[dict]:
@@ -479,22 +466,17 @@ def _publish_to_adopters(name: str, server: "MCPServerTask", key, hints: dict) -
 
 
 def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> List[str]:
-    """Register a connected server's tools plus utilities (initial discovery and list_changed
-    refresh); returns the names. Toolset aliases derive from the live registry, not
-    ``toolsets.TOOLSETS``; lossy normalization collisions (``read-file``/``read_file``) fail closed."""
-    should_register = _make_tool_filter(name, config)
+    """PUBLISH ``server._tools`` (initial discovery, revival, list_changed refresh, reconnect): the
+    connection's published list changed, so every profile using it is recomputed by
+    ``_reconcile_connection`` (the owner under *config*, each adopter under its own policy).
+    Returns the owner's names. Lossy normalization collisions fail closed; a name another toolset
+    owns is never overwritten."""
     key = _server_key_for_task(server)
     _record_tool_trust_metadata(name, config, server._tools, key)
-    candidates = _tool_candidates(name, server._tools, should_register, server.tool_timeout)
-    candidates += _utility_candidates(name, _select_utility_schemas(name, server, config), server.tool_timeout)
-    registered = _register_candidates(
-        name, _resolve_name_collisions(name, candidates),
-        check_fn=_make_check_fn(name), scope=lambda: _core._server_registry_scope(key), lazy=False, key=key)
-    # The cache mirrors every published list, empty ones included (see _write_schema_cache).
-    _write_schema_cache(name, server, config, should_register)
-    # Every profile that adopted the connection gets the same list, live and cached, under its own policy.
-    _publish_to_adopters(name, server, key, _list_hints(server))
-    return registered
+    server._list_published = True
+    with _connection_lock(key):
+        _set_profile_policy(key, _core._server_registry_scope(key), config, server=server, reconcile=False)
+        return _reconcile_connection(key, server)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -523,17 +505,23 @@ def _connection_lock(key) -> "threading.RLock":
 
 
 def _profile_scopes(key) -> List[Optional[str]]:
-    """Every scope with a policy for *key*: the owner's first, then adopters in a stable order."""
+    """The owner's scope (ALWAYS: its slot must equal f(list, owner policy), which is empty when it
+    has none) and every scope holding a policy for *key*, owner first, then a stable order."""
     owner = _core._server_registry_scope(key)
     with _core._lock:
-        scopes = [scope for (k, scope) in _core._server_scope_configs if k == key]
-    return sorted(set(scopes), key=lambda s: (s != owner, "" if s is None else str(s)))
+        scopes = {scope for (k, scope) in _core._server_scope_configs if k == key}
+    scopes.add(owner)
+    return sorted(scopes, key=lambda s: (s != owner, "" if s is None else str(s)))
 
 
 def _sync_membership_locked(key) -> None:
-    """``_server_tool_scopes[key]`` = the non-None scopes holding a policy for *key*. Caller holds
+    """``_server_tool_scopes[key]`` = the owner's scope while the connection is live, plus every
+    non-None scope holding a policy for *key* (derived, never written elsewhere). Caller holds
     ``_core._lock``."""
     scopes = {scope for (k, scope) in _core._server_scope_configs if k == key and scope is not None}
+    owner = _core._server_scope_keys.get(key) or _key_scope(key)
+    if owner is not None and key in _core._servers:
+        scopes.add(owner)
     if scopes:
         _core._server_tool_scopes[key] = scopes
     else:
@@ -653,7 +641,9 @@ def _reconcile_profile(key, scope: Optional[str], *, server=None) -> List[str]:
                 config = _core._server_scope_configs.get(slot)
                 epoch = _core._server_scope_epochs.get(slot, 0)
                 live = server if server is not None else _core._servers.get(key)
-            published = live is not None and bool(getattr(live, "_list_published", False))
+            # MCPServerTask always defines it (False until published); a bare double that lacks it
+            # stands for a connection whose ``_tools`` is its published list.
+            published = live is not None and bool(getattr(live, "_list_published", True))
             desired = _desired_candidates(name, live, config) if (config is not None and published) else []
             with _core._lock:
                 if _core._server_scope_epochs.get(slot, 0) != epoch:
@@ -755,53 +745,45 @@ def _register_connected_into_current_scope(servers: dict) -> int:
     if scope is None:
         return 0
 
+    # This profile's current memberships (its own connections and those it adopted): each is a
+    # policy LOSS (config gone/disabled, route changed, connection down) or a policy CHANGE (config
+    # differs from the recorded one), recomputed immediately either way.
     with _core._lock:
-        stale = []
-        for key, scopes in _core._server_tool_scopes.items():
-            if scope not in scopes:
-                continue
+        memberships = [(key, recorded) for (key, s), recorded in _core._server_scope_configs.items() if s == scope]
+    for key, recorded in memberships:
+        with _core._lock:
             server = _core._servers.get(key)
-            config = servers.get(_key_name(key))
-            cross_profile = _key_scope(key) != scope
-            if (config is None or not _server_enabled(config) or server is None
-                    or getattr(server, "session", None) is None
-                    or not _same_server_route(server, config, cross_profile=cross_profile)):
-                stale.append(key)
-    for key in stale:
-        _remove_server_scope(key, scope)
+        config = servers.get(_key_name(key))
+        cross_profile = _key_scope(key) != scope
+        if (config is None or not _server_enabled(config) or server is None
+                or getattr(server, "session", None) is None
+                or not _same_server_route(server, config, cross_profile=cross_profile)):
+            _remove_server_scope(key, scope)
+        elif dict(config) != recorded:
+            _set_profile_policy(key, scope, config)
 
     registered_servers = 0
     for name, config in servers.items():
         if not _server_enabled(config):
             continue
         with _core._lock:
-            if _server_key(name, scope, current=False) in _core._servers:
-                continue  # this profile has its own connection for the name
+            own = _server_key(name, scope, current=False)
+            if own in _core._servers or own in _core._lazy_server_configs:
+                continue  # this profile has its own connection (live or lazily registered) for the name
             # Any other profile's live connection with the same route AND credentials is shareable.
             shared = [(key, live) for key, live in _core._servers.items()
                       if _key_name(key) == name and getattr(live, "session", None) is not None
                       and _same_server_route(live, config, cross_profile=True)]
         if not shared:
             continue
-        key, server = shared[0]
-        # Visibility for this profile: the owner keeps teardown, this scope sees the connection.
+        key, _server = shared[0]
         with _core._lock:
-            _core._server_tool_scopes.setdefault(key, set()).add(scope)
-            _core._server_scope_configs[(key, scope)] = dict(config)
-        _record_scope_trust(name, config, scope)
-        if registry.get_tool_names_for_toolset(f"mcp-{name}"):
-            continue
-        candidates = _tool_candidates(name, server._tools, _make_tool_filter(name, config), server.tool_timeout)
-        candidates += _utility_candidates(
-            name, _select_utility_schemas(name, server, config), server.tool_timeout)
-        names = _register_candidates(
-            name, _resolve_name_collisions(name, candidates),
-            check_fn=_make_check_fn(name), scope=lambda: scope, lazy=False, key=key)
-        if names:
+            already = (key, scope) in _core._server_scope_configs
+        if already:
+            continue  # reconciled above
+        # GAIN: the owner keeps teardown; this profile's state is recomputed under its own policy.
+        if _set_profile_policy(key, scope, config):
             registered_servers += 1
-            with _core._lock:
-                server._registered_tool_names = sorted(
-                    set(getattr(server, "_registered_tool_names", []) or ()) | set(names))
     return registered_servers
 
 

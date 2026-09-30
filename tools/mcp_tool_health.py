@@ -177,15 +177,12 @@ class MCPServerHealthMixin:
         old_tool_names = set(self._registered_tool_names)
         old_schemas = {t.name: (getattr(t, "description", None), mcp_field(t, "input_schema", "inputSchema"))
                        for t in (self._tools or [])}
-        # Remove only stale names first — no nuke-and-repave: live turns may hold tool-call
-        # IDs pointing at existing handlers; in-place replacement avoids "not connected" races.
-        self._deregister_owned(old_tool_names - {mcp_prefixed_tool_name(self.name, tool.name) for tool in new_mcp_tools})
-        # Re-register; a raw name can become ambiguous after normalization without changing
-        # its normalized name, so also drop old entries the final registration no longer owns.
+        # One reconcile per profile using the connection diffs its own slot against f(list, policy):
+        # stale names go, kept names are overwritten in place (no nuke-and-repave, so live turns
+        # holding tool-call IDs keep a handler), new ones land.
         self._tools = new_mcp_tools
         self._list_cache_meta = list_meta
         registered_names = _registration._register_server_tools(self.name, self, self._config)
-        self._deregister_owned(old_tool_names - set(registered_names))
         self._registered_tool_names = registered_names
         new_tool_names = set(registered_names)
         changed_schemas = {mcp_prefixed_tool_name(self.name, t.name) for t in new_mcp_tools

@@ -572,7 +572,9 @@ class MCPServerRunMixin:
 
     def _deregister_tools(self) -> None:
         """Drop this server's tools from the registry (idempotent); on shutdown AND budget
-        exhaustion, so a dead server never leaves phantom tools in the prompt."""
-        for tool_name in list(getattr(self, "_registered_tool_names", [])):
-            _registration._deregister_mcp_tool_all_scopes(self, tool_name)
+        exhaustion, so a dead server never leaves phantom tools in the prompt. The connection no
+        longer has a published list: every profile using it (owner and adopters, including
+        adopter-only names) is recomputed to empty; memberships and policies are kept for revival."""
+        self._list_published = False
+        _registration._reconcile_connection(_registration._server_key_for_task(self), self)
         self._registered_tool_names = []
