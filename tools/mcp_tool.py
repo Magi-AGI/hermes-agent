@@ -263,7 +263,7 @@ async def _paginate_full_list(list_method, items_attr: str, server_name: str,
     first page's SEP-2549 hints. Callers must hold the server's ``_rpc_lock``."""
     items: list = []
     cursor = None
-    for _ in range(_MCP_LIST_MAX_PAGES):
+    for page_index in range(_MCP_LIST_MAX_PAGES):
         if not cursor:
             result = await list_method()
         else:
@@ -290,7 +290,9 @@ async def _paginate_full_list(list_method, items_attr: str, server_name: str,
                     result = await list_method(cursor=cursor)
             else:
                 result = await list_method(cursor=cursor)
-        if cache_meta_out is not None and not items:
+        # The FIRST RESPONSE's hints govern the list, even when that page carries zero items
+        # (``not items`` let an empty first page's hint be overwritten by page two's).
+        if cache_meta_out is not None and page_index == 0:
             # mcp 2.x fills ttl_ms=0 / cache_scope="private" when the server sends neither, and a
             # recorded 0 is "immediately stale" — every lazy lookup missed. Only wire values count.
             fields_set = getattr(result, "model_fields_set", None)
