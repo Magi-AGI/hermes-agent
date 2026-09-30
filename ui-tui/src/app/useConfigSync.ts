@@ -273,6 +273,10 @@ export interface ConfigRevState {
 
 export const newConfigRevState = (): ConfigRevState => ({ gen: 0, mtime: 0, pending: '', rev: '' })
 
+/** ``config.get`` params bound to the session's profile when there is a session. */
+export const sessionScoped = (params: { key: string }, sessionId?: null | string) =>
+  sessionId ? { ...params, session_id: sessionId } : params
+
 const revKey = (target: { mtime: number; rev: string }) => `${target.mtime}|${target.rev}`
 
 /** Hydrate the display config for ``target`` and only then record it as applied.
@@ -287,7 +291,8 @@ export async function hydrateConfigRevision(
   target: { mtime: number; rev: string },
   setBell: (v: boolean) => void,
   setVoiceRecordKey?: (v: ParsedVoiceRecordKey) => void,
-  setBellOnPrompt?: (v: boolean) => void
+  setBellOnPrompt?: (v: boolean) => void,
+  sessionId?: null | string
 ): Promise<boolean> {
   const key = revKey(target)
 
@@ -298,7 +303,9 @@ export async function hydrateConfigRevision(
   const gen = ++state.gen
   state.pending = key
 
-  const cfg = await quietRpc<ConfigFullResponse>(gw, 'config.get', { key: 'full' })
+  // session_id scopes the read to THIS session's profile (a secondary profile's config otherwise read
+  // as the launch profile's).
+  const cfg = await quietRpc<ConfigFullResponse>(gw, 'config.get', sessionScoped({ key: 'full' }, sessionId))
 
   if (gen !== state.gen) {
     return false
@@ -397,7 +404,7 @@ export function useConfigSync({
     // Environment flags are enough to initialize the UI bit; the heavier status
     // check still runs when the user opens /voice.
     setVoiceEnabled(process.env.HERMES_VOICE === '1')
-    quietRpc<ConfigMtimeResponse>(gw, 'config.get', { key: 'mtime' }).then(r => {
+    quietRpc<ConfigMtimeResponse>(gw, 'config.get', sessionScoped({ key: 'mtime' }, sid)).then(r => {
       // Seed the MCP revision baseline: an unset baseline would make the FIRST cosmetic write
       // (mtime bump, same mcp_rev) look like an MCP change and fire a needless reload.mcp.
       mcpRevRef.current.accepted = String(r?.mcp_rev ?? '')
@@ -408,7 +415,8 @@ export function useConfigSync({
         { mtime: Number(r?.mtime ?? 0), rev: String(r?.rev ?? '') },
         setBellOnComplete,
         setVoiceRecordKey,
-        setBellOnPrompt
+        setBellOnPrompt,
+        sid
       )
     })
   }, [gw, setBellOnComplete, setBellOnPrompt, setVoiceEnabled, setVoiceRecordKey, sid])
@@ -419,7 +427,7 @@ export function useConfigSync({
     }
 
     const id = setInterval(() => {
-      quietRpc<ConfigMtimeResponse>(gw, 'config.get', { key: 'mtime' }).then(r => {
+      quietRpc<ConfigMtimeResponse>(gw, 'config.get', sessionScoped({ key: 'mtime' }, sid)).then(r => {
         const next = Number(r?.mtime ?? 0)
         const nextMcpRev = String(r?.mcp_rev ?? '')
         const nextRev = String(r?.rev ?? '')
@@ -433,7 +441,7 @@ export function useConfigSync({
               mcpRevRef.current.accepted = nextMcpRev
             }
 
-            void hydrateConfigRevision(gw, state, target, setBellOnComplete, setVoiceRecordKey, setBellOnPrompt)
+            void hydrateConfigRevision(gw, state, target, setBellOnComplete, setVoiceRecordKey, setBellOnPrompt, sid)
           }
 
           return
@@ -469,7 +477,7 @@ export function useConfigSync({
         }
 
         // Accepted only after a successful, newest hydration: a failed fetch retries next poll.
-        void hydrateConfigRevision(gw, state, target, setBellOnComplete, setVoiceRecordKey, setBellOnPrompt)
+        void hydrateConfigRevision(gw, state, target, setBellOnComplete, setVoiceRecordKey, setBellOnPrompt, sid)
       })
     }, MTIME_POLL_MS)
 

@@ -7,6 +7,7 @@ import {
   hydrateFullConfig,
   type McpRevState,
   newConfigRevState,
+  sessionScoped,
   normalizeBusyInputMode,
   normalizeIndicatorStyle,
   normalizeMouseTracking,
@@ -660,5 +661,22 @@ describe('hydrateConfigRevision', () => {
     pending.resolve({ config: { display: {} } })
     await expect(first).resolves.toBe(true)
     expect(gw.request).toHaveBeenCalledTimes(1)
+  })
+})
+
+// config-auth closure r3 (finding 3): the poll and the hydration read the SESSION's profile.
+describe('session-scoped config polling', () => {
+  it('binds config.get to the session id, and leaves it unscoped without a session', () => {
+    expect(sessionScoped({ key: 'mtime' }, 'worker-session')).toEqual({ key: 'mtime', session_id: 'worker-session' })
+    expect(sessionScoped({ key: 'full' }, null)).toEqual({ key: 'full' })
+  })
+
+  it('hydrates from the session profile', async () => {
+    const gw = { request: vi.fn(() => Promise.resolve({ config: { display: {} } })), on: vi.fn(), off: vi.fn() } as any
+    const state = newConfigRevState()
+
+    await hydrateConfigRevision(gw, state, { mtime: 3, rev: 'w' }, vi.fn(), undefined, undefined, 'worker-session')
+
+    expect(gw.request).toHaveBeenCalledWith('config.get', { key: 'full', session_id: 'worker-session' })
   })
 })

@@ -189,7 +189,9 @@ def _cfg_get_thinking_mode(params):
 
 
 def _cfg_get_mtime(params):
-    cfg_path = _hermes_home / "config.yaml"
+    # The ACTIVE profile's file (config.get is profile-scoped by session_id/profile): the launch home
+    # missed every edit to a secondary profile's config (closure r3).
+    cfg_path = _active_config_path()
     try:
         mtime = cfg_path.stat().st_mtime if cfg_path.exists() else 0
     except Exception:
