@@ -12,6 +12,7 @@ import copy
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Dict, NamedTuple, Optional
 
@@ -65,20 +66,29 @@ def invalidate_managed_cache() -> None:
     with _CACHE_LOCK:
         _CONFIG_CACHE.clear()
         _ENV_CACHE.clear()
+        _VANISHED_SINCE.clear()
 
 
 class ManagedRead(NamedTuple):
     """One observation of a managed file. ``signature`` is ``utils.content_signature`` of the bytes that
     ``value`` was parsed from (``ABSENT_SIGNATURE`` when there is no file). ``error`` is set when the file
-    exists but could not be read or parsed; ``value`` is then ``{}`` (fail-open for loading) and the
-    caller decides whether a failed authoritative read may drive a decision (A44)."""
+    exists (or was just seen) but could not be read or parsed; ``value`` is then ``{}`` (fail-open for
+    loading) and the caller decides whether a failed authoritative read may drive a decision (A44).
+    ``error_kind``: "read" (retryable: unreadable, vanished mid-replace, or changed while read) or
+    "parse" (complete, stable bytes that are not a YAML mapping)."""
     signature: tuple
     value: dict
     error: Optional[str]
+    error_kind: Optional[str] = None
 
 
 ABSENT_SIGNATURE = (0, 0, 0, 0, b"")
 _ABSENT = ManagedRead(ABSENT_SIGNATURE, {}, None)
+# A managed file this process has read that is now missing reads as a FAILED read for this long before
+# it counts as removed: a delete-then-write editor or a replace must not lift the admin's policy for
+# that window, while a real removal still takes effect (A43 closure r2, finding 6).
+VANISHED_GRACE_SECONDS = 5.0
+_VANISHED_SINCE: Dict[str, float] = {}
 
 
 def _read_managed_bytes(path: Path) -> tuple:
@@ -92,37 +102,53 @@ def _read_managed_bytes(path: Path) -> tuple:
 def _cached_read(path: Path, cache: Dict[str, tuple], parse) -> ManagedRead:
     """Shared content-keyed read of one managed file; ``value`` is a deepcopy of the parse.
 
-    Absent -> ``_ABSENT``. Unreadable or unparseable -> ``error`` set, never cached, logged LOUDLY
-    (the admin needs to know their policy isn't applied) but never raised, so a malformed managed
-    file can't brick startup."""
+    Absent -> ``_ABSENT`` (a file read before counts as absent only after ``VANISHED_GRACE_SECONDS``).
+    Unreadable or unparseable (including a non-mapping root) -> ``error`` set, never cached, logged
+    LOUDLY (the admin needs to know their policy isn't applied) but never raised, so a malformed
+    managed file can't brick startup."""
+    path_key = str(path)
     try:
         key, data = _read_managed_bytes(path)
-    except FileNotFoundError:
+    except FileNotFoundError as exc:
+        with _CACHE_LOCK:
+            known = path_key in cache
+            if not known:
+                return _ABSENT
+            since = _VANISHED_SINCE.setdefault(path_key, time.monotonic())
+            if time.monotonic() - since < VANISHED_GRACE_SECONDS:
+                return _managed_failure(path, "read", exc)
+            cache.pop(path_key, None)
+            _VANISHED_SINCE.pop(path_key, None)
         return _ABSENT
     except OSError as exc:
         return _managed_failure(path, "read", exc)
-    path_key = str(path)
     with _CACHE_LOCK:
+        _VANISHED_SINCE.pop(path_key, None)
         hit = cache.get(path_key)
         if hit is not None and hit[:len(key)] == key:
             return ManagedRead(key, copy.deepcopy(hit[len(key)]), None)
     try:
         parsed = parse(data)
+        if not isinstance(parsed, dict):
+            raise ValueError(f"top level is a {type(parsed).__name__}, not a mapping of settings")
     except Exception as exc:  # noqa: BLE001 — fail-open, but LOUD
-        return _managed_failure(path, "parse", exc)
-    parsed = parsed if isinstance(parsed, dict) else {}
+        try:
+            stable = _read_managed_bytes(path)[1] == data
+        except OSError:
+            stable = False
+        return _managed_failure(path, "parse" if stable else "read", exc)
     with _CACHE_LOCK:
         cache[path_key] = (*key, copy.deepcopy(parsed))
     return ManagedRead(key, parsed, None)
 
 
-def _managed_failure(path: Path, what: str, exc: Exception) -> ManagedRead:
+def _managed_failure(path: Path, kind: str, exc: Exception) -> ManagedRead:
+    verb = "parsed" if kind == "parse" else "read"
     logger.warning(
-        "managed scope: failed to %s %s: %s — IGNORING this managed file. "
+        "managed scope: %s could not be %s: %s — IGNORING this managed file. "
         "Admin policy from this file is NOT being applied. Fix and restart.",
-        what, path, exc)
-    return ManagedRead(ABSENT_SIGNATURE, {}, f"managed file {path} could not be {what} ({exc})".replace(
-        "could not be parse", "could not be parsed"))
+        path, verb, exc)
+    return ManagedRead(ABSENT_SIGNATURE, {}, f"managed file {path} could not be {verb} ({exc})", kind)
 
 
 def _read_managed_file(name: str, cache: Dict[str, tuple], parse) -> ManagedRead:

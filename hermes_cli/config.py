@@ -2433,7 +2433,7 @@ def _load_config_cache_sig(config_path: Path) -> _ConfigSnapshot:
     # managed file that exists but cannot be read is a failed read, never "no managed policy".
     managed = managed_scope.read_managed_config()
     managed_sig = managed.signature
-    managed_error = ConfigReadFailure(managed.error, "read") if managed.error else None
+    managed_error = ConfigReadFailure(managed.error, managed.error_kind or "read") if managed.error else None
     if user_error is not None or managed_error is not None or (user_sig is None and managed_sig == _NO_FILE_SIG):
         return _ConfigSnapshot(user_sig, None, user_bytes, user_error, managed.value, managed_error)
     return _ConfigSnapshot(
