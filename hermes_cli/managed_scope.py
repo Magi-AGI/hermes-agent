@@ -14,7 +14,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Dict, NamedTuple, Optional
+from typing import Any, Dict, NamedTuple, Optional
 
 import yaml
 
@@ -67,6 +67,8 @@ def invalidate_managed_cache() -> None:
         _CONFIG_CACHE.clear()
         _ENV_CACHE.clear()
         _VANISHED_SINCE.clear()
+    global _LAST_MANAGED_DIR
+    _LAST_MANAGED_DIR = None
 
 
 class ManagedRead(NamedTuple):
@@ -151,15 +153,37 @@ def _managed_failure(path: Path, kind: str, exc: Exception) -> ManagedRead:
     return ManagedRead(ABSENT_SIGNATURE, {}, f"managed file {path} could not be {verb} ({exc})", kind)
 
 
+# The managed directory last resolved: when it disappears (renamed/replaced), its files are "known files
+# that vanished" and go through the same grace as a vanished file instead of reading as never present.
+_LAST_MANAGED_DIR: Optional[Path] = None
+
+
 def _read_managed_file(name: str, cache: Dict[str, tuple], parse) -> ManagedRead:
+    global _LAST_MANAGED_DIR
     managed_dir = get_managed_dir()
     if managed_dir is None:
-        return _ABSENT
+        previous = _LAST_MANAGED_DIR
+        if previous is None:
+            return _ABSENT
+        with _CACHE_LOCK:
+            known = str(previous / name) in cache
+        if not known:
+            return _ABSENT
+        # _cached_read sees FileNotFoundError on a known file: failed read inside the grace window,
+        # clean absence (and the entry dropped) after it.
+        return _cached_read(previous / name, cache, parse)
+    _LAST_MANAGED_DIR = managed_dir
     return _cached_read(managed_dir / name, cache, parse)
 
 
-def _parse_managed_yaml(data: bytes) -> dict:
-    return yaml.safe_load(data.decode("utf-8")) or {}
+def _parse_managed_yaml(data: bytes) -> Any:
+    """The parsed document, validated by the caller. Only an EMPTY document (blank or comments-only
+    file) is the intentional "no policy" ``{}``: an explicit ``null``/``false``/``0``/``[]`` root is
+    returned as-is so the mapping check rejects it (closure r3: ``or {}`` accepted them as empty)."""
+    text = data.decode("utf-8")
+    if yaml.compose(text) is None:
+        return {}
+    return yaml.safe_load(text)
 
 
 def read_managed_config() -> ManagedRead:
