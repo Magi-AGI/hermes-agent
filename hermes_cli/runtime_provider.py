@@ -468,26 +468,16 @@ def resolve_requested_provider(requested: Optional[str] = None) -> str:
     return _requested_provider_and_source(requested)[0]
 
 
-def _config_model_provider_name(config: Any) -> str:
-    """``model.provider`` (or a dict ``model.default``'s provider) of one loaded config, lowercased."""
-    model = config.get("model") if isinstance(config, dict) else None
-    if not isinstance(model, dict):
-        return ""
-    provider = model.get("provider")
-    if not (isinstance(provider, str) and provider.strip()) and isinstance(model.get("default"), dict):
-        provider = _config_mod.split_model_config_default(model["default"])[1]
-    return provider.strip().lower() if isinstance(provider, str) else ""
-
-
 def _requested_provider_and_source(requested: Optional[str] = None) -> tuple:
     """``(provider, source)``; source is "explicit" (this run's argument), "config" (the config's pin,
     including a last-known-good config's, per Lake's 2026-09-30 ruling), "env"
     (``HERMES_INFERENCE_PROVIDER``) or "auto". The env override is decided on ONE observation
     (``load_config_with_status``): its failure refuses, else its own pin wins, else the env (A44)."""
     if requested and requested.strip():
-        return requested.strip().lower(), "explicit"
+        requested = requested.strip().lower()
+        return requested, ("auto" if requested == "auto" else "explicit")
     cfg_provider = _get_model_config().get("provider")
-    if isinstance(cfg_provider, str) and cfg_provider.strip():
+    if isinstance(cfg_provider, str) and cfg_provider.strip() and cfg_provider.strip().lower() != "auto":
         from hermes_cli import auth as _auth
         if _auth.REFUSE_LAST_KNOWN_GOOD_PROVIDER:  # Lake ruling switch (default keep)
             _auth._refuse_env_adoption_if_config_corrupt(
@@ -495,10 +485,10 @@ def _requested_provider_and_source(requested: Optional[str] = None) -> tuple:
         return cfg_provider.strip().lower(), "config"
     env_provider = get_secret_str("HERMES_INFERENCE_PROVIDER", "").strip().lower()
     if not env_provider:
-        return "auto", "auto"
-    from hermes_cli.auth import _config_observation, _refuse_env_adoption_if_config_corrupt
+        return "auto", "auto"  # includes a configured ``model.provider: auto`` (discovery, not a pin)
+    from hermes_cli.auth import _config_observation, _refuse_env_adoption_if_config_corrupt, config_pinned_provider
     observed_config, failure = _config_observation()
-    observed = _config_model_provider_name(observed_config)
+    observed = config_pinned_provider(observed_config)
     if observed:
         return observed, "config"
     _refuse_env_adoption_if_config_corrupt(failure, "HERMES_INFERENCE_PROVIDER")
@@ -1029,12 +1019,16 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
         logger.info("model.openai_runtime=codex_app_server overrides the %s runtime (source=%s); its credential/endpoint "
                     "is not used — the app-server authenticates with its own login", runtime.get("provider"), runtime.get("source"))
     runtime["api_mode"] = api_mode
-    if request_source in ("env", "auto") and not (explicit_api_key or explicit_base_url):
-        # The provider was picked from outside the config: if the config stopped reading cleanly while
-        # the runtime was being built, the pick may contradict a pin the file now holds (A44).
-        from hermes_cli.auth import refuse_provider_selection_on_config_failure
-        refuse_provider_selection_on_config_failure(
-            "HERMES_INFERENCE_PROVIDER" if request_source == "env" else "automatic provider detection")
+    # Provenance travels with the runtime so later consumers (auxiliary, vision, agent init) apply the
+    # same rule to routes they build from it.
+    selection = "explicit" if (explicit_api_key or explicit_base_url) else request_source
+    runtime["selection"] = selection
+    # Publication check (A44): one fresh observation; a provider produced while the config does not read
+    # cleanly is refused unless it is an explicit per-run choice or the last-known-good pin.
+    from hermes_cli.auth import refuse_provider_on_config_failure
+    refuse_provider_on_config_failure(
+        str(runtime.get("provider") or requested_provider), selection,
+        {"env": "HERMES_INFERENCE_PROVIDER", "auto": "automatic provider detection"}.get(selection, "the resolved provider"))
     return runtime
 
 

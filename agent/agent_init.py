@@ -833,6 +833,12 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
     if _routed_client is not None:
         from hermes_cli.providers import is_actual_route, normalize_provider
         effective_provider = getattr(_routed_client, "_hermes_aux_effective_provider", "")
+        # Publication check (A44): a client built while the config does not read cleanly is used only
+        # for an explicit per-run choice or the last-known-good pin (one rule: auth).
+        from hermes_cli.auth import refuse_provider_on_config_failure
+        refuse_provider_on_config_failure(
+            effective_provider or agent.provider or "", getattr(agent, "_provider_selection", None),
+            "the agent's provider")
         if is_actual_route(effective_provider):
             agent.provider = normalize_provider(effective_provider)
         return _client_kwargs_from_routed(_routed_client, _provider_timeout)

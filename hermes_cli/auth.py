@@ -1580,6 +1580,66 @@ def _config_observation() -> Tuple[Dict[str, Any], Optional[str]]:
         return {}, ConfigReadFailure(f"{where} could not be read ({exc})", "read")
 
 
+def config_pinned_provider(config: Any) -> str:
+    """The provider a loaded config pins (``model.provider`` or a dict ``model.default``'s), alias-
+    normalised and lowercased; "" for none or ``auto`` (auto is discovery, not a pin)."""
+    model = config.get("model") if isinstance(config, dict) else None
+    if not isinstance(model, dict):
+        return ""
+    provider = model.get("provider")
+    if not (isinstance(provider, str) and provider.strip()) and isinstance(model.get("default"), dict):
+        from hermes_cli.config import split_model_config_default
+        provider = split_model_config_default(model["default"])[1]
+    provider = provider.strip().lower() if isinstance(provider, str) else ""
+    provider = _plugin_aliases().get(provider, provider)
+    return "" if provider == "auto" else provider
+
+
+def _provider_matches_pin(provider: str, pin: str) -> bool:
+    provider = _plugin_aliases().get((provider or "").strip().lower(), (provider or "").strip().lower())
+    if not provider or not pin:
+        return False
+    if provider == pin:
+        return True
+    # A named custom pin resolves to the bare ``custom`` runtime (``custom:<name>`` or a providers: key).
+    if provider == "custom" or provider.startswith("custom:"):
+        if pin == "custom" or pin.startswith("custom:"):
+            return provider == "custom" or provider == pin
+        try:
+            from hermes_cli.runtime_provider_custom import has_named_custom_provider
+            return has_named_custom_provider(pin)
+        except Exception:
+            return False
+    return False
+
+
+def provider_blocked_by_config_failure(provider: str, selection: Optional[str] = None) -> Optional[str]:
+    """THE rule for a provider result produced while the config may not read cleanly (A44, one choke
+    point used at every place that publishes an implicitly chosen route). Takes ONE fresh observation.
+    Returns None when ``provider`` may be used, else the failure that blocks it.
+
+    Allowed during a failed read: an explicit per-run choice (``selection == "explicit"``: --provider,
+    --api-key/--base-url), and — per Lake's 2026-09-30 ruling, unless REFUSE_LAST_KNOWN_GOOD_PROVIDER —
+    the provider the served last-known-good config pins (``selection == "config"``, or a provider that
+    equals that pin). Everything else (env keys, pool, login, free tier, HERMES_INFERENCE_PROVIDER,
+    discovery, fallback chains, a route carried from an env-selected runtime) is refused."""
+    config, failure = _config_observation()
+    if not failure:
+        return None
+    if selection == "explicit":
+        return None
+    if REFUSE_LAST_KNOWN_GOOD_PROVIDER:
+        return failure
+    if selection == "config":
+        return None
+    return None if _provider_matches_pin(provider, config_pinned_provider(config)) else failure
+
+
+def refuse_provider_on_config_failure(provider: str, selection: Optional[str], source: str) -> None:
+    """Raise ``corrupt_config`` when :func:`provider_blocked_by_config_failure` blocks ``provider``."""
+    _refuse_env_adoption_if_config_corrupt(provider_blocked_by_config_failure(provider, selection), source)
+
+
 def _config_model_provider() -> Tuple[Any, Optional[str], Optional[str]]:
     """``(model_cfg, provider, read_failure)`` from ONE config.yaml observation, ``provider`` set when
     ``model.provider`` names a registry provider or a custom OpenAI-compatible endpoint (``custom``,

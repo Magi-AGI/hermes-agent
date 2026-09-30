@@ -3699,6 +3699,8 @@ def _try_anthropic_subscription_only(
 _MAIN_RUNTIME_FIELDS = ("provider", "model", "base_url", "api_key", "api_mode", "auth_mode")
 _MAIN_RUNTIME_CONTEXT_FIELDS = _MAIN_RUNTIME_FIELDS + (
     "requested_provider", "session_id", "cache_scope",
+    # How the main provider was chosen (runtime_provider stamps it): "explicit" | "config" | "env" | "auto".
+    "selection",
 )
 
 
@@ -5323,7 +5325,39 @@ def _try_discovery_chain() -> Tuple[Optional[OpenAI], Optional[str], str]:
     return None, None, ""
 
 
+def _route_blocked(provider: str, selection: Optional[str], task: str) -> bool:
+    """Publication check for an implicitly chosen auxiliary route: the one A44 rule
+    (``auth.provider_blocked_by_config_failure``), re-observed NOW, so a config that broke while the
+    route was being chosen cannot publish it. Explicit per-run choices and the last-known-good pin
+    pass; env/discovery/fallback routes and routes carried from an env-selected runtime do not."""
+    try:
+        from hermes_cli.auth import provider_blocked_by_config_failure
+        failure = provider_blocked_by_config_failure(provider, selection)
+    except Exception as exc:
+        failure = str(exc) or type(exc).__name__
+    if failure:
+        logger.warning("Auxiliary %s: not using %s while the config does not read cleanly (%s).",
+                       task, provider or "an auto-detected provider", failure)
+    return bool(failure)
+
+
 def _resolve_auto_route(
+    main_runtime: Optional[Dict[str, Any]] = None, task: Optional[str] = None
+) -> Tuple[Optional[OpenAI], Optional[str], str]:
+    """``_resolve_auto_route_unchecked`` behind the A44 publication check (one choke point for every
+    auxiliary auto route: main, configured fallback chains, discovery)."""
+    runtime = _normalize_main_runtime(main_runtime)
+    client, model, provider = _resolve_auto_route_unchecked(main_runtime, task)
+    if client is None:
+        return client, model, provider
+    main_provider = str(runtime.get("provider") or "").lower()
+    selection = runtime.get("selection") if provider and provider.lower() == main_provider else None
+    if _route_blocked(provider, selection, task or "call"):
+        return None, None, ""
+    return client, model, provider
+
+
+def _resolve_auto_route_unchecked(
     main_runtime: Optional[Dict[str, Any]] = None, task: Optional[str] = None
 ) -> Tuple[Optional[OpenAI], Optional[str], str]:
     """Full auto-detection chain, including the selected provider identity. Priority: (1) main provider +
@@ -5794,6 +5828,9 @@ def _resolve_custom_branch(req: _ResolveRequest) -> _ResolveResult:
         _try_custom_endpoint, _resolve_api_key_provider)
     for try_fn in _custom_chain:
         client, default = try_fn()
+        if client is not None and try_fn is _resolve_api_key_provider and _route_blocked(
+                _effective_provider_for_client(client, ""), None, "custom"):
+            continue  # the config broke while the env-key scan ran: never publish its pick (A44)
         if client is not None:
             final_model = _normalize_resolved_model(model or default, provider)
             # ``client.api_key`` may be a callable (Azure Entra bearer provider);
@@ -6313,6 +6350,21 @@ def _vision_main_provider_client(
 
 
 def _vision_auto_route(
+    runtime: Dict[str, Any], resolved_model: Optional[str], resolved_api_mode: Optional[str],
+    async_mode: bool,
+) -> Tuple[Optional[str], Optional[Any], Optional[str]]:
+    """``_vision_auto_route_unchecked`` behind the A44 publication check (see ``_route_blocked``)."""
+    provider, client, model = _vision_auto_route_unchecked(runtime, resolved_model, resolved_api_mode, async_mode)
+    if client is None:
+        return provider, client, model
+    main_provider = str((runtime or {}).get("provider") or "").lower()
+    selection = (runtime or {}).get("selection") if (provider or "").lower() == main_provider else None
+    if _route_blocked(provider or "", selection, "vision"):
+        return None, None, None
+    return provider, client, model
+
+
+def _vision_auto_route_unchecked(
     runtime: Dict[str, Any], resolved_model: Optional[str], resolved_api_mode: Optional[str],
     async_mode: bool,
 ) -> Tuple[Optional[str], Optional[Any], Optional[str]]:
