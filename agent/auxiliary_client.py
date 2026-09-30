@@ -5257,7 +5257,21 @@ def _discovery_chain_allowed(main_provider: str, task: Optional[str] = None) -> 
     account they never pointed this session at (xAI OAuth session with a dead token → every
     compression silently charged to a Nous Portal balance)."""
     if (main_provider or "").strip().lower() in {"", "auto"}:
-        return True
+        # "No selected provider" is only a fact when config.yaml read cleanly: a failed read serves
+        # last-known-good/defaults without model.provider, and the chain below sniffs env keys and
+        # logins (A44). The value and the read outcome come from one observation.
+        try:
+            from hermes_cli.config import load_config_with_status
+            read_failure = load_config_with_status()[1]
+        except Exception as exc:
+            read_failure = str(exc) or type(exc).__name__
+        if not read_failure:
+            return True
+        logger.warning(
+            "Auxiliary %s: config.yaml could not be read (%s) — refusing to guess a provider from "
+            "environment keys or logins until it reads cleanly. Fix it with `hermes config check`.",
+            task or "call", read_failure)
+        return False
     logger.warning(
         "Auxiliary %s: main provider %s is unavailable and no fallback_chain / fallback_providers is "
         "configured — refusing to guess another logged-in provider. Re-authenticate (`hermes model`) "

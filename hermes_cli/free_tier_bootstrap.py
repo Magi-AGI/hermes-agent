@@ -147,10 +147,18 @@ def _inventory_other_providers() -> bool:
     seen by the next :func:`reconcile_record`.
     """
     global _inventory_stamp
-    from hermes_cli.auth import resolve_provider
+    from hermes_cli.auth import AuthError, resolve_provider
     _inventory_stamp = _config_stamp()
     try:
         return resolve_provider("auto", skip_free_tier=True) != "nous"
+    except AuthError as exc:
+        # An unreadable config.yaml leaves "what else is configured" unknown: report it as
+        # configured so the mint never claims active_provider while the user's file is unread.
+        if exc.code == "corrupt_config":
+            logger.info("free tier bootstrap: config.yaml unreadable, not claiming inference (%s)", exc)
+            return True
+        logger.debug("free tier bootstrap: nothing else carries inference (%s)", exc)
+        return False
     except Exception as exc:
         logger.debug("free tier bootstrap: nothing else carries inference (%s)", exc)
         return False

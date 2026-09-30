@@ -53,6 +53,7 @@ def test_every_config_loader_sees_a_same_size_same_mtime_edit(home):
     loaders = {
         "load_config": lambda: config_mod.load_config()["model"]["context_length"],
         "load_config_readonly": lambda: config_mod.load_config_readonly()["model"]["context_length"],
+        "load_config_with_status": lambda: config_mod.load_config_with_status()[0]["model"]["context_length"],
         "read_raw_config": lambda: config_mod.read_raw_config()["model"]["context_length"],
         "read_raw_config_readonly": lambda: config_mod.read_raw_config_readonly()["model"]["context_length"],
         "load_user_config_effective": lambda: load_user_config_effective()["model"]["context_length"],
@@ -64,6 +65,7 @@ def test_every_config_loader_sees_a_same_size_same_mtime_edit(home):
 
     stale = {name: value for name, read in loaders.items() if (value := read()) != 65536}
     assert not stale, f"served stale after a same-size edit (metadata unchanged: {file_signature(cfg.stat()) == metadata})"
+    assert config_mod.load_config_with_status()[1] is None
 
 
 def test_managed_config_same_size_edit_is_seen(home, tmp_path, monkeypatch):
@@ -110,14 +112,16 @@ def test_same_size_fix_of_a_broken_config_ends_the_failure(home):
     good_a, broken, good_b = b"agent:\n  max_turns: 11\n", b"agent:\n  max_turns: [1\n", b"agent:\n  max_turns: 22\n"
     assert len(good_a) == len(broken) == len(good_b)
     cfg.write_bytes(good_a)
-    assert config_mod.load_config_readonly()["agent"]["max_turns"] == 11
+    assert config_mod.load_config_with_status() == (config_mod.load_config_readonly(), None)
 
     _rewrite_in_place_keeping_metadata(cfg, broken)
-    assert config_mod.load_config_readonly()["agent"]["max_turns"] == 11  # last-known-good
+    value, failure = config_mod.load_config_with_status()
+    assert failure and value["agent"]["max_turns"] == 11  # last-known-good, reported as a failed read
     assert config_mod.get_active_config_parse_failure()
 
     _rewrite_in_place_keeping_metadata(cfg, good_b)
-    assert config_mod.load_config_readonly()["agent"]["max_turns"] == 22
+    value, failure = config_mod.load_config_with_status()
+    assert failure is None and value["agent"]["max_turns"] == 22
     assert config_mod.get_active_config_parse_failure() is None
 
 

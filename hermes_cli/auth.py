@@ -1419,25 +1419,26 @@ def _get_config_hint_for_unknown_provider(provider_name: str) -> str:
         return ""
 
 
-def _refuse_env_adoption_if_config_corrupt() -> None:
-    """Refuse env-key/pool auto-adoption of openrouter while config.yaml is corrupt.
+def _refuse_env_adoption_if_config_corrupt(read_failure: Optional[str], source: str) -> None:
+    """Refuse adopting a provider from ``source`` (env keys, the credential pool, AWS credentials)
+    when the config read that found no ``model.provider`` did not read the file cleanly.
 
-    A corrupt config loads as ``DEFAULT_CONFIG`` (no ``model.provider``), so the env sniff would
-    silently adopt the PAID openrouter provider over whatever the broken config really names.
-    Fires ONLY on the auto path and clears itself once the file parses again."""
-    try:
-        from hermes_cli.config import get_active_config_parse_failure
-        err = get_active_config_parse_failure()
-        if not err:
-            return
-        path = get_config_path()
-    except Exception as e:
-        logger.debug("Could not probe config parse-failure state: %s", e)
+    A failed read serves last-known-good or ``DEFAULT_CONFIG`` (no ``model.provider``), so the sniff
+    would silently adopt a PAID provider over whatever the unread config really names.
+    ``read_failure`` must come from the SAME observation as the provider value
+    (``load_config_with_status``, A44): a separate failure probe can miss a read that failed and
+    then recovered. Fires ONLY on the auto path; the next clean read ends it."""
+    if not read_failure:
         return
+    try:
+        path = get_config_path()
+    except Exception:
+        path = "config.yaml"
     raise AuthError(
-        f"config.yaml at {path} is corrupt ({err}) — refusing to auto-select "
-        f"an inference provider from environment keys. Fix the YAML (a backup "
-        f"was saved next to it) or run hermes setup.",
+        f"config.yaml at {path} could not be read ({read_failure}) — refusing to auto-select "
+        f"an inference provider from {source}, because the provider that file names is unknown "
+        f"until it reads cleanly. Fix the YAML (a backup was saved next to it) or run "
+        f"`hermes config check`; if the file was being saved, try again.",
         code="corrupt_config")
 
 
@@ -1551,10 +1552,13 @@ def _logged_in_oauth_active_provider(*, skip_free_tier: bool = False) -> Optiona
     return None
 
 
-def _config_model_provider() -> Tuple[Any, Optional[str]]:
-    """``(model_cfg, provider)`` from config.yaml when ``model.provider`` names a registry provider
-    or a custom OpenAI-compatible endpoint (``custom``, ``custom:<name>``, ``vllm``/``ollama``/...).
-    A ``model.provider: openrouter`` pin and a bare ``providers:`` entry name are explicit intent too.
+def _config_model_provider() -> Tuple[Any, Optional[str], Optional[str]]:
+    """``(model_cfg, provider, read_failure)`` from ONE config.yaml observation, ``provider`` set when
+    ``model.provider`` names a registry provider or a custom OpenAI-compatible endpoint (``custom``,
+    ``custom:<name>``, ``vllm``/``ollama``/...). A ``model.provider: openrouter`` pin and a bare
+    ``providers:`` entry name are explicit intent too. ``read_failure`` is why that same read was not
+    a clean read of the file (None when it was, or there is no file); callers must not adopt a
+    provider from outside the config on a failed read (A44).
 
     The normal chat/gateway path resolves config.provider upstream in resolve_requested_provider();
     this is the safety net for the direct ``resolve_provider("auto")`` callers. A configured custom
@@ -1563,34 +1567,39 @@ def _config_model_provider() -> Tuple[Any, Optional[str]]:
     dashboard's Ink chat parked every session on Setup Required while ``hermes chat`` worked
     (#108383)."""
     try:
-        from hermes_cli.config import load_config
-        model_cfg = (load_config() or {}).get("model")
+        from hermes_cli.config import load_config_with_status
+        config, read_failure = load_config_with_status()
+    except Exception as e:
+        logger.debug("Could not read config.yaml model.provider for auto-resolution: %s", e)
+        return None, None, f"could not load it: {e}"
+    try:
+        model_cfg = (config or {}).get("model")
         provider = model_cfg.get("provider") if isinstance(model_cfg, dict) else None
         provider = provider.strip().lower() if isinstance(provider, str) else ""
         provider = _plugin_aliases().get(provider, provider)
         if provider == "custom" or provider.startswith("custom:"):
-            return model_cfg, "custom"
+            return model_cfg, "custom", read_failure
         # openrouter is absent from PROVIDER_REGISTRY on purpose, so it needs its own rung (#109397);
         # a non-openrouter base_url under it is a deliberate mirror (#10622), not a contradiction.
         if provider == "openrouter" or provider in PROVIDER_REGISTRY:
-            return model_cfg, provider
+            return model_cfg, provider, read_failure
         # Bare ``providers:`` name (the ``custom:<name>`` intent spelled without the prefix); reuse the
         # runtime's own lookup so disabled / endpoint-less entries stay excluded.
         if provider:
             from hermes_cli.runtime_provider_custom import has_named_custom_provider
             if has_named_custom_provider(provider):
-                return model_cfg, "custom"
+                return model_cfg, "custom", read_failure
         # No provider pin but a base_url the bare-custom runtime rung would honour (a loopback
         # llama.cpp/vLLM/ollama server) — same explicit intent, spelled by URL.
         base_url = str(model_cfg.get("base_url") or "").strip() if isinstance(model_cfg, dict) else ""
         if base_url:
             from hermes_cli.runtime_provider import _config_base_url_trustworthy_for_bare_custom
             if _config_base_url_trustworthy_for_bare_custom(base_url, provider):
-                return model_cfg, "custom"
-        return model_cfg, None
+                return model_cfg, "custom", read_failure
+        return model_cfg, None, read_failure
     except Exception as e:
         logger.debug("Could not read config.yaml model.provider for auto-resolution: %s", e)
-        return None, None
+        return None, None, read_failure
 
 
 # API-key providers never auto-selected from env: GitHub tokens are commonly present for repo/tool
@@ -1658,13 +1667,16 @@ def resolve_provider(
     if explicit_api_key or explicit_base_url:  # one-off CLI creds always mean openrouter/custom
         return "openrouter"
 
-    _model_cfg, cfg_provider = _config_model_provider()
+    # ONE observation carries the configured provider AND whether that read was clean through every
+    # rung below; a later, separate failure probe could see a file that recovered meanwhile (A44).
+    _model_cfg, cfg_provider, cfg_read_failure = _config_model_provider()
     if cfg_provider:
         return cfg_provider
 
     _scoped_key_env = _scoped_key_env_reader()
     if _openrouter_auto_detected(_scoped_key_env):
-        _refuse_env_adoption_if_config_corrupt()
+        _refuse_env_adoption_if_config_corrupt(
+            cfg_read_failure, "OPENROUTER_API_KEY / OPENAI_API_KEY or the OpenRouter credential pool")
         return "openrouter"
 
     # Determined up front so the env-key tier can warn when an exported key preempts it; the actual
@@ -1672,6 +1684,7 @@ def resolve_provider(
     _oauth_active = _logged_in_oauth_active_provider(skip_free_tier=skip_free_tier)
     env_pid = _env_key_auto_detected(_scoped_key_env, _oauth_active)
     if env_pid:
+        _refuse_env_adoption_if_config_corrupt(cfg_read_failure, f"an environment API key ({env_pid})")
         return env_pid
 
     # Logged-in OAuth provider is a LAST-RESORT fallback (it used to sit above the env/config
@@ -1705,6 +1718,7 @@ def resolve_provider(
     try:
         from agent.bedrock_adapter import has_aws_credentials
         if has_aws_credentials():
+            _refuse_env_adoption_if_config_corrupt(cfg_read_failure, "AWS credentials (Bedrock)")
             return "bedrock"
     except ImportError:
         pass  # boto3 not installed
