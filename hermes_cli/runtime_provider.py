@@ -468,14 +468,17 @@ def resolve_requested_provider(requested: Optional[str] = None) -> str:
     return _requested_provider_and_source(requested)[0]
 
 
-def _requested_provider_and_source(requested: Optional[str] = None) -> tuple:
+def _requested_provider_and_source(requested: Optional[str] = None, origin: Optional[str] = None) -> tuple:
     """``(provider, source)``; source is "explicit" (this run's argument), "config" (the config's pin,
     including a last-known-good config's, per Lake's 2026-09-30 ruling), "env"
     (``HERMES_INFERENCE_PROVIDER``) or "auto". The env override is decided on ONE observation
     (``load_config_with_status``): its failure refuses, else its own pin wins, else the env (A44)."""
     if requested and requested.strip():
         requested = requested.strip().lower()
-        return requested, ("auto" if requested == "auto" else "explicit")
+        if requested == "auto":
+            return requested, "auto"
+        # A saved fallback entry passed as ``requested=`` is a config choice, not this run's --provider.
+        return requested, (origin or "explicit")
     cfg_provider = _get_model_config().get("provider")
     if isinstance(cfg_provider, str) and cfg_provider.strip() and cfg_provider.strip().lower() != "auto":
         from hermes_cli import auth as _auth
@@ -981,7 +984,8 @@ def _openrouter_fallback(requested_provider, explicit_api_key, explicit_base_url
 
 
 def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_key: Optional[str] = None,
-                             explicit_base_url: Optional[str] = None, target_model: Optional[str] = None) -> Dict[str, Any]:
+                             explicit_base_url: Optional[str] = None, target_model: Optional[str] = None,
+                             request_origin: Optional[str] = None) -> Dict[str, Any]:
     """Resolve runtime provider credentials for agent execution. Ladder (order is behavior — each
     rung returns or raises, else falls to the next):
       1. disabled-provider guard (``providers.<name>.enabled: false``)
@@ -998,7 +1002,8 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
          api_mode to ``codex_app_server``; the rung's credential/endpoint is then not used
     target_model overrides model_cfg["default"] when computing provider-specific api_mode (e.g.
     OpenCode Zen/Go where different models route through different API surfaces)."""
-    requested_provider, request_source = _requested_provider_and_source(requested)
+    # request_origin="fallback": a walker resolving a SAVED fallback entry (never "explicit").
+    requested_provider, request_source = _requested_provider_and_source(requested, request_origin)
     _raise_if_provider_disabled(requested_provider)
     # Same alias expansion the auxiliary client applies, so ``provider: openai`` means one thing on
     # every path (background review, curator, MoA slots, delegation) instead of "Unknown provider".
@@ -1021,7 +1026,8 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
     runtime["api_mode"] = api_mode
     # Provenance travels with the runtime so later consumers (auxiliary, vision, agent init) apply the
     # same rule to routes they build from it.
-    selection = "explicit" if (explicit_api_key or explicit_base_url) else request_source
+    selection = request_source if request_source == "fallback" else (
+        "explicit" if (explicit_api_key or explicit_base_url) else request_source)
     runtime["selection"] = selection
     # Publication check (A44): one fresh observation; a provider produced while the config does not read
     # cleanly is refused unless it is an explicit per-run choice or the last-known-good pin.
@@ -1173,7 +1179,7 @@ def resolve_runtime_with_fallback(config: Optional[Dict[str, Any]], *, requested
             model = (entry.get("model") or "").strip()
             if not provider or not model:
                 continue
-            kwargs: Dict[str, Any] = {"requested": provider, "target_model": model}
+            kwargs: Dict[str, Any] = {"requested": provider, "target_model": model, "request_origin": "fallback"}
             if entry.get("base_url"):
                 kwargs["explicit_base_url"] = entry["base_url"]
             if entry_key := resolve_entry_api_key(entry):

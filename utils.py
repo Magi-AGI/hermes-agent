@@ -284,14 +284,15 @@ def _copy_fallback(tmp_str: str, real_path: str) -> None:
     os.unlink(tmp_str)
 
 
-def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
+def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path], recheck=None) -> str:
     """Atomically move *tmp_path* onto *target*, preserving symlinks.
 
     Resolves a symlink first so ``os.replace`` writes the real file in place and the symlink
     survives. Otherwise identical to ``os.replace`` unless the rename fails with EXDEV/EBUSY
     (cross-device, bind-mount, busy file: copy/fsync/unlink immediately — these never clear on
     retry) or a Windows rename contended by another open handle (winerror 5/32/33: bounded retry,
-    then in-place rewrite).
+    then in-place rewrite). *recheck()* (a compare-and-swap) runs again before every retry and
+    before the fallback: a contended rename sleeps, and the target may change meanwhile.
     """
     target_str = str(target)
     real_path = os.path.realpath(target_str) if os.path.islink(target_str) else target_str
@@ -308,6 +309,8 @@ def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
             from agent.retry_utils import jittered_backoff
             for attempt in range(1, _REPLACE_RETRY_ATTEMPTS + 1):
                 time.sleep(jittered_backoff(attempt, base_delay=_REPLACE_RETRY_BASE_DELAY_S, max_delay=_REPLACE_RETRY_MAX_DELAY_S))
+                if recheck is not None:
+                    recheck()
                 try:
                     os.replace(tmp_str, real_path)
                     return real_path
@@ -322,6 +325,8 @@ def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
                      getattr(exc, "winerror", None) or errno.errorcode.get(exc.errno or 0, exc.errno),
                      "in-place rewrite" if contended else "copy")
         # The rewrite re-raises its own error, so an ACL denial is reported as such, not as contention.
+        if recheck is not None:
+            recheck()
         (_rewrite_in_place if contended else _copy_fallback)(tmp_str, real_path)
     return real_path
 
@@ -418,7 +423,7 @@ def _atomic_write(path: Path, write, *, prefix: str, encoding: str = "utf-8", mo
             os.fsync(f.fileno())
         if before_replace is not None:
             before_replace()
-        replaced = Path(atomic_replace(tmp_path, path))  # symlink-preserving actual destination
+        replaced = Path(atomic_replace(tmp_path, path, recheck=before_replace))  # symlink-preserving actual destination
         _restore_file_metadata(replaced, original_owner, mode)
         if fsync_dir:
             fsync_directory(replaced.parent)

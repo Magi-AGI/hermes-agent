@@ -6209,13 +6209,27 @@ def resolve_provider_client(
 
 # ── Public API ──────────────────────────────────────────────────────────────
 
+def _published_route_blocked(client: Any, provider: str, main_runtime: Optional[Dict[str, Any]], task: str) -> bool:
+    """Publication check for a configured/cached auxiliary route (same rule as ``_route_blocked``): the
+    provider actually returned, with the main runtime's provenance only when it IS the main provider."""
+    if client is None:
+        return False
+    runtime = _normalize_main_runtime(main_runtime)
+    actual = _effective_provider_for_client(client, provider or "")
+    selection = runtime.get("selection") if actual and actual.lower() == str(runtime.get("provider") or "").lower() else None
+    return _route_blocked(actual, selection, task)
+
+
 def get_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Optional[OpenAI], Optional[str]]:
     """Return (client, default_model_slug) for text-only aux tasks; ``task`` selects auxiliary.<task> overrides."""
     provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
-    return resolve_provider_client(
+    client, final_model = resolve_provider_client(
         provider, model=model, explicit_base_url=base_url, explicit_api_key=api_key,
         api_mode=api_mode, main_runtime=main_runtime,
     )
+    if _published_route_blocked(client, provider, main_runtime, task or "call"):
+        return None, None
+    return client, final_model
 
 
 _VISION_AUTO_PROVIDER_ORDER = ("openrouter", "nous", "deepinfra")
@@ -6402,6 +6416,19 @@ _ZAI_OPENAI_VISION_URLS = ("https://open.bigmodel.cn/api/paas/v4", "https://api.
 
 
 def resolve_vision_provider_client(
+    provider: Optional[str] = None, model: Optional[str] = None, *, base_url: Optional[str] = None,
+    api_key: Optional[str] = None, async_mode: bool = False,
+    main_runtime: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[str], Optional[Any], Optional[str]]:
+    """``_resolve_vision_provider_client_unchecked`` behind the publication rule (configured and auto)."""
+    chosen, client, final_model = _resolve_vision_provider_client_unchecked(
+        provider, model, base_url=base_url, api_key=api_key, async_mode=async_mode, main_runtime=main_runtime)
+    if _published_route_blocked(client, chosen or "", main_runtime, "vision"):
+        return None, None, None
+    return chosen, client, final_model
+
+
+def _resolve_vision_provider_client_unchecked(
     provider: Optional[str] = None, model: Optional[str] = None, *, base_url: Optional[str] = None,
     api_key: Optional[str] = None, async_mode: bool = False,
     main_runtime: Optional[Dict[str, Any]] = None,
@@ -8040,6 +8067,12 @@ def _resolve_call_client(
                 client, final_model = _get_cached_client(
                     "auto", async_mode=async_mode, main_runtime=main_runtime, task=task)
                 effective_provider = _effective_provider_for_client(client, "auto")
+    if client is not None and _published_route_blocked(
+            client, effective_provider or resolved_provider, main_runtime, task or "call"):
+        # Configured or cached route published while the config does not read cleanly (A44).
+        raise AuxiliaryClientUnavailable(
+            f"Auxiliary {task or 'call'}: not using {effective_provider or resolved_provider} while the "
+            "config does not read cleanly (see `hermes config check`).")
     if client is None:
         if _compression_guard_active():
             # Fail CLOSED, not with the generic "no provider" error: under the
@@ -9040,7 +9073,7 @@ def get_async_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Di
     Returns (None, None) when no provider is available.
     """
     provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
-    return resolve_provider_client(
+    client, final_model = resolve_provider_client(
         provider,
         model=model,
         async_mode=True,
@@ -9049,4 +9082,7 @@ def get_async_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Di
         api_mode=api_mode,
         main_runtime=main_runtime,
     )
+    if _published_route_blocked(client, provider, main_runtime, task or "call"):
+        return None, None
+    return client, final_model
 # ---- END PLUGIN-COMPAT ----

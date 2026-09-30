@@ -65,7 +65,7 @@ import { patchTurnState, useTurnSelector } from './turnStore.js'
 import { $uiState, getUiState, patchUiState } from './uiStore.js'
 import { useBatteryPoll } from './useBatteryPoll.js'
 import { useComposerState } from './useComposerState.js'
-import { useConfigSync } from './useConfigSync.js'
+import { useConfigSync, withSessionScope } from './useConfigSync.js'
 import { shouldDetachEditedHistoryInput, useInputHandlers } from './useInputHandlers.js'
 import { useLongRunToolCharms } from './useLongRunToolCharms.js'
 import {
@@ -523,7 +523,7 @@ export function useMainApp(gw: GatewayClient) {
       params: Record<string, unknown> = {}
     ) => {
       try {
-        const result = asRpcResult<T>(await gw.request<T>(method, params))
+        const result = asRpcResult<T>(await gw.request<T>(method, withSessionScope(method, params, getUiState().sid)))
 
         if (result) {
           return result

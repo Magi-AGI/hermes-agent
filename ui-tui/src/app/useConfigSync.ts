@@ -273,6 +273,14 @@ export interface ConfigRevState {
 
 export const newConfigRevState = (): ConfigRevState => ({ gen: 0, mtime: 0, pending: '', rev: '' })
 
+/** Profile-scoped config RPCs (``config.get`` / ``config.set``) sent without a session or profile are
+ *  bound to the TUI's active session, so a secondary-profile session never reads or writes the launch
+ *  profile's config.yaml (slash commands like /theme sent only ``{key, value}``). */
+export const withSessionScope = (method: string, params: Record<string, unknown>, sid?: null | string) =>
+  sid && method.startsWith('config.') && !('session_id' in params) && !('profile' in params)
+    ? { ...params, session_id: sid }
+    : params
+
 /** ``config.get`` params bound to the session's profile when there is a session. */
 export const sessionScoped = (params: { key: string }, sessionId?: null | string) =>
   sessionId ? { ...params, session_id: sessionId } : params

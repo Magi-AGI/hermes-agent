@@ -8,6 +8,7 @@ import {
   type McpRevState,
   newConfigRevState,
   sessionScoped,
+  withSessionScope,
   normalizeBusyInputMode,
   normalizeIndicatorStyle,
   normalizeMouseTracking,
@@ -678,5 +679,24 @@ describe('session-scoped config polling', () => {
     await hydrateConfigRevision(gw, state, { mtime: 3, rev: 'w' }, vi.fn(), undefined, undefined, 'worker-session')
 
     expect(gw.request).toHaveBeenCalledWith('config.get', { key: 'full', session_id: 'worker-session' })
+  })
+})
+
+// config-auth closure r4 P1: session-owned config RPCs from slash commands (/theme sends {key, value})
+// are bound to the active session at the TUI's rpc boundary.
+describe('withSessionScope', () => {
+  it('adds the active session to config.* calls that name no session or profile', () => {
+    expect(withSessionScope('config.set', { key: 'theme', value: 'dark' }, 'worker')).toEqual({
+      key: 'theme',
+      session_id: 'worker',
+      value: 'dark'
+    })
+  })
+
+  it('leaves explicit scopes, non-config methods and sessionless calls alone', () => {
+    expect(withSessionScope('config.set', { key: 'k', profile: 'p' }, 'worker')).toEqual({ key: 'k', profile: 'p' })
+    expect(withSessionScope('config.get', { key: 'k', session_id: 'other' }, 'worker')).toEqual({ key: 'k', session_id: 'other' })
+    expect(withSessionScope('prompt.submit', { text: 'x' }, 'worker')).toEqual({ text: 'x' })
+    expect(withSessionScope('config.set', { key: 'k' }, null)).toEqual({ key: 'k' })
   })
 })

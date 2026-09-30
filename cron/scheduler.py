@@ -1741,7 +1741,7 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
             try:
                 from hermes_cli.fallback_config import effective_runtime_provider, resolve_entry_api_key
 
-                fb_kwargs = {"requested": fb_provider, "target_model": fb_model}
+                fb_kwargs = {"requested": fb_provider, "target_model": fb_model, "request_origin": "fallback"}
                 if entry.get("base_url"):
                     fb_kwargs["explicit_base_url"] = entry["base_url"]
                 fb_api_key = resolve_entry_api_key(entry)
