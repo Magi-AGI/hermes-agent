@@ -262,6 +262,67 @@ export async function hydrateFullConfig(
   return cfg
 }
 
+/** Which config revision the TUI has APPLIED. ``gen`` numbers hydration attempts so only the
+ *  newest one may apply; ``pending`` names the target of the attempt in flight. */
+export interface ConfigRevState {
+  gen: number
+  mtime: number
+  pending: string
+  rev: string
+}
+
+export const newConfigRevState = (): ConfigRevState => ({ gen: 0, mtime: 0, pending: '', rev: '' })
+
+const revKey = (target: { mtime: number; rev: string }) => `${target.mtime}|${target.rev}`
+
+/** Hydrate the display config for ``target`` and only then record it as applied.
+ *
+ * A revision is accepted after a SUCCESSFUL fetch of the newest attempt: a failed ``config.get``
+ * (null) applies nothing and leaves the old revision, so the next poll retries; an older response
+ * that lands after a newer attempt started is dropped, so it cannot overwrite newer state. An
+ * attempt for the same target already in flight is not duplicated. Returns whether it applied. */
+export async function hydrateConfigRevision(
+  gw: GatewayClient,
+  state: ConfigRevState,
+  target: { mtime: number; rev: string },
+  setBell: (v: boolean) => void,
+  setVoiceRecordKey?: (v: ParsedVoiceRecordKey) => void,
+  setBellOnPrompt?: (v: boolean) => void
+): Promise<boolean> {
+  const key = revKey(target)
+
+  if (state.pending === key) {
+    return false
+  }
+
+  const gen = ++state.gen
+  state.pending = key
+
+  const cfg = await quietRpc<ConfigFullResponse>(gw, 'config.get', { key: 'full' })
+
+  if (gen !== state.gen) {
+    return false
+  }
+
+  state.pending = ''
+
+  if (!cfg) {
+    return false
+  }
+
+  applyDisplay(cfg, setBell, setVoiceRecordKey, setBellOnPrompt)
+
+  if (target.mtime) {
+    state.mtime = target.mtime
+  }
+
+  if (target.rev) {
+    state.rev = target.rev
+  }
+
+  return true
+}
+
 export const applyDisplay = (
   cfg: ConfigFullResponse | null,
   setBell: (v: boolean) => void,
@@ -281,8 +342,8 @@ export const applyDisplay = (
   // config payload. ``quietRpc()`` collapses failures to ``null``; if we
   // reset the cached shortcut on every null we would clobber a custom
   // binding after one transient RPC error until the next config edit
-  // (Copilot round-8 review on #19835). The mtime-poll loop advances
-  // ``mtimeRef`` before this call, so staying silent on null preserves
+  // (Copilot round-8 review on #19835). The poller records a revision only
+  // after a successful hydration (hydrateConfigRevision), so staying silent on null preserves
   // the last-good state and lets the next successful poll refresh it.
   if (setVoiceRecordKey && cfg) {
     setVoiceRecordKey(_voiceRecordKeyFromConfig(cfg))
@@ -323,8 +384,7 @@ export function useConfigSync({
   setVoiceRecordKey,
   sid
 }: UseConfigSyncOptions) {
-  const mtimeRef = useRef(0)
-  const revRef = useRef('')
+  const revStateRef = useRef<ConfigRevState>(newConfigRevState())
   const mcpRevRef = useRef<McpRevState>({ accepted: '', inFlight: false })
 
   useEffect(() => {
@@ -338,15 +398,19 @@ export function useConfigSync({
     // check still runs when the user opens /voice.
     setVoiceEnabled(process.env.HERMES_VOICE === '1')
     quietRpc<ConfigMtimeResponse>(gw, 'config.get', { key: 'mtime' }).then(r => {
-      mtimeRef.current = Number(r?.mtime ?? 0)
-      revRef.current = String(r?.rev ?? '')
-      // Seed the MCP revision baseline too: after a normal boot mtime is
-      // already non-zero, so the poller's baseline branch never runs, and an
-      // unset baseline would make the FIRST cosmetic write (mtime bump, same
-      // mcp_rev) look like an MCP change and fire a needless reload.mcp.
+      // Seed the MCP revision baseline: an unset baseline would make the FIRST cosmetic write
+      // (mtime bump, same mcp_rev) look like an MCP change and fire a needless reload.mcp.
       mcpRevRef.current.accepted = String(r?.mcp_rev ?? '')
+      // The revision is recorded only once its config is applied (hydrateConfigRevision).
+      void hydrateConfigRevision(
+        gw,
+        revStateRef.current,
+        { mtime: Number(r?.mtime ?? 0), rev: String(r?.rev ?? '') },
+        setBellOnComplete,
+        setVoiceRecordKey,
+        setBellOnPrompt
+      )
     })
-    void hydrateFullConfig(gw, setBellOnComplete, setVoiceRecordKey, setBellOnPrompt)
   }, [gw, setBellOnComplete, setBellOnPrompt, setVoiceEnabled, setVoiceRecordKey, sid])
 
   useEffect(() => {
@@ -359,12 +423,17 @@ export function useConfigSync({
         const next = Number(r?.mtime ?? 0)
         const nextMcpRev = String(r?.mcp_rev ?? '')
         const nextRev = String(r?.rev ?? '')
+        const state = revStateRef.current
+        const target = { mtime: next, rev: nextRev }
 
-        if (!mtimeRef.current) {
-          if (next) {
-            mtimeRef.current = next
-            revRef.current = nextRev
-            mcpRevRef.current.accepted = nextMcpRev
+        if (!state.mtime && !state.rev) {
+          // Nothing applied yet (the startup hydration failed or is still in flight): retry it.
+          if (next || nextRev) {
+            if (!mcpRevRef.current.accepted) {
+              mcpRevRef.current.accepted = nextMcpRev
+            }
+
+            void hydrateConfigRevision(gw, state, target, setBellOnComplete, setVoiceRecordKey, setBellOnPrompt)
           }
 
           return
@@ -384,30 +453,23 @@ export function useConfigSync({
 
         // A same-size edit can keep the mtime (Windows tick, restored mtime); the content
         // revision still moves, so either one changing re-hydrates.
-        const mtimeChanged = !!next && next !== mtimeRef.current
-        const revChanged = !!nextRev && nextRev !== revRef.current
+        const mtimeChanged = !!next && next !== state.mtime
+        const revChanged = !!nextRev && nextRev !== state.rev
 
         if (!mtimeChanged && !revChanged) {
           return
         }
 
-        if (next) {
-          mtimeRef.current = next
-        }
-
-        if (nextRev) {
-          revRef.current = nextRev
-        }
-
         // Older gateways don't send mcp_rev — fall back to
         // reload-on-any-change there (no ack tracking possible).
-        if (!nextMcpRev) {
+        if (!nextMcpRev && state.pending !== `${next}|${nextRev}`) {
           quietRpc<ReloadMcpResponse>(gw, 'reload.mcp', { session_id: sid, confirm: true }).then(
             r => r && turnController.pushActivity('MCP reloaded after config change')
           )
         }
 
-        void hydrateFullConfig(gw, setBellOnComplete, setVoiceRecordKey, setBellOnPrompt)
+        // Accepted only after a successful, newest hydration: a failed fetch retries next poll.
+        void hydrateConfigRevision(gw, state, target, setBellOnComplete, setVoiceRecordKey, setBellOnPrompt)
       })
     }, MTIME_POLL_MS)
 
