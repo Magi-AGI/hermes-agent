@@ -597,9 +597,21 @@ class MCPServerTransportMixin:
             self._tools = []
         else:
             async with self._rpc_lock:
-                self._list_cache_meta = {}
-                self._tools = await _core._paginate_full_list(
-                    self.session.list_tools, "tools", self.name, cache_meta_out=self._list_cache_meta)
+                session = self.session
+                if session is None:
+                    return
+                list_meta: dict = {}
+                tools = await _core._paginate_full_list(
+                    session.list_tools, "tools", self.name, cache_meta_out=list_meta)
+            if self.session is not session:
+                return  # this connection was replaced mid-list; its successor discovers for itself
+            if self._registered_tool_names:
+                # A reconnect with the previous connection's tools still registered (or a refresh
+                # that raced it): this list is the live truth, so publish it and its own hints.
+                self._publish_tool_list(tools, list_meta)
+                return
+            self._list_cache_meta = list_meta
+            self._tools = tools
         self._register_discovered_tools_if_needed()
 
     def _register_discovered_tools_if_needed(self) -> None:

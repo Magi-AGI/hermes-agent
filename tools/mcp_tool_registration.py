@@ -404,7 +404,21 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
         check_fn=_make_check_fn(name), scope=lambda: _core._server_registry_scope(key), lazy=False, key=key)
     if registered:
         _write_schema_cache(name, server, config, should_register)
+    else:
+        # A successful list that registers nothing (the server has no tools now, or filters /
+        # name collisions reject them all) must not leave the previous manifest behind: a TTL-less
+        # entry is a permanent lazy hit and the next startup would resurrect the removed tools.
+        _clear_schema_cache(name)
     return registered
+
+
+def _clear_schema_cache(name: str) -> None:
+    """Drop this server's cached manifest (next startup connects live). Never raises."""
+    try:
+        from tools.mcp_schema_cache import clear_cache_entry
+        clear_cache_entry(name)
+    except Exception as exc:
+        logger.debug("MCP schema cache clear failed for '%s': %s", name, exc)
 
 
 def _server_enabled(config: dict) -> bool:
