@@ -306,17 +306,15 @@ def _resolve_name_collisions(name: str, candidates: List[_Candidate]) -> List[_C
 
 
 def _register_candidates(name: str, candidates: List[_Candidate], *, check_fn: Callable,
-                         scope: Callable[[], Optional[str]], lazy: bool, key=None) -> List[str]:
-    """Register candidates under toolset ``mcp-{name}``; returns the names that landed. The
-    ownership pre-check is advisory (servers connect in parallel): ``registry.register()`` is
-    the atomic gate and its verdict is re-read after every call. *key* is the connection whose
-    ``_server_tool_scopes`` records the registering scope (default: this scope's own)."""
+                         scope: Callable[[], Optional[str]], lazy: bool) -> List[str]:
+    """Register LAZY (schema-cache) stubs under toolset ``mcp-{name}``; returns the names that
+    landed. A live connection's per-profile entries are written only by ``_reconcile_profile``.
+    The ownership pre-check is advisory: ``registry.register()`` is the atomic gate and its
+    verdict is re-read after every call."""
     from tools.registry import registry
     toolset_name = f"mcp-{name}"
     registered: List[str] = []
     scope_value = scope()
-    if key is None:
-        key = _server_key(name, scope_value, current=False)
     for c in candidates:
         existing_toolset = registry.get_toolset_for_tool(c.registry_name)
         if existing_toolset and existing_toolset != toolset_name:  # foreign owner: skip, preserve it
@@ -336,9 +334,6 @@ def _register_candidates(name: str, candidates: List[_Candidate], *, check_fn: C
             is_async=False, description=c.schema.get("description") or "", scope=scope_value)
         if registry.get_toolset_for_tool(c.registry_name) == toolset_name:
             _track_mcp_tool_server(c.registry_name, name)
-            if scope_value is not None:
-                with _core._lock:
-                    _core._server_tool_scopes.setdefault(key, set()).add(scope_value)
             registered.append(c.registry_name)
         elif not lazy:
             logger.error("MCP server '%s': registration of %s as '%s' was rejected by the registry; "
@@ -376,8 +371,8 @@ def _write_schema_cache(name: str, server: "MCPServerTask", config: dict, should
     fingerprint and that response's own hints. An empty entry is still a lazy hit (the next startup
     registers nothing and connects nothing: servers such as the Unity bridge list zero tools while
     their host app is closed, and each live connect spawns a costly relay process), and it stops
-    removed tools from being resurrected. Profiles that ADOPTED this connection are published by
-    _register_server_tools (_publish_to_adopters) under their own policy.
+    removed tools from being resurrected. Each profile using the connection gets its own entry,
+    under its own policy, from the per-profile reconcile (_write_profile_cache).
 
     A failed write is logged at WARNING: until a later successful write, the next startup may
     register the previous manifest."""
@@ -412,57 +407,6 @@ def _policy_allows_utility(config: dict, handler_key: str) -> bool:
     if family is None:
         return False
     return _parse_boolish(((config or {}).get("tools") or {}).get(family), default=True)
-
-
-def _publish_to_adopters(name: str, server: "MCPServerTask", key, hints: dict) -> None:
-    """Publish the current list into every OTHER profile that adopted this live connection: its
-    live overlay AND its schema cache, each under that profile's OWN config (tool filter and
-    ``tools.resources`` / ``tools.prompts``), never the owner's. Never raises.
-
-    Cache: only that profile's existing entry for the same route (same fingerprint) is rewritten;
-    a same-named entry for a different route is left alone."""
-    from pathlib import Path
-    from hermes_constants import hermes_home_key, reset_hermes_home_override, set_hermes_home_override
-    from tools.mcp_schema_cache import config_fingerprint, get_cached_entry, write_cache_entry
-    from tools.registry import registry
-
-    with _core._lock:
-        scopes = set(_core._server_tool_scopes.get(key, ()))
-        configs = {scope: _core._server_scope_configs.get((key, scope)) for scope in scopes}
-    try:
-        current = hermes_home_key()
-    except Exception:
-        current = None
-    owner_names = set(getattr(server, "_registered_tool_names", []) or ())
-    for scope in sorted(s for s in scopes if s and s != current):
-        adopter_config = configs.get(scope)
-        if not isinstance(adopter_config, dict):
-            continue  # adopted before configs were recorded; its own next registration pass heals it
-        try:
-            should_register = _make_tool_filter(name, adopter_config)
-            utilities = _select_utility_schemas(name, server, adopter_config)
-            candidates = _tool_candidates(name, server._tools, should_register, server.tool_timeout)
-            candidates += _utility_candidates(name, utilities, server.tool_timeout)
-            names = set(_register_candidates(
-                name, _resolve_name_collisions(name, candidates), check_fn=_make_check_fn(name),
-                scope=lambda scope=scope: scope, lazy=False, key=key))
-            for tool_name in owner_names - names:
-                registry.deregister(tool_name, scope=scope)
-        except Exception as exc:
-            logger.warning("MCP server '%s': live tools for adopting profile %s not updated (%s)", name, scope, exc)
-        token = set_hermes_home_override(Path(scope))
-        try:
-            fingerprint = config_fingerprint(adopter_config)
-            if get_cached_entry(name, fingerprint) is not None:
-                write_cache_entry(
-                    name, fingerprint, tools=_tools_payload(server, _make_tool_filter(name, adopter_config)),
-                    utility_tools=[{"schema": e["schema"], "handler_key": e["handler_key"]}
-                                   for e in _select_utility_schemas(name, server, adopter_config)],
-                    **hints)
-        except Exception as exc:
-            logger.warning("MCP schema cache for '%s' in adopting profile %s not updated (%s)", name, scope, exc)
-        finally:
-            reset_hermes_home_override(token)
 
 
 def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> List[str]:

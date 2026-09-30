@@ -192,14 +192,49 @@ def test_cli_reload_passes_the_flag_only_when_explicit(explicit):
     assert seen == [{"bypass_lazy_cache": True} if explicit else {}]
 
 
-def test_cli_confirmed_slash_command_is_explicit_and_the_watcher_is_not():
-    import inspect
+def test_cli_confirmed_slash_command_reloads_explicitly(monkeypatch):
+    """Drives the real /reload-mcp confirm handler (R10: behavioural, not a source grep)."""
+    from contextlib import nullcontext
 
     from hermes_cli import cli_info_mixin
 
-    src = inspect.getsource(cli_info_mixin.CLIInfoMixin)
-    assert "self._reload_mcp(explicit=True)" in src  # /reload-mcp after confirmation
-    assert "threading.Thread(target=self._reload_mcp, daemon=True)" in src  # watcher: default False
+    calls = []
+    stub = SimpleNamespace(
+        _busy_command=lambda _status: nullcontext(), _slow_command_status=lambda _cmd: "reloading",
+        _reload_mcp=lambda **kw: calls.append(kw))
+    monkeypatch.setattr(cli_info_mixin, "_gated_confirm", lambda *a, **kw: "once")
+    cli_info_mixin.CLIInfoMixin._confirm_and_reload_mcp(stub, "/reload-mcp")
+    assert calls == [{"explicit": True}]
+
+    calls.clear()
+    monkeypatch.setattr(cli_info_mixin, "_gated_confirm", lambda *a, **kw: None)  # Cancel
+    cli_info_mixin.CLIInfoMixin._confirm_and_reload_mcp(stub, "/reload-mcp")
+    assert calls == []
+
+
+def test_cli_config_watcher_reloads_without_the_explicit_flag(monkeypatch):
+    """Drives the real config watcher on an mcp_servers edit: its automatic reload keeps the lazy
+    cache (called with no explicit flag)."""
+    from hermes_cli import cli_info_mixin
+    from hermes_cli.config import get_config_path
+
+    path = Path(get_config_path())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("mcp_servers:\n  unity_bridge:\n    command: unity-relay\n", encoding="utf-8")
+    calls = []
+
+    class _InlineThread:
+        def __init__(self, target, daemon=None, **_kw):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    monkeypatch.setattr(cli_info_mixin.threading, "Thread", _InlineThread)
+    stub = SimpleNamespace(_last_config_check=float("-inf"), _config_sig=None, _config_mcp_servers={},
+                           _reload_mcp=lambda *a, **kw: calls.append((a, kw)))
+    cli_info_mixin.CLIInfoMixin._check_config_mcp_changes(stub)
+    assert calls == [((), {})]
 
 
 @pytest.mark.parametrize("explicit", [True, False])
@@ -227,12 +262,26 @@ def test_compute_host_forwards_the_explicit_flag():
     assert [kw["payload"]["explicit"] for kw in sent] == [True, False]
 
 
-def test_gateway_reload_is_explicit():
-    import inspect
+def test_gateway_reload_is_explicit(monkeypatch):
+    """Drives the real gateway /reload-mcp execution (R10: behavioural, not a source grep)."""
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
+    from gateway.platforms.event import MessageEvent
+    from gateway.session import SessionSource
+    from gateway.config import Platform
+    from tools import mcp_tool_discovery as _mcp_discovery
+    from tools import mcp_tool_lifecycle as _mcp_lifecycle
 
-    from gateway import run_turn
-
-    src = inspect.getsource(run_turn)
-    body = src[src.index("async def _execute_mcp_reload"):]
-    body = body[:body.index("\n    async def ", 10)] if "\n    async def " in body[10:] else body
-    assert "discover_mcp_tools(bypass_lazy_cache=True)" in body
+    seen = []
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=False)
+    runner._agent_cache = {}
+    runner._agent_cache_lock = None
+    runner._async_session_store = SimpleNamespace(
+        get_or_create_session=MagicMock(side_effect=RuntimeError("skip transcript")))
+    monkeypatch.setattr(_mcp_lifecycle, "shutdown_mcp_servers", lambda **_kw: None)
+    monkeypatch.setattr(_mcp_discovery, "discover_mcp_tools", lambda *a, **kw: seen.append(kw) or [])
+    event = MessageEvent(text="/reload-mcp", message_id="m1", source=SessionSource(
+        platform=Platform.TELEGRAM, user_id="u1", chat_id="c1", chat_type="dm"))
+    asyncio.run(runner._execute_mcp_reload(event))
+    assert seen == [{"bypass_lazy_cache": True}]

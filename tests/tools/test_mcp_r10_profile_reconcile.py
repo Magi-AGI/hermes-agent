@@ -285,3 +285,30 @@ def test_concurrent_publishers_and_policy_writers_converge(world):
     w.set_policy("a1", policy(prompts=False))
     w.publish(["beta"])
     w.assert_invariant("after concurrent writers")
+
+
+def test_adopter_only_name_does_not_survive_a_no_capability_reconnect(world):
+    """Codex r9 item 4: the owner's filter excludes ``beta``, an adopter allows it. After a
+    successor without the tools capability, the adopter's ``beta`` must be gone although the
+    owner never had any name (the old code keyed the republish on the owner's names)."""
+    import asyncio
+
+    w = world
+    w.set_policy("owner", policy(include=[], resources=False, prompts=False))
+    w.set_policy("a1", policy(include=["beta"], resources=False, prompts=False))
+    w.publish(["beta"], {"resources": False, "prompts": False})
+    w.assert_invariant("owner empty, adopter has beta")
+    assert w.server._registered_tool_names == [], "precondition: the owner itself has no names"
+    assert w.live("a1") == {f"mcp__{NAME}__beta"}
+
+    async def forbidden_list(**_kwargs):
+        raise AssertionError("no tools capability: tools/list must not be called")
+
+    w.server.session = SimpleNamespace(list_tools=forbidden_list)
+    w.server.initialize_result = SimpleNamespace(capabilities=SimpleNamespace(tools=None, resources=None, prompts=None))
+    with profile(w.homes["owner"]):
+        asyncio.run(w.server._discover_tools())
+    w.tool_names = []
+    w.caps = {"resources": False, "prompts": False}
+    w.assert_invariant("after no-capability successor")
+    assert w.live("a1") == set()

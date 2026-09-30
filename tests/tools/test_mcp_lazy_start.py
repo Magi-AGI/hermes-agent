@@ -262,35 +262,38 @@ class TestLazyFirstUseConnect:
         assert "playwright" not in mcp._lazy_server_tool_names
 
     def test_lazy_connect_deregisters_phantom_cached_tools(self):
-        # Stale-cache reconciliation: the cached manifest advertised tool X,
-        # but the live server only registers tool Y → X must be deregistered
-        # after the first-use connect so the model stops seeing a phantom.
-        from tools.registry import registry
+        # Stale-cache reconciliation: the cached manifest advertised tools x and y, but the live
+        # server only serves y. After the first-use connect the model must stop seeing x.
+        # R10: the connect's PUBLICATION reconciles the owner's slot to the live list (the separate
+        # phantom pass was deleted), so this drives the real lazy registration and publication.
+        import mcp.types as types
+        from tools.mcp_tool import MCPServerTask
+        from tools.registry import ToolRegistry
 
-        mcp._lazy_server_configs["playwright"] = {"command": "npx", "lazy": True}
-        mcp._lazy_server_fingerprints["playwright"] = "stale-fp"
-        mcp._lazy_server_tool_names["playwright"] = [
-            "mcp_playwright_tool_x",
-            "mcp_playwright_tool_y",
-        ]
+        config = {"command": "npx", "lazy": True}
+        entry = {"tools": [{"name": n, "description": n, "inputSchema": {"type": "object"}}
+                           for n in ("tool_x", "tool_y")], "utility_tools": []}
+        with patch("tools.registry.registry", ToolRegistry()) as reg,                 patch.object(_mcp_registration, "_select_utility_schemas", return_value=[]):
+            stubs = _mcp_registration._register_from_cache_sync("playwright", config, entry)
+            assert sorted(stubs) == ["mcp__playwright__tool_x", "mcp__playwright__tool_y"]
 
-        connected = SimpleNamespace(
-            session=MagicMock(),
-            _registered_tool_names=["mcp_playwright_tool_y"],
-        )
+            def _fake_run(coro_or_factory, timeout=30):
+                coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+                coro.close()
+                server = MCPServerTask("playwright")
+                server._config = dict(config)
+                server._tools = [types.Tool.model_validate(
+                    {"name": "tool_y", "description": "y", "inputSchema": {"type": "object"}})]
+                server.session = MagicMock()
+                mcp._servers["playwright"] = server
+                server._registered_tool_names = _mcp_registration._register_server_tools(
+                    "playwright", server, config)
+                return server._registered_tool_names
 
-        def _fake_run(coro_or_factory, timeout=30):
-            mcp._servers["playwright"] = connected
-            coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
-            coro.close()
-            return ["mcp_playwright_tool_y"]
+            with patch.object(_mcp_loop, "_ensure_mcp_loop"),                  patch.object(_mcp_loop, "_run_on_mcp_loop", side_effect=_fake_run):
+                assert _mcp_discovery._ensure_lazy_server_connected("playwright") is True
 
-        with patch.object(_mcp_loop, "_ensure_mcp_loop"), \
-             patch.object(_mcp_loop, "_run_on_mcp_loop", side_effect=_fake_run), \
-             patch.object(registry, "deregister") as mock_dereg:
-            assert _mcp_discovery._ensure_lazy_server_connected("playwright") is True
-
-        mock_dereg.assert_called_once_with("mcp_playwright_tool_x", scope=None)
+            assert reg.get_tool_names_for_toolset("mcp-playwright") == ["mcp__playwright__tool_y"]
 
     def test_lazy_connect_failure_records_cooldown(self):
         mcp._lazy_server_configs["playwright"] = {"command": "npx", "lazy": True}

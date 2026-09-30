@@ -250,17 +250,11 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
     _note_connect_success(server_name)
     with _core._lock:
         _core._lazy_server_configs.pop(key, None)
-        stale_fingerprint = _core._lazy_server_fingerprints.pop(key, None)
-        cached_names = _core._lazy_server_tool_names.pop(key, None) or []
+        _core._lazy_server_fingerprints.pop(key, None)
+        _core._lazy_server_tool_names.pop(key, None)
         server = _core._servers.get(key)
-        live_names = set(getattr(server, "_registered_tool_names", []) or [])
-    # The cached manifest may advertise tools the live server no longer serves.
-    phantom_names = [n for n in cached_names if n not in live_names]
-    if phantom_names:
-        for tool_name in phantom_names:
-            _registration._deregister_mcp_tool_all_scopes(key, tool_name)
-        logger.info("MCP server '%s': deregistered %d phantom cached tool(s) not served live (stale schema-cache "
-                    "fingerprint %s): %s", server_name, len(phantom_names), stale_fingerprint, ", ".join(phantom_names))
+    # Cached stubs the live server no longer serves were removed by the connection's first
+    # publication: the per-profile reconcile makes the owner's slot equal the live list.
     return server is not None and server.session is not None
 
 

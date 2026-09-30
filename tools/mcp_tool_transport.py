@@ -596,7 +596,7 @@ class MCPServerTransportMixin:
                         "skipping tools/list (prompts/resources remain available)", self.name)
             # A session without the capability has published an EMPTY list with NO hints: whatever
             # the previous connection had (tools, ttl, cache scope) does not describe this session.
-            if self._registered_tool_names:
+            if self._list_published:
                 self._publish_tool_list([], {})
                 return
             self._list_cache_meta = {}
@@ -611,9 +611,10 @@ class MCPServerTransportMixin:
                     session.list_tools, "tools", self.name, cache_meta_out=list_meta)
             if self.session is not session:
                 return  # this connection was replaced mid-list; its successor discovers for itself
-            if self._registered_tool_names:
-                # A reconnect with the previous connection's tools still registered (or a refresh
-                # that raced it): this list is the live truth, so publish it and its own hints.
+            if self._list_published:
+                # A reconnect while the previous connection's list is still published (for any
+                # profile, adopter-only names included): this list is the live truth, so publish it
+                # and its own hints.
                 self._publish_tool_list(tools, list_meta)
                 return
             self._list_cache_meta = list_meta

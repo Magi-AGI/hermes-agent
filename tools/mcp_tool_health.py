@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Iterable, Optional
+from typing import Optional
 from tools.mcp_tool_errors import _is_method_not_found_error, _unwrap_exception_group
 from tools.mcp_tool_schema import mcp_prefixed_tool_name
 from tools.mcp_tool_common import _core, mcp_field
@@ -121,13 +121,6 @@ class MCPServerHealthMixin:
             except Exception:
                 logger.exception("Error in MCP message handler for '%s'", self.name)
         return _handler
-
-    def _deregister_owned(self, tool_names: Iterable[str]) -> None:
-        """Deregister *tool_names* this server's toolset still owns (never a colliding name owned by another server)."""
-        from tools.registry import registry
-        for tool_name in tool_names:
-            if registry.get_toolset_for_tool(tool_name) == f"mcp-{self.name}":
-                _registration._deregister_mcp_tool_all_scopes(self, tool_name)
 
     async def _refresh_tools(self):
         """Re-fetch tools on ``tools/list_changed`` and update the registry. The lock serializes rapid-fire
