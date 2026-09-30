@@ -2234,6 +2234,22 @@ def load_config_with_status() -> Tuple[Dict[str, Any], Optional[str]]:
     return _load_config_impl(want_deepcopy=False, with_status=True)
 
 
+def config_read_failure_notice() -> Optional[str]:
+    """User copy when the active config.yaml does not read cleanly right now (one fresh
+    observation), else None. For errors whose real cause may be that failed read: a provider defined
+    under ``providers:`` disappears with it, and "Unknown provider" alone sends the user hunting in
+    a file that is fine (A45)."""
+    try:
+        failure = load_config_with_status()[1]
+    except Exception as exc:
+        failure = str(exc) or type(exc).__name__
+    if not failure:
+        return None
+    return (
+        f"Your settings file ({get_config_path()}) could not be read ({failure}), so the providers "
+        f"and other settings defined in it are not loaded. Fix it with `hermes config edit` and check "
+        f"it with `hermes config check`, then try again.")
+
 
 def _ensure_dict(parent: Dict[str, Any], key: str) -> Dict[str, Any]:
     """Return ``parent[key]`` as a dict, replacing a missing or non-dict value with ``{}``."""

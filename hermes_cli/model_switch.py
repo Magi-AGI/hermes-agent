@@ -1026,6 +1026,10 @@ def _ollama_configured_base() -> tuple[dict, str]:
 
 
 def _unknown_provider_message(explicit_provider: str) -> str:
+    from hermes_cli.config import config_read_failure_notice
+    notice = config_read_failure_notice()
+    if notice:  # the provider may be defined in the file that did not load (A45)
+        return f"Provider '{explicit_provider}' is not available. {notice}"
     msg = (
         f"Unknown provider '{explicit_provider}'. Check 'hermes model' for available "
         f"providers, or define it in config.yaml under 'providers:'.")

@@ -1659,6 +1659,10 @@ def resolve_provider(
     if normalized in ("openrouter", "custom") or _registry_lookup(normalized) is not None:
         return normalized
     if normalized != "auto":
+        from hermes_cli.config import config_read_failure_notice
+        notice = config_read_failure_notice()
+        if notice:  # a providers: entry may live in the file that did not load (A45)
+            raise AuthError(f"Provider '{normalized}' is not available. {notice}", code="invalid_provider")
         hint = _get_config_hint_for_unknown_provider(normalized)
         tail = (f"\n\n{hint}" if hint else " Check 'hermes model' for available providers, "
                 "or run 'hermes doctor' to diagnose config issues.")

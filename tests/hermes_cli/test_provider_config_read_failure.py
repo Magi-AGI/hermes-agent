@@ -138,3 +138,28 @@ def test_auxiliary_discovery_needs_a_clean_read(home, monkeypatch):
     _fail_config_reads(monkeypatch, cfg)
     assert _discovery_chain_allowed("", "compression") is False
 
+
+def test_unknown_provider_names_the_failed_config_read(home, monkeypatch):
+    from hermes_cli.model_switch import switch_model
+
+    cfg = home / "config.yaml"
+    cfg.write_text("providers:\n  relaybox:\n    base_url: http://127.0.0.1:11434/v1\n", encoding="utf-8")
+    kwargs = dict(current_provider="anthropic", current_model="old-model", explicit_provider="relaybox-missing")
+
+    clean = switch_model("local-model", **kwargs, user_providers={})
+    assert not clean.success and "Unknown provider 'relaybox-missing'" in clean.error_message
+    with pytest.raises(auth.AuthError, match="Unknown provider 'relaybox-missing'"):
+        auth.resolve_provider("relaybox-missing")
+
+    _fail_config_reads(monkeypatch, cfg)
+    failed = switch_model("local-model", **kwargs, user_providers={})
+    assert not failed.success
+    for message in (failed.error_message, _auth_error_text("relaybox-missing")):
+        assert "Unknown provider" not in message
+        assert str(cfg) in message and "could not be read" in message and "hermes config check" in message
+
+
+def _auth_error_text(name: str) -> str:
+    with pytest.raises(auth.AuthError) as excinfo:
+        auth.resolve_provider(name)
+    return str(excinfo.value)
