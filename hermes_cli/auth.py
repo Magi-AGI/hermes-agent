@@ -1420,26 +1420,33 @@ def _get_config_hint_for_unknown_provider(provider_name: str) -> str:
 
 
 def _refuse_env_adoption_if_config_corrupt(read_failure: Optional[str], source: str) -> None:
-    """Refuse adopting a provider from ``source`` (env keys, the credential pool, AWS credentials)
-    when the config read that found no ``model.provider`` did not read the file cleanly.
+    """Refuse picking a provider from ``source`` (anything outside the config: env keys, the credential
+    pool, AWS, a saved login, the free tier, HERMES_INFERENCE_PROVIDER) when the authoritative config
+    read (user or managed file) did not succeed.
 
-    A failed read serves last-known-good or ``DEFAULT_CONFIG`` (no ``model.provider``), so the sniff
-    would silently adopt a PAID provider over whatever the unread config really names.
-    ``read_failure`` must come from the SAME observation as the provider value
-    (``load_config_with_status``, A44): a separate failure probe can miss a read that failed and
-    then recovered. Fires ONLY on the auto path; the next clean read ends it."""
+    A failed read serves last-known-good or ``DEFAULT_CONFIG`` without the ``model.provider`` pin, so
+    any fallback could silently replace the provider that file names. ``read_failure`` must come
+    from the SAME observation as the provider value (``load_config_with_status``, A44). The wording
+    follows its kind: a read that failed or caught a save in progress says retry; complete bytes
+    that do not parse say fix the file (``hermes_cli.config.ConfigReadFailure``)."""
     if not read_failure:
         return
-    try:
-        path = get_config_path()
-    except Exception:
-        path = "config.yaml"
+    from hermes_cli.config import config_failure_advice
+    what = ("could not be read just now" if getattr(read_failure, "kind", "parse") == "read"
+            else "has an error")
     raise AuthError(
-        f"config.yaml at {path} could not be read ({read_failure}) — refusing to auto-select "
-        f"an inference provider from {source}, because the provider that file names is unknown "
-        f"until it reads cleanly. Fix the YAML (a backup was saved next to it) or run "
-        f"`hermes config check`; if the file was being saved, try again.",
+        f"Your settings {what}: {read_failure}. Refusing to choose an inference provider from "
+        f"{source} until they read cleanly, because the provider they name is unknown. "
+        f"{config_failure_advice(read_failure)}",
         code="corrupt_config")
+
+
+def refuse_provider_selection_on_config_failure(source: str) -> None:
+    """For provider choices made OUTSIDE ``resolve_provider("auto")`` (``HERMES_INFERENCE_PROVIDER``,
+    a model-name detection, a terminal fallback): one fresh observation; raises ``corrupt_config``
+    when the authoritative config did not read cleanly."""
+    from hermes_cli.config import current_config_read_failure
+    _refuse_env_adoption_if_config_corrupt(current_config_read_failure(), source)
 
 
 # Provider aliases accepted by resolve_provider(). Plugin-declared aliases
@@ -1676,11 +1683,14 @@ def resolve_provider(
     _model_cfg, cfg_provider, cfg_read_failure = _config_model_provider()
     if cfg_provider:
         return cfg_provider
+    # Every rung below picks a provider from outside the config (env keys, the pool, a saved login,
+    # the free tier, AWS). After a failed authoritative read none of them may run: the file that did
+    # not read may pin a different provider (A44; subscription-only rule).
+    _refuse_env_adoption_if_config_corrupt(
+        cfg_read_failure, "environment keys, the credential pool, a saved login, the free tier or AWS")
 
     _scoped_key_env = _scoped_key_env_reader()
     if _openrouter_auto_detected(_scoped_key_env):
-        _refuse_env_adoption_if_config_corrupt(
-            cfg_read_failure, "OPENROUTER_API_KEY / OPENAI_API_KEY or the OpenRouter credential pool")
         return "openrouter"
 
     # Determined up front so the env-key tier can warn when an exported key preempts it; the actual
@@ -1688,7 +1698,6 @@ def resolve_provider(
     _oauth_active = _logged_in_oauth_active_provider(skip_free_tier=skip_free_tier)
     env_pid = _env_key_auto_detected(_scoped_key_env, _oauth_active)
     if env_pid:
-        _refuse_env_adoption_if_config_corrupt(cfg_read_failure, f"an environment API key ({env_pid})")
         return env_pid
 
     # Logged-in OAuth provider is a LAST-RESORT fallback (it used to sit above the env/config
@@ -1722,7 +1731,6 @@ def resolve_provider(
     try:
         from agent.bedrock_adapter import has_aws_credentials
         if has_aws_credentials():
-            _refuse_env_adoption_if_config_corrupt(cfg_read_failure, "AWS credentials (Bedrock)")
             return "bedrock"
     except ImportError:
         pass  # boto3 not installed

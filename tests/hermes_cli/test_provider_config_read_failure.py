@@ -83,7 +83,8 @@ def test_failed_config_read_refuses_every_adoption_rung(home, monkeypatch, rung)
 
 def test_read_that_recovers_before_the_env_rung_still_refuses(home, monkeypatch):
     """The failure is carried from the observation that produced the value: a file that reads
-    cleanly again by the time the env rung runs must not turn the failed read into consent."""
+    cleanly again later must not turn the failed read into consent. The refusal now comes before
+    any env rung runs, so the env rung is never even consulted."""
     cfg = home / "config.yaml"
     cfg.write_text(_CONFIGURED, encoding="utf-8")
     pid, var = _env_key_provider()
@@ -100,7 +101,8 @@ def test_read_that_recovers_before_the_env_rung_still_refuses(home, monkeypatch)
     monkeypatch.setattr(auth, "_env_key_auto_detected", env_rung_after_recovery)
     with pytest.raises(auth.AuthError) as excinfo:
         auth.resolve_provider("auto")
-    assert recovered and excinfo.value.code == "corrupt_config"
+    assert excinfo.value.code == "corrupt_config"
+    assert not recovered, "no env rung may run after a failed read"
 
 
 def test_clean_read_keeps_env_adoption_and_config_pin(home, monkeypatch):

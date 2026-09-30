@@ -116,7 +116,13 @@ class CLIInitMixin:
         # resume must not clobber an explicit -m with the session's stored model.
         self._explicit_model_override = bool(model)
         self.model = model or _config_model or ""
-        _cfg_provider = _model_config.get("provider") or os.getenv("HERMES_INFERENCE_PROVIDER")
+        _cfg_provider = _model_config.get("provider")
+        if not _cfg_provider:
+            # The env override stands in only for a config that read cleanly; after a failed read the
+            # request stays "auto" and provider resolution refuses with the read error (A44).
+            from hermes_cli.config import current_config_read_failure
+            if not current_config_read_failure():
+                _cfg_provider = os.getenv("HERMES_INFERENCE_PROVIDER")
         _startup_provider_override = _startup_base_url_override = _startup_api_key_override = ""
         if self.model:
             from hermes_cli.model_switch import resolve_startup_model_route

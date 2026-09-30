@@ -470,7 +470,22 @@ def resolve_requested_provider(requested: Optional[str] = None) -> str:
     cfg_provider = _get_model_config().get("provider")
     if isinstance(cfg_provider, str) and cfg_provider.strip():
         return cfg_provider.strip().lower()
-    return get_secret_str("HERMES_INFERENCE_PROVIDER", "").strip().lower() or "auto"
+    env_provider = get_secret_str("HERMES_INFERENCE_PROVIDER", "").strip().lower()
+    if not env_provider:
+        return "auto"
+    # The env override applies only when a clean read shows the config names no provider: after a
+    # failed read the file may pin another one (A44). Decide on ONE observation: its failure, else
+    # its own provider, else the env value.
+    from hermes_cli.config import current_config_read_failure, load_config_readonly
+    failure = current_config_read_failure()
+    if failure:
+        from hermes_cli.auth import _refuse_env_adoption_if_config_corrupt
+        _refuse_env_adoption_if_config_corrupt(failure, "HERMES_INFERENCE_PROVIDER")
+    model = load_config_readonly().get("model")
+    observed = model.get("provider") if isinstance(model, dict) else None
+    if isinstance(observed, str) and observed.strip():
+        return observed.strip().lower()
+    return env_provider
 
 
 # ── extracted collaborators (re-exported; see module docstring) ────────────────────────────
@@ -1059,6 +1074,11 @@ def _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, targe
     pconfig = PROVIDER_REGISTRY.get(provider)
     if pconfig and pconfig.auth_type == "api_key":
         yield _api_key_provider_runtime(provider, pconfig, requested_provider, model_cfg, target_model)
+    if not (explicit_api_key or explicit_base_url) and provider != "openrouter":
+        # The terminal OpenRouter rung adopts OpenRouter env keys: never after a failed config read
+        # (A44). Explicit per-run credentials (--api-key / --base-url) are the user's own choice.
+        from hermes_cli.auth import refuse_provider_selection_on_config_failure
+        refuse_provider_selection_on_config_failure("OpenRouter environment keys (fallback)")
     fallback = _openrouter_fallback(requested_provider, explicit_api_key, explicit_base_url)
     if swallowed_auth_error is not None and not fallback.get("api_key"):
         fallback["auth_error"] = swallowed_auth_error
@@ -1112,6 +1132,10 @@ def resolve_runtime_with_fallback(config: Optional[Dict[str, Any]], *, requested
         return resolve_runtime_provider(requested=requested, target_model=target_model,
                                         explicit_base_url=explicit_base_url, explicit_api_key=explicit_api_key), None
     except AuthError as primary_exc:
+        if getattr(primary_exc, "code", None) == "corrupt_config":
+            # A failed config read is not a credential problem, and the chain below was read from that
+            # same failed observation: never walk it into another provider (A44).
+            raise
         from hermes_cli.fallback_config import effective_runtime_provider, get_fallback_chain, resolve_entry_api_key
         for entry in get_fallback_chain(config):
             provider = (entry.get("provider") or "").strip().lower()

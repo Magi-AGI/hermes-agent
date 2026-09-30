@@ -1469,6 +1469,11 @@ def _resolve_startup_runtime() -> tuple[str, str | None]:
         return model, explicit_provider
     if not (explicit_model := _env_model_seed()):
         return model, None
+    from hermes_cli.config import current_config_read_failure
+    if current_config_read_failure():
+        # No provider detection or env stand-in after a failed config read (A44): the runtime
+        # resolves "auto", which refuses with the read error.
+        return model, None
     with contextlib.suppress(Exception):
         from hermes_cli.model_switch import resolve_startup_model_route
         from hermes_cli.models import detect_static_provider_for_model
@@ -2286,6 +2291,8 @@ def _resolve_runtime_with_fallback(resolve_kwargs: dict | None = None) -> _Runti
     try:
         return _RuntimeFallbackResolution(resolve_runtime_provider(**(resolve_kwargs or {})), None, False)
     except AuthError as primary_exc:
+        if getattr(primary_exc, "code", None) == "corrupt_config":
+            raise  # a failed config read is not a credential problem; never walk its chain (A44)
         for entry in _load_fallback_model() or []:
             fb_provider = str(entry.get("provider") or "").strip() if isinstance(entry, dict) else ""
             fb_model = str(entry.get("model") or "").strip() if isinstance(entry, dict) else ""

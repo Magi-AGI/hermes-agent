@@ -1,6 +1,7 @@
 """Codex mcp-hbhc closure r4 probes for deploy gates A43, A44, A45, adopted from
 review-artifacts/mcp-hbhc/codex-closure-r4/root/test_gate_a43_a44.py (one documented edit in the
-first A44 probe: a corrupt_config refusal counts as not selecting the env provider)."""
+first A44 probe: a corrupt_config refusal counts as not selecting the env provider; and, since the
+closure round, the env rung it hooks is never reached after a failed read, so its restore is optional)."""
 
 from __future__ import annotations
 
@@ -80,7 +81,9 @@ def test_a44_interrupted_config_read_cannot_select_env_provider(tmp_path, monkey
             result = auth.resolve_provider("auto")
         except auth.AuthError as exc:
             result = f"refused:{exc.code}"
-        assert interrupted and restored
+        # Adoption note 2 (config-closure): the refusal now happens before any env rung runs, so the
+        # probe's restore inside the env sniff may never execute.
+        assert interrupted
         assert result != "openrouter", "an interrupted config read must not select an env provider"
     finally:
         reset_hermes_home_override(token)
