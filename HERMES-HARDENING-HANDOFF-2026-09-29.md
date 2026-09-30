@@ -1,5 +1,7 @@
 # Hermes hardening pass: handoff to the managing session (2026-09-29)
 
+> **SUPERSEDED by `HERMES-HARDENING-HANDOFF-2026-09-30.md`.** Kept as history.
+
 You are taking over coordination of the Hermes hardening pass, which runs until the final code deploy. Lake (the user)
 arbitrates every scope and risk decision. You coordinate: you route work to implementers, relay reviews, keep the records
 current, and integrate. Read this whole file, then the files it points to, before doing anything.
