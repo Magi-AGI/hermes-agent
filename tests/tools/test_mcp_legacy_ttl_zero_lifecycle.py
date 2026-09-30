@@ -181,3 +181,40 @@ def test_first_page_hint_survives_later_pages():
                                                    {"tools": [_tool("b")]}),
                                             "tools", "srv", cache_meta_out=meta))
     assert meta == {"ttl_ms": 60000} and len(items) == 2
+
+
+def test_warm_rediscovery_honours_backoff_and_reload_mcp_retries_once():
+    """R4 AG-9: in ONE process (no cold restart). A failed connect stamps the connect backoff;
+    a warm re-discovery (config watcher, a second register pass) must honour it: no new attempt,
+    no registration from the legacy miss, entry untouched. ``/reload-mcp`` (shutdown) clears the
+    backoff, and the next pass makes exactly one more suppressed attempt."""
+    from tools.mcp_oauth import OAuthNonInteractiveError, _is_interactive
+    from tools.mcp_tool_lifecycle import shutdown_mcp_servers
+
+    _seed_legacy_entry()
+    legacy = _cache_entry()
+    attempts: list[bool] = []
+
+    async def _failing_connect(name, cfg):
+        attempts.append(_is_interactive())
+        raise OAuthNonInteractiveError(f"MCP OAuth for '{name}': no cached tokens")
+
+    _new_process()
+    _startup(_failing_connect)
+    assert attempts == [False]
+    with mcp._lock:
+        assert any(_NAME in str(k) for k in mcp._server_connect_retry_after), "no backoff stamped"
+
+    _startup(_failing_connect)  # warm: same process, backoff still active
+    assert attempts == [False], "a warm re-discovery ignored the connect backoff"
+    with mcp._lock:
+        assert not any(_NAME in str(k) for k in mcp._lazy_server_configs), "registered from a miss"
+    assert _cache_entry() == legacy
+
+    with patch("tools.mcp_tool_loop._stop_mcp_loop"):
+        shutdown_mcp_servers()  # what /reload-mcp does first
+    with mcp._lock:
+        assert not any(_NAME in str(k) for k in mcp._server_connect_retry_after)
+    _startup(_failing_connect)
+    assert attempts == [False, False], "reload must retry exactly once, suppressed"
+    assert _cache_entry() == legacy
