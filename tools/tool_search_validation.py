@@ -221,6 +221,20 @@ def deferred_direct_call_error(name: str) -> str:
             "Use tool_describe first if you need its parameter schema.")
 
 
+def connector_direct_call_error(name: str) -> str:
+    """A ``connectors__`` name called directly in a session whose ``tool_call`` admits connector
+    batches. Remote connector tools are never in the local registry, so reachability of THIS name
+    is not known here: the text names the door without asserting that the tool exists."""
+    return (f"'{name}' is a connector tool name. Connector tools are not directly callable: "
+            "invoke them through tool_call: "
+            f'{{"calls": [{{"name": "{name}", "arguments": {{...}}}}]}}. '
+            "Use tool_describe first to confirm it is available here and to get its parameter schema.")
+
+
+SCOPE_UNKNOWN_HINT = (" If this is a deferred tool (tool_search lists them), it is not directly "
+                      "callable: invoke it through tool_call.")
+
+
 def not_deferrable_error(name: str) -> str:
     """Rejection for a ``tool_call`` naming something that is not a deferred tool.
     Two different mistakes reach here and need opposite corrections: a directly-listed

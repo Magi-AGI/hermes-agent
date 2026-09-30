@@ -363,25 +363,32 @@ def _append_skipped_tool_results(
     return True
 
 
-def _tool_search_scoped_names(agent) -> frozenset:
-    """Deferrable tool names the session may invoke via ``tool_call``; the unwrap bypasses
-    the bridge's scope check in ``model_tools.handle_function_call``, so restricted sessions
-    validate against this set. Cached on the agent, keyed by registry scope/generation."""
+def _tool_search_scope(agent) -> Optional[frozenset]:
+    """Deferrable tool names the session may invoke via ``tool_call``, or None when the scope
+    cannot be determined right now. A failure is never cached: an empty set would read as "no
+    deferred tools", which let name repair turn a deferred tool into a different visible one.
+    Cached on the agent, keyed by registry scope/generation, the toolset selection, and the
+    explicit availability re-probe epoch (``invalidate_check_fn_cache``: ``/reload-mcp``)."""
     try:
         import model_tools
         from tools import tool_search as _ts
+        from tools.registry import check_fn_cache_epoch
         from tools.registry import registry as _registry
     except Exception:
-        return frozenset()
+        return None
 
     enabled = getattr(agent, "enabled_toolsets", None)
     disabled = getattr(agent, "disabled_toolsets", None)
-    cache_key = (
-        _registry.current_scope_key(),
-        getattr(_registry, "_generation", 0),
-        frozenset(enabled) if enabled is not None else None,
-        frozenset(disabled) if disabled is not None else None,
-    )
+    try:
+        cache_key = (
+            _registry.current_scope_key(),
+            getattr(_registry, "_generation", 0),
+            frozenset(enabled) if enabled is not None else None,
+            frozenset(disabled) if disabled is not None else None,
+            check_fn_cache_epoch(),
+        )
+    except Exception:
+        return None
     cached = getattr(agent, "_tool_search_scope_cache", None)
     if cached is not None and cached[0] == cache_key:
         return cached[1]
@@ -390,10 +397,18 @@ def _tool_search_scoped_names(agent) -> frozenset:
             enabled_toolsets=enabled, disabled_toolsets=disabled, quiet_mode=True, skip_tool_search_assembly=True,
         ) or [])
     except Exception:
-        names = frozenset()
+        logger.debug("tool_search scope lookup failed; scope unknown for this call", exc_info=True)
+        return None
     with contextlib.suppress(Exception):
         agent._tool_search_scope_cache = (cache_key, names)
     return names
+
+
+def _tool_search_scoped_names(agent) -> frozenset:
+    """``_tool_search_scope`` for the executor's admission check: an unknown scope admits
+    nothing (the bridge refuses rather than guesses)."""
+    names = _tool_search_scope(agent)
+    return names if names is not None else frozenset()
 
 
 def _canonical_tool_name(function_name: str) -> str:

@@ -401,9 +401,22 @@ def _memo_check(fn: Callable, memo: Dict[Callable, bool]) -> bool:
     return memo[fn]
 
 
+# Bumped by every explicit invalidation, so caches DERIVED from availability (the per-agent
+# tool_search scope) can tell an explicit re-probe (``/reload-mcp``, ``hermes tools enable``) apart
+# from TTL churn, without re-running probes on every lookup.
+_check_fn_epoch = 0
+
+
+def check_fn_cache_epoch() -> int:
+    """How many explicit ``invalidate_check_fn_cache`` calls this process has seen."""
+    return _check_fn_epoch
+
+
 def invalidate_check_fn_cache() -> None:
     """Drop all cached ``check_fn`` results (after config changes like ``hermes tools enable``)."""
+    global _check_fn_epoch
     with _check_fn_cache_lock:
+        _check_fn_epoch += 1
         _check_fn_cache.clear()
         _check_fn_last_good.clear()
         _check_fn_ever_good.clear()

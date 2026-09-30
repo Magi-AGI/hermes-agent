@@ -67,18 +67,87 @@ def _partial_exit(agent, messages, conversation_history, api_call_count, final_r
     }, "truncated", True)
 
 
-def _deferred_reachable_names(agent: Any, valid_names, tool_calls) -> frozenset:
+def _deferred_reachable_names(agent: Any, valid_names, tool_calls) -> Optional[frozenset]:
     """Scoped deferred names (``tool_call``-reachable) — computed only when the bridge is
-    visible and some call name is not directly valid, so the common path pays nothing."""
+    visible and some call name is not directly valid, so the common path pays nothing.
+    None = the scope could not be determined (repair must then fail safe, not proceed)."""
     try:
         from tools import tool_search as _ts
         if _ts.TOOL_CALL_NAME not in valid_names or all(tc.function.name in valid_names for tc in tool_calls):
             return frozenset()
-        from agent.tool_executor import _tool_search_scoped_names
-        return _tool_search_scoped_names(agent)
+        from agent.tool_executor import _tool_search_scope
+        return _tool_search_scope(agent)
     except Exception:
-        logger.debug("deferred-name scope lookup failed; repair proceeds unguarded", exc_info=True)
-        return frozenset()
+        logger.debug("deferred-name scope lookup failed; scope unknown", exc_info=True)
+        return None
+
+
+def _name_variants(name: str) -> set:
+    """The spellings ``repair_tool_call`` itself would try: XML-fragment trim, lowercase,
+    ``-``/space -> ``_``, camelCase -> snake_case."""
+    import re
+
+    for sep in ('"', "'", "<", ">"):
+        idx = name.find(sep)
+        if idx > 0:
+            name = name[:idx]
+    lowered = name.lower()
+    normalized = lowered.replace("-", "_").replace(" ", "_")
+    camel = re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower().replace("-", "_").replace(" ", "_")
+    return {v for v in (name, lowered, normalized, camel, camel.replace("__", "_")) if v}
+
+
+def _known_deferred_name(candidate: str) -> bool:
+    """Registered and deferrable, from the registry alone (used only when the session scope is
+    unknown: it guards repair, it never feeds a message, so nothing leaks)."""
+    try:
+        from tools import tool_search as _ts
+        from tools.tool_search_catalog import _registry_entry
+
+        if _registry_entry(candidate) is None:
+            return False
+        try:
+            defer = _ts.load_config_readonly().effective_defer_tools
+        except Exception:
+            defer = _ts._DEFAULT_DEFERRED_TOOLS
+        return _ts.is_deferrable_tool_name(candidate, defer)
+    except Exception:
+        return True  # cannot tell: treat as deferred, i.e. do not repair it into something else
+
+
+def _deferred_target(name: str, valid_names, deferred: Optional[frozenset]) -> tuple:
+    """``(guarded, exact)`` for one invalid call name. ``guarded``: never auto-repair it into a
+    visible tool. ``exact``: the reachable deferred name it denotes, for the tool_call correction.
+
+    A spelling that normalises to a VISIBLE tool keeps the normal repair (``write file`` ->
+    ``write_file``). Otherwise a spelling of a reachable deferred tool (``Read_Terminal``,
+    ``read-terminal``, ``readTerminal``) is guarded and mapped to that deferred name; a near miss
+    whose closest name is deferred rather than visible is guarded but keeps its own name. With
+    the scope unknown, any spelling of a registered deferrable tool is guarded without a mapping."""
+    from difflib import get_close_matches
+
+    from tools.connectors import is_connector_name
+
+    if is_connector_name(name):
+        return True, None
+    variants = _name_variants(name)
+    if variants & set(valid_names):
+        return False, None
+    if deferred is None:
+        return any(_known_deferred_name(v) for v in variants), None
+    if name in deferred:
+        return True, name
+    hits = sorted(v for v in variants if v in deferred)
+    if hits:
+        return True, hits[0]
+    if deferred:
+        # A near miss closer to a deferred tool than to any visible one is guarded from repair
+        # but NOT renamed: a similar deferred name is a guess, and the correction must not
+        # assert a tool the model did not name (``mcp__srv__no_such_tool`` keeps its own name).
+        close = get_close_matches(name.lower(), [*valid_names, *deferred], n=1, cutoff=0.7)
+        if close and close[0] in deferred:
+            return True, None
+    return False, None
 
 
 def validate_tool_calls(
@@ -102,18 +171,28 @@ def validate_tool_calls(
     # pre-API sanitizer keeps only the first call/result per id.
     agent._uniquify_tool_call_ids(tool_calls)
 
-    # Repair mismatched tool names before validating (model hallucinations). An EXACT
-    # deferred name the bridge can reach is not a typo: fuzzy repair would rewrite e.g.
-    # ``read_terminal`` into ``terminal`` and run a different tool. Leave it invalid so it
-    # gets the tool_call correction from _invalid_tool_name_error_content.
+    # Repair mismatched tool names before validating (model hallucinations). A deferred name the
+    # bridge can reach, in any spelling repair itself would normalise (``Read_Terminal``,
+    # ``read-terminal``, ``readTerminal``), is not a typo: fuzzy repair would rewrite it into
+    # ``terminal`` and run a different tool. It is left invalid (under its exact deferred name) so
+    # it gets the tool_call correction from _invalid_tool_name_error_content. When the scope cannot
+    # be determined, any spelling of a registered deferrable tool is left unrepaired (_deferred_target).
     deferred_reachable = _deferred_reachable_names(agent, valid_names, tool_calls)
     for tc in tool_calls:
-        if tc.function.name not in valid_names and tc.function.name not in deferred_reachable:
-            repaired = agent._repair_tool_call(tc.function.name)
-            if repaired:
-                agent._vprint(f"{agent.log_prefix}🔧 Auto-repaired tool name: '{tc.function.name}' -> '{repaired}'",
-                              force=True, diagnostic=True)
-                tc.function.name = repaired
+        if tc.function.name in valid_names:
+            continue
+        guarded, exact = _deferred_target(tc.function.name, valid_names, deferred_reachable)
+        if guarded:
+            if exact and exact != tc.function.name:
+                agent._vprint(f"{agent.log_prefix}🔧 Deferred tool name normalised: '{tc.function.name}' -> "
+                              f"'{exact}' (answered with the tool_call correction)", force=True, diagnostic=True)
+                tc.function.name = exact
+            continue
+        repaired = agent._repair_tool_call(tc.function.name)
+        if repaired:
+            agent._vprint(f"{agent.log_prefix}🔧 Auto-repaired tool name: '{tc.function.name}' -> '{repaired}'",
+                          force=True, diagnostic=True)
+            tc.function.name = repaired
     invalid_tool_calls = [tc.function.name for tc in tool_calls if tc.function.name not in valid_names]
     # Mixed batch: error-result ONLY the invalid calls and run the valid
     # ones; voiding the turn discards real work. Strikes advance only when a

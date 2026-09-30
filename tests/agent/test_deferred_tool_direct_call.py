@@ -226,3 +226,138 @@ def test_exact_deferred_name_is_not_auto_repaired_into_another_tool(deferred_gui
     assert "terminal" not in dispatched, f"deferred {gui} was rewritten and dispatched as terminal"
     content = _tool_result(result["messages"], "g1")["content"]
     assert "tool_call" in content and gui in content, content
+
+
+# ---------------------------------------------------------------------------
+# R4-1: separator / case / camelCase variants of a reachable deferred name.
+# ``repair_tool_call`` normalises before its fuzzy step, so ``read-terminal`` etc. were not
+# exact members of the deferred set and fell through to difflib -> ``terminal``.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def deferred_variants_agent():
+    from tools.registry import registry
+
+    deferred = ("read_terminal", "close_terminal")
+    for name in deferred:
+        registry.register(name=name, toolset="desktop_ui", schema=_td(name)["function"],
+                          handler=lambda args, **kw: json.dumps({"ok": True}))
+    visible = [_td("terminal"), _td("write_file")]
+    full = visible + [_td(n) for n in deferred]
+    assembled = visible + bridge_tool_schemas(len(deferred))
+
+    def _defs(*_a, **kw):
+        return list(full if kw.get("skip_tool_search_assembly") else assembled)
+
+    with (
+        patch("model_tools.get_tool_definitions", side_effect=_defs),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        agent = AIAgent(api_key="test-key-1234567890", base_url="https://openrouter.ai/api/v1",
+                        quiet_mode=True, skip_context_files=True, skip_memory=True)
+        agent.client = MagicMock()
+        agent._cached_system_prompt = "You are helpful."
+        agent._use_prompt_caching = False
+        agent.compression_enabled = False
+        agent.save_trajectories = False
+        try:
+            yield agent
+        finally:
+            for name in deferred:
+                registry.deregister(name)
+
+
+@pytest.mark.parametrize("variant,exact", [
+    ("read-terminal", "read_terminal"),
+    ("close-terminal", "close_terminal"),
+    ("Read_Terminal", "read_terminal"),
+    ("readTerminal", "read_terminal"),
+    ("read terminal", "read_terminal"),
+    ("READ_TERMINAL", "read_terminal"),
+])
+def test_deferred_name_variants_get_the_correction_not_a_different_tool(deferred_variants_agent, variant, exact):
+    agent = deferred_variants_agent
+    with patch("model_tools.handle_function_call", return_value=json.dumps({"ok": True})) as dispatch:
+        result = _run(agent, [_resp([_tc(variant, {"pane_id": "p1"}, "v1")]), _resp(content="done")])
+    dispatched = [c.args[0] if c.args else c.kwargs.get("function_name") for c in dispatch.call_args_list]
+    assert "terminal" not in dispatched, f"{variant!r} was rewritten and dispatched as terminal"
+    content = _tool_result(result["messages"], "v1")["content"]
+    assert "tool_call" in content and f"'{exact}'" in content, content
+
+
+def test_legitimate_visible_repair_still_works_next_to_deferred_names(deferred_variants_agent):
+    agent = deferred_variants_agent
+    with patch("model_tools.handle_function_call", return_value=json.dumps({"ok": True})) as dispatch:
+        _run(agent, [_resp([_tc("write file", {"path": "a"}, "w1")]), _resp(content="done")])
+    dispatched = [c.args[0] if c.args else c.kwargs.get("function_name") for c in dispatch.call_args_list]
+    assert dispatched == ["write_file"], dispatched
+
+
+# ---------------------------------------------------------------------------
+# R4-5: an individually unavailable tool is outside the scope set, so it never gets the
+# "invoke via tool_call" hint (which tool_call would then refuse). Real get_tool_definitions.
+# ---------------------------------------------------------------------------
+
+def test_unavailable_mcp_tool_in_enabled_toolset_is_not_in_scope():
+    from types import SimpleNamespace
+
+    from agent.tool_executor import _tool_search_scoped_names
+    from tools import mcp_tool
+    from tools.registry import registry
+
+    server = "pytest_r4_scope"
+    ok, off = f"mcp__{server}__ok", f"mcp__{server}__off"
+    registry.register(name=ok, toolset=f"mcp-{server}", schema=_td(ok)["function"],
+                      handler=lambda args, **kw: "{}")
+    registry.register(name=off, toolset=f"mcp-{server}", schema=_td(off)["function"],
+                      handler=lambda args, **kw: "{}", check_fn=lambda: False)
+    with mcp_tool._lock:
+        for name in (ok, off):
+            mcp_tool._mcp_tool_server_names[name] = server
+    try:
+        agent = SimpleNamespace(enabled_toolsets=[f"mcp-{server}"], disabled_toolsets=None)
+        names = _tool_search_scoped_names(agent)
+        assert ok in names, sorted(names)
+        assert off not in names, "an unavailable tool must not be advertised as tool_call-reachable"
+    finally:
+        with mcp_tool._lock:
+            for name in (ok, off):
+                mcp_tool._mcp_tool_server_names.pop(name, None)
+        for name in (ok, off):
+            registry.deregister(name)
+
+
+# ---------------------------------------------------------------------------
+# R4-7: the scope set is computed once and reused across validation and every error result.
+# ---------------------------------------------------------------------------
+
+def test_scope_set_is_computed_once_for_several_invalid_calls(deferred_mcp_agent):
+    agent, _ = deferred_mcp_agent
+    seen = []
+    real = _get_tool_definitions
+
+    def counting(*a, **kw):
+        if kw.get("skip_tool_search_assembly"):
+            seen.append(1)
+        return real(*a, **kw)
+
+    with patch("model_tools.get_tool_definitions", side_effect=counting):
+        _run(agent, [
+            _resp([_tc(_TOOL, {"q": "a"}, "x1"), _tc(_OTHER, {"q": "b"}, "x2")]),
+            _resp([_tc(_TOOL, {"q": "c"}, "x3")]),
+            _resp(content="done"),
+        ])
+    assert len(seen) <= 1, f"scope recomputed {len(seen)} times"
+
+
+def test_near_miss_of_a_deferred_name_is_not_repaired_into_a_visible_tool(deferred_variants_agent):
+    """``read_termnal`` is closer to the deferred ``read_terminal`` than to ``terminal``: never
+    dispatched as ``terminal``, and not renamed either (the correction must not assert a tool
+    the model did not name)."""
+    agent = deferred_variants_agent
+    with patch("model_tools.handle_function_call", return_value=json.dumps({"ok": True})) as dispatch:
+        result = _run(agent, [_resp([_tc("read_termnal", {}, "n1")]), _resp(content="done")])
+    dispatched = [c.args[0] if c.args else c.kwargs.get("function_name") for c in dispatch.call_args_list]
+    assert "terminal" not in dispatched, dispatched
+    assert _tool_result(result["messages"], "n1")["content"].startswith("Tool 'read_termnal' does not exist.")
