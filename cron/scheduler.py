@@ -1722,7 +1722,8 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
         is_transient_net = _is_transient_provider_resolve_error(resolve_exc)
         # A failed config read is not a credential problem, and the chain comes from that same failed
         # read: never walk it into another provider (A44).
-        if is_auth and getattr(resolve_exc, "code", None) == "corrupt_config":
+        from hermes_cli.runtime_provider import fallback_chain_walk_allowed
+        if not fallback_chain_walk_allowed(resolve_exc):
             raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc
         if not (is_auth or is_transient_net):
             raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc

@@ -361,8 +361,10 @@ class CLIAgentSetupMixin:
         None when the error is not auth-related or no fallback resolves."""
         from cli import _cprint, logger
         from hermes_cli.auth import AuthError, primary_failure_wording
-        from hermes_cli.runtime_provider import resolve_runtime_provider
+        from hermes_cli.runtime_provider import fallback_chain_walk_allowed, resolve_runtime_provider
         if not isinstance(primary_exc, AuthError):
+            return None
+        if not fallback_chain_walk_allowed(primary_exc):  # never after a failed config read (A44)
             return None
         _fb_chain = self._fallback_model if isinstance(self._fallback_model, list) else []
         for _fb in _fb_chain:

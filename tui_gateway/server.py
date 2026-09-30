@@ -2338,8 +2338,9 @@ def _resolve_runtime_with_fallback(resolve_kwargs: dict | None = None) -> _Runti
     try:
         return _RuntimeFallbackResolution(resolve_runtime_provider(**(resolve_kwargs or {})), None, False)
     except AuthError as primary_exc:
-        if getattr(primary_exc, "code", None) == "corrupt_config":
-            raise  # a failed config read is not a credential problem; never walk its chain (A44)
+        from hermes_cli.runtime_provider import fallback_chain_walk_allowed
+        if not fallback_chain_walk_allowed(primary_exc):
+            raise  # never walk the configured chain while the config does not read cleanly (A44)
         for entry in _load_fallback_model() or []:
             fb_provider = str(entry.get("provider") or "").strip() if isinstance(entry, dict) else ""
             fb_model = str(entry.get("model") or "").strip() if isinstance(entry, dict) else ""

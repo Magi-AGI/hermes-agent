@@ -843,6 +843,10 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
     # reach the chain instead of dying at init with a misleading "No LLM provider configured" error. See
     # #17929.
     _explicit = (agent.provider or "").strip().lower()
+    # The chain is an implicit choice from the config: never walked while the config does not read
+    # cleanly (A44). Refuses with the read error instead of the no-provider diagnostic.
+    from hermes_cli.auth import refuse_provider_selection_on_config_failure
+    refuse_provider_selection_on_config_failure("the fallback providers")
     for _fb in _fallback_entries(fallback_model):
         try:
             from hermes_cli.fallback_config import resolve_entry_api_key

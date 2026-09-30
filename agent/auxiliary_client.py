@@ -5250,6 +5250,21 @@ def _try_main_provider_route(
     return client, resolved or main_model, resolved_provider
 
 
+def _config_read_failure_for_discovery(task: str) -> Optional[str]:
+    """Why the config does not read cleanly right now (logged), or None. Gate for every auxiliary path
+    that picks a provider from env keys, pools or logins rather than from the config (A44)."""
+    try:
+        from hermes_cli.config import current_config_read_failure
+        failure = current_config_read_failure()
+    except Exception as exc:
+        failure = str(exc) or type(exc).__name__
+    if failure:
+        logger.warning(
+            "Auxiliary %s: config.yaml could not be read (%s) — not picking a provider from environment "
+            "keys or logins until it reads cleanly.", task, failure)
+    return failure or None
+
+
 def _discovery_chain_allowed(main_provider: str, task: Optional[str] = None) -> bool:
     """The built-in discovery chain is a convenience for installs with NO selected main provider.
     Once the user picked one, every auxiliary route must be a provider they configured (main,
@@ -5324,6 +5339,10 @@ def _resolve_auto_route(
     routed = _try_main_provider_route(main_provider, main_model, base_url, api_key, api_mode)
     if routed is not None:
         return routed
+    # Everything below is an implicit choice (the configured fallback chains, then env/login discovery):
+    # never while the config does not read cleanly (A44).
+    if _config_read_failure_for_discovery(task or "call"):
+        return None, None, ""
     if task:
         fb_client, fb_model, fb_label = _try_configured_fallback_chain(
             task, main_provider or "auto", reason="main provider unavailable")
@@ -5769,8 +5788,11 @@ def _resolve_custom_branch(req: _ResolveRequest) -> _ResolveResult:
         client = _wrap_transport(req, client, final_model, wrap_base or custom_base, custom_key)
         return _route_client(req, client, final_model)
     # Try custom first, then API-key providers (Codex excluded here:
-    # falling through to Codex with no model is a stale-constant trap).
-    for try_fn in (_try_custom_endpoint, _resolve_api_key_provider):
+    # falling through to Codex with no model is a stale-constant trap). The API-key scan picks a provider
+    # from env keys / pools: never while the config does not read cleanly (A44).
+    _custom_chain = (_try_custom_endpoint,) if _config_read_failure_for_discovery("custom") else (
+        _try_custom_endpoint, _resolve_api_key_provider)
+    for try_fn in _custom_chain:
         client, default = try_fn()
         if client is not None:
             final_model = _normalize_resolved_model(model or default, provider)
@@ -6308,7 +6330,10 @@ def _vision_auto_route(
         client, default_model = _vision_main_provider_client(main_provider, main_model, runtime, resolved_model, resolved_api_mode)
         if client is not None:
             return _finalize_vision_client(main_provider, client, default_model, resolved_model, async_mode)
-    # Aggregators use their dedicated vision model, not the user's main model.
+    # Aggregators use their dedicated vision model, not the user's main model. They are picked from
+    # env keys / logins, so never while the config does not read cleanly (A44).
+    if _config_read_failure_for_discovery("vision"):
+        return None, None, None
     for candidate in _VISION_AUTO_PROVIDER_ORDER:
         if candidate == main_provider:
             continue  # already tried above

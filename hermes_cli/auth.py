@@ -1445,8 +1445,7 @@ def refuse_provider_selection_on_config_failure(source: str) -> None:
     """For provider choices made OUTSIDE ``resolve_provider("auto")`` (``HERMES_INFERENCE_PROVIDER``,
     a model-name detection, a terminal fallback): one fresh observation; raises ``corrupt_config``
     when the authoritative config did not read cleanly."""
-    from hermes_cli.config import current_config_read_failure
-    _refuse_env_adoption_if_config_corrupt(current_config_read_failure(), source)
+    _refuse_env_adoption_if_config_corrupt(_config_observation()[1], source)
 
 
 # Provider aliases accepted by resolve_provider(). Plugin-declared aliases
@@ -1559,6 +1558,28 @@ def _logged_in_oauth_active_provider(*, skip_free_tier: bool = False) -> Optiona
     return None
 
 
+# Lake's ruling (2026-09-30): after a failed config read, a provider pinned by the LAST-KNOWN-GOOD
+# config is still used (an editor save must not stop 20+ sessions, and it cannot move them to metered
+# billing because every implicit fallback still refuses). Codex recommended refusing; this is an
+# accepted divergence. Set True to refuse even the last-known-good pin (one switch, tested both ways).
+REFUSE_LAST_KNOWN_GOOD_PROVIDER = False
+
+
+def _config_observation() -> Tuple[Dict[str, Any], Optional[str]]:
+    """``load_config_with_status()``; a loader that itself raises is a failed READ (retryable),
+    typed so the refusal gives retry advice, not fix-the-file advice."""
+    from hermes_cli.config import ConfigReadFailure, get_config_path, load_config_with_status
+    try:
+        return load_config_with_status()
+    except Exception as exc:
+        logger.debug("Could not read config.yaml for provider resolution: %s", exc)
+        try:
+            where = str(get_config_path())
+        except Exception:
+            where = "config.yaml"
+        return {}, ConfigReadFailure(f"{where} could not be read ({exc})", "read")
+
+
 def _config_model_provider() -> Tuple[Any, Optional[str], Optional[str]]:
     """``(model_cfg, provider, read_failure)`` from ONE config.yaml observation, ``provider`` set when
     ``model.provider`` names a registry provider or a custom OpenAI-compatible endpoint (``custom``,
@@ -1573,12 +1594,7 @@ def _config_model_provider() -> Tuple[Any, Optional[str], Optional[str]]:
     (``free_tier_bootstrap``) read a llama.cpp/vLLM install as "nothing configured" and the
     dashboard's Ink chat parked every session on Setup Required while ``hermes chat`` worked
     (#108383)."""
-    try:
-        from hermes_cli.config import load_config_with_status
-        config, read_failure = load_config_with_status()
-    except Exception as e:
-        logger.debug("Could not read config.yaml model.provider for auto-resolution: %s", e)
-        return None, None, f"could not load it: {e}"
+    config, read_failure = _config_observation()
     try:
         model_cfg = (config or {}).get("model")
         provider = model_cfg.get("provider") if isinstance(model_cfg, dict) else None
@@ -1681,7 +1697,7 @@ def resolve_provider(
     # ONE observation carries the configured provider AND whether that read was clean through every
     # rung below; a later, separate failure probe could see a file that recovered meanwhile (A44).
     _model_cfg, cfg_provider, cfg_read_failure = _config_model_provider()
-    if cfg_provider:
+    if cfg_provider and not (cfg_read_failure and REFUSE_LAST_KNOWN_GOOD_PROVIDER):
         return cfg_provider
     # Every rung below picks a provider from outside the config (env keys, the pool, a saved login,
     # the free tier, AWS). After a failed authoritative read none of them may run: the file that did
