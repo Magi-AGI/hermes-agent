@@ -418,23 +418,44 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
     owns is never overwritten."""
     key = _server_key_for_task(server)
     owner_scope = _core._server_registry_scope(key)
-    with _core._lock:
-        recorded = _core._server_scope_configs.get((key, owner_scope))
-    # A REPUBLICATION by the same connection task (list_changed, reconnect, revival) passes its
-    # connect-time config. If the owner's recorded policy is for the same route, it is the current
-    # policy (a config-only edit applied by the registration pass: trust, include/exclude): keep it,
-    # never revert it to the connect-time snapshot. A task's FIRST publication, or a different route,
-    # takes the passed config (a record from an earlier connection is not this task's policy).
-    policy = config
-    if (getattr(server, "_published_before", False) is True
-            and isinstance(recorded, dict) and isinstance(config, dict)
-            and _connection_identity(_without_visibility_filter(recorded))
-            == _connection_identity(_without_visibility_filter(config))):
-        policy = recorded
-    _record_tool_trust_metadata(name, policy, server._tools, key)
-    server._list_published = True
-    server._published_before = True
+    slot = (key, owner_scope)
+    # Selecting the policy and writing it happen under the SAME per-connection lock as
+    # _set_profile_policy, so a concurrent owner edit cannot land between them; the policy epoch is
+    # re-validated before writing, so an edit that lands even re-entrantly restarts the selection
+    # (the round-10 stale-recompute rule).
     with _connection_lock(key):
+        for _ in range(_RECONCILE_MAX_PASSES):
+            with _core._lock:
+                recorded = _core._server_scope_configs.get(slot)
+                epoch = _core._server_scope_epochs.get(slot, 0)
+            # A REPUBLICATION by the same connection task (list_changed, reconnect, revival) passes its
+            # connect-time config. If the owner's recorded policy is for the same route, it is the
+            # current policy (a config-only edit applied by the registration pass: trust,
+            # include/exclude): keep it, never revert it to the connect-time snapshot. A task's FIRST
+            # publication, or a different route, takes the passed config (a record from an earlier
+            # connection is not this task's policy).
+            policy = config
+            if (getattr(server, "_published_before", False) is True
+                    and isinstance(recorded, dict) and isinstance(config, dict)
+                    and _connection_identity(_without_visibility_filter(recorded))
+                    == _connection_identity(_without_visibility_filter(config))):
+                policy = recorded
+            _record_tool_trust_metadata(name, policy, server._tools, key)
+            with _core._lock:
+                if _core._server_scope_epochs.get(slot, 0) != epoch:
+                    continue  # the owner's policy moved while selecting: select again
+            server._list_published = True
+            server._published_before = True
+            _set_profile_policy(key, owner_scope, policy, server=server, reconcile=False)
+            return _reconcile_connection(key, server)
+        logger.warning("MCP server '%s': owner policy kept changing during publication; publishing with the "
+                       "latest recorded policy", name)
+        with _core._lock:
+            latest = _core._server_scope_configs.get(slot)
+        policy = latest if isinstance(latest, dict) else config
+        _record_tool_trust_metadata(name, policy, server._tools, key)
+        server._list_published = True
+        server._published_before = True
         _set_profile_policy(key, owner_scope, policy, server=server, reconcile=False)
         return _reconcile_connection(key, server)
 
