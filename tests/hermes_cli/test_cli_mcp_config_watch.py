@@ -3,7 +3,7 @@ import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from utils import file_signature
+from utils import file_content_signature
 
 
 def _make_cli(tmp_path, mcp_servers=None, extra_config=None):
@@ -20,7 +20,7 @@ def _make_cli(tmp_path, mcp_servers=None, extra_config=None):
 
     cfg_file = tmp_path / "config.yaml"
     cfg_file.write_text("mcp_servers: {}\n")
-    obj._config_sig = file_signature(cfg_file.stat())
+    obj._config_sig = file_content_signature(cfg_file)
 
     obj._reload_mcp = MagicMock()
     obj._busy_command = MagicMock()
@@ -198,7 +198,7 @@ class TestMCPConfigWatch:
 def test_tui_init_run_state_seeds_config_sig_when_config_exists(monkeypatch):
     """REPL init must seed _config_sig from on-disk config.yaml.
 
-    file_signature is only evaluated when the file exists (short-circuit
+    The config signature is only evaluated when the file exists (short-circuit
     otherwise). Isolated-home tests without a config file therefore never
     exercised the call, and a missing import crashed every real CLI launch.
     """
@@ -215,7 +215,7 @@ def test_tui_init_run_state_seeds_config_sig_when_config_exists(monkeypatch):
     obj.config = {"mcp_servers": {}}
     obj._tui_init_run_state()
 
-    assert obj._config_sig == file_signature(cfg_file.stat())
+    assert obj._config_sig == file_content_signature(cfg_file)
 
 
 def test_pinned_mtime_same_size_replacement_triggers_reload(tmp_path):
@@ -225,7 +225,7 @@ def test_pinned_mtime_same_size_replacement_triggers_reload(tmp_path):
 
     obj, cfg_file = _make_cli(tmp_path, mcp_servers={"bb": {"command": "b"}})
     cfg_file.write_text("mcp_servers:\n  bb: {command: b}\n")
-    obj._config_sig = file_signature(cfg_file.stat())
+    obj._config_sig = file_content_signature(cfg_file)
     other = tmp_path / "other.yaml"
     other.write_text("mcp_servers:\n  aa: {command: a}\n")
     shutil.copy2(other, cfg_file)
