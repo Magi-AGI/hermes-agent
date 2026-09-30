@@ -9,7 +9,7 @@ import time
 from typing import Iterable, Optional
 from tools.mcp_tool_errors import _is_method_not_found_error, _unwrap_exception_group
 from tools.mcp_tool_schema import mcp_prefixed_tool_name
-from tools.mcp_tool_common import _core
+from tools.mcp_tool_common import _core, mcp_field
 from tools import mcp_tool_registration as _registration
 
 logger = logging.getLogger("tools.mcp_tool")
@@ -135,7 +135,8 @@ class MCPServerHealthMixin:
         if not self._advertises_tools():
             return  # tools/list would raise MCPError(-32601)
         async with self._refresh_lock:
-            old_tool_names = set(self._registered_tool_names)
+            # No "old names" snapshot here: _publish_tool_list diffs against the state at
+            # publication time (a reconnect's discovery may publish while this waits for the lock).
             async with self._rpc_lock:
                 # Snapshot the session only once the RPC lock is held: run() resets self.session
                 # to None on every transport teardown (reconnect, backoff, park, cancel) outside
@@ -160,15 +161,22 @@ class MCPServerHealthMixin:
                 logger.debug("MCP server '%s': dropping a tools/list_changed result from a replaced session",
                              self.name)
                 return
-            self._publish_tool_list(new_mcp_tools, list_meta, old_tool_names)
+            self._publish_tool_list(new_mcp_tools, list_meta, origin="list_changed")
 
-    def _publish_tool_list(self, new_mcp_tools, list_meta: dict, old_tool_names=None) -> None:
-        """Make one successful ``tools/list`` result the live state: registry, ``_tools``, the
-        list's own cache hints, and the schema cache. Synchronous, so atomic on the event loop.
-        Used by a ``tools/list_changed`` refresh and by a reconnect's discovery when the previous
-        connection's tools are still registered."""
-        if old_tool_names is None:
-            old_tool_names = set(self._registered_tool_names)
+    def _publish_tool_list(self, new_mcp_tools, list_meta: dict, *, origin: str = "reconnect") -> None:
+        """Make one successful ``tools/list`` result (or a successor without the tools capability,
+        as an empty list) the live state: registry, ``_registered_tool_names``, ``_tools``, the
+        list's own cache hints, and the schema cache of this profile and of profiles that adopted
+        the connection. Synchronous, so atomic on the event loop.
+
+        Invariant (H-A): for a server, all of those always equal the last list published by its
+        CURRENT session, and this method is the only writer after the initial registration. So
+        the diff is taken HERE, against the state at publication time, never against a snapshot
+        taken before an await (a refresh queued behind a reconnect's discovery would otherwise
+        diff against the old connection and leave the reconnect's tools registered)."""
+        old_tool_names = set(self._registered_tool_names)
+        old_schemas = {t.name: (getattr(t, "description", None), mcp_field(t, "input_schema", "inputSchema"))
+                       for t in (self._tools or [])}
         # Remove only stale names first — no nuke-and-repave: live turns may hold tool-call
         # IDs pointing at existing handlers; in-place replacement avoids "not connected" races.
         self._deregister_owned(old_tool_names - {mcp_prefixed_tool_name(self.name, tool.name) for tool in new_mcp_tools})
@@ -180,8 +188,21 @@ class MCPServerHealthMixin:
         self._deregister_owned(old_tool_names - set(registered_names))
         self._registered_tool_names = registered_names
         new_tool_names = set(registered_names)
+        changed_schemas = {mcp_prefixed_tool_name(self.name, t.name) for t in new_mcp_tools
+                           if t.name in old_schemas and old_schemas[t.name] != (
+                               getattr(t, "description", None), mcp_field(t, "input_schema", "inputSchema"))}
+        changed_schemas &= new_tool_names & old_tool_names
+        # A server that changes a tool's meaning MID-SESSION (tools/list_changed) is warned about like
+        # an added or removed tool. Across a reconnect only name changes warn; a schema-only change
+        # there is ordinary server evolution and is logged at INFO.
+        schema_changes = ([f"description or schema changed: {', '.join(sorted(changed_schemas))}"]
+                          if changed_schemas else [])
         changes = [f"{label}: {', '.join(sorted(names))}" for label, names in
                    (("added", new_tool_names - old_tool_names), ("removed", old_tool_names - new_tool_names)) if names]
+        if origin == "list_changed":
+            changes += schema_changes
+        elif schema_changes:
+            logger.info("MCP server '%s' (reconnect): %s", self.name, schema_changes[0])
         if changes:
             logger.warning("MCP server '%s': tools changed dynamically — %s. "
                            "Verify these changes are expected.", self.name, "; ".join(changes))

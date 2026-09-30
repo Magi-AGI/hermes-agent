@@ -360,34 +360,87 @@ def _register_candidates(name: str, candidates: List[_Candidate], *, check_fn: C
     return registered
 
 
-def _write_schema_cache(name: str, server: "MCPServerTask", config: dict, should_register) -> None:
-    """Write-through: persist the manifest so the next startup registers this server lazily (no spawn). Never raises."""
+def _tools_payload(server: "MCPServerTask", should_register) -> List[dict]:
+    """The cache rows for ``server._tools`` that *should_register* admits."""
+    rows = []
+    for t in server._tools:
+        if not should_register(t.name):
+            continue
+        # mcp 2.0 renamed every Tool model field to snake_case and left camelCase as a
+        # *serialization* alias only, which pydantic does not apply to attribute access: a bare
+        # camelCase getattr returns None on 2.x instead of raising. That silently wrote an empty
+        # ``inputSchema`` into the schema cache on every write-through, so a ``lazy: true`` server
+        # registered from cache with every parameter stripped. ``mcp_field`` reads both spellings.
+        schema_obj = mcp_field(t, "input_schema", "inputSchema")
+        rows.append({
+            "name": t.name, "description": t.description or "",
+            "inputSchema": schema_obj if isinstance(schema_obj, dict) else {},
+            "annotations": {"readOnlyHint": _annotation_read_only_hint(t)},  # lazy path trust-gates identically
+        })
+    return rows
+
+
+def _write_schema_cache(name: str, server: "MCPServerTask", config: dict, should_register, key=None) -> None:
+    """Write-through (#56832): persist the list just published so the next startup registers this
+    server lazily (no spawn). Never raises.
+
+    The entry always mirrors the published list, INCLUDING an empty one: ``tools: []`` with the
+    fingerprint and that response's own hints. An empty entry is still a lazy hit (the next startup
+    registers nothing and connects nothing: servers such as the Unity bridge list zero tools while
+    their host app is closed, and each live connect spawns a costly relay process), and it stops
+    removed tools from being resurrected. Profiles that ADOPTED this connection keep their own
+    cache under their own home; their matching entries are reconciled too (_reconcile_adopter_caches).
+
+    A failed write is logged at WARNING: until a later successful write, the next startup may
+    register the previous manifest."""
+    from tools.mcp_schema_cache import config_fingerprint, write_cache_entry
+
     try:
-        # Write-through (#56832): refresh the on-disk schema cache after a live connect so the next startup
-        # can lazily register this server without spawning it. Cache failures never break registration.
-        from tools.mcp_schema_cache import config_fingerprint, write_cache_entry
-        tools_payload = []
-        for t in server._tools:
-            if not should_register(t.name):
-                continue
-            # mcp 2.0 renamed every Tool model field to snake_case and left camelCase as a
-            # *serialization* alias only, which pydantic does not apply to attribute access: a bare
-            # camelCase getattr returns None on 2.x instead of raising. That silently wrote an empty
-            # ``inputSchema`` into the schema cache on every write-through, so a ``lazy: true`` server
-            # registered from cache with every parameter stripped. ``mcp_field`` reads both spellings.
-            schema_obj = mcp_field(t, "input_schema", "inputSchema")
-            tools_payload.append({
-                "name": t.name, "description": t.description or "",
-                "inputSchema": schema_obj if isinstance(schema_obj, dict) else {},
-                "annotations": {"readOnlyHint": _annotation_read_only_hint(t)},  # lazy path trust-gates identically
-            })
+        fingerprint = config_fingerprint(config)
         utility_payload = [{"schema": e["schema"], "handler_key": e["handler_key"]}
                            for e in _select_utility_schemas(name, server, config)]
         cache_meta = getattr(server, "_list_cache_meta", None) or {}
-        write_cache_entry(name, config_fingerprint(config), tools=tools_payload, utility_tools=utility_payload,
-                          ttl_ms=cache_meta.get("ttl_ms"), cache_scope=cache_meta.get("cache_scope"))
     except Exception as exc:
-        logger.debug("MCP schema cache write failed for '%s': %s", name, exc)
+        logger.warning("MCP schema cache for '%s' not updated (%s); the next startup may use the previous manifest",
+                       name, exc)
+        return
+    hints = {"ttl_ms": cache_meta.get("ttl_ms"), "cache_scope": cache_meta.get("cache_scope")}
+    try:
+        write_cache_entry(name, fingerprint, tools=_tools_payload(server, should_register),
+                          utility_tools=utility_payload, **hints)
+    except Exception as exc:
+        logger.warning("MCP schema cache write failed for '%s' (%s); the next startup may use the previous "
+                       "manifest until a live connect rewrites it", name, exc)
+    _reconcile_adopter_caches(name, server, fingerprint, utility_payload, hints,
+                              key if key is not None else _server_key_for_task(server))
+
+
+def _reconcile_adopter_caches(name: str, server: "MCPServerTask", fingerprint: str,
+                              utility_payload: List[dict], hints: dict, key) -> None:
+    """Rewrite the schema-cache entry of every OTHER profile that adopted this live connection,
+    when that profile's entry is for the same route (same fingerprint). A same-named entry for a
+    different route is left alone. The rows are unfiltered: an adopter's lazy startup applies its
+    own tool filter when it registers from cache. Never raises."""
+    from hermes_constants import hermes_home_key, reset_hermes_home_override, set_hermes_home_override
+    from pathlib import Path
+    from tools.mcp_schema_cache import get_cached_entry, write_cache_entry
+
+    with _core._lock:
+        scopes = set(_core._server_tool_scopes.get(key, ()))
+    try:
+        current = hermes_home_key()
+    except Exception:
+        current = None
+    for scope in sorted(s for s in scopes if s and s != current):
+        token = set_hermes_home_override(Path(scope))
+        try:
+            if get_cached_entry(name, fingerprint) is not None:
+                write_cache_entry(name, fingerprint, tools=_tools_payload(server, lambda _n: True),
+                                  utility_tools=utility_payload, **hints)
+        except Exception as exc:
+            logger.warning("MCP schema cache for '%s' in adopting profile %s not updated (%s)", name, scope, exc)
+        finally:
+            reset_hermes_home_override(token)
 
 
 def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> List[str]:
@@ -402,23 +455,9 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
     registered = _register_candidates(
         name, _resolve_name_collisions(name, candidates),
         check_fn=_make_check_fn(name), scope=lambda: _core._server_registry_scope(key), lazy=False, key=key)
-    if registered:
-        _write_schema_cache(name, server, config, should_register)
-    else:
-        # A successful list that registers nothing (the server has no tools now, or filters /
-        # name collisions reject them all) must not leave the previous manifest behind: a TTL-less
-        # entry is a permanent lazy hit and the next startup would resurrect the removed tools.
-        _clear_schema_cache(name)
+    # The cache mirrors every published list, empty ones included (see _write_schema_cache).
+    _write_schema_cache(name, server, config, should_register, key)
     return registered
-
-
-def _clear_schema_cache(name: str) -> None:
-    """Drop this server's cached manifest (next startup connects live). Never raises."""
-    try:
-        from tools.mcp_schema_cache import clear_cache_entry
-        clear_cache_entry(name)
-    except Exception as exc:
-        logger.debug("MCP schema cache clear failed for '%s': %s", name, exc)
 
 
 def _server_enabled(config: dict) -> bool:
