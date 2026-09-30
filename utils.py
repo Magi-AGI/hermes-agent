@@ -551,9 +551,16 @@ def atomic_yaml_write(path: Union[str, Path], data: Any, *, default_flow_style: 
     _atomic_write(path, _write, prefix=f".{path.stem}_", mode=_mode_for_write(path, create_mode))
 
 
-def _roundtrip_load(path: Path):
+class ConfigChangedDuringWrite(RuntimeError):
+    """The file no longer holds the bytes a read-modify-write was based on (compare-and-swap)."""
+
+
+def _roundtrip_load(path: Path, expected_signature: Any = None):
     """``(yaml_rt, CommentedMap)``: a ruamel round-trip loader keeping quotes/Unicode with 2-space
-    indents, plus *path* loaded through it (empty map when missing/blank)."""
+    indents, plus *path* loaded through it (empty map when missing/blank). With
+    ``expected_signature`` (a :func:`content_signature`, or None-for-absent via ``"absent"``), the bytes
+    loaded must be exactly the ones the caller's mutation was based on, else
+    :class:`ConfigChangedDuringWrite`: the merge base and the caller's view are then one observation."""
     from ruamel.yaml import YAML
     from ruamel.yaml.comments import CommentedMap
 
@@ -562,7 +569,17 @@ def _roundtrip_load(path: Path):
     yaml_rt.allow_unicode = True
     yaml_rt.default_flow_style = False
     yaml_rt.indent(mapping=2, sequence=4, offset=2)
-    data = yaml_rt.load(path.read_text(encoding="utf-8")) if path.exists() else None
+    try:
+        with open(path, "rb") as handle:
+            st = os.fstat(handle.fileno())
+            raw = handle.read()
+    except FileNotFoundError:
+        st = raw = None
+    if expected_signature is not None:
+        current = "absent" if raw is None else content_signature(st, raw)
+        if current != expected_signature:
+            raise ConfigChangedDuringWrite(f"{path} changed after it was read; not overwriting it")
+    data = yaml_rt.load(raw.decode("utf-8")) if raw is not None else None
     return yaml_rt, data if isinstance(data, CommentedMap) else CommentedMap(data or {})
 
 
@@ -620,12 +637,15 @@ def atomic_roundtrip_yaml_update(path: Union[str, Path], key_path: str, value: A
 _YAML11_AMBIGUOUS_WORDS = frozenset({"y", "n", "yes", "no", "true", "false", "on", "off", "null", "~"})
 
 
-def atomic_roundtrip_yaml_save(path: Union[str, Path], new_state: dict) -> None:
+def atomic_roundtrip_yaml_save(path: Union[str, Path], new_state: dict, *, expected_signature: Any = None) -> None:
     """Persist a full config-state dict while preserving comments and ordering.
 
     Comment-safe replacement for ``yaml.safe_dump(cfg, f)``: writes the whole file from
     ``new_state`` through ruamel round-trip mode so existing comments, key order, quotes and
-    readable Unicode survive.
+    readable Unicode survive. Keys absent from ``new_state`` are deleted, so ``new_state`` must come
+    from the file's CURRENT content: pass the ``content_signature`` it was read from as
+    ``expected_signature`` (``"absent"`` for no file) and a concurrent edit raises
+    :class:`ConfigChangedDuringWrite` instead of being overwritten.
     """
     from ruamel.yaml.comments import CommentedMap
     from ruamel.yaml.scalarstring import DoubleQuotedScalarString
@@ -636,7 +656,7 @@ def atomic_roundtrip_yaml_save(path: Union[str, Path], new_state: dict) -> None:
 
     mkdir_under_hermes_home(path.parent)
     require_readable_config_before_write(path)
-    yaml_rt, existing = _roundtrip_load(path)
+    yaml_rt, existing = _roundtrip_load(path, expected_signature)
 
     def _merge(dst: CommentedMap, src: dict) -> None:
         for key, value in src.items():
