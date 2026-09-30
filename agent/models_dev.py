@@ -215,6 +215,12 @@ def config_snapshot():
         _CONFIG_SNAPSHOT.reset(token)
 
 
+def bound_config_snapshot() -> Optional[Dict[str, Any]]:
+    """The config bound by an enclosing :func:`config_snapshot` block on this thread, else None.
+    Read-only: it is the loader's shared cached object."""
+    return _CONFIG_SNAPSHOT.get()
+
+
 def _cfg_get(*keys: str, default: Any) -> Any:
     """``cfg_get`` over the read-only config (the bound snapshot, if any); *default* on any failure."""
     try:
