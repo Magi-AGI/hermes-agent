@@ -728,10 +728,18 @@ def _auth_type(config: dict) -> str:
 def _same_server_route(server: Any, config: dict, *, cross_profile: bool = False) -> bool:
     """Whether *server* matches *config*, with OAuth connections never reusable across profiles.
 
+    WHICH TOOLS a profile sees (``tools.include`` / ``tools.exclude``) is its POLICY, applied by
+    its own reconcile against its own slot, not part of which connection it is: two profiles with
+    the same endpoint and credentials but different filters are the same route and share one
+    connection (one process; for stdio relays such as ``unity-*`` that is one child, not two).
+    The owner path already stripped the filter before calling here; stripping it HERE makes the
+    cross-profile adoption path agree, so route identity means the same thing on both.
+
     OAuth credentials live in the owning profile's token storage rather than the static config,
     so identical OAuth configs cannot prove that two profiles authenticate as the same account.
     """
-    if _connection_identity(getattr(server, "_config", {}) or {}) != _connection_identity(config):
+    if (_connection_identity(_without_visibility_filter(getattr(server, "_config", {}) or {}))
+            != _connection_identity(_without_visibility_filter(config))):
         return False
     # Identities match, so both sides carry the same normalised auth type.
     return not (cross_profile and _auth_type(config) == "oauth")
@@ -770,12 +778,11 @@ def _register_connected_into_current_scope(servers: dict) -> int:
             server = _core._servers.get(key)
         config = servers.get(_key_name(key))
         cross_profile = _key_scope(key) != scope
-        route_config = config if cross_profile or not isinstance(config, dict) else _without_visibility_filter(config)
-        route_server = server if cross_profile or server is None else SimpleNamespace(
-            _config=_without_visibility_filter(getattr(server, "_config", {}) or {}))
+        # ``_same_server_route`` strips the visibility filter on both sides, so owner and adopter
+        # are judged by the same route identity.
         if (config is None or not _server_enabled(config) or server is None
                 or getattr(server, "session", None) is None
-                or not _same_server_route(route_server, route_config, cross_profile=cross_profile)):
+                or not _same_server_route(server, config, cross_profile=cross_profile)):
             _remove_server_scope(key, scope)
         elif dict(config) != recorded:
             _set_profile_policy(key, scope, config)
