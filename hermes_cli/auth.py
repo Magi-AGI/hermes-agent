@@ -1596,21 +1596,44 @@ def config_pinned_provider(config: Any) -> str:
 
 
 def _provider_matches_pin(provider: str, pin: str) -> bool:
+    """Whether *provider* IS the provider *pin* names (the identity check, not "is pin configured").
+
+    A named custom endpoint is spelled three ways that all mean the same route: ``custom:<name>``,
+    the bare ``providers:`` key ``<name>``, and the plain ``custom`` the runtime reports once it has
+    resolved one. So a pin naming an entry authorises that entry and the bare runtime -- but NOT a
+    DIFFERENT entry: with several named custom providers, ``alpha`` must not authorise
+    ``custom:beta`` (both are "a configured providers: entry", which is why the old membership test
+    passed them both).
+    """
     provider = _plugin_aliases().get((provider or "").strip().lower(), (provider or "").strip().lower())
+    pin = (pin or "").strip().lower()
     if not provider or not pin:
         return False
     if provider == pin:
         return True
-    # A named custom pin resolves to the bare ``custom`` runtime (``custom:<name>`` or a providers: key).
-    if provider == "custom" or provider.startswith("custom:"):
-        if pin == "custom" or pin.startswith("custom:"):
-            return provider == "custom" or provider == pin
-        try:
-            from hermes_cli.runtime_provider_custom import has_named_custom_provider
-            return has_named_custom_provider(pin)
-        except Exception:
-            return False
-    return False
+    if not (provider == "custom" or provider.startswith("custom:")):
+        return False
+    pin_name = _named_custom_entry(pin)
+    if pin_name is None:
+        return False  # the pin is not a custom route at all
+    # The bare ``custom`` runtime carries no name: it is the resolved form of the pinned entry.
+    if provider == "custom":
+        return True
+    return _named_custom_entry(provider) == pin_name
+
+
+def _named_custom_entry(provider: str) -> Optional[str]:
+    """The ``providers:`` entry name *provider* denotes, ``""`` for the nameless bare ``custom``
+    runtime, or None when it is not a custom route at all."""
+    if provider == "custom":
+        return ""
+    if provider.startswith("custom:"):
+        return provider[len("custom:"):] or ""
+    try:
+        from hermes_cli.runtime_provider_custom import has_named_custom_provider
+        return provider if has_named_custom_provider(provider) else None
+    except Exception:
+        return None
 
 
 def provider_blocked_by_config_failure(provider: str, selection: Optional[str] = None) -> Optional[str]:
@@ -1620,9 +1643,12 @@ def provider_blocked_by_config_failure(provider: str, selection: Optional[str] =
 
     Allowed during a failed read: an explicit per-run choice (``selection == "explicit"``: --provider,
     --api-key/--base-url), and — per Lake's 2026-09-30 ruling, unless REFUSE_LAST_KNOWN_GOOD_PROVIDER —
-    the provider the served last-known-good config pins (``selection == "config"``, or a provider that
-    equals that pin). Everything else (env keys, pool, login, free tier, HERMES_INFERENCE_PROVIDER,
-    discovery, fallback chains, a route carried from an env-selected runtime) is refused."""
+    the provider the served last-known-good config pins. ``selection == "config"`` says the CALLER
+    believes it picked the config's provider; it still has to BE that provider, so it goes through the
+    same pin-identity comparison as an unlabelled pick (a caller whose route drifted from the pin --
+    a task override, a chain entry, an alias -- must not publish it merely by labelling it "config").
+    Everything else (env keys, pool, login, free tier, HERMES_INFERENCE_PROVIDER, discovery, fallback
+    chains, a route carried from an env-selected runtime) is refused."""
     config, failure = _config_observation()
     if not failure:
         return None
@@ -1630,8 +1656,6 @@ def provider_blocked_by_config_failure(provider: str, selection: Optional[str] =
         return None
     if REFUSE_LAST_KNOWN_GOOD_PROVIDER:
         return failure
-    if selection == "config":
-        return None
     return None if _provider_matches_pin(provider, config_pinned_provider(config)) else failure
 
 
