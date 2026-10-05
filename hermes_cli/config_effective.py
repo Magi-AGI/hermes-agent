@@ -28,6 +28,15 @@ _LAST_GOOD_USER_RAW: Dict[str, Dict[str, Any]] = {}
 _EFFECTIVE_CACHE: Dict[str, Tuple[Any, ...]] = {}
 
 
+class _ManagedConfigUnreadable(OSError):
+    """The managed (admin) config.yaml exists but did not read, raised only under ``fail_closed``.
+
+    An ``OSError``, because that is what the fail-closed callers' ``except Exception`` handlers
+    already treat as "could not read the config; keep the last known-good state" — the same shape a
+    torn user file produces.
+    """
+
+
 def _effective(raw: Dict[str, Any], managed: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     expanded = _config._expand_env_vars(raw)
     merged = managed_scope.apply_managed_overlay(expanded if isinstance(expanded, dict) else {}, managed)
@@ -57,7 +66,14 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
     last-good state); otherwise the last successfully parsed user file — in-process first, then
     the newest ``backups/config/*.good.*`` copy — is served through the same pipeline, so a
     mid-edit torn write never silently drops user overrides (same contract as ``load_config``).
-    Cached on the user + managed file signatures and the values of every referenced env var."""
+    Cached on the user + managed file signatures and the values of every referenced env var.
+
+    A failed MANAGED read is a failed read too (A44, and ``load_config`` already treats it as one).
+    The admin layer can only ever REMOVE or override what the user file says — a managed
+    ``fallback_providers: []`` suppresses a user chain — so applying an unreadable managed file as an
+    empty overlay hands the caller the user's unconstrained config while reporting success. Every
+    ``fail_closed`` caller holds its own last-known-good state for exactly this case, so it raises
+    here as well."""
     if config_path is None:
         config_path = _config.get_config_path()
     path_key = str(config_path)
@@ -66,6 +82,8 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
         # read all come from the same read, so a same-metadata edit is never served stale.
         snap = _config._load_config_cache_sig(config_path)
         user_sig, cache_sig = snap.user_sig, snap.cache_sig
+        if fail_closed and snap.managed_error is not None:
+            raise _ManagedConfigUnreadable(str(snap.managed_error))
         cached = _EFFECTIVE_CACHE.get(path_key)
         n = len(cache_sig) if cache_sig is not None else 0
         if cached is not None and cache_sig is not None and tuple(cached[:n]) == tuple(cache_sig):
