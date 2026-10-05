@@ -5325,20 +5325,31 @@ def _try_discovery_chain() -> Tuple[Optional[OpenAI], Optional[str], str]:
     return None, None, ""
 
 
-def _route_blocked(provider: str, selection: Optional[str], task: str) -> bool:
+def _route_blocked(provider: str, selection: Optional[str], task: str, *, base_url: str = "") -> bool:
     """Publication check for an implicitly chosen auxiliary route: the one A44 rule
     (``auth.provider_blocked_by_config_failure``), re-observed NOW, so a config that broke while the
     route was being chosen cannot publish it. Explicit per-run choices and the last-known-good pin
-    pass; env/discovery/fallback routes and routes carried from an env-selected runtime do not."""
+    pass; env/discovery/fallback routes and routes carried from an env-selected runtime do not.
+
+    ``base_url`` carries the route's endpoint: every named custom entry reports the nameless provider
+    ``custom``, so the pin comparison needs it to tell one configured entry from another (CA-P2-2)."""
     try:
         from hermes_cli.auth import provider_blocked_by_config_failure
-        failure = provider_blocked_by_config_failure(provider, selection)
+        failure = provider_blocked_by_config_failure(provider, selection, base_url=base_url)
     except Exception as exc:
         failure = str(exc) or type(exc).__name__
     if failure:
         logger.warning("Auxiliary %s: not using %s while the config does not read cleanly (%s).",
                        task, provider or "an auto-detected provider", failure)
     return bool(failure)
+
+
+def _client_base_url(client: Any) -> str:
+    """A routed client's endpoint as a plain string ("" when it has none)."""
+    try:
+        return str(getattr(client, "base_url", "") or "")
+    except Exception:
+        return ""
 
 
 def _resolve_auto_route(
@@ -5352,7 +5363,7 @@ def _resolve_auto_route(
         return client, model, provider
     main_provider = str(runtime.get("provider") or "").lower()
     selection = runtime.get("selection") if provider and provider.lower() == main_provider else None
-    if _route_blocked(provider, selection, task or "call"):
+    if _route_blocked(provider, selection, task or "call", base_url=_client_base_url(client)):
         return None, None, ""
     return client, model, provider
 
@@ -5829,7 +5840,8 @@ def _resolve_custom_branch(req: _ResolveRequest) -> _ResolveResult:
     for try_fn in _custom_chain:
         client, default = try_fn()
         if client is not None and try_fn is _resolve_api_key_provider and _route_blocked(
-                _effective_provider_for_client(client, ""), None, "custom"):
+                _effective_provider_for_client(client, ""), None, "custom",
+                base_url=_client_base_url(client)):
             continue  # the config broke while the env-key scan ran: never publish its pick (A44)
         if client is not None:
             final_model = _normalize_resolved_model(model or default, provider)
@@ -6217,7 +6229,7 @@ def _published_route_blocked(client: Any, provider: str, main_runtime: Optional[
     runtime = _normalize_main_runtime(main_runtime)
     actual = _effective_provider_for_client(client, provider or "")
     selection = runtime.get("selection") if actual and actual.lower() == str(runtime.get("provider") or "").lower() else None
-    return _route_blocked(actual, selection, task)
+    return _route_blocked(actual, selection, task, base_url=_client_base_url(client))
 
 
 def get_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Optional[OpenAI], Optional[str]]:

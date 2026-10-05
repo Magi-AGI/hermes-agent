@@ -838,7 +838,7 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
         from hermes_cli.auth import refuse_provider_on_config_failure
         refuse_provider_on_config_failure(
             effective_provider or agent.provider or "", getattr(agent, "_provider_selection", None),
-            "the agent's provider")
+            "the agent's provider", base_url=str(getattr(_routed_client, "base_url", "") or ""))
         if is_actual_route(effective_provider):
             agent.provider = normalize_provider(effective_provider)
         return _client_kwargs_from_routed(_routed_client, _provider_timeout)

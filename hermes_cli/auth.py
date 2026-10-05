@@ -1595,7 +1595,7 @@ def config_pinned_provider(config: Any) -> str:
     return "" if provider == "auto" else provider
 
 
-def _provider_matches_pin(provider: str, pin: str) -> bool:
+def _provider_matches_pin(provider: str, pin: str, *, config: Any = None, base_url: str = "") -> bool:
     """Whether *provider* IS the provider *pin* names (the identity check, not "is pin configured").
 
     A named custom endpoint is spelled three ways that all mean the same route: ``custom:<name>``,
@@ -1604,6 +1604,19 @@ def _provider_matches_pin(provider: str, pin: str) -> bool:
     DIFFERENT entry: with several named custom providers, ``alpha`` must not authorise
     ``custom:beta`` (both are "a configured providers: entry", which is why the old membership test
     passed them both).
+
+    The bare form is where the identity is LOST, not merely unspelled: every named endpoint is built
+    by ``runtime_provider_custom._custom_runtime`` as the literal provider ``"custom"``, so the
+    production resolution path hands this rule the nameless form for ``alpha`` AND for ``beta``. Two
+    rungs recover the identity, in order:
+
+    1. *base_url* -- the resolved runtime's endpoint maps back to its ``custom:<name>`` entry
+       (``find_custom_provider_identity``). This is exact, and it is what the publication check on
+       ``resolve_runtime_provider`` passes.
+    2. Otherwise the nameless form authorises the pin only when no OTHER enabled custom entry could
+       be meant. One configured entry => the bare runtime IS the pinned entry (the documented
+       widening). Several => the name is genuinely ambiguous and a failed read is the wrong moment
+       to guess, so it is refused.
     """
     provider = _plugin_aliases().get((provider or "").strip().lower(), (provider or "").strip().lower())
     pin = (pin or "").strip().lower()
@@ -1616,10 +1629,46 @@ def _provider_matches_pin(provider: str, pin: str) -> bool:
     pin_name = _named_custom_entry(pin)
     if pin_name is None:
         return False  # the pin is not a custom route at all
-    # The bare ``custom`` runtime carries no name: it is the resolved form of the pinned entry.
     if provider == "custom":
-        return True
+        identity = _custom_identity_for_endpoint(base_url)
+        if identity is not None:
+            return _named_custom_entry(identity) == pin_name
+        others = [name for name in _enabled_custom_entry_names(config) if name != pin_name]
+        return not others
     return _named_custom_entry(provider) == pin_name
+
+
+def _custom_identity_for_endpoint(base_url: str) -> Optional[str]:
+    """The durable ``custom:<name>`` identity of *base_url*, or None when it maps to no entry."""
+    if not str(base_url or "").strip():
+        return None
+    try:
+        from hermes_cli.runtime_provider_custom import find_custom_provider_identity
+        return find_custom_provider_identity(str(base_url))
+    except Exception:
+        return None
+
+
+def _enabled_custom_entry_names(config: Any) -> List[str]:
+    """Normalised names of the enabled custom endpoints *config* defines (``providers:`` keys, then
+    legacy ``custom_providers:`` display names). Read from the config already observed by the
+    caller, so the ambiguity test and the pin come from the SAME observation (A44)."""
+    if not isinstance(config, dict):
+        return []
+    names: List[str] = []
+    providers = config.get("providers")
+    if isinstance(providers, dict):
+        from hermes_cli.config_providers import is_provider_enabled
+        for key, entry in providers.items():
+            if isinstance(entry, dict) and is_provider_enabled(entry):
+                names.append(str(key).strip().lower())
+    legacy = config.get("custom_providers")
+    if isinstance(legacy, list):
+        for entry in legacy:
+            name = entry.get("provider_key") or entry.get("name") if isinstance(entry, dict) else None
+            if isinstance(name, str) and name.strip():
+                names.append(name.strip().lower().replace(" ", "-"))
+    return list(dict.fromkeys(names))
 
 
 def _named_custom_entry(provider: str) -> Optional[str]:
@@ -1636,7 +1685,8 @@ def _named_custom_entry(provider: str) -> Optional[str]:
         return None
 
 
-def provider_blocked_by_config_failure(provider: str, selection: Optional[str] = None) -> Optional[str]:
+def provider_blocked_by_config_failure(provider: str, selection: Optional[str] = None, *,
+                                       base_url: str = "") -> Optional[str]:
     """THE rule for a provider result produced while the config may not read cleanly (A44, one choke
     point used at every place that publishes an implicitly chosen route). Takes ONE fresh observation.
     Returns None when ``provider`` may be used, else the failure that blocks it.
@@ -1648,7 +1698,12 @@ def provider_blocked_by_config_failure(provider: str, selection: Optional[str] =
     same pin-identity comparison as an unlabelled pick (a caller whose route drifted from the pin --
     a task override, a chain entry, an alias -- must not publish it merely by labelling it "config").
     Everything else (env keys, pool, login, free tier, HERMES_INFERENCE_PROVIDER, discovery, fallback
-    chains, a route carried from an env-selected runtime) is refused."""
+    chains, a route carried from an env-selected runtime) is refused.
+
+    ``base_url``: the resolved runtime's endpoint. Every named custom endpoint reports the nameless
+    provider ``custom``, so without it the comparison cannot tell WHICH entry a custom route is; pass
+    it wherever a runtime dict is at hand (see :func:`_provider_matches_pin`).
+    """
     config, failure = _config_observation()
     if not failure:
         return None
@@ -1656,12 +1711,15 @@ def provider_blocked_by_config_failure(provider: str, selection: Optional[str] =
         return None
     if REFUSE_LAST_KNOWN_GOOD_PROVIDER:
         return failure
-    return None if _provider_matches_pin(provider, config_pinned_provider(config)) else failure
+    matches = _provider_matches_pin(provider, config_pinned_provider(config), config=config, base_url=base_url)
+    return None if matches else failure
 
 
-def refuse_provider_on_config_failure(provider: str, selection: Optional[str], source: str) -> None:
+def refuse_provider_on_config_failure(provider: str, selection: Optional[str], source: str, *,
+                                      base_url: str = "") -> None:
     """Raise ``corrupt_config`` when :func:`provider_blocked_by_config_failure` blocks ``provider``."""
-    _refuse_env_adoption_if_config_corrupt(provider_blocked_by_config_failure(provider, selection), source)
+    _refuse_env_adoption_if_config_corrupt(
+        provider_blocked_by_config_failure(provider, selection, base_url=base_url), source)
 
 
 def _config_model_provider() -> Tuple[Any, Optional[str], Optional[str]]:

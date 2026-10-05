@@ -1030,11 +1030,14 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
         "explicit" if (explicit_api_key or explicit_base_url) else request_source)
     runtime["selection"] = selection
     # Publication check (A44): one fresh observation; a provider produced while the config does not read
-    # cleanly is refused unless it is an explicit per-run choice or the last-known-good pin.
+    # cleanly is refused unless it is an explicit per-run choice or the last-known-good pin. The resolved
+    # endpoint goes with it: a named custom entry resolves to the nameless provider ``custom``, so the
+    # pin comparison needs the base_url to tell alpha's route from beta's (CA-P2-2).
     from hermes_cli.auth import refuse_provider_on_config_failure
     refuse_provider_on_config_failure(
         str(runtime.get("provider") or requested_provider), selection,
-        {"env": "HERMES_INFERENCE_PROVIDER", "auto": "automatic provider detection"}.get(selection, "the resolved provider"))
+        {"env": "HERMES_INFERENCE_PROVIDER", "auto": "automatic provider detection"}.get(selection, "the resolved provider"),
+        base_url=str(runtime.get("base_url") or ""))
     return runtime
 
 
