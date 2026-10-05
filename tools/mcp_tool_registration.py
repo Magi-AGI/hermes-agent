@@ -510,15 +510,32 @@ def _sync_membership_locked(key) -> None:
 
 
 def _set_profile_policy(key, scope: Optional[str], config: Optional[dict], *, server=None,
-                        reconcile: bool = True) -> List[str]:
+                        reconcile: bool = True, require_live: bool = False) -> List[str]:
     """The ONLY writer of a profile's policy for a connection: gain (config for a new scope), change
     (a different config), or loss (``None``). Recomputes that profile unless *reconcile* is False
-    (the caller reconciles the whole connection next). Returns the profile's landed names."""
+    (the caller reconciles the whole connection next). Returns the profile's landed names.
+
+    ``require_live``: the caller decided from a snapshot of ``_core._servers`` taken OUTSIDE this
+    lock (the adoption pass in ``_register_connected_into_current_scope``). A shutdown landing in
+    that window has already run ``_forget_connection_profiles_locked``, so writing the snapshot's
+    policy now would resurrect a record for a destroyed connection: a ghost policy and membership
+    that teardown will never revisit and that the orphan re-registration
+    (``mcp_tool_lifecycle._reregister_orphaned_adopters``, whose pending set was built from the
+    membership that existed AT teardown) cannot see, leaving the profile tool-less until its next
+    discovery. Re-validated here, under the same lock the write takes, a dead connection is a
+    policy LOSS instead (the state teardown left), so the next pass re-adopts or connects cleanly.
+    """
     name = _key_name(key)
     with _connection_lock(key):
         owner = _core._server_registry_scope(key)
         with _core._lock:
             slot = (key, scope)
+            if require_live and config is not None:
+                live_now = _core._servers.get(key)
+                if live_now is None or getattr(live_now, "session", None) is None:
+                    logger.debug("MCP server '%s': connection was destroyed while profile %s was adopting it; "
+                                 "not recording a policy for the dead connection", name, scope)
+                    config = None
             if config is None:
                 _core._server_scope_configs.pop(slot, None)
             else:
@@ -785,7 +802,9 @@ def _register_connected_into_current_scope(servers: dict) -> int:
                 or not _same_server_route(server, config, cross_profile=cross_profile)):
             _remove_server_scope(key, scope)
         elif dict(config) != recorded:
-            _set_profile_policy(key, scope, config)
+            # Same out-of-lock snapshot as the gain below: a connection torn down in the window
+            # must end as a policy loss, not as a changed policy for a dead key.
+            _set_profile_policy(key, scope, config, require_live=True)
 
     registered_servers = 0
     for name, config in servers.items():
@@ -807,7 +826,9 @@ def _register_connected_into_current_scope(servers: dict) -> int:
         if already:
             continue  # reconciled above
         # GAIN: the owner keeps teardown; this profile's state is recomputed under its own policy.
-        if _set_profile_policy(key, scope, config):
+        # ``shared`` was read outside the connection lock, so the write re-validates that the
+        # connection is still alive (else it would leave a ghost policy for a destroyed one).
+        if _set_profile_policy(key, scope, config, require_live=True):
             registered_servers += 1
     return registered_servers
 
