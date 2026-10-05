@@ -18,9 +18,25 @@ What IS real is narrower than the report said: the assignment happens after
 the caller's store has its ``_record_owner_name_snapshot`` write clobbered. That window is a few
 bytecodes wide and no deterministic probe can sit inside it, so it is closed STRUCTURALLY instead of
 by test: ``_register_server_tools`` is now the single writer of the attribute and the callers read it
-back. Severity recorded as **P3** — matching Gemini's assessment, now with the reason established
-rather than assumed (status/count staleness only, self-correcting on the next reconcile, and the
-stated P2 mechanism disproved).
+back.
+
+Severity — the one explicit decision, because the two reviewers split and so did this branch's own
+records. Codex said P2; Gemini said P3 on identical code facts; the commit that introduced this
+file argues in its message for P2 ("a lost write with no deadline is not a cosmetic lag"), while
+this docstring is the adjudicated record and says **P3**. Reconciled deliberately rather than left
+as drift, on three grounds the P2 argument does not address:
+
+1. the stated P2 mechanism is DISPROVED above (the epoch makes the return value post-edit), so the
+   wide window the P2 rating was assigned to does not exist;
+2. what remains is a few bytecodes between the return and the caller's store -- not a window a
+   policy edit realistically lands in;
+3. the damage is confined to ``_registered_tool_names``, which only feeds status and tool-count
+   display (``get_mcp_status``, ``_connected_summary``). It does NOT gate tool availability or
+   trust: the registry holds the real entries, so no tool is lost, exposed, or mis-authorised.
+
+The "no deadline" point stands and is why this is still FIXED rather than accepted -- unbounded
+display staleness is a real defect. It is just not a deploy blocker. Anyone re-reading the commit
+message should treat THIS as the current disposition.
 
 R2 (relay finding) — the owner policy write had no ``require_live``, and that IS a real P2 of the
 same class as MCP-P2-2: a teardown landing mid-publication popped the key and swept the policies,
