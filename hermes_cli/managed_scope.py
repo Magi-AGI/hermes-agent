@@ -67,6 +67,7 @@ def invalidate_managed_cache() -> None:
         _CONFIG_CACHE.clear()
         _ENV_CACHE.clear()
         _VANISHED_SINCE.clear()
+        _FAILED_READS.clear()
     global _LAST_MANAGED_DIR
     _LAST_MANAGED_DIR = None
 
@@ -91,6 +92,16 @@ _ABSENT = ManagedRead(ABSENT_SIGNATURE, {}, None)
 # that window, while a real removal still takes effect (A43 closure r2, finding 6).
 VANISHED_GRACE_SECONDS = 5.0
 _VANISHED_SINCE: Dict[str, float] = {}
+# Managed files this process OBSERVED but could not use: a malformed file is never cached (the cache
+# holds parses), so without this the admin's broken-but-present policy would vanish into a clean
+# absence the moment its directory is renamed -- the one window in which an env provider can pass.
+# "Known" for the vanish grace means OBSERVED, not CACHED.
+_FAILED_READS: set = set()
+
+
+def _observed(path_key: str, cache: Dict[str, tuple]) -> bool:
+    """Whether this process has seen this managed file at all: a usable parse OR a failed read."""
+    return path_key in cache or path_key in _FAILED_READS
 
 
 def _read_managed_bytes(path: Path) -> tuple:
@@ -104,30 +115,32 @@ def _read_managed_bytes(path: Path) -> tuple:
 def _cached_read(path: Path, cache: Dict[str, tuple], parse) -> ManagedRead:
     """Shared content-keyed read of one managed file; ``value`` is a deepcopy of the parse.
 
-    Absent -> ``_ABSENT`` (a file read before counts as absent only after ``VANISHED_GRACE_SECONDS``).
-    Unreadable or unparseable (including a non-mapping root) -> ``error`` set, never cached, logged
-    LOUDLY (the admin needs to know their policy isn't applied) but never raised, so a malformed
-    managed file can't brick startup."""
+    Absent -> ``_ABSENT`` (a file OBSERVED before -- parsed or failed -- counts as absent only after
+    ``VANISHED_GRACE_SECONDS``). Unreadable or unparseable (including a non-mapping root) -> ``error``
+    set, never cached but RECORDED as observed, logged LOUDLY (the admin needs to know their policy
+    isn't applied) but never raised, so a malformed managed file can't brick startup."""
     path_key = str(path)
     try:
         key, data = _read_managed_bytes(path)
     except FileNotFoundError as exc:
         with _CACHE_LOCK:
-            known = path_key in cache
-            if not known:
+            if not _observed(path_key, cache):
                 return _ABSENT
             since = _VANISHED_SINCE.setdefault(path_key, time.monotonic())
-            if time.monotonic() - since < VANISHED_GRACE_SECONDS:
-                return _managed_failure(path, "read", exc)
-            cache.pop(path_key, None)
-            _VANISHED_SINCE.pop(path_key, None)
-        return _ABSENT
+            within_grace = time.monotonic() - since < VANISHED_GRACE_SECONDS
+            if not within_grace:  # really gone: forget it so a later file starts a fresh grace
+                cache.pop(path_key, None)
+                _FAILED_READS.discard(path_key)
+                _VANISHED_SINCE.pop(path_key, None)
+        # _managed_failure takes _CACHE_LOCK itself, so it is called outside this block.
+        return _managed_failure(path, "read", exc) if within_grace else _ABSENT
     except OSError as exc:
         return _managed_failure(path, "read", exc)
     with _CACHE_LOCK:
         _VANISHED_SINCE.pop(path_key, None)
         hit = cache.get(path_key)
         if hit is not None and hit[:len(key)] == key:
+            _FAILED_READS.discard(path_key)
             return ManagedRead(key, copy.deepcopy(hit[len(key)]), None)
     try:
         parsed = parse(data)
@@ -141,11 +154,14 @@ def _cached_read(path: Path, cache: Dict[str, tuple], parse) -> ManagedRead:
         return _managed_failure(path, "parse" if stable else "read", exc)
     with _CACHE_LOCK:
         cache[path_key] = (*key, copy.deepcopy(parsed))
+        _FAILED_READS.discard(path_key)
     return ManagedRead(key, parsed, None)
 
 
 def _managed_failure(path: Path, kind: str, exc: Exception) -> ManagedRead:
     verb = "parsed" if kind == "parse" else "read"
+    with _CACHE_LOCK:
+        _FAILED_READS.add(str(path))
     logger.warning(
         "managed scope: %s could not be %s: %s — IGNORING this managed file. "
         "Admin policy from this file is NOT being applied. Fix and restart.",
@@ -166,7 +182,7 @@ def _read_managed_file(name: str, cache: Dict[str, tuple], parse) -> ManagedRead
         if previous is None:
             return _ABSENT
         with _CACHE_LOCK:
-            known = str(previous / name) in cache
+            known = _observed(str(previous / name), cache)
         if not known:
             return _ABSENT
         # _cached_read sees FileNotFoundError on a known file: failed read inside the grace window,
