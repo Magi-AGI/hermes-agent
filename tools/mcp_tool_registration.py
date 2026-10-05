@@ -640,10 +640,34 @@ def _reconcile_profile(key, scope: Optional[str], *, server=None) -> List[str]:
                                    "is left unchanged until a publication succeeds", name, scope)
                 else:
                     _write_profile_cache(name, live, config, scope)
+            _record_owner_name_snapshot(key, scope, live, landed)
             return landed
     logger.warning("MCP server '%s': profile %s policy kept changing during reconcile; left for the next pass",
                    name, scope)
     return []
+
+
+def _record_owner_name_snapshot(key, scope: Optional[str], live, landed: List[str]) -> None:
+    """Keep the owner's ``_registered_tool_names`` equal to what its slot actually holds.
+
+    The snapshot is the status/tool-count source (``mcp_tool_discovery.get_mcp_status`` and the
+    ``_connected_summary`` line read ``len(server._registered_tool_names)``). It used to be written
+    only where ``_register_server_tools`` is CALLED (discovery, ``_publish_tool_list``), so an
+    owner-policy-only edit applied by the registration pass -- which reaches the registry through
+    ``_set_profile_policy`` -> ``_reconcile_profile`` and never republishes -- moved the live
+    entries while the snapshot kept the pre-edit names. Writing it here, in the one place that
+    computes the owner's landed set, makes the two equal for EVERY input change (publish, teardown,
+    policy edit), not only for a publication.
+    """
+    if live is None or scope != _core._server_registry_scope(key):
+        return
+    with _core._lock:
+        if _core._servers.get(key) is not live:
+            return  # a bare double or a replaced connection: not the live owner's snapshot
+    try:
+        live._registered_tool_names = list(landed)
+    except AttributeError:  # a test double without the slot
+        pass
 
 
 def _reconcile_connection(key, server=None) -> List[str]:
