@@ -39,6 +39,14 @@ logger = logging.getLogger("gateway.run")
 
 DEFAULT_HUMAN_DELAY_RANGE_MS: tuple[int, int] = (800, 2500)
 
+# hermes_home_key -> the last CLEANLY read fallback chain for that home (None = the home has no
+# chain). One process serves many profiles, so this is keyed per home, never a single slot: a
+# runner-wide slot handed a secondary profile the default profile's chain. Read only when the
+# config.yaml for that home does NOT read cleanly, so the admin layer's last allowed answer
+# survives a torn write instead of the user's unconstrained chain being published
+# (:meth:`GatewayRunner._load_fallback_model`, CA-P2/P3-6 round 3).
+_LAST_CLEAN_FALLBACK_CHAIN: Dict[str, Optional[List[Any]]] = {}
+
 _BUSY_INPUT_MODES = {"interrupt", "queue", "steer"}
 
 
@@ -505,13 +513,47 @@ class GatewayConfigLoadersMixin:
 
     @staticmethod
     def _load_fallback_model() -> list | None:
-        """Fallback chain: ``fallback_providers`` (kept first) merged with legacy ``fallback_model``."""
-        from gateway.run import _load_gateway_config
+        """Fallback chain: ``fallback_providers`` (kept first) merged with legacy ``fallback_model``.
+
+        Read FAIL-CLOSED, per Hermes home. This is the chain source for every agent created without
+        a confirmed runtime lock (``gateway/platforms/api_server.py``: ``"fallback_model": None if
+        confirmed_runtime_lock else GatewayRunner._load_fallback_model()``), and the admin layer can
+        only ever REMOVE or override what the user file says — a managed ``fallback_providers: []``
+        suppresses a user chain. Through the fail-OPEN ``_load_gateway_config`` an unreadable managed
+        file was applied as an EMPTY overlay, so a newly created API agent received exactly the chain
+        the admin layer had suppressed, and ``agent.chat_completion_helpers.try_activate_fallback``
+        installs chain entries with no A44 gate of its own (CA-P2/P3-6 round 3).
+
+        On a failed read the last CLEAN answer for that home is served, never the user's
+        unconstrained chain: a managed file that stopped reading says nothing about the chain the
+        admin layer last allowed, and dropping to an empty chain would silently disable failover for
+        every agent created afterwards. Per home, because one process serves many profiles and a
+        single runner-wide slot would hand a secondary profile the default profile's chain.
+
+        The gate is applied HERE rather than in ``_load_gateway_config``: that loader is the
+        documented fail-open primitive with ~15 callers whose contract is "``{}`` on any error", and
+        converting it would change all of them. Same shape ``_refresh_fallback_model`` already uses.
+        The activation seam (``try_activate_fallback``) is deliberately NOT gated as well — it would
+        need the A44 observation threaded through the mid-turn retry loop, which is CA-P2/P3-6's
+        standing P3 follow-up; closing the constructor means there is no suppressed entry in the
+        chain for it to install.
+        """
+        from gateway.run import _gateway_config_home
+        from hermes_constants import hermes_home_key
+        home = _gateway_config_home()
+        home_key = hermes_home_key(home)
         try:
-            # Canonical gateway loader (fail-open): managed overlay + ${VAR} expansion apply here too.
-            return get_fallback_chain(_load_gateway_config()) or None
+            from hermes_cli.config_effective import load_user_config_effective
+            cfg = load_user_config_effective(home / "config.yaml", fail_closed=True)
         except Exception:
-            return None
+            retained = _LAST_CLEAN_FALLBACK_CHAIN.get(home_key)
+            logger.debug("fallback chain: config.yaml for %s did not read cleanly; serving the last clean "
+                         "chain (%s entries) rather than the unconstrained user chain",
+                         home, len(retained or []), exc_info=True)
+            return retained
+        chain = get_fallback_chain(cfg) or None
+        _LAST_CLEAN_FALLBACK_CHAIN[home_key] = chain
+        return chain
 
     def _refresh_fallback_model(self) -> list | None:
         """Re-read fallback_providers from disk for the next agent create/reuse.
