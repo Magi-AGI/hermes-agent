@@ -1031,13 +1031,16 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
     runtime["selection"] = selection
     # Publication check (A44): one fresh observation; a provider produced while the config does not read
     # cleanly is refused unless it is an explicit per-run choice or the last-known-good pin. The resolved
-    # endpoint goes with it: a named custom entry resolves to the nameless provider ``custom``, so the
-    # pin comparison needs the base_url to tell alpha's route from beta's (CA-P2-2).
+    # entry's IDENTITY goes with it: a named custom entry resolves to the nameless provider ``custom``, so
+    # the pin comparison cannot otherwise tell alpha's route from beta's (CA-P2-2). ``custom_identity`` is
+    # the entry the ladder actually picked (stamped by ``_apply_custom_provider_extras``); ``base_url`` is
+    # the weaker fallback for routes carrying no identity, and two entries may share one endpoint.
     from hermes_cli.auth import refuse_provider_on_config_failure
     refuse_provider_on_config_failure(
         str(runtime.get("provider") or requested_provider), selection,
         {"env": "HERMES_INFERENCE_PROVIDER", "auto": "automatic provider detection"}.get(selection, "the resolved provider"),
-        base_url=str(runtime.get("base_url") or ""))
+        base_url=str(runtime.get("base_url") or ""),
+        custom_identity=str(runtime.get("custom_identity") or ""))
     return runtime
 
 

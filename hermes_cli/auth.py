@@ -1595,7 +1595,8 @@ def config_pinned_provider(config: Any) -> str:
     return "" if provider == "auto" else provider
 
 
-def _provider_matches_pin(provider: str, pin: str, *, config: Any = None, base_url: str = "") -> bool:
+def _provider_matches_pin(provider: str, pin: str, *, config: Any = None, base_url: str = "",
+                          custom_identity: str = "") -> bool:
     """Whether *provider* IS the provider *pin* names (the identity check, not "is pin configured").
 
     A named custom endpoint is spelled three ways that all mean the same route: ``custom:<name>``,
@@ -1607,16 +1608,24 @@ def _provider_matches_pin(provider: str, pin: str, *, config: Any = None, base_u
 
     The bare form is where the identity is LOST, not merely unspelled: every named endpoint is built
     by ``runtime_provider_custom._custom_runtime`` as the literal provider ``"custom"``, so the
-    production resolution path hands this rule the nameless form for ``alpha`` AND for ``beta``. Two
-    rungs recover the identity, in order:
+    production resolution path hands this rule the nameless form for ``alpha`` AND for ``beta``.
+    Three rungs recover the identity, in order, and every one of them reads the SAME observed
+    *config* the pin came from (R3-2):
 
-    1. *base_url* -- the resolved runtime's endpoint maps back to its ``custom:<name>`` entry
-       (``find_custom_provider_identity``). This is exact, and it is what the publication check on
-       ``resolve_runtime_provider`` passes.
-    2. Otherwise the nameless form authorises the pin only when no OTHER enabled custom entry could
-       be meant. One configured entry => the bare runtime IS the pinned entry (the documented
-       widening). Several => the name is genuinely ambiguous and a failed read is the wrong moment
-       to guess, so it is refused.
+    1. *custom_identity* -- the canonical ``custom:<name>`` of the entry the RESOLVER actually
+       picked, carried on the runtime it built. The resolver already knows which entry it chose, so
+       this is the authoritative answer and does not have to be re-derived from the URL.
+    2. *base_url* -- the resolved runtime's endpoint mapped back to a configured entry, for routes
+       that carry no identity (an ad-hoc ``model_aliases:`` endpoint, a cached auxiliary client).
+       Two entries may legitimately share one endpoint with different credentials, so this rung
+       answers only when EXACTLY ONE entry matches: unmatched and ambiguous are the same answer
+       during a failed read, and that answer is refuse. ``return not others`` was the wrong default
+       on a failed lookup -- an endpoint belonging to no configured entry is positively NOT the
+       pinned one (CA-P2-2 round 3).
+    3. Otherwise -- no identity and no endpoint at all -- the nameless form authorises the pin only
+       when no OTHER enabled custom endpoint could be meant. One configured endpoint => the bare
+       runtime IS the pinned entry (the documented widening). Several => the name is genuinely
+       ambiguous and a failed read is the wrong moment to guess, so it is refused.
     """
     provider = _plugin_aliases().get((provider or "").strip().lower(), (provider or "").strip().lower())
     pin = (pin or "").strip().lower()
@@ -1626,67 +1635,111 @@ def _provider_matches_pin(provider: str, pin: str, *, config: Any = None, base_u
         return True
     if not (provider == "custom" or provider.startswith("custom:")):
         return False
-    pin_name = _named_custom_entry(pin)
+    pin_name = _named_custom_entry(pin, config=config)
     if pin_name is None:
         return False  # the pin is not a custom route at all
-    if provider == "custom":
-        identity = _custom_identity_for_endpoint(base_url)
-        if identity is not None:
-            return _named_custom_entry(identity) == pin_name
-        others = [name for name in _enabled_custom_entry_names(config) if name != pin_name]
-        return not others
-    return _named_custom_entry(provider) == pin_name
+    if provider != "custom":
+        return _named_custom_entry(provider, config=config) == pin_name
+    identity = str(custom_identity or "").strip().lower()
+    if identity:  # rung 1: the resolver's own answer travels with the runtime
+        return _named_custom_entry(identity, config=config) == pin_name
+    if str(base_url or "").strip():  # rung 2: endpoint -> entry, only when unambiguous
+        matched = _custom_identities_for_endpoint(config, base_url)
+        return matched is not None and len(matched) == 1 and matched[0] == pin_name
+    others = _enabled_custom_entry_names(config)  # rung 3: the documented one-endpoint widening
+    if others is None:
+        return False  # the entry list did not read: refuse rather than assume the pin
+    return not [name for name in others if name != pin_name]
 
 
-def _custom_identity_for_endpoint(base_url: str) -> Optional[str]:
-    """The durable ``custom:<name>`` identity of *base_url*, or None when it maps to no entry."""
-    if not str(base_url or "").strip():
+def _custom_endpoint_entries(config: Any) -> Optional[List[Tuple[str, str]]]:
+    """``(entry name, normalised base_url)`` for every ENABLED custom endpoint *config* defines, or
+    None when that list could not be determined.
+
+    Read from the config the caller already observed, so the pin, the endpoint lookup and the
+    ambiguity test all come from ONE observation (A44, R3-2). ``find_custom_provider_identity``
+    performs its own independent ``load_config()``, a second read that can disagree with this one
+    during a torn write, which is why the lookup lives here instead.
+
+    Only REAL custom endpoints count. ``providers:`` also holds registry-provider credentials
+    (``providers: {anthropic: {api_key: ...}}``, written by the model picker and read by doctor);
+    counting those as rival custom entries refuses the exact single-endpoint widening this rule
+    documents (R3-1). ``providers_dict_to_custom_providers`` -- which requires a usable ``base_url``
+    -- is the canonical filter, so it is the one used here rather than a second, looser one.
+
+    None, never ``[]``, on failure: ``[]`` reads as "no other entry could be meant" and ADMITS the
+    nameless route, which is the wrong direction for a failed read (R3-4).
+    """
+    if not isinstance(config, dict):
         return None
     try:
-        from hermes_cli.runtime_provider_custom import find_custom_provider_identity
-        return find_custom_provider_identity(str(base_url))
-    except Exception:
+        from hermes_cli.config_providers import get_compatible_custom_providers
+        from hermes_cli.providers import custom_provider_slug
+        entries = get_compatible_custom_providers(config)
+    except Exception as exc:
+        logger.warning("Could not enumerate the configured custom endpoints for the provider pin "
+                       "check (%s); the route is refused rather than assumed to be the pinned one", exc)
         return None
+    out: List[Tuple[str, str]] = []
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        name = custom_provider_slug(str(entry.get("name") or ""),
+                                    str(entry.get("provider_key") or "")).split(":", 1)[1]
+        if name:
+            out.append((name, str(entry.get("base_url") or "").strip().rstrip("/").lower()))
+    return out
 
 
-def _enabled_custom_entry_names(config: Any) -> List[str]:
-    """Normalised names of the enabled custom endpoints *config* defines (``providers:`` keys, then
-    legacy ``custom_providers:`` display names). Read from the config already observed by the
-    caller, so the ambiguity test and the pin come from the SAME observation (A44)."""
-    if not isinstance(config, dict):
+def _custom_identities_for_endpoint(config: Any, base_url: str) -> Optional[List[str]]:
+    """Every configured entry name whose endpoint IS *base_url* (None when the list did not read).
+
+    More than one is not a tie to break: two entries may share a base_url with DIFFERENT
+    credentials, and the URL alone cannot say which runtime this is.
+    """
+    target = str(base_url or "").strip().rstrip("/").lower()
+    if not target:
         return []
-    names: List[str] = []
-    providers = config.get("providers")
-    if isinstance(providers, dict):
-        from hermes_cli.config_providers import is_provider_enabled
-        for key, entry in providers.items():
-            if isinstance(entry, dict) and is_provider_enabled(entry):
-                names.append(str(key).strip().lower())
-    legacy = config.get("custom_providers")
-    if isinstance(legacy, list):
-        for entry in legacy:
-            name = entry.get("provider_key") or entry.get("name") if isinstance(entry, dict) else None
-            if isinstance(name, str) and name.strip():
-                names.append(name.strip().lower().replace(" ", "-"))
-    return list(dict.fromkeys(names))
+    entries = _custom_endpoint_entries(config)
+    if entries is None:
+        return None
+    return list(dict.fromkeys(name for name, url in entries if url and url == target))
 
 
-def _named_custom_entry(provider: str) -> Optional[str]:
+def _enabled_custom_entry_names(config: Any) -> Optional[List[str]]:
+    """Names of the enabled custom endpoints *config* defines (None when the list did not read)."""
+    entries = _custom_endpoint_entries(config)
+    if entries is None:
+        return None
+    return list(dict.fromkeys(name for name, _url in entries))
+
+
+def _named_custom_entry(provider: str, *, config: Any = None) -> Optional[str]:
     """The ``providers:`` entry name *provider* denotes, ``""`` for the nameless bare ``custom``
-    runtime, or None when it is not a custom route at all."""
+    runtime, or None when it is not a custom route at all.
+
+    Resolved against the OBSERVED *config* whenever the caller has one, so the pin's identity and
+    the ambiguity test cannot come from two disagreeing reads (R3-2). ``has_named_custom_provider``
+    does its own read and is only the fallback for a caller with no observation to offer.
+    """
     if provider == "custom":
         return ""
     if provider.startswith("custom:"):
         return provider[len("custom:"):] or ""
+    if config is not None:
+        names = _enabled_custom_entry_names(config)
+        return None if names is None else (provider if provider in names else None)
     try:
         from hermes_cli.runtime_provider_custom import has_named_custom_provider
-        return provider if has_named_custom_provider(provider) else None
-    except Exception:
+    except ImportError as exc:
+        logger.warning("Custom-provider identity lookup is unavailable (%s); %r is not treated as a "
+                       "custom route", exc, provider)
         return None
+    return provider if has_named_custom_provider(provider) else None
 
 
 def provider_blocked_by_config_failure(provider: str, selection: Optional[str] = None, *,
-                                       base_url: str = "") -> Optional[str]:
+                                       base_url: str = "", custom_identity: str = "") -> Optional[str]:
     """THE rule for a provider result produced while the config may not read cleanly (A44, one choke
     point used at every place that publishes an implicitly chosen route). Takes ONE fresh observation.
     Returns None when ``provider`` may be used, else the failure that blocks it.
@@ -1700,9 +1753,14 @@ def provider_blocked_by_config_failure(provider: str, selection: Optional[str] =
     Everything else (env keys, pool, login, free tier, HERMES_INFERENCE_PROVIDER, discovery, fallback
     chains, a route carried from an env-selected runtime) is refused.
 
-    ``base_url``: the resolved runtime's endpoint. Every named custom endpoint reports the nameless
-    provider ``custom``, so without it the comparison cannot tell WHICH entry a custom route is; pass
-    it wherever a runtime dict is at hand (see :func:`_provider_matches_pin`).
+    ``custom_identity``: the ``custom:<name>`` of the entry the RESOLVER picked, when the caller has a
+    resolved runtime. Preferred over ``base_url``, because the resolver knows which entry it chose and
+    an endpoint shared by two entries cannot say.
+
+    ``base_url``: the resolved runtime's endpoint, for routes carrying no identity. Every named custom
+    endpoint reports the nameless provider ``custom``, so without one of these two the comparison
+    cannot tell WHICH entry a custom route is; pass whichever the call site has
+    (see :func:`_provider_matches_pin`).
     """
     config, failure = _config_observation()
     if not failure:
@@ -1711,15 +1769,17 @@ def provider_blocked_by_config_failure(provider: str, selection: Optional[str] =
         return None
     if REFUSE_LAST_KNOWN_GOOD_PROVIDER:
         return failure
-    matches = _provider_matches_pin(provider, config_pinned_provider(config), config=config, base_url=base_url)
+    matches = _provider_matches_pin(provider, config_pinned_provider(config), config=config,
+                                    base_url=base_url, custom_identity=custom_identity)
     return None if matches else failure
 
 
 def refuse_provider_on_config_failure(provider: str, selection: Optional[str], source: str, *,
-                                      base_url: str = "") -> None:
+                                      base_url: str = "", custom_identity: str = "") -> None:
     """Raise ``corrupt_config`` when :func:`provider_blocked_by_config_failure` blocks ``provider``."""
     _refuse_env_adoption_if_config_corrupt(
-        provider_blocked_by_config_failure(provider, selection, base_url=base_url), source)
+        provider_blocked_by_config_failure(provider, selection, base_url=base_url,
+                                           custom_identity=custom_identity), source)
 
 
 def _config_model_provider() -> Tuple[Any, Optional[str], Optional[str]]:
