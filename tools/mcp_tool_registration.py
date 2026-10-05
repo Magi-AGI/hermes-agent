@@ -415,10 +415,29 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
     connection's published list changed, so every profile using it is recomputed by
     ``_reconcile_connection`` (the owner under *config*, each adopter under its own policy).
     Returns the owner's names. Lossy normalization collisions fail closed; a name another toolset
-    owns is never overwritten."""
+    owns is never overwritten.
+
+    This function OWNS ``server._registered_tool_names``: it is written here, inside
+    ``_connection_lock(key)``, never by a caller after the lock is released (MCP-P2-1 round 2).
+    Callers used to assign the return value themselves, so an owner policy edit interleaving
+    between the reconcile and that assignment installed the correct snapshot and had it overwritten
+    with this publication's earlier names — status/tool counts then read stale until the next
+    reconcile. Use the return value; do not assign the attribute.
+    """
     key = _server_key_for_task(server)
     owner_scope = _core._server_registry_scope(key)
     slot = (key, owner_scope)
+    # Was this task THE live connection for *key* when the publication started? The adoption paths
+    # pass ``require_live`` because they decide from a snapshot taken outside the lock; the owner
+    # path has the same exposure (relay finding R2): a teardown landing mid-publication pops the key
+    # and runs ``_forget_connection_profiles_locked``, after which writing the owner policy
+    # resurrects a record for a destroyed connection. It cannot simply pass ``require_live=True``,
+    # because a legitimate publication by a server that is NOT in ``_servers`` exists -- a retained
+    # initial-failure connection republishing once ``_ready`` is set
+    # (``mcp_tool_transport._register_discovered_tools_if_needed``). So the guard is conditional on
+    # having BEEN live: only a connection that was live and then vanished is a teardown.
+    with _core._lock:
+        was_live = _core._servers.get(key) is server
     # Selecting the policy and writing it happen under the SAME per-connection lock as
     # _set_profile_policy, so a concurrent owner edit cannot land between them; the policy epoch is
     # re-validated before writing, so an edit that lands even re-entrantly restarts the selection
@@ -446,8 +465,9 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
                     continue  # the owner's policy moved while selecting: select again
             server._list_published = True
             server._published_before = True
-            _set_profile_policy(key, owner_scope, policy, server=server, reconcile=False)
-            return _reconcile_connection(key, server)
+            _set_profile_policy(key, owner_scope, policy, server=server, reconcile=False,
+                                require_live=was_live)
+            return _publish_owner_names(key, server, _reconcile_connection(key, server))
         logger.warning("MCP server '%s': owner policy kept changing during publication; publishing with the "
                        "latest recorded policy", name)
         with _core._lock:
@@ -456,8 +476,29 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
         _record_tool_trust_metadata(name, policy, server._tools, key)
         server._list_published = True
         server._published_before = True
-        _set_profile_policy(key, owner_scope, policy, server=server, reconcile=False)
-        return _reconcile_connection(key, server)
+        _set_profile_policy(key, owner_scope, policy, server=server, reconcile=False,
+                            require_live=was_live)
+        return _publish_owner_names(key, server, _reconcile_connection(key, server))
+
+
+def _publish_owner_names(key, server, names: List[str]) -> List[str]:
+    """Settle ``server._registered_tool_names`` while the caller still holds ``_connection_lock``.
+
+    ``_reconcile_profile`` already writes the snapshot through ``_record_owner_name_snapshot`` for a
+    live owner, which is the normal path; this covers the one case that skips — a server publishing
+    while it is not (yet / any longer) the entry in ``_core._servers`` for *key*, e.g. a retained
+    initial-failure connection whose ``_ready`` is set (``mcp_tool_transport.
+    _register_discovered_tools_if_needed``). Doing it here rather than in the caller is the point:
+    inside the lock no policy edit can interleave, so this write can never clobber a newer snapshot.
+    """
+    with _core._lock:
+        if _core._servers.get(key) is server:
+            return names  # _record_owner_name_snapshot already wrote it under this same lock
+    try:
+        server._registered_tool_names = list(names)
+    except AttributeError:  # a test double without the slot
+        pass
+    return names
 
 
 # ---------------------------------------------------------------------------------------------
@@ -516,14 +557,23 @@ def _set_profile_policy(key, scope: Optional[str], config: Optional[dict], *, se
     (the caller reconciles the whole connection next). Returns the profile's landed names.
 
     ``require_live``: the caller decided from a snapshot of ``_core._servers`` taken OUTSIDE this
-    lock (the adoption pass in ``_register_connected_into_current_scope``). A shutdown landing in
-    that window has already run ``_forget_connection_profiles_locked``, so writing the snapshot's
+    lock -- the adoption pass in ``_register_connected_into_current_scope``, and the owner
+    publication in ``_register_server_tools``. A shutdown landing in that window has already run
+    ``_forget_connection_profiles_locked``, so writing the snapshot's
     policy now would resurrect a record for a destroyed connection: a ghost policy and membership
     that teardown will never revisit and that the orphan re-registration
     (``mcp_tool_lifecycle._reregister_orphaned_adopters``, whose pending set was built from the
     membership that existed AT teardown) cannot see, leaving the profile tool-less until its next
-    discovery. Re-validated here, under the same lock the write takes, a dead connection is a
-    policy LOSS instead (the state teardown left), so the next pass re-adopts or connects cleanly.
+    discovery. Re-validated here, a dead connection is a policy LOSS instead (the state teardown
+    left), so the next pass re-adopts or connects cleanly.
+
+    WHICH lock carries that invariant: ``_core._lock``, NOT ``_connection_lock(key)``.
+    ``mcp_tool_lifecycle.shutdown_mcp_servers`` never acquires a connection lock -- it pops
+    ``_core._servers`` and runs ``clear_selected_status`` -> ``_forget_connection_profiles_locked``
+    inside ``_core._lock``. So the liveness re-read and the policy write below sit in ONE
+    ``_core._lock`` block on purpose: that is what makes them atomic against the sweep.
+    ``_connection_lock(key)`` serializes publication against concurrent policy edits -- a
+    different race -- and would not order anything against teardown.
     """
     name = _key_name(key)
     with _connection_lock(key):

@@ -175,8 +175,12 @@ class MCPServerHealthMixin:
         # holding tool-call IDs keep a handler), new ones land.
         self._tools = new_mcp_tools
         self._list_cache_meta = list_meta
-        registered_names = _registration._register_server_tools(self.name, self, self._config)
-        self._registered_tool_names = registered_names
+        # ``_register_server_tools`` settles ``_registered_tool_names`` under the connection lock and
+        # returns what it wrote. Re-assigning it HERE, after that lock is released, is what let an
+        # interleaved owner policy edit have its correct snapshot overwritten by this publication's
+        # earlier names (MCP-P2-1 round 2) — read the attribute back instead.
+        _registration._register_server_tools(self.name, self, self._config)
+        registered_names = list(self._registered_tool_names)
         new_tool_names = set(registered_names)
         changed_schemas = {mcp_prefixed_tool_name(self.name, t.name) for t in new_mcp_tools
                            if t.name in old_schemas and old_schemas[t.name] != (
