@@ -229,6 +229,33 @@ def shutdown_mcp_servers(*, scope: Optional[str] = None, names: Optional[set] = 
     actually stops the loop."""
     from tools.mcp_tool_scope import _key_name
     wildcard = scope is None and names is None
+    selected: list = []
+
+    def record_orphaned_adopters():
+        """Queue every non-owner profile still using the selected connections for re-registration.
+
+        Caller holds ``_core._lock``. Called TWICE: once with the teardown selection (an adopter
+        whose overlay is dropped by the task's own ``_deregister_tools`` would otherwise be
+        forgotten) and once immediately before the keys are popped. The second call is what closes
+        the window Codex named in round 1: ``_servers`` still holds the key with a live session for
+        the whole duration of ``await server.shutdown()``, so an adoption landing there legitimately
+        passes ``_set_profile_policy``'s ``require_live`` re-validation, records a policy and a
+        membership, and is absent from a snapshot taken before the await. Its policy is then swept
+        by ``_forget_connection_profiles_locked`` and nothing re-runs its discovery — the #106005
+        tool-loss symptom with no ghost record. Re-reading membership under the SAME lock
+        acquisition that pops the key makes the queue cover the whole teardown; ``setdefault`` /
+        ``add`` make the repeat idempotent.
+
+        Wildcard teardown is exempt: it destroys every profile's connections, so there is no
+        surviving adopter to re-register.
+        """
+        if wildcard:
+            return
+        for key in selected:
+            for adopter in _core._server_tool_scopes.get(key, ()):
+                if adopter != scope:
+                    _core._orphaned_adopters.setdefault(adopter, set()).add(_key_name(key))
+
     with _core._lock:
         selected = [key for key in _core._servers if wildcard or _core._server_scope_keys.get(key) == scope]
         if names is not None:
@@ -243,14 +270,7 @@ def shutdown_mcp_servers(*, scope: Optional[str] = None, names: Optional[set] = 
                 | set(_core._server_connecting) | set(_core._server_connect_errors))
         else:
             selected_status = {key for key, owner in _core._server_scope_keys.items() if owner == scope}
-        # Adopters of the connections being torn down lose their overlays with the tasks' own
-        # ``_deregister_tools``; remember them so the next discovery pass re-registers them
-        # (``_reregister_orphaned_adopters``).
-        if not wildcard:
-            for key in selected:
-                for adopter in _core._server_tool_scopes.get(key, ()):
-                    if adopter != scope:
-                        _core._orphaned_adopters.setdefault(adopter, set()).add(_key_name(key))
+        record_orphaned_adopters()
 
     def clear_selected_status():
         from tools import mcp_tool_registration as _registration
@@ -274,6 +294,9 @@ def shutdown_mcp_servers(*, scope: Optional[str] = None, names: Optional[set] = 
                 if isinstance(result, Exception):
                     logger.debug("Error closing MCP server '%s': %s", server.name, result)
             with _core._lock:
+                # Before the keys go: an adopter may have joined (and legitimately passed
+                # require_live) at any point during the await above.
+                record_orphaned_adopters()
                 for key in selected:
                     _core._servers.pop(key, None)
                     _core._server_scope_keys.pop(key, None)
