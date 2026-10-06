@@ -417,12 +417,21 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
     Returns the owner's names. Lossy normalization collisions fail closed; a name another toolset
     owns is never overwritten.
 
-    This function OWNS ``server._registered_tool_names``: it is written here, inside
-    ``_connection_lock(key)``, never by a caller after the lock is released (MCP-P2-1 round 2).
-    Callers used to assign the return value themselves, so an owner policy edit interleaving
-    between the reconcile and that assignment installed the correct snapshot and had it overwritten
-    with this publication's earlier names — status/tool counts then read stale until the next
-    reconcile. Use the return value; do not assign the attribute.
+    This function OWNS the PUBLICATION writes to ``server._registered_tool_names``: a published
+    name list is written here, inside ``_connection_lock(key)``, never by a caller after the lock
+    is released (MCP-P2-1 round 2). Callers used to assign the return value themselves, so an owner
+    policy edit interleaving between the reconcile and that assignment installed the correct
+    snapshot and had it overwritten with this publication's earlier names — status/tool counts then
+    read stale until the next reconcile. Use the return value; do not assign the attribute.
+
+    ONE carve-out, and it is not a publication: the TEARDOWN/PARK reset in
+    ``MCPServerTask._deregister_tools`` (``mcp_tool_server_run.py``, reached from ``shutdown()``
+    and from the park path) clears ``_list_published``, calls ``_reconcile_connection`` to empty
+    every profile, then assigns ``[]``. That assignment is outside this lock, but it cannot lose a
+    publication's write: it only ever stores the empty list that the reconcile it just ran has
+    already made true, and a publication racing it re-establishes both the registry entries and
+    the snapshot together under the lock. The single-writer rule constrains who may write a
+    NON-EMPTY list; the deregistration reset is idempotent with its own reconcile (R3-3).
     """
     key = _server_key_for_task(server)
     owner_scope = _core._server_registry_scope(key)
@@ -436,6 +445,21 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
     # initial-failure connection republishing once ``_ready`` is set
     # (``mcp_tool_transport._register_discovered_tools_if_needed``). So the guard is conditional on
     # having BEEN live: only a connection that was live and then vanished is a teardown.
+    #
+    # KNOWN RESIDUAL (R3-5), recorded rather than closed, with its width stated. This read takes
+    # ``_core._lock`` on its own and releases it before ``_connection_lock(key)`` is acquired
+    # below, so the two are not one atomic observation. A connection that is NOT yet the
+    # ``_servers`` entry when ``was_live`` is read, becomes it immediately after, and is then torn
+    # down before ``_set_profile_policy`` runs, carries ``was_live=False`` past the guard and can
+    # still resurrect a ghost owner record. Width: the interval between this lock release and the
+    # policy write inside the loop below — and it requires that exact become-live-then-die ordering
+    # inside it. Not merged into the publication lock on purpose: teardown orders against
+    # ``_core._lock``, never against ``_connection_lock(key)`` (relay R1), so holding ``_core._lock``
+    # across the whole publication would be a lock-order inversion with ``_set_profile_policy``'s
+    # own acquisition rather than a fix. Closing it properly means teardown and publication sharing
+    # one liveness epoch; that is a design change beyond this round's scope and is the recorded
+    # follow-up. Blast radius is the MCP-P2-2 class (a ghost policy/membership record for a
+    # destroyed connection, swept at the next discovery), not tool exposure or trust.
     with _core._lock:
         was_live = _core._servers.get(key) is server
     # Selecting the policy and writing it happen under the SAME per-connection lock as

@@ -3,15 +3,21 @@
 Three contracts about work that lands at or after the per-connection lock that protects publication.
 Read the dispositions: they differ, and only two of these were red on ``d9ee36e999``.
 
-B4 — ``_registered_tool_names`` assigned by the CALLER, outside the lock. **Codex's stated mechanism
-does not hold, and this file is the evidence.** The claim was that an interleaved owner policy edit
-installs the correct snapshot and "publication then overwrites it with its earlier names". It cannot:
-the value the callers assigned is the RETURN of ``_register_server_tools``, which is
-``_reconcile_connection``'s owner names computed by the final reconcile pass — and the round-10
-policy epoch makes a pass whose input moved restart, so the return value is already the POST-edit
-set. ``test_a_policy_edit_during_publication_is_not_overwritten_by_the_publications_names`` drives
+B4 — ``_registered_tool_names`` assigned by the CALLER, outside the lock. **The P2-rated WIDE
+window is not demonstrated, and this file is the evidence.** The stated mechanism was that an
+interleaved owner policy edit installs the correct snapshot and "publication then overwrites it
+with its earlier names". That does not hold on this code: the value the callers assigned is the
+RETURN of ``_register_server_tools``, which is ``_reconcile_connection``'s owner names computed by
+the final reconcile pass — and the round-10 policy epoch makes a pass whose input moved restart, so
+the return value is already the POST-edit set.
+``test_a_policy_edit_during_publication_is_not_overwritten_by_the_publications_names`` drives
 exactly that race through the real ``_publish_tool_list`` caller and **passes on ``d9ee36e999``**.
-It is kept as the contract pin for the convergence property, not as a regression test.
+It is kept as the contract pin for the convergence property, not as a regression test. Note the
+limit of that probe honestly: its edit lands BEFORE the original reconciliation call, whereas the
+R1 finding was an edit AFTER the return and the lock release. The epoch checks do not cover that
+later interval, so this file establishes that the WIDE window the P2 rating was assigned to is not
+demonstrated — it does not prove the later gap is harmless, and "a few bytecodes" is not
+synchronisation (R3-6a).
 
 What IS real is narrower than the report said: the assignment happens after
 ``_connection_lock(key)`` is released, so a policy edit landing in the gap between the return and
@@ -26,10 +32,10 @@ file argues in its message for P2 ("a lost write with no deadline is not a cosme
 this docstring is the adjudicated record and says **P3**. Reconciled deliberately rather than left
 as drift, on three grounds the P2 argument does not address:
 
-1. the stated P2 mechanism is DISPROVED above (the epoch makes the return value post-edit), so the
-   wide window the P2 rating was assigned to does not exist;
+1. the P2-rated WIDE window is not demonstrated (the epoch makes the return value post-edit), so
+   the window that rating was assigned to is not established — see the probe-limit note above;
 2. what remains is a few bytecodes between the return and the caller's store -- not a window a
-   policy edit realistically lands in;
+   policy edit realistically lands in; it is closed structurally rather than argued away;
 3. the damage is confined to ``_registered_tool_names``, which only feeds status and tool-count
    display (``get_mcp_status``, ``_connected_summary``). It does NOT gate tool availability or
    trust: the registry holds the real entries, so no tool is lost, exposed, or mis-authorised.
