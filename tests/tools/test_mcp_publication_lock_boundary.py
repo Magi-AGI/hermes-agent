@@ -44,7 +44,8 @@ The "no deadline" point stands and is why this is still FIXED rather than accept
 display staleness is a real defect. It is just not a deploy blocker. Anyone re-reading the commit
 message should treat THIS as the current disposition.
 
-R2 (relay finding) — the owner policy write had no ``require_live``, and that IS a real P2 of the
+R2 (relay finding) — the owner policy write had no bound-connection re-validation, and that IS a
+real P2 of the
 same class as MCP-P2-2: a teardown landing mid-publication popped the key and swept the policies,
 after which the publication re-recorded an owner policy for a destroyed connection. Red on
 ``d9ee36e999``.
@@ -146,7 +147,8 @@ def test_the_owner_publication_does_not_record_a_policy_for_a_connection_teardow
     """Relay R2: the owner path re-validates liveness like the adoption paths do.
 
     The teardown lands after the publication read ``_servers`` and before its policy write — the
-    same window ``require_live`` closes for adopters. A destroyed connection must end as a policy
+    same window the ``bound=`` re-validation closes for adopters. A destroyed connection must end
+    as a policy
     LOSS, not a resurrected owner record.
     """
     name = "r12_owner_teardown_window"

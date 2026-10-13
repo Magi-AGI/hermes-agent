@@ -5,7 +5,8 @@
 block, while the key stays in ``_core._servers`` with a live session until the awaited tail runs.
 An adoption landing in that window:
 
-  * passes ``_set_profile_policy``'s ``require_live`` re-validation (the session is still non-null),
+  * passes ``_set_profile_policy``'s bound-connection re-validation (same object, session still
+    non-null, route unchanged),
     so it records a policy and a membership — correctly, at that moment;
   * is absent from the orphan snapshot taken before the await;
   * has its policy swept moments later by the tail's ``_forget_connection_profiles_locked``.
@@ -69,7 +70,7 @@ class _AdoptingServer:
         self._adopt = adopt
 
     async def shutdown(self):
-        # Still live here (session non-null, key present in _servers): require_live admits the
+        # Still live here (same object under the key, session non-null): the re-validation admits the
         # adoption, which is correct — the connection has not been destroyed yet.
         self._adopt()
         self.session = None

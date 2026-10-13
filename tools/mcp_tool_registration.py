@@ -437,14 +437,21 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
     owner_scope = _core._server_registry_scope(key)
     slot = (key, owner_scope)
     # Was this task THE live connection for *key* when the publication started? The adoption paths
-    # pass ``require_live`` because they decide from a snapshot taken outside the lock; the owner
+    # pass ``bound`` because they decide from a snapshot taken outside the lock; the owner
     # path has the same exposure (relay finding R2): a teardown landing mid-publication pops the key
     # and runs ``_forget_connection_profiles_locked``, after which writing the owner policy
-    # resurrects a record for a destroyed connection. It cannot simply pass ``require_live=True``,
+    # resurrects a record for a destroyed connection. It cannot bind unconditionally,
     # because a legitimate publication by a server that is NOT in ``_servers`` exists -- a retained
     # initial-failure connection republishing once ``_ready`` is set
     # (``mcp_tool_transport._register_discovered_tools_if_needed``). So the guard is conditional on
     # having BEEN live: only a connection that was live and then vanished is a teardown.
+    #
+    # Binding is by OBJECT IDENTITY (``bound=server``), not liveness: a replacement published under
+    # the same ``(owner, name)`` key mid-publication makes THIS task stale, and its owner policy
+    # must not land on the replacement either (BLOCK-SA-1, the same defect class as the adopter
+    # paths below). ``bound_route`` stays None here: a reconnect refreshes ``server._config`` in
+    # place, so the connect-time *config* this call was handed can legitimately differ from it, and
+    # route identity is not this path's guard.
     #
     # KNOWN RESIDUAL (R3-5), recorded rather than closed, with its width stated. This read takes
     # ``_core._lock`` on its own and releases it before ``_connection_lock(key)`` is acquired
@@ -466,6 +473,9 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
     # exposure from it, which is why the rating stays P3.
     with _core._lock:
         was_live = _core._servers.get(key) is server
+    # Only a connection that WAS live is re-validated; a retained initial-failure republication has
+    # no live entry to bind to and is not a teardown.
+    bound = server if was_live else None
     # Selecting the policy and writing it happen under the SAME per-connection lock as
     # _set_profile_policy, so a concurrent owner edit cannot land between them; the policy epoch is
     # re-validated before writing, so an edit that lands even re-entrantly restarts the selection
@@ -494,7 +504,7 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
             server._list_published = True
             server._published_before = True
             _set_profile_policy(key, owner_scope, policy, server=server, reconcile=False,
-                                require_live=was_live)
+                                bound=bound)
             return _publish_owner_names(key, server, _reconcile_connection(key, server))
         logger.warning("MCP server '%s': owner policy kept changing during publication; publishing with the "
                        "latest recorded policy", name)
@@ -505,7 +515,7 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
         server._list_published = True
         server._published_before = True
         _set_profile_policy(key, owner_scope, policy, server=server, reconcile=False,
-                            require_live=was_live)
+                            bound=bound)
         return _publish_owner_names(key, server, _reconcile_connection(key, server))
 
 
@@ -578,28 +588,85 @@ def _sync_membership_locked(key) -> None:
         _core._server_tool_scopes.pop(key, None)
 
 
+def _bound_connection_still_serves_locked(key, bound, config: Optional[dict],
+                                          cross_profile: Optional[bool], name: str,
+                                          scope: Optional[str]) -> bool:
+    """Is *bound* -- the connection the caller validated OUTSIDE ``_core._lock`` -- still the
+    connection this policy write would bind, and does it still match *config*? Caller holds
+    ``_core._lock``.
+
+    Liveness alone is NOT enough (BLOCK-SA-1). ``_server_key`` is ``(owner_scope, name)``
+    (``mcp_tool_scope``), so a REPLACEMENT connection published under the same key while the caller
+    was out of the lock is a *different object behind an identical key*; and ``_reconcile_profile``
+    resolves ``_core._servers.get(key)``, never the caller's snapshot. A liveness-only guard
+    therefore let an adopter gain a membership on a connection whose route it had never checked and
+    had the REPLACEMENT's tools published under its policy -- a live, differently-authenticated
+    connection serving that profile's calls (executable cross-profile credential substitution), not
+    the ghost record for a destroyed connection the liveness check was written for.
+
+    Three questions, answered in the ONE ``_core._lock`` block that also writes the membership:
+
+    1. IDENTITY -- the live entry for *key* IS the validated object. A pop (teardown) and a swap
+       (replacement) both fail here, so this subsumes the old liveness-only "is it None" test.
+    2. LIVENESS -- it still has a session. A connection kept in ``_servers`` with its session
+       already cleared is destroyed for every purpose that matters here.
+    3. ROUTE, when *cross_profile* is not None -- ``_same_server_route(bound, config)`` re-tested
+       NOW. Identity is not sufficient on its own: a task's ``_config`` is refreshed in place on
+       reconnect (``mcp_tool_server_run``), so the same object can come to stand for different
+       credentials, and what adopting it means changes with it. The owner publication passes None
+       here on purpose -- its connect-time *config* legitimately differs from a refreshed
+       ``_config``, so route identity is not that path's guard.
+
+    A False answer makes the write a policy LOSS rather than a refusal in place: that is the state
+    teardown would have left, so the next discovery pass re-judges the membership from scratch and
+    adopts the then-live connection only after validating ITS route.
+    """
+    live_now = _core._servers.get(key)
+    if live_now is not bound:
+        logger.warning("MCP server '%s': the connection profile %s validated is no longer the live entry for its "
+                       "key (destroyed, or replaced by another connection under the same owner+name); refusing to "
+                       "bind a policy to a connection whose route was never checked", name, scope)
+        return False
+    if getattr(live_now, "session", None) is None:
+        logger.debug("MCP server '%s': connection was destroyed while profile %s was adopting it; "
+                     "not recording a policy for the dead connection", name, scope)
+        return False
+    if cross_profile is not None and not _same_server_route(live_now, config, cross_profile=cross_profile):
+        logger.warning("MCP server '%s': the connection's route or credentials changed while profile %s was "
+                       "adopting it; refusing the policy write", name, scope)
+        return False
+    return True
+
+
 def _set_profile_policy(key, scope: Optional[str], config: Optional[dict], *, server=None,
-                        reconcile: bool = True, require_live: bool = False) -> List[str]:
+                        reconcile: bool = True, bound=None,
+                        bound_route: Optional[bool] = None) -> List[str]:
     """The ONLY writer of a profile's policy for a connection: gain (config for a new scope), change
     (a different config), or loss (``None``). Recomputes that profile unless *reconcile* is False
     (the caller reconciles the whole connection next). Returns the profile's landed names.
 
-    ``require_live``: the caller decided from a snapshot of ``_core._servers`` taken OUTSIDE this
-    lock -- the adoption pass in ``_register_connected_into_current_scope``, and the owner
-    publication in ``_register_server_tools``. A shutdown landing in that window has already run
-    ``_forget_connection_profiles_locked``, so writing the snapshot's
-    policy now would resurrect a record for a destroyed connection: a ghost policy and membership
-    that teardown will never revisit and that the orphan re-registration
+    ``bound``: the connection object the caller validated from a snapshot of ``_core._servers``
+    taken OUTSIDE this lock -- the adoption pass in ``_register_connected_into_current_scope``, and
+    the owner publication in ``_register_server_tools``. Passing it turns on
+    ``_bound_connection_still_serves_locked`` (``bound_route`` chooses whether route compatibility
+    is re-tested too); ``None`` means the caller has no out-of-lock snapshot to re-validate.
+
+    Two different things that window admits, both closed by that re-validation:
+    a shutdown landing in it has already run ``_forget_connection_profiles_locked``, so writing the
+    snapshot's policy now would resurrect a record for a destroyed connection -- a ghost policy and
+    membership that teardown will never revisit and that the orphan re-registration
     (``mcp_tool_lifecycle._reregister_orphaned_adopters``, whose pending set was built from the
     membership that existed AT teardown) cannot see, leaving the profile tool-less until its next
-    discovery. Re-validated here, a dead connection is a policy LOSS instead (the state teardown
-    left), so the next pass re-adopts or connects cleanly.
+    discovery; and a REPLACEMENT landing in it (BLOCK-SA-1) would bind the profile to a live
+    connection it never validated. Re-validated here, either one is a policy LOSS instead (the
+    state teardown left), so the next pass re-adopts or connects cleanly.
 
     WHICH lock carries that invariant: ``_core._lock``, NOT ``_connection_lock(key)``.
     ``mcp_tool_lifecycle.shutdown_mcp_servers`` never acquires a connection lock -- it pops
     ``_core._servers`` and runs ``clear_selected_status`` -> ``_forget_connection_profiles_locked``
-    inside ``_core._lock``. So the liveness re-read and the policy write below sit in ONE
-    ``_core._lock`` block on purpose: that is what makes them atomic against the sweep.
+    inside ``_core._lock``. So the re-validation and the policy write below sit in ONE
+    ``_core._lock`` block on purpose: that is what makes them atomic against the sweep, and it is
+    the same block that writes the membership through ``_sync_membership_locked``.
     ``_connection_lock(key)`` serializes publication against concurrent policy edits -- a
     different race -- and would not order anything against teardown.
     """
@@ -608,12 +675,9 @@ def _set_profile_policy(key, scope: Optional[str], config: Optional[dict], *, se
         owner = _core._server_registry_scope(key)
         with _core._lock:
             slot = (key, scope)
-            if require_live and config is not None:
-                live_now = _core._servers.get(key)
-                if live_now is None or getattr(live_now, "session", None) is None:
-                    logger.debug("MCP server '%s': connection was destroyed while profile %s was adopting it; "
-                                 "not recording a policy for the dead connection", name, scope)
-                    config = None
+            if bound is not None and config is not None and not _bound_connection_still_serves_locked(
+                    key, bound, config, bound_route, name, scope):
+                config = None
             if config is None:
                 _core._server_scope_configs.pop(slot, None)
             else:
@@ -880,9 +944,12 @@ def _register_connected_into_current_scope(servers: dict) -> int:
                 or not _same_server_route(server, config, cross_profile=cross_profile)):
             _remove_server_scope(key, scope)
         elif dict(config) != recorded:
-            # Same out-of-lock snapshot as the gain below: a connection torn down in the window
-            # must end as a policy loss, not as a changed policy for a dead key.
-            _set_profile_policy(key, scope, config, require_live=True)
+            # Same out-of-lock snapshot as the gain below, and the write is BOUND to it: a
+            # connection torn down in the window must end as a policy loss, not as a changed policy
+            # for a dead key, and a connection REPLACED in the window (a different object under the
+            # same ``(owner, name)``) must not inherit this profile's changed policy either.
+            _set_profile_policy(key, scope, config, server=server, bound=server,
+                                bound_route=cross_profile)
 
     registered_servers = 0
     for name, config in servers.items():
@@ -904,9 +971,13 @@ def _register_connected_into_current_scope(servers: dict) -> int:
         if already:
             continue  # reconciled above
         # GAIN: the owner keeps teardown; this profile's state is recomputed under its own policy.
-        # ``shared`` was read outside the connection lock, so the write re-validates that the
-        # connection is still alive (else it would leave a ghost policy for a destroyed one).
-        if _set_profile_policy(key, scope, config, require_live=True):
+        # ``shared`` was read outside the connection lock, so the write is BOUND to the exact
+        # connection whose route was validated above: it re-checks identity, liveness AND route in
+        # the same ``_core._lock`` block that writes the membership, and refuses (policy LOSS, the
+        # state the next pass re-judges from scratch) if the key now holds a destroyed connection or
+        # a replacement. Passing ``server=`` as well makes the reconcile publish THAT connection's
+        # tools rather than re-resolving ``_core._servers[key]`` after the lock is released.
+        if _set_profile_policy(key, scope, config, server=_server, bound=_server, bound_route=True):
             registered_servers += 1
     return registered_servers
 

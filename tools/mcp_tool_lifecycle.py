@@ -239,7 +239,7 @@ def shutdown_mcp_servers(*, scope: Optional[str] = None, names: Optional[set] = 
         forgotten) and once immediately before the keys are popped. The second call is what closes
         the window Codex named in round 1: ``_servers`` still holds the key with a live session for
         the whole duration of ``await server.shutdown()``, so an adoption landing there legitimately
-        passes ``_set_profile_policy``'s ``require_live`` re-validation, records a policy and a
+        passes ``_set_profile_policy``'s bound-connection re-validation, records a policy and a
         membership, and is absent from a snapshot taken before the await. Its policy is then swept
         by ``_forget_connection_profiles_locked`` and nothing re-runs its discovery — the #106005
         tool-loss symptom with no ghost record. Re-reading membership under the SAME lock
@@ -295,7 +295,7 @@ def shutdown_mcp_servers(*, scope: Optional[str] = None, names: Optional[set] = 
                     logger.debug("Error closing MCP server '%s': %s", server.name, result)
             with _core._lock:
                 # Before the keys go: an adopter may have joined (and legitimately passed
-                # require_live) at any point during the await above.
+                # the bound-connection re-validation) at any point during the await above.
                 record_orphaned_adopters()
                 for key in selected:
                     _core._servers.pop(key, None)
