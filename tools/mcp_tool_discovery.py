@@ -318,10 +318,8 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         _core._server_connecting.discard(key)
         _core._server_connect_errors.pop(key, None)
     _adopt_server(name, server)
-    # The snapshot is written inside the connection lock by _register_server_tools; assigning it
-    # again out here could clobber a policy edit that landed in between (MCP-P2-1 round 2).
-    _registration._register_server_tools(name, server, config)
-    registered_names = list(server._registered_tool_names)
+    registered_names = _registration._register_server_tools(name, server, config)
+    server._registered_tool_names = list(registered_names)
     logger.info("MCP server '%s' (%s): registered %d tool(s): %s", name,
                 "HTTP" if "url" in config else "stdio", len(registered_names), ", ".join(registered_names))
     return registered_names

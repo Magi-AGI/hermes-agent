@@ -574,13 +574,7 @@ class MCPServerRunMixin:
         """Drop this server's tools from the registry (idempotent); on shutdown AND budget
         exhaustion, so a dead server never leaves phantom tools in the prompt. The connection no
         longer has a published list: every profile using it (owner and adopters, including
-        adopter-only names) is recomputed to empty; memberships and policies are kept for revival.
-
-        The ``_registered_tool_names = []`` below is the one write to that attribute outside
-        ``_register_server_tools``'s lock (the publication single-writer rule, MCP-P2-1 r2/R3-3).
-        It is a TEARDOWN reset, not a publication: it stores only the empty list the reconcile on
-        the line above has already made true, so it cannot clobber a publication's snapshot the way
-        the removed caller-side assignments could."""
+        adopter-only names) is recomputed to empty; memberships and policies are kept for revival."""
         self._list_published = False
         _registration._reconcile_connection(_registration._server_key_for_task(self), self)
         self._registered_tool_names = []

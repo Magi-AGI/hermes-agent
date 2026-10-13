@@ -415,67 +415,10 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
     connection's published list changed, so every profile using it is recomputed by
     ``_reconcile_connection`` (the owner under *config*, each adopter under its own policy).
     Returns the owner's names. Lossy normalization collisions fail closed; a name another toolset
-    owns is never overwritten.
-
-    This function OWNS the PUBLICATION writes to ``server._registered_tool_names``: a published
-    name list is written here, inside ``_connection_lock(key)``, never by a caller after the lock
-    is released (MCP-P2-1 round 2). Callers used to assign the return value themselves, so an owner
-    policy edit interleaving between the reconcile and that assignment installed the correct
-    snapshot and had it overwritten with this publication's earlier names — status/tool counts then
-    read stale until the next reconcile. Use the return value; do not assign the attribute.
-
-    ONE carve-out, and it is not a publication: the TEARDOWN/PARK reset in
-    ``MCPServerTask._deregister_tools`` (``mcp_tool_server_run.py``, reached from ``shutdown()``
-    and from the park path) clears ``_list_published``, calls ``_reconcile_connection`` to empty
-    every profile, then assigns ``[]``. That assignment is outside this lock, but it cannot lose a
-    publication's write: it only ever stores the empty list that the reconcile it just ran has
-    already made true, and a publication racing it re-establishes both the registry entries and
-    the snapshot together under the lock. The single-writer rule constrains who may write a
-    NON-EMPTY list; the deregistration reset is idempotent with its own reconcile (R3-3).
-    """
+    owns is never overwritten."""
     key = _server_key_for_task(server)
     owner_scope = _core._server_registry_scope(key)
     slot = (key, owner_scope)
-    # Was this task THE live connection for *key* when the publication started? The adoption paths
-    # pass ``bound`` because they decide from a snapshot taken outside the lock; the owner
-    # path has the same exposure (relay finding R2): a teardown landing mid-publication pops the key
-    # and runs ``_forget_connection_profiles_locked``, after which writing the owner policy
-    # resurrects a record for a destroyed connection. It cannot bind unconditionally,
-    # because a legitimate publication by a server that is NOT in ``_servers`` exists -- a retained
-    # initial-failure connection republishing once ``_ready`` is set
-    # (``mcp_tool_transport._register_discovered_tools_if_needed``). So the guard is conditional on
-    # having BEEN live: only a connection that was live and then vanished is a teardown.
-    #
-    # Binding is by OBJECT IDENTITY (``bound=server``), not liveness: a replacement published under
-    # the same ``(owner, name)`` key mid-publication makes THIS task stale, and its owner policy
-    # must not land on the replacement either (BLOCK-SA-1, the same defect class as the adopter
-    # paths below). ``bound_route`` stays None here: a reconnect refreshes ``server._config`` in
-    # place, so the connect-time *config* this call was handed can legitimately differ from it, and
-    # route identity is not this path's guard.
-    #
-    # KNOWN RESIDUAL (R3-5), recorded rather than closed, with its width stated. This read takes
-    # ``_core._lock`` on its own and releases it before ``_connection_lock(key)`` is acquired
-    # below, so the two are not one atomic observation. A connection that is NOT yet the
-    # ``_servers`` entry when ``was_live`` is read, becomes it immediately after, and is then torn
-    # down before ``_set_profile_policy`` runs, carries ``was_live=False`` past the guard and can
-    # still resurrect a ghost owner record. That ordering is SUFFICIENT but not the only one: a
-    # teardown landing between ``_server_key_for_task``'s own lookup (``:87``) and this read
-    # reaches the same state, so the window is the whole span from that lookup to the policy write,
-    # not just the lock-release gap. Not merged into the publication lock on purpose: teardown
-    # orders against ``_core._lock``, never against ``_connection_lock(key)`` (relay R1), so
-    # holding ``_core._lock`` across the whole publication would be a lock-order inversion with
-    # ``_set_profile_policy``'s own acquisition rather than a fix. Closing it properly means
-    # teardown and publication sharing one liveness epoch; that is a design change beyond this
-    # round's scope and is the recorded follow-up. Blast radius: a ghost record for a destroyed
-    # connection (the MCP-P2-2 class), swept at the next discovery. Publication writes trust
-    # metadata and can reconcile registry/cache state, not membership alone, so the radius is
-    # wider than "a membership row" — but neither review lane established executable unauthorized
-    # exposure from it, which is why the rating stays P3.
-    with _core._lock:
-        was_live = _core._servers.get(key) is server
-    # Only a connection that WAS live is re-validated; a retained initial-failure republication has
-    # no live entry to bind to and is not a teardown.
-    bound = server if was_live else None
     # Selecting the policy and writing it happen under the SAME per-connection lock as
     # _set_profile_policy, so a concurrent owner edit cannot land between them; the policy epoch is
     # re-validated before writing, so an edit that lands even re-entrantly restarts the selection
@@ -503,9 +446,8 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
                     continue  # the owner's policy moved while selecting: select again
             server._list_published = True
             server._published_before = True
-            _set_profile_policy(key, owner_scope, policy, server=server, reconcile=False,
-                                bound=bound)
-            return _publish_owner_names(key, server, _reconcile_connection(key, server))
+            _set_profile_policy(key, owner_scope, policy, server=server, reconcile=False)
+            return _reconcile_connection(key, server)
         logger.warning("MCP server '%s': owner policy kept changing during publication; publishing with the "
                        "latest recorded policy", name)
         with _core._lock:
@@ -514,29 +456,8 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
         _record_tool_trust_metadata(name, policy, server._tools, key)
         server._list_published = True
         server._published_before = True
-        _set_profile_policy(key, owner_scope, policy, server=server, reconcile=False,
-                            bound=bound)
-        return _publish_owner_names(key, server, _reconcile_connection(key, server))
-
-
-def _publish_owner_names(key, server, names: List[str]) -> List[str]:
-    """Settle ``server._registered_tool_names`` while the caller still holds ``_connection_lock``.
-
-    ``_reconcile_profile`` already writes the snapshot through ``_record_owner_name_snapshot`` for a
-    live owner, which is the normal path; this covers the one case that skips — a server publishing
-    while it is not (yet / any longer) the entry in ``_core._servers`` for *key*, e.g. a retained
-    initial-failure connection whose ``_ready`` is set (``mcp_tool_transport.
-    _register_discovered_tools_if_needed``). Doing it here rather than in the caller is the point:
-    inside the lock no policy edit can interleave, so this write can never clobber a newer snapshot.
-    """
-    with _core._lock:
-        if _core._servers.get(key) is server:
-            return names  # _record_owner_name_snapshot already wrote it under this same lock
-    try:
-        server._registered_tool_names = list(names)
-    except AttributeError:  # a test double without the slot
-        pass
-    return names
+        _set_profile_policy(key, owner_scope, policy, server=server, reconcile=False)
+        return _reconcile_connection(key, server)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -588,96 +509,16 @@ def _sync_membership_locked(key) -> None:
         _core._server_tool_scopes.pop(key, None)
 
 
-def _bound_connection_still_serves_locked(key, bound, config: Optional[dict],
-                                          cross_profile: Optional[bool], name: str,
-                                          scope: Optional[str]) -> bool:
-    """Is *bound* -- the connection the caller validated OUTSIDE ``_core._lock`` -- still the
-    connection this policy write would bind, and does it still match *config*? Caller holds
-    ``_core._lock``.
-
-    Liveness alone is NOT enough (BLOCK-SA-1). ``_server_key`` is ``(owner_scope, name)``
-    (``mcp_tool_scope``), so a REPLACEMENT connection published under the same key while the caller
-    was out of the lock is a *different object behind an identical key*; and ``_reconcile_profile``
-    resolves ``_core._servers.get(key)``, never the caller's snapshot. A liveness-only guard
-    therefore let an adopter gain a membership on a connection whose route it had never checked and
-    had the REPLACEMENT's tools published under its policy -- a live, differently-authenticated
-    connection serving that profile's calls (executable cross-profile credential substitution), not
-    the ghost record for a destroyed connection the liveness check was written for.
-
-    Three questions, answered in the ONE ``_core._lock`` block that also writes the membership:
-
-    1. IDENTITY -- the live entry for *key* IS the validated object. A pop (teardown) and a swap
-       (replacement) both fail here, so this subsumes the old liveness-only "is it None" test.
-    2. LIVENESS -- it still has a session. A connection kept in ``_servers`` with its session
-       already cleared is destroyed for every purpose that matters here.
-    3. ROUTE, when *cross_profile* is not None -- ``_same_server_route(bound, config)`` re-tested
-       NOW. Identity is not sufficient on its own: a task's ``_config`` is refreshed in place on
-       reconnect (``mcp_tool_server_run``), so the same object can come to stand for different
-       credentials, and what adopting it means changes with it. The owner publication passes None
-       here on purpose -- its connect-time *config* legitimately differs from a refreshed
-       ``_config``, so route identity is not that path's guard.
-
-    A False answer makes the write a policy LOSS rather than a refusal in place: that is the state
-    teardown would have left, so the next discovery pass re-judges the membership from scratch and
-    adopts the then-live connection only after validating ITS route.
-    """
-    live_now = _core._servers.get(key)
-    if live_now is not bound:
-        logger.warning("MCP server '%s': the connection profile %s validated is no longer the live entry for its "
-                       "key (destroyed, or replaced by another connection under the same owner+name); refusing to "
-                       "bind a policy to a connection whose route was never checked", name, scope)
-        return False
-    if getattr(live_now, "session", None) is None:
-        logger.debug("MCP server '%s': connection was destroyed while profile %s was adopting it; "
-                     "not recording a policy for the dead connection", name, scope)
-        return False
-    if cross_profile is not None and not _same_server_route(live_now, config, cross_profile=cross_profile):
-        logger.warning("MCP server '%s': the connection's route or credentials changed while profile %s was "
-                       "adopting it; refusing the policy write", name, scope)
-        return False
-    return True
-
-
 def _set_profile_policy(key, scope: Optional[str], config: Optional[dict], *, server=None,
-                        reconcile: bool = True, bound=None,
-                        bound_route: Optional[bool] = None) -> List[str]:
+                        reconcile: bool = True) -> List[str]:
     """The ONLY writer of a profile's policy for a connection: gain (config for a new scope), change
     (a different config), or loss (``None``). Recomputes that profile unless *reconcile* is False
-    (the caller reconciles the whole connection next). Returns the profile's landed names.
-
-    ``bound``: the connection object the caller validated from a snapshot of ``_core._servers``
-    taken OUTSIDE this lock -- the adoption pass in ``_register_connected_into_current_scope``, and
-    the owner publication in ``_register_server_tools``. Passing it turns on
-    ``_bound_connection_still_serves_locked`` (``bound_route`` chooses whether route compatibility
-    is re-tested too); ``None`` means the caller has no out-of-lock snapshot to re-validate.
-
-    Two different things that window admits, both closed by that re-validation:
-    a shutdown landing in it has already run ``_forget_connection_profiles_locked``, so writing the
-    snapshot's policy now would resurrect a record for a destroyed connection -- a ghost policy and
-    membership that teardown will never revisit and that the orphan re-registration
-    (``mcp_tool_lifecycle._reregister_orphaned_adopters``, whose pending set was built from the
-    membership that existed AT teardown) cannot see, leaving the profile tool-less until its next
-    discovery; and a REPLACEMENT landing in it (BLOCK-SA-1) would bind the profile to a live
-    connection it never validated. Re-validated here, either one is a policy LOSS instead (the
-    state teardown left), so the next pass re-adopts or connects cleanly.
-
-    WHICH lock carries that invariant: ``_core._lock``, NOT ``_connection_lock(key)``.
-    ``mcp_tool_lifecycle.shutdown_mcp_servers`` never acquires a connection lock -- it pops
-    ``_core._servers`` and runs ``clear_selected_status`` -> ``_forget_connection_profiles_locked``
-    inside ``_core._lock``. So the re-validation and the policy write below sit in ONE
-    ``_core._lock`` block on purpose: that is what makes them atomic against the sweep, and it is
-    the same block that writes the membership through ``_sync_membership_locked``.
-    ``_connection_lock(key)`` serializes publication against concurrent policy edits -- a
-    different race -- and would not order anything against teardown.
-    """
+    (the caller reconciles the whole connection next). Returns the profile's landed names."""
     name = _key_name(key)
     with _connection_lock(key):
         owner = _core._server_registry_scope(key)
         with _core._lock:
             slot = (key, scope)
-            if bound is not None and config is not None and not _bound_connection_still_serves_locked(
-                    key, bound, config, bound_route, name, scope):
-                config = None
             if config is None:
                 _core._server_scope_configs.pop(slot, None)
             else:
@@ -799,34 +640,10 @@ def _reconcile_profile(key, scope: Optional[str], *, server=None) -> List[str]:
                                    "is left unchanged until a publication succeeds", name, scope)
                 else:
                     _write_profile_cache(name, live, config, scope)
-            _record_owner_name_snapshot(key, scope, live, landed)
             return landed
     logger.warning("MCP server '%s': profile %s policy kept changing during reconcile; left for the next pass",
                    name, scope)
     return []
-
-
-def _record_owner_name_snapshot(key, scope: Optional[str], live, landed: List[str]) -> None:
-    """Keep the owner's ``_registered_tool_names`` equal to what its slot actually holds.
-
-    The snapshot is the status/tool-count source (``mcp_tool_discovery.get_mcp_status`` and the
-    ``_connected_summary`` line read ``len(server._registered_tool_names)``). It used to be written
-    only where ``_register_server_tools`` is CALLED (discovery, ``_publish_tool_list``), so an
-    owner-policy-only edit applied by the registration pass -- which reaches the registry through
-    ``_set_profile_policy`` -> ``_reconcile_profile`` and never republishes -- moved the live
-    entries while the snapshot kept the pre-edit names. Writing it here, in the one place that
-    computes the owner's landed set, makes the two equal for EVERY input change (publish, teardown,
-    policy edit), not only for a publication.
-    """
-    if live is None or scope != _core._server_registry_scope(key):
-        return
-    with _core._lock:
-        if _core._servers.get(key) is not live:
-            return  # a bare double or a replaced connection: not the live owner's snapshot
-    try:
-        live._registered_tool_names = list(landed)
-    except AttributeError:  # a test double without the slot
-        pass
 
 
 def _reconcile_connection(key, server=None) -> List[str]:
@@ -887,18 +704,10 @@ def _auth_type(config: dict) -> str:
 def _same_server_route(server: Any, config: dict, *, cross_profile: bool = False) -> bool:
     """Whether *server* matches *config*, with OAuth connections never reusable across profiles.
 
-    WHICH TOOLS a profile sees (``tools.include`` / ``tools.exclude``) is its POLICY, applied by
-    its own reconcile against its own slot, not part of which connection it is: two profiles with
-    the same endpoint and credentials but different filters are the same route and share one
-    connection (one process; for stdio relays such as ``unity-*`` that is one child, not two).
-    The owner path already stripped the filter before calling here; stripping it HERE makes the
-    cross-profile adoption path agree, so route identity means the same thing on both.
-
     OAuth credentials live in the owning profile's token storage rather than the static config,
     so identical OAuth configs cannot prove that two profiles authenticate as the same account.
     """
-    if (_connection_identity(_without_visibility_filter(getattr(server, "_config", {}) or {}))
-            != _connection_identity(_without_visibility_filter(config))):
+    if _connection_identity(getattr(server, "_config", {}) or {}) != _connection_identity(config):
         return False
     # Identities match, so both sides carry the same normalised auth type.
     return not (cross_profile and _auth_type(config) == "oauth")
@@ -937,19 +746,15 @@ def _register_connected_into_current_scope(servers: dict) -> int:
             server = _core._servers.get(key)
         config = servers.get(_key_name(key))
         cross_profile = _key_scope(key) != scope
-        # ``_same_server_route`` strips the visibility filter on both sides, so owner and adopter
-        # are judged by the same route identity.
+        route_config = config if cross_profile or not isinstance(config, dict) else _without_visibility_filter(config)
+        route_server = server if cross_profile or server is None else SimpleNamespace(
+            _config=_without_visibility_filter(getattr(server, "_config", {}) or {}))
         if (config is None or not _server_enabled(config) or server is None
                 or getattr(server, "session", None) is None
-                or not _same_server_route(server, config, cross_profile=cross_profile)):
+                or not _same_server_route(route_server, route_config, cross_profile=cross_profile)):
             _remove_server_scope(key, scope)
         elif dict(config) != recorded:
-            # Same out-of-lock snapshot as the gain below, and the write is BOUND to it: a
-            # connection torn down in the window must end as a policy loss, not as a changed policy
-            # for a dead key, and a connection REPLACED in the window (a different object under the
-            # same ``(owner, name)``) must not inherit this profile's changed policy either.
-            _set_profile_policy(key, scope, config, server=server, bound=server,
-                                bound_route=cross_profile)
+            _set_profile_policy(key, scope, config)
 
     registered_servers = 0
     for name, config in servers.items():
@@ -971,13 +776,7 @@ def _register_connected_into_current_scope(servers: dict) -> int:
         if already:
             continue  # reconciled above
         # GAIN: the owner keeps teardown; this profile's state is recomputed under its own policy.
-        # ``shared`` was read outside the connection lock, so the write is BOUND to the exact
-        # connection whose route was validated above: it re-checks identity, liveness AND route in
-        # the same ``_core._lock`` block that writes the membership, and refuses (policy LOSS, the
-        # state the next pass re-judges from scratch) if the key now holds a destroyed connection or
-        # a replacement. Passing ``server=`` as well makes the reconcile publish THAT connection's
-        # tools rather than re-resolving ``_core._servers[key]`` after the lock is released.
-        if _set_profile_policy(key, scope, config, server=_server, bound=_server, bound_route=True):
+        if _set_profile_policy(key, scope, config):
             registered_servers += 1
     return registered_servers
 

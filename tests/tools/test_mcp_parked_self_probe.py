@@ -15,13 +15,7 @@ import pytest
 
 
 def test_revival_discovery_registers_tools_while_ready_is_cleared(monkeypatch):
-    """A managed server revival must publish tools before readiness is reset.
-
-    ``_register_server_tools`` owns ``_registered_tool_names`` (MCP-P2-1 round 2): it writes the
-    snapshot inside ``_connection_lock`` and callers read it back, instead of re-assigning the
-    return value after the lock is released. So the stand-in here performs that write — mocking it
-    away without the side effect would assert a contract that no longer exists.
-    """
+    """A managed server revival must publish tools before readiness is reset."""
     from tools import mcp_tool
     from tools import mcp_tool_registration as _mcp_registration
     from tools.mcp_tool import MCPServerTask
@@ -39,11 +33,7 @@ def test_revival_discovery_registers_tools_while_ready_is_cleared(monkeypatch):
     server._registered_tool_names = []
     monkeypatch.setitem(mcp_tool._servers, server.name, server)
 
-    def _publish(name, srv, config):
-        srv._registered_tool_names = ["srv__send_message"]
-        return list(srv._registered_tool_names)
-
-    register = MagicMock(side_effect=_publish)
+    register = MagicMock(return_value=["srv__send_message"])
     monkeypatch.setattr(_mcp_registration, "_register_server_tools", register)
 
     asyncio.run(server._discover_tools())
