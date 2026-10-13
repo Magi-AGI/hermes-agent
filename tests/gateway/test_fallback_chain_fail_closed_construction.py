@@ -100,11 +100,20 @@ def test_a_previously_clean_chain_is_retained_across_a_later_managed_failure(hom
     A managed file that stops reading says nothing about the chain the admin layer last allowed, so
     the reader keeps serving that one rather than dropping to an empty chain and silently disabling
     failover for every agent created afterwards.
+
+    The managed layer NARROWS the user chain rather than permitting it wholesale, so the retained
+    answer differs from the user's own ``fallback_providers``. With a permissive managed layer
+    (``telemetry: false``) the clean chain EQUALS the user chain and the unfixed base passes this
+    arm for the wrong reason — it was non-discriminating, not "correct before the fix by
+    construction" (R4-8).
     """
     home, managed = homes
-    (home / "config.yaml").write_text(_USER_CHAIN, encoding="utf-8")
-    # The managed layer permits the user chain (no fallback key at all).
-    (managed / "config.yaml").write_text("telemetry: false\n", encoding="utf-8")
+    (home / "config.yaml").write_text(
+        _USER_CHAIN + "  - provider: deepinfra\n    model: other/model\n", encoding="utf-8")
+    # The managed layer allows only the FIRST user entry: the clean answer is narrower than the user
+    # chain, so serving the user chain is distinguishable from serving the retained one.
+    (managed / "config.yaml").write_text(
+        "fallback_providers:\n  - provider: openrouter\n    model: some/model\n", encoding="utf-8")
     _clear_caches()
 
     from gateway.run import GatewayRunner
@@ -116,8 +125,12 @@ def test_a_previously_clean_chain_is_retained_across_a_later_managed_failure(hom
     # Only the config-read caches: the retained slot IS the state under test here.
     _clear_config_caches()
 
-    assert GatewayRunner._load_fallback_model() == clean, (
+    chain = GatewayRunner._load_fallback_model()
+    assert chain == clean, (
         "a later managed failure destroyed the chain the admin layer had already allowed")
+    assert chain != [{"provider": "openrouter", "model": "some/model"},
+                     {"provider": "deepinfra", "model": "other/model"}], (
+        "the user's unconstrained chain was served instead of the retained clean one")
 
 
 def test_a_new_api_agent_does_not_receive_a_chain_the_admin_layer_suppressed(homes):
