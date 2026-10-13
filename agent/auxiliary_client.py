@@ -6379,13 +6379,20 @@ def _vision_auto_route(
     runtime: Dict[str, Any], resolved_model: Optional[str], resolved_api_mode: Optional[str],
     async_mode: bool,
 ) -> Tuple[Optional[str], Optional[Any], Optional[str]]:
-    """``_vision_auto_route_unchecked`` behind the A44 publication check (see ``_route_blocked``)."""
+    """``_vision_auto_route_unchecked`` behind the A44 publication check (see ``_route_blocked``).
+
+    The endpoint is threaded from the client the unchecked route returned. Every named custom entry
+    reports the nameless provider ``custom``, so without it the pin comparison reaches the one-entry
+    widening and ADMITS a nameless route on a pinned entry's name even when the runtime endpoint
+    belongs to no configured entry — the same class the sibling call sites avoid by passing
+    ``_client_base_url(client)`` (R4-3).
+    """
     provider, client, model = _vision_auto_route_unchecked(runtime, resolved_model, resolved_api_mode, async_mode)
     if client is None:
         return provider, client, model
     main_provider = str((runtime or {}).get("provider") or "").lower()
     selection = (runtime or {}).get("selection") if (provider or "").lower() == main_provider else None
-    if _route_blocked(provider or "", selection, "vision"):
+    if _route_blocked(provider or "", selection, "vision", base_url=_client_base_url(client)):
         return None, None, None
     return provider, client, model
 
