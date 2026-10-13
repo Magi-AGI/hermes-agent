@@ -451,15 +451,19 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
     # below, so the two are not one atomic observation. A connection that is NOT yet the
     # ``_servers`` entry when ``was_live`` is read, becomes it immediately after, and is then torn
     # down before ``_set_profile_policy`` runs, carries ``was_live=False`` past the guard and can
-    # still resurrect a ghost owner record. Width: the interval between this lock release and the
-    # policy write inside the loop below — and it requires that exact become-live-then-die ordering
-    # inside it. Not merged into the publication lock on purpose: teardown orders against
-    # ``_core._lock``, never against ``_connection_lock(key)`` (relay R1), so holding ``_core._lock``
-    # across the whole publication would be a lock-order inversion with ``_set_profile_policy``'s
-    # own acquisition rather than a fix. Closing it properly means teardown and publication sharing
-    # one liveness epoch; that is a design change beyond this round's scope and is the recorded
-    # follow-up. Blast radius is the MCP-P2-2 class (a ghost policy/membership record for a
-    # destroyed connection, swept at the next discovery), not tool exposure or trust.
+    # still resurrect a ghost owner record. That ordering is SUFFICIENT but not the only one: a
+    # teardown landing between ``_server_key_for_task``'s own lookup (``:87``) and this read
+    # reaches the same state, so the window is the whole span from that lookup to the policy write,
+    # not just the lock-release gap. Not merged into the publication lock on purpose: teardown
+    # orders against ``_core._lock``, never against ``_connection_lock(key)`` (relay R1), so
+    # holding ``_core._lock`` across the whole publication would be a lock-order inversion with
+    # ``_set_profile_policy``'s own acquisition rather than a fix. Closing it properly means
+    # teardown and publication sharing one liveness epoch; that is a design change beyond this
+    # round's scope and is the recorded follow-up. Blast radius: a ghost record for a destroyed
+    # connection (the MCP-P2-2 class), swept at the next discovery. Publication writes trust
+    # metadata and can reconcile registry/cache state, not membership alone, so the radius is
+    # wider than "a membership row" — but neither review lane established executable unauthorized
+    # exposure from it, which is why the rating stays P3.
     with _core._lock:
         was_live = _core._servers.get(key) is server
     # Selecting the policy and writing it happen under the SAME per-connection lock as
