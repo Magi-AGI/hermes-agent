@@ -1664,8 +1664,18 @@ def _custom_endpoint_entries(config: Any) -> Optional[List[Tuple[str, str]]]:
     Only REAL custom endpoints count. ``providers:`` also holds registry-provider credentials
     (``providers: {anthropic: {api_key: ...}}``, written by the model picker and read by doctor);
     counting those as rival custom entries refuses the exact single-endpoint widening this rule
-    documents (R3-1). ``providers_dict_to_custom_providers`` -- which requires a usable ``base_url``
-    -- is the canonical filter, so it is the one used here rather than a second, looser one.
+    documents (R3-1). The discriminator is "has a usable ``base_url``", which is what
+    ``_normalize_custom_provider_entry`` enforces, so ``custom_endpoint_identities`` — built on that
+    same normalizer — keeps the R3-1 exclusion.
+
+    Every DISTINCT KEYED entry counts, though. This used to enumerate through
+    ``get_compatible_custom_providers``, a UI-facing list view whose dedupe key is
+    ``(name, base_url, model)``: two separately keyed entries sharing a display name and endpoint
+    with DIFFERENT credentials collapsed to one row, so the pin check read a shared endpoint as
+    UNIQUELY the first entry (rung 2 saw ``len(matched) == 1``) and the one-entry widening admitted
+    the nameless route (rung 3 saw a single name) while two identities were enabled — the second
+    entry's runtime satisfied the first entry's pin (R4-1). Identity cardinality is not a list
+    view's question; ``custom_endpoint_identities`` answers it with no display-based dedupe.
 
     None, never ``[]``, on failure: ``[]`` reads as "no other entry could be meant" and ADMITS the
     nameless route, which is the wrong direction for a failed read (R3-4).
@@ -1673,22 +1683,12 @@ def _custom_endpoint_entries(config: Any) -> Optional[List[Tuple[str, str]]]:
     if not isinstance(config, dict):
         return None
     try:
-        from hermes_cli.config_providers import get_compatible_custom_providers
-        from hermes_cli.providers import custom_provider_slug
-        entries = get_compatible_custom_providers(config)
+        from hermes_cli.config_providers import custom_endpoint_identities
+        return list(custom_endpoint_identities(config))
     except Exception as exc:
         logger.warning("Could not enumerate the configured custom endpoints for the provider pin "
                        "check (%s); the route is refused rather than assumed to be the pinned one", exc)
         return None
-    out: List[Tuple[str, str]] = []
-    for entry in entries or []:
-        if not isinstance(entry, dict):
-            continue
-        name = custom_provider_slug(str(entry.get("name") or ""),
-                                    str(entry.get("provider_key") or "")).split(":", 1)[1]
-        if name:
-            out.append((name, str(entry.get("base_url") or "").strip().rstrip("/").lower()))
-    return out
 
 
 def _custom_identities_for_endpoint(config: Any, base_url: str) -> Optional[List[str]]:

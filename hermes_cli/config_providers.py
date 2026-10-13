@@ -11,6 +11,7 @@ import re
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import urlparse
 
+from hermes_cli.providers import custom_provider_slug
 from hermes_cli.route_identity import normalize_route_base_url
 
 # Log-record parity with the origin module.
@@ -314,16 +315,19 @@ def providers_dict_to_custom_providers(providers_dict: Any) -> List[Dict[str, An
     return custom_providers
 
 
-def get_compatible_custom_providers(
-    config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    """Deduplicated list view over legacy ``custom_providers`` and v12+ ``providers``.
+def custom_provider_candidates(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Every normalized custom-endpoint entry *config* defines, in view order, BEFORE any dedupe.
 
-    Never materialised back into config.yaml (it would duplicate entries in UIs).
+    Legacy ``custom_providers:`` entries first, then the v12+ ``providers:`` map, both through the
+    same ``_normalize_custom_provider_entry``. That normalizer requires a usable ``base_url``
+    (:func:`_pick_provider_base_url`), so registry-provider credentials legitimately stored under
+    ``providers:`` (``providers: {anthropic: {api_key: ...}}``, written by the model picker and read
+    by doctor) are NOT custom endpoints and never appear here.
+
+    Two consumers with different dedupe rules build on this: the UI list view
+    (:func:`get_compatible_custom_providers`, deduplicated by display identity) and the identity
+    enumeration (:func:`custom_endpoint_identities`, deduplicated by canonical identity only).
     """
-    from hermes_cli.config import load_config
-    if config is None:
-        config = load_config()
-
     custom_providers = config.get("custom_providers")
     if custom_providers is not None and not isinstance(custom_providers, list):
         # A malformed legacy value (a string written by an old `config set`) used to empty the
@@ -336,6 +340,52 @@ def get_compatible_custom_providers(
         custom_providers = []
     candidates = [_normalize_custom_provider_entry(e) for e in (custom_providers or [])]
     candidates += providers_dict_to_custom_providers(config.get("providers"))
+    return [entry for entry in candidates if entry is not None]
+
+
+def custom_endpoint_identities(config: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """``(entry identity, normalised base_url)`` for every DISTINCT custom endpoint in *config*.
+
+    The identity is :func:`hermes_cli.providers.custom_provider_slug` with its ``custom:`` prefix
+    stripped — the keyed ``providers:`` entry's own config key, or a legacy entry's normalized
+    display name — i.e. exactly the thing that decides WHICH configured entry a route is.
+
+    Deduplicated by that identity and by nothing else. :func:`get_compatible_custom_providers` is a
+    UI-facing *list view* whose dedupe key is ``(name, base_url, model)``, so two separately keyed
+    entries sharing a display name and endpoint with DIFFERENT credentials collapse into one there.
+    Counting identities through that view told the provider-pin check a single custom endpoint was
+    configured while two were enabled, which made the second entry's runtime satisfy the first
+    entry's pin and widened the nameless route onto it (R4-1). Cardinality of identities is not a
+    list view's question; it is this function's.
+
+    Entry order is preserved so the first spelling of an identity wins, matching the resolver.
+    """
+    out: List[Tuple[str, str]] = []
+    seen: set = set()
+    for entry in custom_provider_candidates(config):
+        identity = custom_provider_slug(
+            str(entry.get("name") or ""), str(entry.get("provider_key") or "")).split(":", 1)[1]
+        if not identity or identity in seen:
+            continue
+        seen.add(identity)
+        out.append((identity, str(entry.get("base_url") or "").strip().rstrip("/").lower()))
+    return out
+
+
+def get_compatible_custom_providers(
+    config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """Deduplicated list view over legacy ``custom_providers`` and v12+ ``providers``.
+
+    Never materialised back into config.yaml (it would duplicate entries in UIs). The dedupe is
+    DISPLAY-facing: entries agreeing on ``(name, base_url, model)`` are one row even when they are
+    separate keyed entries with different credentials. Callers that need how many distinct
+    *identities* exist want :func:`custom_endpoint_identities` instead (R4-1).
+    """
+    from hermes_cli.config import load_config
+    if config is None:
+        config = load_config()
+
+    candidates = custom_provider_candidates(config)
 
     def _norm(entry: Dict[str, Any], field: str) -> str:
         return str(entry.get(field, "") or "").strip().lower()
