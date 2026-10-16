@@ -3699,6 +3699,8 @@ def _try_anthropic_subscription_only(
 _MAIN_RUNTIME_FIELDS = ("provider", "model", "base_url", "api_key", "api_mode", "auth_mode")
 _MAIN_RUNTIME_CONTEXT_FIELDS = _MAIN_RUNTIME_FIELDS + (
     "requested_provider", "session_id", "cache_scope",
+    # How the main provider was chosen (runtime_provider stamps it): "explicit" | "config" | "env" | "auto".
+    "selection",
 )
 
 
@@ -5250,6 +5252,21 @@ def _try_main_provider_route(
     return client, resolved or main_model, resolved_provider
 
 
+def _config_read_failure_for_discovery(task: str) -> Optional[str]:
+    """Why the config does not read cleanly right now (logged), or None. Gate for every auxiliary path
+    that picks a provider from env keys, pools or logins rather than from the config (A44)."""
+    try:
+        from hermes_cli.config import current_config_read_failure
+        failure = current_config_read_failure()
+    except Exception as exc:
+        failure = str(exc) or type(exc).__name__
+    if failure:
+        logger.warning(
+            "Auxiliary %s: config.yaml could not be read (%s) — not picking a provider from environment "
+            "keys or logins until it reads cleanly.", task, failure)
+    return failure or None
+
+
 def _discovery_chain_allowed(main_provider: str, task: Optional[str] = None) -> bool:
     """The built-in discovery chain is a convenience for installs with NO selected main provider.
     Once the user picked one, every auxiliary route must be a provider they configured (main,
@@ -5257,7 +5274,21 @@ def _discovery_chain_allowed(main_provider: str, task: Optional[str] = None) -> 
     account they never pointed this session at (xAI OAuth session with a dead token → every
     compression silently charged to a Nous Portal balance)."""
     if (main_provider or "").strip().lower() in {"", "auto"}:
-        return True
+        # "No selected provider" is only a fact when config.yaml read cleanly: a failed read serves
+        # last-known-good/defaults without model.provider, and the chain below sniffs env keys and
+        # logins (A44). The value and the read outcome come from one observation.
+        try:
+            from hermes_cli.config import load_config_with_status
+            read_failure = load_config_with_status()[1]
+        except Exception as exc:
+            read_failure = str(exc) or type(exc).__name__
+        if not read_failure:
+            return True
+        logger.warning(
+            "Auxiliary %s: config.yaml could not be read (%s) — refusing to guess a provider from "
+            "environment keys or logins until it reads cleanly. Fix it with `hermes config check`.",
+            task or "call", read_failure)
+        return False
     logger.warning(
         "Auxiliary %s: main provider %s is unavailable and no fallback_chain / fallback_providers is "
         "configured — refusing to guess another logged-in provider. Re-authenticate (`hermes model`) "
@@ -5294,7 +5325,50 @@ def _try_discovery_chain() -> Tuple[Optional[OpenAI], Optional[str], str]:
     return None, None, ""
 
 
+def _route_blocked(provider: str, selection: Optional[str], task: str, *, base_url: str = "") -> bool:
+    """Publication check for an implicitly chosen auxiliary route: the one A44 rule
+    (``auth.provider_blocked_by_config_failure``), re-observed NOW, so a config that broke while the
+    route was being chosen cannot publish it. Explicit per-run choices and the last-known-good pin
+    pass; env/discovery/fallback routes and routes carried from an env-selected runtime do not.
+
+    ``base_url`` carries the route's endpoint: every named custom entry reports the nameless provider
+    ``custom``, so the pin comparison needs it to tell one configured entry from another (CA-P2-2)."""
+    try:
+        from hermes_cli.auth import provider_blocked_by_config_failure
+        failure = provider_blocked_by_config_failure(provider, selection, base_url=base_url)
+    except Exception as exc:
+        failure = str(exc) or type(exc).__name__
+    if failure:
+        logger.warning("Auxiliary %s: not using %s while the config does not read cleanly (%s).",
+                       task, provider or "an auto-detected provider", failure)
+    return bool(failure)
+
+
+def _client_base_url(client: Any) -> str:
+    """A routed client's endpoint as a plain string ("" when it has none)."""
+    try:
+        return str(getattr(client, "base_url", "") or "")
+    except Exception:
+        return ""
+
+
 def _resolve_auto_route(
+    main_runtime: Optional[Dict[str, Any]] = None, task: Optional[str] = None
+) -> Tuple[Optional[OpenAI], Optional[str], str]:
+    """``_resolve_auto_route_unchecked`` behind the A44 publication check (one choke point for every
+    auxiliary auto route: main, configured fallback chains, discovery)."""
+    runtime = _normalize_main_runtime(main_runtime)
+    client, model, provider = _resolve_auto_route_unchecked(main_runtime, task)
+    if client is None:
+        return client, model, provider
+    main_provider = str(runtime.get("provider") or "").lower()
+    selection = runtime.get("selection") if provider and provider.lower() == main_provider else None
+    if _route_blocked(provider, selection, task or "call", base_url=_client_base_url(client)):
+        return None, None, ""
+    return client, model, provider
+
+
+def _resolve_auto_route_unchecked(
     main_runtime: Optional[Dict[str, Any]] = None, task: Optional[str] = None
 ) -> Tuple[Optional[OpenAI], Optional[str], str]:
     """Full auto-detection chain, including the selected provider identity. Priority: (1) main provider +
@@ -5310,6 +5384,10 @@ def _resolve_auto_route(
     routed = _try_main_provider_route(main_provider, main_model, base_url, api_key, api_mode)
     if routed is not None:
         return routed
+    # Everything below is an implicit choice (the configured fallback chains, then env/login discovery):
+    # never while the config does not read cleanly (A44).
+    if _config_read_failure_for_discovery(task or "call"):
+        return None, None, ""
     if task:
         fb_client, fb_model, fb_label = _try_configured_fallback_chain(
             task, main_provider or "auto", reason="main provider unavailable")
@@ -5755,9 +5833,16 @@ def _resolve_custom_branch(req: _ResolveRequest) -> _ResolveResult:
         client = _wrap_transport(req, client, final_model, wrap_base or custom_base, custom_key)
         return _route_client(req, client, final_model)
     # Try custom first, then API-key providers (Codex excluded here:
-    # falling through to Codex with no model is a stale-constant trap).
-    for try_fn in (_try_custom_endpoint, _resolve_api_key_provider):
+    # falling through to Codex with no model is a stale-constant trap). The API-key scan picks a provider
+    # from env keys / pools: never while the config does not read cleanly (A44).
+    _custom_chain = (_try_custom_endpoint,) if _config_read_failure_for_discovery("custom") else (
+        _try_custom_endpoint, _resolve_api_key_provider)
+    for try_fn in _custom_chain:
         client, default = try_fn()
+        if client is not None and try_fn is _resolve_api_key_provider and _route_blocked(
+                _effective_provider_for_client(client, ""), None, "custom",
+                base_url=_client_base_url(client)):
+            continue  # the config broke while the env-key scan ran: never publish its pick (A44)
         if client is not None:
             final_model = _normalize_resolved_model(model or default, provider)
             # ``client.api_key`` may be a callable (Azure Entra bearer provider);
@@ -6136,13 +6221,27 @@ def resolve_provider_client(
 
 # ── Public API ──────────────────────────────────────────────────────────────
 
+def _published_route_blocked(client: Any, provider: str, main_runtime: Optional[Dict[str, Any]], task: str) -> bool:
+    """Publication check for a configured/cached auxiliary route (same rule as ``_route_blocked``): the
+    provider actually returned, with the main runtime's provenance only when it IS the main provider."""
+    if client is None:
+        return False
+    runtime = _normalize_main_runtime(main_runtime)
+    actual = _effective_provider_for_client(client, provider or "")
+    selection = runtime.get("selection") if actual and actual.lower() == str(runtime.get("provider") or "").lower() else None
+    return _route_blocked(actual, selection, task, base_url=_client_base_url(client))
+
+
 def get_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Optional[OpenAI], Optional[str]]:
     """Return (client, default_model_slug) for text-only aux tasks; ``task`` selects auxiliary.<task> overrides."""
     provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
-    return resolve_provider_client(
+    client, final_model = resolve_provider_client(
         provider, model=model, explicit_base_url=base_url, explicit_api_key=api_key,
         api_mode=api_mode, main_runtime=main_runtime,
     )
+    if _published_route_blocked(client, provider, main_runtime, task or "call"):
+        return None, None
+    return client, final_model
 
 
 _VISION_AUTO_PROVIDER_ORDER = ("openrouter", "nous", "deepinfra")
@@ -6280,6 +6379,28 @@ def _vision_auto_route(
     runtime: Dict[str, Any], resolved_model: Optional[str], resolved_api_mode: Optional[str],
     async_mode: bool,
 ) -> Tuple[Optional[str], Optional[Any], Optional[str]]:
+    """``_vision_auto_route_unchecked`` behind the A44 publication check (see ``_route_blocked``).
+
+    The endpoint is threaded from the client the unchecked route returned. Every named custom entry
+    reports the nameless provider ``custom``, so without it the pin comparison reaches the one-entry
+    widening and ADMITS a nameless route on a pinned entry's name even when the runtime endpoint
+    belongs to no configured entry — the same class the sibling call sites avoid by passing
+    ``_client_base_url(client)`` (R4-3).
+    """
+    provider, client, model = _vision_auto_route_unchecked(runtime, resolved_model, resolved_api_mode, async_mode)
+    if client is None:
+        return provider, client, model
+    main_provider = str((runtime or {}).get("provider") or "").lower()
+    selection = (runtime or {}).get("selection") if (provider or "").lower() == main_provider else None
+    if _route_blocked(provider or "", selection, "vision", base_url=_client_base_url(client)):
+        return None, None, None
+    return provider, client, model
+
+
+def _vision_auto_route_unchecked(
+    runtime: Dict[str, Any], resolved_model: Optional[str], resolved_api_mode: Optional[str],
+    async_mode: bool,
+) -> Tuple[Optional[str], Optional[Any], Optional[str]]:
     """Auto-detect order: 1. main provider + model, 2. OpenRouter, 3. Nous Portal, 4. DeepInfra, 5. stop."""
     main_provider = str(runtime.get("provider") or _read_main_provider())
     main_model = str(runtime.get("model") or _read_main_model())
@@ -6294,7 +6415,10 @@ def _vision_auto_route(
         client, default_model = _vision_main_provider_client(main_provider, main_model, runtime, resolved_model, resolved_api_mode)
         if client is not None:
             return _finalize_vision_client(main_provider, client, default_model, resolved_model, async_mode)
-    # Aggregators use their dedicated vision model, not the user's main model.
+    # Aggregators use their dedicated vision model, not the user's main model. They are picked from
+    # env keys / logins, so never while the config does not read cleanly (A44).
+    if _config_read_failure_for_discovery("vision"):
+        return None, None, None
     for candidate in _VISION_AUTO_PROVIDER_ORDER:
         if candidate == main_provider:
             continue  # already tried above
@@ -6311,6 +6435,19 @@ _ZAI_OPENAI_VISION_URLS = ("https://open.bigmodel.cn/api/paas/v4", "https://api.
 
 
 def resolve_vision_provider_client(
+    provider: Optional[str] = None, model: Optional[str] = None, *, base_url: Optional[str] = None,
+    api_key: Optional[str] = None, async_mode: bool = False,
+    main_runtime: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[str], Optional[Any], Optional[str]]:
+    """``_resolve_vision_provider_client_unchecked`` behind the publication rule (configured and auto)."""
+    chosen, client, final_model = _resolve_vision_provider_client_unchecked(
+        provider, model, base_url=base_url, api_key=api_key, async_mode=async_mode, main_runtime=main_runtime)
+    if _published_route_blocked(client, chosen or "", main_runtime, "vision"):
+        return None, None, None
+    return chosen, client, final_model
+
+
+def _resolve_vision_provider_client_unchecked(
     provider: Optional[str] = None, model: Optional[str] = None, *, base_url: Optional[str] = None,
     api_key: Optional[str] = None, async_mode: bool = False,
     main_runtime: Optional[Dict[str, Any]] = None,
@@ -7949,6 +8086,12 @@ def _resolve_call_client(
                 client, final_model = _get_cached_client(
                     "auto", async_mode=async_mode, main_runtime=main_runtime, task=task)
                 effective_provider = _effective_provider_for_client(client, "auto")
+    if client is not None and _published_route_blocked(
+            client, effective_provider or resolved_provider, main_runtime, task or "call"):
+        # Configured or cached route published while the config does not read cleanly (A44).
+        raise AuxiliaryClientUnavailable(
+            f"Auxiliary {task or 'call'}: not using {effective_provider or resolved_provider} while the "
+            "config does not read cleanly (see `hermes config check`).")
     if client is None:
         if _compression_guard_active():
             # Fail CLOSED, not with the generic "no provider" error: under the
@@ -8949,7 +9092,7 @@ def get_async_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Di
     Returns (None, None) when no provider is available.
     """
     provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
-    return resolve_provider_client(
+    client, final_model = resolve_provider_client(
         provider,
         model=model,
         async_mode=True,
@@ -8958,4 +9101,7 @@ def get_async_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Di
         api_mode=api_mode,
         main_runtime=main_runtime,
     )
+    if _published_route_blocked(client, provider, main_runtime, task or "call"):
+        return None, None
+    return client, final_model
 # ---- END PLUGIN-COMPAT ----

@@ -537,7 +537,7 @@ export interface ConfigGetParams {
   cwd?: string | null
   session_id?: string | null
 }
-/** Union of every getter's payload: ``value`` for the simple words, ``config`` for ``full``, ``mtime`` / ``mcp_rev`` for the poller, ``model`` / ``provider`` / ``providers`` for ``provider``, ``home`` / ``display`` for ``profile``, ``cwd`` / ``branch`` for ``project``, ``prompt``. */
+/** Union of every getter's payload: ``value`` for the simple words, ``config`` for ``full``, ``mtime`` / ``mcp_rev`` / ``rev`` for the poller, ``model`` / ``provider`` / ``providers`` for ``provider``, ``home`` / ``display`` for ``profile``, ``cwd`` / ``branch`` for ``project``, ``prompt``. */
 export interface ConfigGetResult {
   value?: string | null
   display?: string | null
@@ -552,6 +552,7 @@ export interface ConfigGetResult {
   prompt?: string | null
   mtime?: number | null
   mcp_rev?: string | null
+  rev?: string | null
 }
 /** ``hermes_cli/models.py::list_available_providers`` row. */
 export interface ConfigProviderRef {

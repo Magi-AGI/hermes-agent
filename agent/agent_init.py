@@ -833,6 +833,12 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
     if _routed_client is not None:
         from hermes_cli.providers import is_actual_route, normalize_provider
         effective_provider = getattr(_routed_client, "_hermes_aux_effective_provider", "")
+        # Publication check (A44): a client built while the config does not read cleanly is used only
+        # for an explicit per-run choice or the last-known-good pin (one rule: auth).
+        from hermes_cli.auth import refuse_provider_on_config_failure
+        refuse_provider_on_config_failure(
+            effective_provider or agent.provider or "", getattr(agent, "_provider_selection", None),
+            "the agent's provider", base_url=str(getattr(_routed_client, "base_url", "") or ""))
         if is_actual_route(effective_provider):
             agent.provider = normalize_provider(effective_provider)
         return _client_kwargs_from_routed(_routed_client, _provider_timeout)
@@ -843,6 +849,10 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
     # reach the chain instead of dying at init with a misleading "No LLM provider configured" error. See
     # #17929.
     _explicit = (agent.provider or "").strip().lower()
+    # The chain is an implicit choice from the config: never walked while the config does not read
+    # cleanly (A44). Refuses with the read error instead of the no-provider diagnostic.
+    from hermes_cli.auth import refuse_provider_selection_on_config_failure
+    refuse_provider_selection_on_config_failure("the fallback providers")
     for _fb in _fallback_entries(fallback_model):
         try:
             from hermes_cli.fallback_config import resolve_entry_api_key

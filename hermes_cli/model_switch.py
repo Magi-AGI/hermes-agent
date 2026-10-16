@@ -19,7 +19,7 @@ from hermes_cli.providers import (
 from hermes_cli.model_normalize import normalize_model_for_provider
 from agent.models_dev import (
     ModelCapabilities, ModelInfo, get_model_capabilities, get_model_info, list_provider_models)
-from utils import base_url_host_matches, base_url_hostname, base_url_origin, file_signature
+from utils import base_url_host_matches, base_url_hostname, base_url_origin
 # Re-exported: callers/tests patch hermes_cli.model_switch.<name>.
 from hermes_cli.model_switch_providers import list_authenticated_providers
 
@@ -270,13 +270,16 @@ def _direct_alias_source_identity() -> Optional[tuple]:
     except Exception:
         return None
     try:
-        stat = path.stat()
-    except OSError:
-        # A missing config is still a definite identity for this profile.
-        return (str(path), None)
+        # The loader's own content-keyed observation (user + managed): a same-size edit with the
+        # mtime restored must not keep a stale alias (A43). A missing config is still a definite
+        # identity for this profile; a failed read is not (never reuse on it).
+        from hermes_cli.config import _load_config_cache_sig
+        snap = _load_config_cache_sig(path)
     except Exception:
         return None
-    return (str(path), file_signature(stat))
+    if snap.user_error is not None or snap.managed_error is not None:
+        return None
+    return (str(path), snap.cache_sig)
 
 
 def _ensure_direct_aliases() -> None:
@@ -1026,6 +1029,10 @@ def _ollama_configured_base() -> tuple[dict, str]:
 
 
 def _unknown_provider_message(explicit_provider: str) -> str:
+    from hermes_cli.config import config_read_failure_notice
+    notice = config_read_failure_notice()
+    if notice:  # the provider may be defined in the file that did not load (A45)
+        return f"Provider '{explicit_provider}' is not available. {notice}"
     msg = (
         f"Unknown provider '{explicit_provider}'. Check 'hermes model' for available "
         f"providers, or define it in config.yaml under 'providers:'.")
@@ -1375,6 +1382,12 @@ def _route_from_model_input(st: _Switch) -> Optional[ModelSwitchResult]:
         current_provider in {"custom", "local"} or current_provider.startswith("custom:")
         or base_url_hostname(st.current_base_url or "") in ("localhost", "127.0.0.1"))
     if not config_routed and not is_custom:  # e
+        # Detection picks a provider from available credentials; after a failed config read that may
+        # contradict the pin the file holds (A44). /model <name> --provider still works.
+        from hermes_cli.config import config_read_failure_notice
+        notice = config_read_failure_notice()
+        if notice:
+            return st.fail(f"Cannot pick a provider for {st.new_model} automatically. {notice}")
         detected = detect_provider_for_model(st.new_model, current_provider)
         if detected:
             st.target_provider, st.new_model = detected

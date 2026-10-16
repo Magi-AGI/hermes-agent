@@ -20,18 +20,26 @@ from typing import Any, Dict, Optional, Tuple
 
 from hermes_cli import config as _config
 from hermes_cli import managed_scope
-from utils import fast_safe_load
 
 # path -> raw user mapping from the last successful parse in this process; served (through the
 # normal pipeline) when the file is later found mid-edit as broken YAML.
 _LAST_GOOD_USER_RAW: Dict[str, Dict[str, Any]] = {}
-# path -> (*user_signature, *managed_signature, effective, env_snapshot); see utils.file_signature.
+# path -> (*cache_sig, effective, env_snapshot); cache_sig = user + managed utils.content_signature.
 _EFFECTIVE_CACHE: Dict[str, Tuple[Any, ...]] = {}
 
 
-def _effective(raw: Dict[str, Any]) -> Dict[str, Any]:
+class _ManagedConfigUnreadable(OSError):
+    """The managed (admin) config.yaml exists but did not read, raised only under ``fail_closed``.
+
+    An ``OSError``, because that is what the fail-closed callers' ``except Exception`` handlers
+    already treat as "could not read the config; keep the last known-good state" — the same shape a
+    torn user file produces.
+    """
+
+
+def _effective(raw: Dict[str, Any], managed: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     expanded = _config._expand_env_vars(raw)
-    merged = managed_scope.apply_managed_overlay(expanded if isinstance(expanded, dict) else {})
+    merged = managed_scope.apply_managed_overlay(expanded if isinstance(expanded, dict) else {}, managed)
     return _config._normalize_root_model_keys(merged if isinstance(merged, dict) else {})
 
 
@@ -58,33 +66,48 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
     last-good state); otherwise the last successfully parsed user file — in-process first, then
     the newest ``backups/config/*.good.*`` copy — is served through the same pipeline, so a
     mid-edit torn write never silently drops user overrides (same contract as ``load_config``).
-    Cached on the user + managed file signatures and the values of every referenced env var."""
+    Cached on the user + managed file signatures and the values of every referenced env var.
+
+    A failed MANAGED read is a failed read too (A44, and ``load_config`` already treats it as one).
+    The admin layer can only ever REMOVE or override what the user file says — a managed
+    ``fallback_providers: []`` suppresses a user chain — so applying an unreadable managed file as an
+    empty overlay hands the caller the user's unconstrained config while reporting success. Every
+    ``fail_closed`` caller holds its own last-known-good state for exactly this case, so it raises
+    here as well."""
     if config_path is None:
         config_path = _config.get_config_path()
     path_key = str(config_path)
     with _config._CONFIG_LOCK:
-        user_sig, cache_sig = _config._load_config_cache_sig(config_path)
+        # One content-keyed observation (A43): the signature, the bytes parsed below and a failed
+        # read all come from the same read, so a same-metadata edit is never served stale.
+        snap = _config._load_config_cache_sig(config_path)
+        user_sig, cache_sig = snap.user_sig, snap.cache_sig
+        if fail_closed and snap.managed_error is not None:
+            raise _ManagedConfigUnreadable(str(snap.managed_error))
         cached = _EFFECTIVE_CACHE.get(path_key)
-        if cached is not None and cache_sig is not None and cached[:8] == cache_sig:
-            if all(_config._env_ref_lookup(k) == v for k, v in cached[9].items()):
-                return copy.deepcopy(cached[8])
+        n = len(cache_sig) if cache_sig is not None else 0
+        if cached is not None and cache_sig is not None and tuple(cached[:n]) == tuple(cache_sig):
+            if all(_config._env_ref_lookup(k) == v for k, v in cached[n + 1].items()):
+                return copy.deepcopy(cached[n])
 
         raw: Dict[str, Any] = {}
         recovered = False
-        raw_hit = _config._RAW_CONFIG_CACHE.get(path_key)
-        if user_sig is not None and raw_hit is not None and raw_hit[:4] == user_sig:
-            raw = copy.deepcopy(raw_hit[4])  # one parse per process, shared with read_raw_config()
+        raw_hit = _config._raw_config_cache_hit(path_key, user_sig) if snap.user_error is None and user_sig else None
+        if raw_hit is not None:
+            raw = copy.deepcopy(raw_hit)  # one parse per process, shared with read_raw_config()
             _LAST_GOOD_USER_RAW.setdefault(path_key, copy.deepcopy(raw))
         elif user_sig is not None:
             try:
-                with open(config_path, encoding="utf-8") as f:
-                    loaded = fast_safe_load(f)
+                if snap.user_error is not None:
+                    raise snap.user_error
+                loaded = _config._parse_config_bytes(snap.user_bytes)
             except Exception as exc:
                 if fail_closed:
                     raise
                 raw, recovered = _recover_user_raw(config_path, path_key, exc), True
             else:
                 raw = loaded if isinstance(loaded, dict) else {}
+                _config._clear_parse_failure_after_clean_read(config_path, user_sig)
                 _config._RAW_CONFIG_CACHE[path_key] = (*user_sig, copy.deepcopy(raw))
                 _LAST_GOOD_USER_RAW[path_key] = copy.deepcopy(raw)
                 # Same copy load_config keeps: a fresh process recovers from it (see _recover_user_raw).
@@ -95,10 +118,10 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
                     backup_config(config_path, "good")
 
         env_snapshot = _config._env_ref_snapshot(raw)
-        managed = managed_scope.load_managed_config()
+        managed = snap.managed_value  # the managed bytes cache_sig signed (A43)
         if managed:
             _config._env_ref_snapshot(managed, env_snapshot)
-        effective = _effective(raw)
+        effective = _effective(raw, managed)
         # A recovered result is never cached under the corrupt file's signature: a later
         # ``fail_closed`` caller must still see the parse error, not a cache hit.
         if cache_sig is not None and not recovered:

@@ -407,11 +407,31 @@ def _custom_provider_request_overrides(custom_provider: Dict[str, Any]) -> Dict[
     return {"extra_body": dict(extra_body)}
 
 
+def custom_entry_identity(custom_provider: Dict[str, Any]) -> str:
+    """The canonical ``custom:<name>`` of a RESOLVED ``providers:`` / ``custom_providers:`` entry.
+
+    Every named endpoint's runtime reports the bare billing class ``custom``
+    (:func:`_custom_runtime`), so the entry the resolver picked is otherwise unrecoverable from the
+    runtime alone. ``base_url`` is not a substitute: two entries may legitimately share one
+    endpoint with different credentials, and the URL then identifies neither (CA-P2-2 round 3).
+    """
+    return custom_provider_slug(str(custom_provider.get("name") or ""),
+                                str(custom_provider.get("provider_key") or ""))
+
+
 def _apply_custom_provider_extras(custom_provider: Dict[str, Any], target_model: Optional[str], result: Dict[str, Any]) -> None:
     """Copy model / capabilities / extra_headers / request_overrides onto a
     resolved custom runtime. An explicit ``target_model`` wins over the provider's configured
     default (auxiliary slots / background-review resolve a concrete model and must not fall back to
-    ``default_model``). ``extra_headers`` may carry credentials — NEVER log them."""
+    ``default_model``). ``extra_headers`` may carry credentials — NEVER log them.
+
+    Also stamps ``custom_identity``: the publication check (A44) compares the resolved route against
+    the config's pin, and the bare ``custom`` provider cannot say WHICH entry it is. The resolver
+    already knows, so the identity travels with the runtime instead of being re-derived from the URL
+    at check time (CA-P2-2 round 3)."""
+    identity = custom_entry_identity(custom_provider)
+    if identity and identity != "custom:":
+        result["custom_identity"] = identity
     model_name = target_model or custom_provider.get("model")
     if model_name:
         result["model"] = model_name

@@ -393,6 +393,10 @@ def _resolve_model_and_provider(cfg: dict, model: Optional[str], provider: Optio
     choice = _ModelChoice(explicit_model or _configured_model(model_cfg), (provider or "").strip() or None)
     if choice.provider is not None or not explicit_model:
         return choice
+    # Below, a provider is picked for the model from aliases, env and available credentials. After a
+    # failed config read that may override the provider the file pins (A44); --provider still works.
+    from hermes_cli.auth import refuse_provider_selection_on_config_failure
+    refuse_provider_selection_on_config_failure("the model name (detecting which provider serves it)")
 
     # DIRECT_ALIASES (config.yaml ``model_aliases:``) map a user alias to (model, provider,
     # base_url) for endpoints outside any catalog (local servers, custom proxies, ...).

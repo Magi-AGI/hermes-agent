@@ -41,7 +41,7 @@ class ConfigProviderRef(OpenModel):
 
 class ConfigGetResult(Result):
     """Union of every getter's payload: ``value`` for the simple words, ``config`` for ``full``,
-    ``mtime`` / ``mcp_rev`` for the poller, ``model`` / ``provider`` / ``providers`` for ``provider``,
+    ``mtime`` / ``mcp_rev`` / ``rev`` for the poller, ``model`` / ``provider`` / ``providers`` for ``provider``,
     ``home`` / ``display`` for ``profile``, ``cwd`` / ``branch`` for ``project``, ``prompt``."""
 
     value: str | None = None
@@ -57,6 +57,9 @@ class ConfigGetResult(Result):
     prompt: str | None = None
     mtime: float | None = None
     mcp_rev: str | None = None
+    # Content revision of the active profile's config.yaml + managed config (A43): moves on a same-size
+    # edit that kept the mtime; "" when it could not be observed.
+    rev: str | None = None
 
 
 method("config.get", params=ConfigGetParams, result=ConfigGetResult,

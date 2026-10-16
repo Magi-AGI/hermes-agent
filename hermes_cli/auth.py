@@ -1419,26 +1419,33 @@ def _get_config_hint_for_unknown_provider(provider_name: str) -> str:
         return ""
 
 
-def _refuse_env_adoption_if_config_corrupt() -> None:
-    """Refuse env-key/pool auto-adoption of openrouter while config.yaml is corrupt.
+def _refuse_env_adoption_if_config_corrupt(read_failure: Optional[str], source: str) -> None:
+    """Refuse picking a provider from ``source`` (anything outside the config: env keys, the credential
+    pool, AWS, a saved login, the free tier, HERMES_INFERENCE_PROVIDER) when the authoritative config
+    read (user or managed file) did not succeed.
 
-    A corrupt config loads as ``DEFAULT_CONFIG`` (no ``model.provider``), so the env sniff would
-    silently adopt the PAID openrouter provider over whatever the broken config really names.
-    Fires ONLY on the auto path and clears itself once the file parses again."""
-    try:
-        from hermes_cli.config import get_active_config_parse_failure
-        err = get_active_config_parse_failure()
-        if not err:
-            return
-        path = get_config_path()
-    except Exception as e:
-        logger.debug("Could not probe config parse-failure state: %s", e)
+    A failed read serves last-known-good or ``DEFAULT_CONFIG`` without the ``model.provider`` pin, so
+    any fallback could silently replace the provider that file names. ``read_failure`` must come
+    from the SAME observation as the provider value (``load_config_with_status``, A44). The wording
+    follows its kind: a read that failed or caught a save in progress says retry; complete bytes
+    that do not parse say fix the file (``hermes_cli.config.ConfigReadFailure``)."""
+    if not read_failure:
         return
+    from hermes_cli.config import config_failure_advice
+    what = ("could not be read just now" if getattr(read_failure, "kind", "parse") == "read"
+            else "has an error")
     raise AuthError(
-        f"config.yaml at {path} is corrupt ({err}) — refusing to auto-select "
-        f"an inference provider from environment keys. Fix the YAML (a backup "
-        f"was saved next to it) or run hermes setup.",
+        f"Your settings {what}: {read_failure}. Refusing to choose an inference provider from "
+        f"{source} until they read cleanly, because the provider they name is unknown. "
+        f"{config_failure_advice(read_failure)}",
         code="corrupt_config")
+
+
+def refuse_provider_selection_on_config_failure(source: str) -> None:
+    """For provider choices made OUTSIDE ``resolve_provider("auto")`` (``HERMES_INFERENCE_PROVIDER``,
+    a model-name detection, a terminal fallback): one fresh observation; raises ``corrupt_config``
+    when the authoritative config did not read cleanly."""
+    _refuse_env_adoption_if_config_corrupt(_config_observation()[1], source)
 
 
 # Provider aliases accepted by resolve_provider(). Plugin-declared aliases
@@ -1551,10 +1558,237 @@ def _logged_in_oauth_active_provider(*, skip_free_tier: bool = False) -> Optiona
     return None
 
 
-def _config_model_provider() -> Tuple[Any, Optional[str]]:
-    """``(model_cfg, provider)`` from config.yaml when ``model.provider`` names a registry provider
-    or a custom OpenAI-compatible endpoint (``custom``, ``custom:<name>``, ``vllm``/``ollama``/...).
-    A ``model.provider: openrouter`` pin and a bare ``providers:`` entry name are explicit intent too.
+# Lake's ruling (2026-09-30): after a failed config read, a provider pinned by the LAST-KNOWN-GOOD
+# config is still used (an editor save must not stop 20+ sessions, and it cannot move them to metered
+# billing because every implicit fallback still refuses). Codex recommended refusing; this is an
+# accepted divergence. Set True to refuse even the last-known-good pin (one switch, tested both ways).
+REFUSE_LAST_KNOWN_GOOD_PROVIDER = False
+
+
+def _config_observation() -> Tuple[Dict[str, Any], Optional[str]]:
+    """``load_config_with_status()``; a loader that itself raises is a failed READ (retryable),
+    typed so the refusal gives retry advice, not fix-the-file advice."""
+    from hermes_cli.config import ConfigReadFailure, get_config_path, load_config_with_status
+    try:
+        return load_config_with_status()
+    except Exception as exc:
+        logger.debug("Could not read config.yaml for provider resolution: %s", exc)
+        try:
+            where = str(get_config_path())
+        except Exception:
+            where = "config.yaml"
+        return {}, ConfigReadFailure(f"{where} could not be read ({exc})", "read")
+
+
+def config_pinned_provider(config: Any) -> str:
+    """The provider a loaded config pins (``model.provider`` or a dict ``model.default``'s), alias-
+    normalised and lowercased; "" for none or ``auto`` (auto is discovery, not a pin)."""
+    model = config.get("model") if isinstance(config, dict) else None
+    if not isinstance(model, dict):
+        return ""
+    provider = model.get("provider")
+    if not (isinstance(provider, str) and provider.strip()) and isinstance(model.get("default"), dict):
+        from hermes_cli.config import split_model_config_default
+        provider = split_model_config_default(model["default"])[1]
+    provider = provider.strip().lower() if isinstance(provider, str) else ""
+    provider = _plugin_aliases().get(provider, provider)
+    return "" if provider == "auto" else provider
+
+
+def _provider_matches_pin(provider: str, pin: str, *, config: Any = None, base_url: str = "",
+                          custom_identity: str = "") -> bool:
+    """Whether *provider* IS the provider *pin* names (the identity check, not "is pin configured").
+
+    A named custom endpoint is spelled three ways that all mean the same route: ``custom:<name>``,
+    the bare ``providers:`` key ``<name>``, and the plain ``custom`` the runtime reports once it has
+    resolved one. So a pin naming an entry authorises that entry and the bare runtime -- but NOT a
+    DIFFERENT entry: with several named custom providers, ``alpha`` must not authorise
+    ``custom:beta`` (both are "a configured providers: entry", which is why the old membership test
+    passed them both).
+
+    The bare form is where the identity is LOST, not merely unspelled: every named endpoint is built
+    by ``runtime_provider_custom._custom_runtime`` as the literal provider ``"custom"``, so the
+    production resolution path hands this rule the nameless form for ``alpha`` AND for ``beta``.
+    Three rungs recover the identity, in order, and every one of them reads the SAME observed
+    *config* the pin came from (R3-2):
+
+    1. *custom_identity* -- the canonical ``custom:<name>`` of the entry the RESOLVER actually
+       picked, carried on the runtime it built. The resolver already knows which entry it chose, so
+       this is the authoritative answer and does not have to be re-derived from the URL.
+    2. *base_url* -- the resolved runtime's endpoint mapped back to a configured entry, for routes
+       that carry no identity (an ad-hoc ``model_aliases:`` endpoint, a cached auxiliary client).
+       Two entries may legitimately share one endpoint with different credentials, so this rung
+       answers only when EXACTLY ONE entry matches: unmatched and ambiguous are the same answer
+       during a failed read, and that answer is refuse. ``return not others`` was the wrong default
+       on a failed lookup -- an endpoint belonging to no configured entry is positively NOT the
+       pinned one (CA-P2-2 round 3).
+    3. Otherwise -- no identity and no endpoint at all -- the nameless form authorises the pin only
+       when no OTHER enabled custom endpoint could be meant. One configured endpoint => the bare
+       runtime IS the pinned entry (the documented widening). Several => the name is genuinely
+       ambiguous and a failed read is the wrong moment to guess, so it is refused.
+    """
+    provider = _plugin_aliases().get((provider or "").strip().lower(), (provider or "").strip().lower())
+    pin = (pin or "").strip().lower()
+    if not provider or not pin:
+        return False
+    if provider == pin:
+        return True
+    if not (provider == "custom" or provider.startswith("custom:")):
+        return False
+    pin_name = _named_custom_entry(pin, config=config)
+    if pin_name is None:
+        return False  # the pin is not a custom route at all
+    if provider != "custom":
+        return _named_custom_entry(provider, config=config) == pin_name
+    identity = str(custom_identity or "").strip().lower()
+    if identity:  # rung 1: the resolver's own answer travels with the runtime
+        return _named_custom_entry(identity, config=config) == pin_name
+    if str(base_url or "").strip():  # rung 2: endpoint -> entry, only when unambiguous
+        matched = _custom_identities_for_endpoint(config, base_url)
+        return matched is not None and len(matched) == 1 and matched[0] == pin_name
+    others = _enabled_custom_entry_names(config)  # rung 3: the documented one-endpoint widening
+    if others is None:
+        return False  # the entry list did not read: refuse rather than assume the pin
+    return not [name for name in others if name != pin_name]
+
+
+def _custom_endpoint_entries(config: Any) -> Optional[List[Tuple[str, str]]]:
+    """``(entry name, normalised base_url)`` for every ENABLED custom endpoint *config* defines, or
+    None when that list could not be determined.
+
+    Read from the config the caller already observed, so the pin, the endpoint lookup and the
+    ambiguity test all come from ONE observation (A44, R3-2). ``find_custom_provider_identity``
+    performs its own independent ``load_config()``, a second read that can disagree with this one
+    during a torn write, which is why the lookup lives here instead.
+
+    Only REAL custom endpoints count. ``providers:`` also holds registry-provider credentials
+    (``providers: {anthropic: {api_key: ...}}``, written by the model picker and read by doctor);
+    counting those as rival custom entries refuses the exact single-endpoint widening this rule
+    documents (R3-1). The discriminator is "has a usable ``base_url``", which is what
+    ``_normalize_custom_provider_entry`` enforces, so ``custom_endpoint_identities`` — built on that
+    same normalizer — keeps the R3-1 exclusion.
+
+    Every DISTINCT KEYED entry counts, though. This used to enumerate through
+    ``get_compatible_custom_providers``, a UI-facing list view whose dedupe key is
+    ``(name, base_url, model)``: two separately keyed entries sharing a display name and endpoint
+    with DIFFERENT credentials collapsed to one row, so the pin check read a shared endpoint as
+    UNIQUELY the first entry (rung 2 saw ``len(matched) == 1``) and the one-entry widening admitted
+    the nameless route (rung 3 saw a single name) while two identities were enabled — the second
+    entry's runtime satisfied the first entry's pin (R4-1). Identity cardinality is not a list
+    view's question; ``custom_endpoint_identities`` answers it with no display-based dedupe.
+
+    None, never ``[]``, on failure: ``[]`` reads as "no other entry could be meant" and ADMITS the
+    nameless route, which is the wrong direction for a failed read (R3-4).
+    """
+    if not isinstance(config, dict):
+        return None
+    try:
+        from hermes_cli.config_providers import custom_endpoint_identities
+        return list(custom_endpoint_identities(config))
+    except Exception as exc:
+        logger.warning("Could not enumerate the configured custom endpoints for the provider pin "
+                       "check (%s); the route is refused rather than assumed to be the pinned one", exc)
+        return None
+
+
+def _custom_identities_for_endpoint(config: Any, base_url: str) -> Optional[List[str]]:
+    """Every configured entry name whose endpoint IS *base_url* (None when the list did not read).
+
+    More than one is not a tie to break: two entries may share a base_url with DIFFERENT
+    credentials, and the URL alone cannot say which runtime this is.
+    """
+    target = str(base_url or "").strip().rstrip("/").lower()
+    if not target:
+        return []
+    entries = _custom_endpoint_entries(config)
+    if entries is None:
+        return None
+    return list(dict.fromkeys(name for name, url in entries if url and url == target))
+
+
+def _enabled_custom_entry_names(config: Any) -> Optional[List[str]]:
+    """Names of the enabled custom endpoints *config* defines (None when the list did not read)."""
+    entries = _custom_endpoint_entries(config)
+    if entries is None:
+        return None
+    return list(dict.fromkeys(name for name, _url in entries))
+
+
+def _named_custom_entry(provider: str, *, config: Any = None) -> Optional[str]:
+    """The ``providers:`` entry name *provider* denotes, ``""`` for the nameless bare ``custom``
+    runtime, or None when it is not a custom route at all.
+
+    Resolved against the OBSERVED *config* whenever the caller has one, so the pin's identity and
+    the ambiguity test cannot come from two disagreeing reads (R3-2). ``has_named_custom_provider``
+    does its own read and is only the fallback for a caller with no observation to offer.
+    """
+    if provider == "custom":
+        return ""
+    if provider.startswith("custom:"):
+        return provider[len("custom:"):] or ""
+    if config is not None:
+        names = _enabled_custom_entry_names(config)
+        return None if names is None else (provider if provider in names else None)
+    try:
+        from hermes_cli.runtime_provider_custom import has_named_custom_provider
+    except ImportError as exc:
+        logger.warning("Custom-provider identity lookup is unavailable (%s); %r is not treated as a "
+                       "custom route", exc, provider)
+        return None
+    return provider if has_named_custom_provider(provider) else None
+
+
+def provider_blocked_by_config_failure(provider: str, selection: Optional[str] = None, *,
+                                       base_url: str = "", custom_identity: str = "") -> Optional[str]:
+    """THE rule for a provider result produced while the config may not read cleanly (A44, one choke
+    point used at every place that publishes an implicitly chosen route). Takes ONE fresh observation.
+    Returns None when ``provider`` may be used, else the failure that blocks it.
+
+    Allowed during a failed read: an explicit per-run choice (``selection == "explicit"``: --provider,
+    --api-key/--base-url), and — per Lake's 2026-09-30 ruling, unless REFUSE_LAST_KNOWN_GOOD_PROVIDER —
+    the provider the served last-known-good config pins. ``selection == "config"`` says the CALLER
+    believes it picked the config's provider; it still has to BE that provider, so it goes through the
+    same pin-identity comparison as an unlabelled pick (a caller whose route drifted from the pin --
+    a task override, a chain entry, an alias -- must not publish it merely by labelling it "config").
+    Everything else (env keys, pool, login, free tier, HERMES_INFERENCE_PROVIDER, discovery, fallback
+    chains, a route carried from an env-selected runtime) is refused.
+
+    ``custom_identity``: the ``custom:<name>`` of the entry the RESOLVER picked, when the caller has a
+    resolved runtime. Preferred over ``base_url``, because the resolver knows which entry it chose and
+    an endpoint shared by two entries cannot say.
+
+    ``base_url``: the resolved runtime's endpoint, for routes carrying no identity. Every named custom
+    endpoint reports the nameless provider ``custom``, so without one of these two the comparison
+    cannot tell WHICH entry a custom route is; pass whichever the call site has
+    (see :func:`_provider_matches_pin`).
+    """
+    config, failure = _config_observation()
+    if not failure:
+        return None
+    if selection == "explicit":
+        return None
+    if REFUSE_LAST_KNOWN_GOOD_PROVIDER:
+        return failure
+    matches = _provider_matches_pin(provider, config_pinned_provider(config), config=config,
+                                    base_url=base_url, custom_identity=custom_identity)
+    return None if matches else failure
+
+
+def refuse_provider_on_config_failure(provider: str, selection: Optional[str], source: str, *,
+                                      base_url: str = "", custom_identity: str = "") -> None:
+    """Raise ``corrupt_config`` when :func:`provider_blocked_by_config_failure` blocks ``provider``."""
+    _refuse_env_adoption_if_config_corrupt(
+        provider_blocked_by_config_failure(provider, selection, base_url=base_url,
+                                           custom_identity=custom_identity), source)
+
+
+def _config_model_provider() -> Tuple[Any, Optional[str], Optional[str]]:
+    """``(model_cfg, provider, read_failure)`` from ONE config.yaml observation, ``provider`` set when
+    ``model.provider`` names a registry provider or a custom OpenAI-compatible endpoint (``custom``,
+    ``custom:<name>``, ``vllm``/``ollama``/...). A ``model.provider: openrouter`` pin and a bare
+    ``providers:`` entry name are explicit intent too. ``read_failure`` is why that same read was not
+    a clean read of the file (None when it was, or there is no file); callers must not adopt a
+    provider from outside the config on a failed read (A44).
 
     The normal chat/gateway path resolves config.provider upstream in resolve_requested_provider();
     this is the safety net for the direct ``resolve_provider("auto")`` callers. A configured custom
@@ -1562,35 +1796,35 @@ def _config_model_provider() -> Tuple[Any, Optional[str]]:
     (``free_tier_bootstrap``) read a llama.cpp/vLLM install as "nothing configured" and the
     dashboard's Ink chat parked every session on Setup Required while ``hermes chat`` worked
     (#108383)."""
+    config, read_failure = _config_observation()
     try:
-        from hermes_cli.config import load_config
-        model_cfg = (load_config() or {}).get("model")
+        model_cfg = (config or {}).get("model")
         provider = model_cfg.get("provider") if isinstance(model_cfg, dict) else None
         provider = provider.strip().lower() if isinstance(provider, str) else ""
         provider = _plugin_aliases().get(provider, provider)
         if provider == "custom" or provider.startswith("custom:"):
-            return model_cfg, "custom"
+            return model_cfg, "custom", read_failure
         # openrouter is absent from PROVIDER_REGISTRY on purpose, so it needs its own rung (#109397);
         # a non-openrouter base_url under it is a deliberate mirror (#10622), not a contradiction.
         if provider == "openrouter" or provider in PROVIDER_REGISTRY:
-            return model_cfg, provider
+            return model_cfg, provider, read_failure
         # Bare ``providers:`` name (the ``custom:<name>`` intent spelled without the prefix); reuse the
         # runtime's own lookup so disabled / endpoint-less entries stay excluded.
         if provider:
             from hermes_cli.runtime_provider_custom import has_named_custom_provider
             if has_named_custom_provider(provider):
-                return model_cfg, "custom"
+                return model_cfg, "custom", read_failure
         # No provider pin but a base_url the bare-custom runtime rung would honour (a loopback
         # llama.cpp/vLLM/ollama server) — same explicit intent, spelled by URL.
         base_url = str(model_cfg.get("base_url") or "").strip() if isinstance(model_cfg, dict) else ""
         if base_url:
             from hermes_cli.runtime_provider import _config_base_url_trustworthy_for_bare_custom
             if _config_base_url_trustworthy_for_bare_custom(base_url, provider):
-                return model_cfg, "custom"
-        return model_cfg, None
+                return model_cfg, "custom", read_failure
+        return model_cfg, None, read_failure
     except Exception as e:
         logger.debug("Could not read config.yaml model.provider for auto-resolution: %s", e)
-        return None, None
+        return None, None, read_failure
 
 
 # API-key providers never auto-selected from env: GitHub tokens are commonly present for repo/tool
@@ -1650,6 +1884,10 @@ def resolve_provider(
     if normalized in ("openrouter", "custom") or _registry_lookup(normalized) is not None:
         return normalized
     if normalized != "auto":
+        from hermes_cli.config import config_read_failure_notice
+        notice = config_read_failure_notice()
+        if notice:  # a providers: entry may live in the file that did not load (A45)
+            raise AuthError(f"Provider '{normalized}' is not available. {notice}", code="invalid_provider")
         hint = _get_config_hint_for_unknown_provider(normalized)
         tail = (f"\n\n{hint}" if hint else " Check 'hermes model' for available providers, "
                 "or run 'hermes doctor' to diagnose config issues.")
@@ -1658,13 +1896,19 @@ def resolve_provider(
     if explicit_api_key or explicit_base_url:  # one-off CLI creds always mean openrouter/custom
         return "openrouter"
 
-    _model_cfg, cfg_provider = _config_model_provider()
-    if cfg_provider:
+    # ONE observation carries the configured provider AND whether that read was clean through every
+    # rung below; a later, separate failure probe could see a file that recovered meanwhile (A44).
+    _model_cfg, cfg_provider, cfg_read_failure = _config_model_provider()
+    if cfg_provider and not (cfg_read_failure and REFUSE_LAST_KNOWN_GOOD_PROVIDER):
         return cfg_provider
+    # Every rung below picks a provider from outside the config (env keys, the pool, a saved login,
+    # the free tier, AWS). After a failed authoritative read none of them may run: the file that did
+    # not read may pin a different provider (A44; subscription-only rule).
+    _refuse_env_adoption_if_config_corrupt(
+        cfg_read_failure, "environment keys, the credential pool, a saved login, the free tier or AWS")
 
     _scoped_key_env = _scoped_key_env_reader()
     if _openrouter_auto_detected(_scoped_key_env):
-        _refuse_env_adoption_if_config_corrupt()
         return "openrouter"
 
     # Determined up front so the env-key tier can warn when an exported key preempts it; the actual

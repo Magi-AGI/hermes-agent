@@ -1720,6 +1720,11 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
         # OAuth refresh); anything else re-raises.
         is_auth = isinstance(resolve_exc, AuthError)
         is_transient_net = _is_transient_provider_resolve_error(resolve_exc)
+        # A failed config read is not a credential problem, and the chain comes from that same failed
+        # read: never walk it into another provider (A44).
+        from hermes_cli.runtime_provider import fallback_chain_walk_allowed
+        if not fallback_chain_walk_allowed(resolve_exc):
+            raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc
         if not (is_auth or is_transient_net):
             raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc
 
@@ -1736,7 +1741,7 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
             try:
                 from hermes_cli.fallback_config import effective_runtime_provider, resolve_entry_api_key
 
-                fb_kwargs = {"requested": fb_provider, "target_model": fb_model}
+                fb_kwargs = {"requested": fb_provider, "target_model": fb_model, "request_origin": "fallback"}
                 if entry.get("base_url"):
                     fb_kwargs["explicit_base_url"] = entry["base_url"]
                 fb_api_key = resolve_entry_api_key(entry)

@@ -465,12 +465,37 @@ def resolve_requested_provider(requested: Optional[str] = None) -> str:
     """Provider request from explicit arg, then config, then ``HERMES_INFERENCE_PROVIDER``, else
     "auto". Config beats the env so chat uses the endpoint the user last saved, not a stale
     shell/.env override."""
+    return _requested_provider_and_source(requested)[0]
+
+
+def _requested_provider_and_source(requested: Optional[str] = None, origin: Optional[str] = None) -> tuple:
+    """``(provider, source)``; source is "explicit" (this run's argument), "config" (the config's pin,
+    including a last-known-good config's, per Lake's 2026-09-30 ruling), "env"
+    (``HERMES_INFERENCE_PROVIDER``) or "auto". The env override is decided on ONE observation
+    (``load_config_with_status``): its failure refuses, else its own pin wins, else the env (A44)."""
     if requested and requested.strip():
-        return requested.strip().lower()
+        requested = requested.strip().lower()
+        if requested == "auto":
+            return requested, "auto"
+        # A saved fallback entry passed as ``requested=`` is a config choice, not this run's --provider.
+        return requested, (origin or "explicit")
     cfg_provider = _get_model_config().get("provider")
-    if isinstance(cfg_provider, str) and cfg_provider.strip():
-        return cfg_provider.strip().lower()
-    return get_secret_str("HERMES_INFERENCE_PROVIDER", "").strip().lower() or "auto"
+    if isinstance(cfg_provider, str) and cfg_provider.strip() and cfg_provider.strip().lower() != "auto":
+        from hermes_cli import auth as _auth
+        if _auth.REFUSE_LAST_KNOWN_GOOD_PROVIDER:  # Lake ruling switch (default keep)
+            _auth._refuse_env_adoption_if_config_corrupt(
+                _auth._config_observation()[1], "the last-known-good config")
+        return cfg_provider.strip().lower(), "config"
+    env_provider = get_secret_str("HERMES_INFERENCE_PROVIDER", "").strip().lower()
+    if not env_provider:
+        return "auto", "auto"  # includes a configured ``model.provider: auto`` (discovery, not a pin)
+    from hermes_cli.auth import _config_observation, _refuse_env_adoption_if_config_corrupt, config_pinned_provider
+    observed_config, failure = _config_observation()
+    observed = config_pinned_provider(observed_config)
+    if observed:
+        return observed, "config"
+    _refuse_env_adoption_if_config_corrupt(failure, "HERMES_INFERENCE_PROVIDER")
+    return env_provider, "env"
 
 
 # ── extracted collaborators (re-exported; see module docstring) ────────────────────────────
@@ -959,7 +984,8 @@ def _openrouter_fallback(requested_provider, explicit_api_key, explicit_base_url
 
 
 def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_key: Optional[str] = None,
-                             explicit_base_url: Optional[str] = None, target_model: Optional[str] = None) -> Dict[str, Any]:
+                             explicit_base_url: Optional[str] = None, target_model: Optional[str] = None,
+                             request_origin: Optional[str] = None) -> Dict[str, Any]:
     """Resolve runtime provider credentials for agent execution. Ladder (order is behavior — each
     rung returns or raises, else falls to the next):
       1. disabled-provider guard (``providers.<name>.enabled: false``)
@@ -976,7 +1002,8 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
          api_mode to ``codex_app_server``; the rung's credential/endpoint is then not used
     target_model overrides model_cfg["default"] when computing provider-specific api_mode (e.g.
     OpenCode Zen/Go where different models route through different API surfaces)."""
-    requested_provider = resolve_requested_provider(requested)
+    # request_origin="fallback": a walker resolving a SAVED fallback entry (never "explicit").
+    requested_provider, request_source = _requested_provider_and_source(requested, request_origin)
     _raise_if_provider_disabled(requested_provider)
     # Same alias expansion the auxiliary client applies, so ``provider: openai`` means one thing on
     # every path (background review, curator, MoA slots, delegation) instead of "Unknown provider".
@@ -997,6 +1024,23 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
         logger.info("model.openai_runtime=codex_app_server overrides the %s runtime (source=%s); its credential/endpoint "
                     "is not used — the app-server authenticates with its own login", runtime.get("provider"), runtime.get("source"))
     runtime["api_mode"] = api_mode
+    # Provenance travels with the runtime so later consumers (auxiliary, vision, agent init) apply the
+    # same rule to routes they build from it.
+    selection = request_source if request_source == "fallback" else (
+        "explicit" if (explicit_api_key or explicit_base_url) else request_source)
+    runtime["selection"] = selection
+    # Publication check (A44): one fresh observation; a provider produced while the config does not read
+    # cleanly is refused unless it is an explicit per-run choice or the last-known-good pin. The resolved
+    # entry's IDENTITY goes with it: a named custom entry resolves to the nameless provider ``custom``, so
+    # the pin comparison cannot otherwise tell alpha's route from beta's (CA-P2-2). ``custom_identity`` is
+    # the entry the ladder actually picked (stamped by ``_apply_custom_provider_extras``); ``base_url`` is
+    # the weaker fallback for routes carrying no identity, and two entries may share one endpoint.
+    from hermes_cli.auth import refuse_provider_on_config_failure
+    refuse_provider_on_config_failure(
+        str(runtime.get("provider") or requested_provider), selection,
+        {"env": "HERMES_INFERENCE_PROVIDER", "auto": "automatic provider detection"}.get(selection, "the resolved provider"),
+        base_url=str(runtime.get("base_url") or ""),
+        custom_identity=str(runtime.get("custom_identity") or ""))
     return runtime
 
 
@@ -1059,6 +1103,11 @@ def _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, targe
     pconfig = PROVIDER_REGISTRY.get(provider)
     if pconfig and pconfig.auth_type == "api_key":
         yield _api_key_provider_runtime(provider, pconfig, requested_provider, model_cfg, target_model)
+    if not (explicit_api_key or explicit_base_url) and provider != "openrouter":
+        # The terminal OpenRouter rung adopts OpenRouter env keys: never after a failed config read
+        # (A44). Explicit per-run credentials (--api-key / --base-url) are the user's own choice.
+        from hermes_cli.auth import refuse_provider_selection_on_config_failure
+        refuse_provider_selection_on_config_failure("OpenRouter environment keys (fallback)")
     fallback = _openrouter_fallback(requested_provider, explicit_api_key, explicit_base_url)
     if swallowed_auth_error is not None and not fallback.get("api_key"):
         fallback["auth_error"] = swallowed_auth_error
@@ -1093,6 +1142,22 @@ def __getattr__(name):  # PEP 562 — lazy so no import cycles
 # ---- END PLUGIN-COMPAT ----
 
 
+def fallback_chain_walk_allowed(primary_exc: Exception) -> bool:
+    """Whether a resolution-time walker may try the configured fallback chain after the primary failed.
+    Never after a failed config read (``corrupt_config``), and never while the config does not read
+    cleanly NOW: the chain is an implicit choice from that config, even when the primary was explicit
+    (a per-run ``--provider`` authorizes the primary, not the saved fallback) (A44)."""
+    if getattr(primary_exc, "code", None) == "corrupt_config":
+        return False
+    from hermes_cli.config import current_config_read_failure
+    failure = current_config_read_failure()
+    if failure:
+        logger.warning("Not trying fallback providers after %s: the config did not read cleanly (%s)",
+                       type(primary_exc).__name__, failure)
+        return False
+    return True
+
+
 def resolve_runtime_with_fallback(config: Optional[Dict[str, Any]], *, requested: Optional[str] = None,
                                   target_model: Optional[str] = None, explicit_base_url: Optional[str] = None,
                                   explicit_api_key: Optional[str] = None,
@@ -1112,13 +1177,15 @@ def resolve_runtime_with_fallback(config: Optional[Dict[str, Any]], *, requested
         return resolve_runtime_provider(requested=requested, target_model=target_model,
                                         explicit_base_url=explicit_base_url, explicit_api_key=explicit_api_key), None
     except AuthError as primary_exc:
+        if not fallback_chain_walk_allowed(primary_exc):
+            raise
         from hermes_cli.fallback_config import effective_runtime_provider, get_fallback_chain, resolve_entry_api_key
         for entry in get_fallback_chain(config):
             provider = (entry.get("provider") or "").strip().lower()
             model = (entry.get("model") or "").strip()
             if not provider or not model:
                 continue
-            kwargs: Dict[str, Any] = {"requested": provider, "target_model": model}
+            kwargs: Dict[str, Any] = {"requested": provider, "target_model": model, "request_origin": "fallback"}
             if entry.get("base_url"):
                 kwargs["explicit_base_url"] = entry["base_url"]
             if entry_key := resolve_entry_api_key(entry):

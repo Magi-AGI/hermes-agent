@@ -7858,7 +7858,7 @@
       },
       "ConfigGetResult": {
         "additionalProperties": false,
-        "description": "Union of every getter's payload: ``value`` for the simple words, ``config`` for ``full``,\n``mtime`` / ``mcp_rev`` for the poller, ``model`` / ``provider`` / ``providers`` for ``provider``,\n``home`` / ``display`` for ``profile``, ``cwd`` / ``branch`` for ``project``, ``prompt``.",
+        "description": "Union of every getter's payload: ``value`` for the simple words, ``config`` for ``full``,\n``mtime`` / ``mcp_rev`` / ``rev`` for the poller, ``model`` / ``provider`` / ``providers`` for ``provider``,\n``home`` / ``display`` for ``profile``, ``cwd`` / ``branch`` for ``project``, ``prompt``.",
         "properties": {
           "value": {
             "anyOf": [
@@ -8019,6 +8019,18 @@
             ],
             "default": null,
             "title": "Mcp Rev"
+          },
+          "rev": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Rev"
           }
         },
         "title": "ConfigGetResult",

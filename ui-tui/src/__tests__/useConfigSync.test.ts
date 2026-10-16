@@ -3,8 +3,12 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { $uiState, resetUiState } from '../app/uiStore.js'
 import {
   applyDisplay,
+  hydrateConfigRevision,
   hydrateFullConfig,
   type McpRevState,
+  newConfigRevState,
+  sessionScoped,
+  withSessionScope,
   normalizeBusyInputMode,
   normalizeIndicatorStyle,
   normalizeMouseTracking,
@@ -589,5 +593,110 @@ describe('hydrateFullConfig', () => {
     // display flags (round-2 / round-8 invariant).
     await expect(hydrateFullConfig(gw, setBell)).resolves.toBeTruthy()
     expect(setBell).toHaveBeenCalledWith(true)
+  })
+})
+
+// config-auth closure r2 (finding 9): a revision is recorded only after its config was applied by the
+// newest hydration, so a failed fetch retries next poll and an older response cannot land last.
+describe('hydrateConfigRevision', () => {
+  beforeEach(() => {
+    resetUiState()
+  })
+
+  const deferred = <T>() => {
+    let resolve!: (v: T) => void
+    const promise = new Promise<T>(r => (resolve = r))
+
+    return { promise, resolve }
+  }
+
+  it('does not accept the revision when config.get full fails, so the next poll retries', async () => {
+    const gw = { request: vi.fn(() => Promise.reject(new Error('boom'))), on: vi.fn(), off: vi.fn() } as any
+    const state = newConfigRevState()
+    const setBell = vi.fn()
+
+    await expect(hydrateConfigRevision(gw, state, { mtime: 5, rev: 'r1' }, setBell)).resolves.toBe(false)
+
+    expect(state.rev).toBe('')
+    expect(state.mtime).toBe(0)
+    expect(setBell).not.toHaveBeenCalled() // no defaults applied for a failed fetch
+
+    gw.request = vi.fn(() => Promise.resolve({ config: { display: { bell_on_complete: true } } }))
+    await expect(hydrateConfigRevision(gw, state, { mtime: 5, rev: 'r1' }, setBell)).resolves.toBe(true)
+    expect(state).toMatchObject({ mtime: 5, rev: 'r1' })
+    expect(setBell).toHaveBeenLastCalledWith(true)
+  })
+
+  it('drops an older response that resolves after a newer hydration started', async () => {
+    const older = deferred<unknown>()
+    const newer = deferred<unknown>()
+    const gw = {
+      request: vi.fn().mockReturnValueOnce(older.promise).mockReturnValueOnce(newer.promise),
+      on: vi.fn(),
+      off: vi.fn()
+    } as any
+    const state = newConfigRevState()
+    const setBell = vi.fn()
+
+    const first = hydrateConfigRevision(gw, state, { mtime: 1, rev: 'old' }, setBell)
+    const second = hydrateConfigRevision(gw, state, { mtime: 1, rev: 'new' }, setBell)
+
+    newer.resolve({ config: { display: { bell_on_complete: true } } })
+    await expect(second).resolves.toBe(true)
+    older.resolve({ config: { display: { bell_on_complete: false } } })
+    await expect(first).resolves.toBe(false)
+
+    expect(state.rev).toBe('new')
+    expect(setBell).toHaveBeenCalledTimes(1)
+    expect(setBell).toHaveBeenLastCalledWith(true)
+  })
+
+  it('does not start a second fetch for the same revision while one is in flight', async () => {
+    const pending = deferred<unknown>()
+    const gw = { request: vi.fn(() => pending.promise), on: vi.fn(), off: vi.fn() } as any
+    const state = newConfigRevState()
+    const setBell = vi.fn()
+
+    const first = hydrateConfigRevision(gw, state, { mtime: 2, rev: 'r' }, setBell)
+    await expect(hydrateConfigRevision(gw, state, { mtime: 2, rev: 'r' }, setBell)).resolves.toBe(false)
+    pending.resolve({ config: { display: {} } })
+    await expect(first).resolves.toBe(true)
+    expect(gw.request).toHaveBeenCalledTimes(1)
+  })
+})
+
+// config-auth closure r3 (finding 3): the poll and the hydration read the SESSION's profile.
+describe('session-scoped config polling', () => {
+  it('binds config.get to the session id, and leaves it unscoped without a session', () => {
+    expect(sessionScoped({ key: 'mtime' }, 'worker-session')).toEqual({ key: 'mtime', session_id: 'worker-session' })
+    expect(sessionScoped({ key: 'full' }, null)).toEqual({ key: 'full' })
+  })
+
+  it('hydrates from the session profile', async () => {
+    const gw = { request: vi.fn(() => Promise.resolve({ config: { display: {} } })), on: vi.fn(), off: vi.fn() } as any
+    const state = newConfigRevState()
+
+    await hydrateConfigRevision(gw, state, { mtime: 3, rev: 'w' }, vi.fn(), undefined, undefined, 'worker-session')
+
+    expect(gw.request).toHaveBeenCalledWith('config.get', { key: 'full', session_id: 'worker-session' })
+  })
+})
+
+// config-auth closure r4 P1: session-owned config RPCs from slash commands (/theme sends {key, value})
+// are bound to the active session at the TUI's rpc boundary.
+describe('withSessionScope', () => {
+  it('adds the active session to config.* calls that name no session or profile', () => {
+    expect(withSessionScope('config.set', { key: 'theme', value: 'dark' }, 'worker')).toEqual({
+      key: 'theme',
+      session_id: 'worker',
+      value: 'dark'
+    })
+  })
+
+  it('leaves explicit scopes, non-config methods and sessionless calls alone', () => {
+    expect(withSessionScope('config.set', { key: 'k', profile: 'p' }, 'worker')).toEqual({ key: 'k', profile: 'p' })
+    expect(withSessionScope('config.get', { key: 'k', session_id: 'other' }, 'worker')).toEqual({ key: 'k', session_id: 'other' })
+    expect(withSessionScope('prompt.submit', { text: 'x' }, 'worker')).toEqual({ text: 'x' })
+    expect(withSessionScope('config.set', { key: 'k' }, null)).toEqual({ key: 'k' })
   })
 })

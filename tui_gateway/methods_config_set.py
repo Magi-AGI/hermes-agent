@@ -18,17 +18,19 @@ _profile_scoped = _registry.profile_scoped
 # ── shared helpers
 
 def _write_display_sections(*, sections=None, drop_sections=(), **display_fields) -> None:
-    """Persist ``display.<field>`` + ``display.sections`` edits via the raw (uncached) write-back."""
-    cfg = _load_cfg_raw()
-    display = cfg.get("display") if isinstance(cfg.get("display"), dict) else {}
-    cur = display.get("sections") if isinstance(display.get("sections"), dict) else {}
-    display.update(display_fields)
-    cur.update(sections or {})
-    for name in drop_sections:
-        cur.pop(name, None)
-    display["sections"] = cur
-    cfg["display"] = display
-    _save_cfg(cfg)
+    """Persist ``display.<field>`` + ``display.sections`` edits as one raw read-modify-write
+    transaction (``_update_cfg``: strict read, compare-and-swap save)."""
+    def _apply(cfg: dict) -> None:
+        display = cfg.get("display") if isinstance(cfg.get("display"), dict) else {}
+        cur = display.get("sections") if isinstance(display.get("sections"), dict) else {}
+        display.update(display_fields)
+        cur.update(sections or {})
+        for name in drop_sections:
+            cur.pop(name, None)
+        display["sections"] = cur
+        cfg["display"] = display
+
+    _update_cfg(_apply)
 
 
 def _emit_session_info(sid: str, session: dict) -> None:
@@ -423,12 +425,13 @@ def _set_cwd(rid, params, key, value, session):
 
 @_cfgset_guarded
 def _set_prompt(rid, params, key, value, session):
-    cfg = _load_cfg_raw()  # write-back round-trip
-    if value == "clear":
-        cfg.pop("custom_prompt", None)
-    else:
-        cfg["custom_prompt"] = value
-    _save_cfg(cfg)
+    def _apply(cfg: dict) -> None:  # raw read-modify-write transaction
+        if value == "clear":
+            cfg.pop("custom_prompt", None)
+        else:
+            cfg["custom_prompt"] = value
+
+    _update_cfg(_apply)
     return _kv(rid, key, "" if value == "clear" else value)
 
 

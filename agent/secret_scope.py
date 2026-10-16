@@ -20,7 +20,7 @@ from contextvars import ContextVar, Token
 from pathlib import Path
 from typing import Dict, Mapping, Optional, Tuple
 
-from utils import file_signature
+from utils import content_signature
 
 
 # Process-global (describes the deployment mode, not a per-task value): set once
@@ -227,9 +227,9 @@ def _parse_env_value(raw_value: str) -> str:
 # turn, cron fire, MCP/browser adoption and housekeeping drain, and each call used to re-read and
 # re-parse the whole file.
 #
-# FRESHNESS: every call still OPENS the file and keys on ``utils.file_signature`` of that
-# descriptor's ``fstat`` (mtime_ns, size, inode, ctime_ns — ctime can't be backdated, so a pinned-
-# timestamp rewrite is still seen), re-checked after the read. The open keeps close-to-open
+# FRESHNESS: every call still OPENS and READS the file and keys on ``utils.content_signature`` of
+# that descriptor's ``fstat`` plus a SHA-256 of the bytes read (metadata alone misses a same-size
+# in-place edit on Windows, where ino/ctime are stable), so the cached map is always of these bytes. The open keeps close-to-open
 # revalidation on NFS, a vanished/unreadable file fails the open and is never cached (a transient
 # EACCES must not become "this profile has no secrets"), and the descriptor pins one inode so a
 # symlink repointed mid-read can't file one file's contents under another's identity.
@@ -284,35 +284,34 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
     Invalid UTF-8 decodes as latin-1, exactly like ``env_loader._load_dotenv_with_fallback`` installs it
     into ``os.environ``. Absent/unreadable → ``{}``.
 
-    Memoised per path on the open descriptor's stat identity (see the cache comment above). Always
+    Memoised per path on the descriptor's stat identity + content digest (see the cache comment above). Always
     returns a fresh dict: callers mutate what they get back (``build_profile_secret_scope`` layers
     external secrets over it).
     """
     key = str(env_path)
     try:
         with open(env_path, "rb") as handle:
-            fingerprint = file_signature(os.fstat(handle.fileno()))
-            with _ENV_FILE_CACHE_LOCK:
-                cached = _ENV_FILE_CACHE.get(key)
-                if cached is not None and cached[0] == fingerprint:
-                    _ENV_FILE_CACHE.move_to_end(key)
-                    return dict(cached[1])
+            st = os.fstat(handle.fileno())
             raw = handle.read()
-            # Same descriptor: a rewrite that landed between the fstat and the read is parsed but not
-            # stored under the pre-write fingerprint.
-            settled = file_signature(os.fstat(handle.fileno())) == fingerprint
     except OSError:
         # Gone or unreadable: drop any entry so a stale map cannot outlive the file.
         invalidate_env_file_cache(env_path)
         return {}
+    # Keyed on the bytes just read (A43): a same-length key rotation written in place keeps
+    # Windows' mtime/ino/ctime, and the parse below is of exactly these bytes.
+    fingerprint = content_signature(st, raw)
+    with _ENV_FILE_CACHE_LOCK:
+        cached = _ENV_FILE_CACHE.get(key)
+        if cached is not None and cached[0] == fingerprint:
+            _ENV_FILE_CACHE.move_to_end(key)
+            return dict(cached[1])
 
     secrets = _parse_env_text(_decode_env_bytes(raw))
-    if settled:
-        with _ENV_FILE_CACHE_LOCK:
-            _ENV_FILE_CACHE[key] = (fingerprint, dict(secrets))
-            _ENV_FILE_CACHE.move_to_end(key)
-            while len(_ENV_FILE_CACHE) > _ENV_FILE_CACHE_MAX:
-                _ENV_FILE_CACHE.popitem(last=False)
+    with _ENV_FILE_CACHE_LOCK:
+        _ENV_FILE_CACHE[key] = (fingerprint, dict(secrets))
+        _ENV_FILE_CACHE.move_to_end(key)
+        while len(_ENV_FILE_CACHE) > _ENV_FILE_CACHE_MAX:
+            _ENV_FILE_CACHE.popitem(last=False)
     return secrets
 
 

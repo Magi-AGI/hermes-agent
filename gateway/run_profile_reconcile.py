@@ -17,12 +17,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from gateway.run_shutdown import _log_suppressed
-from utils import file_signature
+from utils import file_content_signature
 
 logger = logging.getLogger(__name__)
 
@@ -31,12 +30,13 @@ _PROFILE_SIGNATURE_FILES = ("config.yaml", ".env")
 
 
 def profile_serve_signature(home: "Path") -> tuple:
-    """Cheap change detector for a served profile's credentials/config: file signature per file."""
+    """Change detector for a served profile's credentials/config: content signature per file
+    (metadata + SHA-256). Metadata alone misses a same-size Windows edit, e.g. a rotated API key
+    of the same length (A43); one small read per file per rescan interval."""
     sig = []
     for name in _PROFILE_SIGNATURE_FILES:
         try:
-            st = os.stat(Path(home) / name)
-            sig.append(file_signature(st))
+            sig.append(file_content_signature(Path(home) / name))
         except OSError:
             sig.append(None)
     return tuple(sig)
