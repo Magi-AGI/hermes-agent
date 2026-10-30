@@ -93,13 +93,23 @@ class _ControlledChild(_Parent):
         self.closed.set()
 
 
-def _batch(parent, *children):
+class _FakeWriter:
+    path = None  # _dispatch_unit's transcript map reads .path on every writer
+
+    def __init__(self):
+        self.finalized = []
+
+    def finalize(self, entry):
+        self.finalized.append(dict(entry))
+
+
+def _batch(parent, *children, live_writers=()):
     tasks = [{"goal": f"wait until cancelled {i}"} for i in range(len(children))]
     parent._active_children.extend(children)
     return _Batch(
         task_list=tasks, children=[(i, tasks[i], child) for i, child in enumerate(children)], parent_agent=parent,
         creds={"model": children[0].model}, context=None, top_role="leaf", max_children=len(children),
-        live_deleg_id=None, live_writers=[], live_paths=[], origin_wake_sid="",
+        live_deleg_id="cap-refusal-test", live_writers=list(live_writers), live_paths=[], origin_wake_sid="",
         origin_ui_session_id="", origin_owner_transport=None,
         origin_owner_session_record=None, origin_session_history_delivery=False, overall_start=time.monotonic(),
     )
@@ -144,7 +154,8 @@ def test_rejected_background_child_stops_with_parent(
         pending_child.session_id += "-pending"
         batch = _batch(parent, background_child, child, pending_child)
     else:
-        batch = _batch(parent, child)
+        batch = _batch(parent, child,
+                       live_writers=[_FakeWriter()] if rejection == "capacity" else ())
     occupied = threading.Event()
     release_occupier = threading.Event()
     admission_started = threading.Event()
@@ -220,6 +231,24 @@ def test_rejected_background_child_stops_with_parent(
         if stop_timing == "during_admission":
             request_stop(stop_message)
         continue_admission.set()
+        if rejection == "capacity":
+            # Gate H5: capacity no longer degrades to a blocking synchronous run — the call is
+            # REFUSED with a structured result, and the refusal OWNS the teardown the sync
+            # fallback used to provide (agy R2-1/R2-2): every pre-built child is closed and
+            # detached, its roster card completed, and the live transcripts finalized.
+            result = outcome.result(timeout=5)
+            assert result["status"] == "rejected"
+            assert result["reason"] == "at_capacity"
+            assert "refused" in result.get("note", "").lower()
+            assert "capacity" in result.get("error", "")
+            assert not child.started.is_set(), "a refused batch still ran its child"
+            assert child.closed.wait(5), "a refused child was never closed"
+            assert child.close_count == 1
+            # (closed_while_running is meaningless here: the child never ran at all.)
+            assert parent._active_children == [], "a refused child squatted _active_children"
+            assert batch.live_writers and all(w.finalized for w in batch.live_writers), (
+                "refused live transcripts were not finalized")
+            return
         assert child.started.wait(5)
         if stop_timing == "running":
             request_stop(stop_message)
@@ -250,7 +279,7 @@ def test_rejected_background_child_stops_with_parent(
         assert parent._active_children == []
     finally:
         continue_admission.set()
-        if not child.finished.is_set():
+        if rejection != "capacity" and not child.finished.is_set():
             child.hard_interrupt("test teardown")
         child.allow_finish.set()
         worker.join(timeout=5)

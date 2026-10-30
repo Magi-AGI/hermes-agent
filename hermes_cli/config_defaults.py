@@ -524,6 +524,15 @@ DEFAULT_CONFIG = {
         # with N servers spawns N process trees in the same instant (RAM/CPU spike, 429 fan-out on
         # multi-profile fleets). 0 = unlimited.
         "discovery_concurrency": 4,
+        # Unattended MCP OAuth. true (upstream behaviour) = any connect on a real console may open a
+        # browser authorization flow (CLI startup, config-watcher reload, a lazy first-use connect
+        # inside a tool call, a mid-session re-auth). false = only an explicit, user-started login
+        # (`hermes mcp login <server>`, the desktop/dashboard login button) may; every other connect
+        # needing authorization fails with the "run `hermes mcp login <server>`" error. Background
+        # paths (startup discovery, gateway, keepalive reconnects) are non-interactive either way.
+        # false also refuses a model's manage_connections authorize (it starts OAuth before any
+        # click); an unreadable or unparseable config.yaml counts as false.
+        "interactive_oauth": True,
     },
     # Tool-output truncation. max_bytes: terminal_tool output cap in chars (head+tail kept; 50_000 ≈
     # 12-15K tokens). max_lines: max `limit` one read_file call may request before clamping.
@@ -1989,7 +1998,10 @@ DEFAULT_CONFIG = {
     "logging": {  # File logging to ~/.hermes/logs/: agent.log captures INFO+, errors.log WARNING+.
         "level": "INFO",       # minimum level for agent.log: DEBUG, INFO, WARNING
         "max_size_mb": 5,      # max size per log file before rotation
-        "backup_count": 3,     # rotated backups to keep
+        "backup_count": 3,     # rotated backups to keep (per process on Windows)
+        # Windows writes per-process segments under logs/<stem>.d/ (no shared file, no cross-process
+        # lock); segments older than this are pruned when a process starts logging. 0 = never prune.
+        "retention_days": 7,
     },
     # Remote model-catalog manifest: curated OpenRouter / Nous Portal model lists fetched from this
     # URL (falls back to the in-repo snapshot on network failure), so picker lists update without a

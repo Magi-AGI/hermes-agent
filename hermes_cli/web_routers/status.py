@@ -797,13 +797,14 @@ async def get_logs(
     file: str = "agent", lines: int = 100, level: Optional[str] = None,
     component: Optional[str] = None, search: Optional[str] = None,
     profile: Optional[str] = None):
-    from hermes_cli.logs import _read_tail, LOG_FILES
+    from hermes_cli.logs import LOG_FILES
+    from hermes_cli.logs_merge import log_sources, read_merged_tail
     log_name = LOG_FILES.get(file)
     if not log_name:
         raise HTTPException(status_code=400, detail=f"Unknown log file: {file}")
     with _config_profile_scope(profile):
-        log_path = get_hermes_home() / "logs" / log_name
-    if not log_path.exists():
+        log_dir = get_hermes_home() / "logs"
+    if not log_sources(log_dir, log_name):
         return {"file": file, "lines": []}
 
     try:
@@ -819,13 +820,10 @@ async def get_logs(
         if comp_prefixes is None:
             raise HTTPException(status_code=400, detail=f"Unknown component: {component}. "
                                 f"Available: {', '.join(sorted(COMPONENT_PREFIXES))}")
-    result = _read_tail(
-        log_path, min(lines, 500) if not search else 2000,
-        has_filters=bool(min_level or comp_prefixes or search),
-        min_level=min_level, component_prefixes=comp_prefixes)
-    # _read_tail doesn't support free-text search, so post-filter (case-insensitive
-    # substring) here and trim to the requested line count afterward.
-    if search:
-        needle = search.lower()
-        result = [l for l in result if needle in l.lower()][-min(lines, 500):]
+    # Every filter, search included, selects whole entries so a matching traceback keeps its
+    # frames (the page renders one row per returned line).
+    result = read_merged_tail(
+        log_dir, log_name, max(0, min(lines, 500)),
+        has_filters=bool(min_level or comp_prefixes),
+        min_level=min_level, component_prefixes=comp_prefixes, search=search or None)
     return {"file": file, "lines": result}

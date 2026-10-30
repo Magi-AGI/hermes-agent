@@ -304,10 +304,28 @@ def _parse_tui_skills_env() -> list[str]:
 
 
 def _load_fallback_model():
-    """Configured fallback chain via the shared ``get_fallback_chain`` (parity with
-    HermesCLI/gateway: ``fallback_providers`` first, legacy ``fallback_model`` merged after)."""
-    from hermes_cli.fallback_config import get_fallback_chain
-    return get_fallback_chain(_load_cfg())
+    """The fallback chain a NEW desktop/TUI agent may be constructed with, read FAIL-CLOSED.
+
+    ``_load_cfg()`` is the documented fail-OPEN behavioural read (``{}`` on any error), which is
+    right for the settings around it but wrong for this one: a failed MANAGED read is a failed read
+    (A44), the admin layer can only ever REMOVE or override what the user file says, so applying an
+    unreadable managed file as an empty overlay handed every newly built agent exactly the chain a
+    managed ``fallback_providers: []`` was suppressing — and ``try_activate_fallback`` installs chain
+    entries with no gate of its own (R4-4, closed as R5-2).
+
+    The per-turn sync below (:func:`_sync_agent_fallback_with_config`) is fail-closed too, but it
+    only corrects an EXISTING agent: it returns early when the session has no agent yet, so it can
+    never repair the chain a new agent was born with. The constructor has to fail closed itself.
+    Since R9 both go through the same shared primitive, so a suppression the sync observes is also
+    on record for the NEXT constructor.
+
+    Shares the gateway constructor's ONE per-home retention
+    (``gateway/run_config_loaders.load_fail_closed_fallback_chain``) rather than adding a fourth
+    cache, and resolves the home from ``_active_config_path()`` so a session bound to a profile
+    override records under THAT home, not the launch one.
+    """
+    from gateway.run_config_loaders import load_fail_closed_fallback_chain
+    return load_fail_closed_fallback_chain(_active_config_path().parent)
 
 
 def _sync_agent_fallback_with_config(sid: str, session: dict) -> None:
@@ -319,15 +337,31 @@ def _sync_agent_fallback_with_config(sid: str, session: dict) -> None:
     gateway applies to its cached agents (``GatewayRunner._refresh_fallback_model``): the config is
     read fail-closed, so a torn/invalid config.yaml keeps the agent's last known-good chain instead of
     ``_load_cfg()``'s fail-open ``{}`` reading as "chain removed" and wiping it. Never blocks the turn.
+
+    Goes through the SHARED primitive
+    (``gateway/run_config_loaders.record_clean_fallback_chain_observation``), so a successful
+    observation — **including an empty one, i.e. a clean managed suppression** — is published to the
+    one per-home retention the CONSTRUCTORS read, with its observation epoch (R5-3 ordering).
+
+    It used to call ``get_fallback_chain(load_user_config_effective(...))`` directly. That was
+    fail-closed for the agent in front of it and published nothing, and this function is on the
+    NORMAL turn admission path (``tui_gateway/prompt_turn.py:587``), so:
+
+    1. a constructor records the allowed chain ``F`` in the shared retention;
+    2. the admin layer revokes it; this sync observes the suppression and clears THAT agent's chain;
+    3. the managed file then stops reading, and within
+       ``FALLBACK_CHAIN_RETENTION_GRACE_SECONDS`` the next constructor serves the untouched ``F`` to
+       a brand-new agent (``server.py:2524``), where ``try_activate_fallback`` installs it ungated.
+
+    No race and no CLI source was needed for that; it is closed by publishing here (R9/R5-2).
     """
     agent = session.get("agent")
     if agent is None:
         return
     try:
         from gateway.run import GatewayRunner
-        from hermes_cli.config_effective import load_user_config_effective
-        from hermes_cli.fallback_config import get_fallback_chain
-        chain = get_fallback_chain(load_user_config_effective(_active_config_path(), fail_closed=True))
+        from gateway.run_config_loaders import record_clean_fallback_chain_observation
+        chain = record_clean_fallback_chain_observation(_active_config_path().parent)
     except Exception as e:
         logger.warning("fallback chain sync skipped for %s (keeping current chain): %s", sid, e)
         return
@@ -531,7 +565,11 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
         # /new is a full conversation boundary: session-scoped runtime overrides (/model,
         # /reasoning, /fast) do NOT carry forward and the pins are cleared so a rebuild can't
         # resurrect them. Global process state is never touched (see _apply_model_switch).
-        for k in ("model_override", "create_reasoning_override", "create_service_tier_override", "one_turn_model_restore"):
+        # The model pin goes through the publisher so the selection sequence advances: a
+        # /model ack still in flight from before the reset must not reinstall the pin
+        # (Codex HS-C6, reset arm).
+        _publish_model_override(session, None)
+        for k in ("create_reasoning_override", "create_service_tier_override", "one_turn_model_restore"):
             session.pop(k, None)
         new_agent = _rebuild_session_agent(
             sid, session, session_id=session["session_key"],

@@ -10,7 +10,6 @@ import os
 import queue
 import threading
 from datetime import datetime
-from hermes_cli.fallback_config import get_fallback_chain
 from hermes_state_ids import new_session_id
 from pathlib import Path
 from rich.console import Console
@@ -19,6 +18,43 @@ from utils import base_url_host_matches, base_url_hostname, is_truthy_value
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("cli")
+
+
+def _fail_closed_fallback_chain_for_cli() -> Any:
+    """The fallback chain a NEW classic-CLI agent may be constructed with, read FAIL-CLOSED.
+
+    ``CLI_CONFIG`` comes from ``cli_config_load.load_cli_config``, whose managed overlay is
+    ``managed_scope.apply_managed_overlay`` — documented **fail-open** ("returns ``config``
+    unchanged when no scope is present or on any error"), which is right for the dozens of display
+    and routing settings around it and wrong for this one. A failed MANAGED read is a failed read
+    (A44): the admin layer can only ever REMOVE or override what the user file says, so applying an
+    unreadable managed file as an empty overlay handed this agent exactly the chain a managed
+    ``fallback_providers: []`` was suppressing — and ``agent/chat_completion_helpers.
+    try_activate_fallback`` installs chain entries with no gate of its own (reachable from
+    ``agent/turn_api_error.py``).
+
+    The per-turn resync ``cli_chat_turn_mixin._sync_fallback_chain_with_config`` IS fail-closed, but
+    it runs AFTER ``_init_agent``, and on a failed read it deliberately keeps the current chain
+    (#95066) — so it preserves a suppressed startup chain rather than repairing it, and
+    ``_resolve_runtime_with_fallback`` has already walked that chain during credential resolution
+    (``cli_agent_setup_mixin.py``). The constructor has to fail closed itself (R5-6 option 2).
+
+    Shares the gateway constructor's ONE per-home retention
+    (``gateway/run_config_loaders.load_fail_closed_fallback_chain``) rather than adding another
+    cache: two slots for one fact is the R4-2 bug class. The gateway import is lazy and costs
+    0.02 s / 17 modules once ``cli`` is loaded (the same shape ``cli_chat_turn_mixin`` already uses).
+
+    ``--safe-mode`` / ``--ignore-user-config`` is handled INSIDE the primitive now, so there is no
+    branch here. The earlier R9 shape — returning ``get_fallback_chain(CLI_CONFIG)`` under the flag
+    — was wrong in both directions (R10/D-2): ``cli.CLI_CONFIG`` is an import-time snapshot
+    (``cli.py:326``) built by fail-open ``load_cli_config``, so a process that imported ``cli``
+    before the flag was applied got the user's chain straight back, and a managed revocation after
+    import could never reach it. The bypass must NARROW a live fail-closed read, which is exactly
+    what ``record_clean_fallback_chain_observation`` now does.
+    """
+    from gateway.run_config_loaders import load_fail_closed_fallback_chain
+    from hermes_constants import get_hermes_home
+    return load_fail_closed_fallback_chain(get_hermes_home())
 
 
 class CLIInitMixin:
@@ -116,7 +152,13 @@ class CLIInitMixin:
         # resume must not clobber an explicit -m with the session's stored model.
         self._explicit_model_override = bool(model)
         self.model = model or _config_model or ""
-        _cfg_provider = _model_config.get("provider") or os.getenv("HERMES_INFERENCE_PROVIDER")
+        _cfg_provider = _model_config.get("provider")
+        if not _cfg_provider:
+            # The env override stands in only for a config that read cleanly; after a failed read the
+            # request stays "auto" and provider resolution refuses with the read error (A44).
+            from hermes_cli.config import current_config_read_failure
+            if not current_config_read_failure():
+                _cfg_provider = os.getenv("HERMES_INFERENCE_PROVIDER")
         _startup_provider_override = _startup_base_url_override = _startup_api_key_override = ""
         if self.model:
             from hermes_cli.model_switch import resolve_startup_model_route
@@ -277,7 +319,7 @@ class CLIInitMixin:
             except (TypeError, ValueError):
                 pass
 
-        self._fallback_model = get_fallback_chain(CLI_CONFIG)
+        self._fallback_model = _fail_closed_fallback_chain_for_cli()
 
     def _init_runtime_state(self, resume):
         """Session store + all per-run mutable state (queues, overlays, pet/voice/status-bar fields)."""

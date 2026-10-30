@@ -228,3 +228,21 @@ def test_a_run_that_writes_into_the_checkout_fails_and_names_the_path(tmp_path, 
     assert all((repo / stray).exists() for stray in strays)
     named = bool(strays) and strays[0].split("/")[0] in err
     assert (rc, "CHECKOUT WRITE" in err, named) == ((5, True, True) if counts else (0, False, False))
+
+
+def test_log_snapshot_covers_windows_per_process_segments(tmp_path, monkeypatch):
+    """Gate H4: Windows writes logs/<stem>.d/*.log; a test that leaks into the live home there
+    must still be caught by the appended-content scan (root home and profile homes alike)."""
+    root = tmp_path / "root"
+    segments = [root / "logs" / "agent.d" / "11-20261030-100000.1.log",
+                root / "profiles" / "x" / "logs" / "errors.d" / "12-20261030-100000.1.log"]
+    for seg in segments:
+        seg.parent.mkdir(parents=True)
+        seg.write_text("quiet\n")
+    monkeypatch.setattr(rti, "LIVE_ROOT", root)
+    before = rti._log_snapshot([])
+    for seg in segments:
+        with open(seg, "a") as fh:
+            fh.write("leaked under pytest-of-someone\n")
+    hits, problems = rti._scan_appended(before)
+    assert len(hits) == 2 and not problems

@@ -122,13 +122,14 @@ def reset_for_tests() -> None:
 
 
 def _config_stamp() -> tuple:
+    """Content signature per inventory file: mtime + size miss a same-size Windows edit (A43)."""
     from hermes_cli.config import get_hermes_home
+    from utils import file_content_signature
     home = get_hermes_home()
     stamp = []
     for name in _INVENTORY_FILES:
         try:
-            st = (home / name).stat()
-            stamp.append((st.st_mtime_ns, st.st_size))
+            stamp.append(file_content_signature(home / name))
         except OSError:
             stamp.append(None)
     return tuple(stamp)
@@ -146,10 +147,18 @@ def _inventory_other_providers() -> bool:
     seen by the next :func:`reconcile_record`.
     """
     global _inventory_stamp
-    from hermes_cli.auth import resolve_provider
+    from hermes_cli.auth import AuthError, resolve_provider
     _inventory_stamp = _config_stamp()
     try:
         return resolve_provider("auto", skip_free_tier=True) != "nous"
+    except AuthError as exc:
+        # An unreadable config.yaml leaves "what else is configured" unknown: report it as
+        # configured so the mint never claims active_provider while the user's file is unread.
+        if exc.code == "corrupt_config":
+            logger.info("free tier bootstrap: config.yaml unreadable, not claiming inference (%s)", exc)
+            return True
+        logger.debug("free tier bootstrap: nothing else carries inference (%s)", exc)
+        return False
     except Exception as exc:
         logger.debug("free tier bootstrap: nothing else carries inference (%s)", exc)
         return False

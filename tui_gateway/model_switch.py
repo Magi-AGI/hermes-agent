@@ -228,6 +228,18 @@ def _expensive_model_confirm(result, current_base_url: str, current_api_key, age
     return {"value": result.new_model, "warning": msg, "confirm_required": True, "confirm_message": msg}
 
 
+def _invalidate_mirror_model(session) -> None:
+    """Drop the metadata mirror's model/provider after a committed switch: they are stale for
+    EVERY switch shape (in-place, agentless/isolated, one-turn) and the next host turn
+    repopulates them. Locked like every other mirror writer; other keys stay valid."""
+    mirror = session.get("_metadata_mirror") if isinstance(session, dict) else None
+    if isinstance(mirror, dict):
+        import threading as _threading
+        with session.setdefault("history_lock", _threading.Lock()):
+            mirror.pop("model", None)
+            mirror.pop("provider", None)
+
+
 def _commit_agent_switch(sid: str, session: dict, agent, result, current_model: str, snapshot):
     """Swap the live agent in place, then restart/persist/mark/announce; a failed swap aborts."""
     try:
@@ -249,6 +261,9 @@ def _commit_agent_switch(sid: str, session: dict, agent, result, current_model: 
     _persist_live_session_runtime(session)
     _persist_live_session_system_prompt(session)
     _append_model_switch_marker(session, model=result.new_model, provider=result.target_provider)
+    # Invalidate BEFORE the broadcast (agy R4-7: the emit ran before the pop, and one-turn
+    # switches never popped at all).
+    _invalidate_mirror_model(session)
     _emit_session_info(sid, session)
     if snapshot is not None:
         session["one_turn_model_restore"] = snapshot
@@ -314,9 +329,13 @@ def _apply_model_switch(
     # Deliberately NOT written to process-global env (HERMES_MODEL & co.): the desktop hosts
     # every same-profile session in one process, so os.environ would leak the switch to all.
     if pin_session_override and isinstance(session, dict) and not one_turn:
-        session["model_override"] = {
+        _publish_model_override(session, {
             "model": result.new_model, "provider": result.target_provider,
-            "base_url": result.base_url, "api_key": result.api_key, "api_mode": result.api_mode}
+            "base_url": result.base_url, "api_key": result.api_key, "api_mode": result.api_mode})
+        # An AGENTLESS (isolated) session's switch never reaches _commit_agent_switch, so the
+        # mirror would keep reporting the pre-switch host model (agy R5-3: S8 removed this pop
+        # as a duplicate and regressed exactly that path). Idempotent with _commit's call.
+        _invalidate_mirror_model(session)
     if persist_global:
         from hermes_cli.model_switch import persist_model_selection
         persist_model_selection(result)
@@ -412,7 +431,7 @@ def _sync_agent_model_with_config(sid: str, session: dict) -> None:
             return
         # A later profile edit supersedes the canonical chat's explicit pick. Clearing both fields lets
         # the normal config-sync path switch now and prevents the old composer pick resurfacing on rebuild.
-        superseded_pin = session.pop("model_override"), composer_profile
+        superseded_pin = _publish_model_override(session, None), composer_profile
         session["composer_override_profile"] = None
     # Record first so a broken config gets one attempt per edit, not per turn.
     session["config_model_seen"] = target

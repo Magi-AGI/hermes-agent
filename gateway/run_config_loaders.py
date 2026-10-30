@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from contextlib import suppress
 from pathlib import Path
@@ -38,6 +39,217 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 logger = logging.getLogger("gateway.run")
 
 DEFAULT_HUMAN_DELAY_RANGE_MS: tuple[int, int] = (800, 2500)
+
+# hermes_home_key -> the last CLEANLY read fallback chain for that home (None = the home has no
+# chain). One process serves many profiles, so this is keyed per home, never a single slot: a
+# runner-wide slot handed a secondary profile the default profile's chain. Read only when the
+# config.yaml for that home does NOT read cleanly, so the admin layer's last allowed answer
+# survives a torn write instead of the user's unconstrained chain being published
+# (:meth:`GatewayRunner._load_fallback_model`, CA-P2/P3-6 round 3).
+#
+# ONE slot per home for ONE fact, shared by the constructor and the per-turn refresh. They used to
+# keep separate caches — this module global and ``self._fallback_model_by_home`` — and never
+# cross-updated, so a chain the admin layer had suppressed could be refreshed away on the instance
+# while this slot still held the older, WIDER answer; the next managed failure served that revoked
+# chain to a newly constructed API agent, which installs it ungated
+# (``agent/chat_completion_helpers.py``). Both writers now record here, including a successful
+# EMPTY observation — a clean suppression is retained AS a suppression, which is the whole point
+# (R4-2). Writes are ``_record_clean_fallback_chain``; reads are ``_retained_fallback_chain``.
+_LAST_CLEAN_FALLBACK_CHAIN: Dict[str, Optional[List[Any]]] = {}
+
+# How long a retained chain may be served after the config for that home stopped reading cleanly.
+# Unbounded retention means a permanently broken managed file serves the stale chain for the
+# process's whole life; the bounded analogue is ``hermes_cli/managed_scope.py``'s
+# ``VANISHED_GRACE_SECONDS``. Past the grace the answer is None (no chain) — fail closed, same
+# direction as a cold process (R4-6).
+FALLBACK_CHAIN_RETENTION_GRACE_SECONDS = 300.0
+
+# hermes_home_key -> monotonic timestamp of the write that filled _LAST_CLEAN_FALLBACK_CHAIN.
+_LAST_CLEAN_FALLBACK_CHAIN_AT: Dict[str, float] = {}
+
+# hermes_home_key -> the observation epoch (hermes_cli.config_effective's per-read sequence) behind
+# the retained record. Observation happens under ``_config._CONFIG_LOCK``; publication happens AFTER
+# that lock is released, and the write used to overwrite value and timestamp unconditionally. So
+# reader A could observe chain F, be descheduled, reader B observe and publish a suppression, and A
+# then publish F with a FRESH timestamp — the newer suppression lost, and the next managed failure
+# serving the revoked chain. Gateway turns run in a thread pool, so concurrent readers are normal.
+# Carrying the epoch lets a publication be REFUSED when a strictly newer observation is already on
+# record, which is the ordering guarantee without holding the config lock across the publication
+# (R5-3).
+_LAST_CLEAN_FALLBACK_CHAIN_EPOCH: Dict[str, int] = {}
+
+# Guards the three retention dicts as ONE record: a reader must never see a value from one
+# publication with the timestamp or epoch of another.
+_FALLBACK_CHAIN_RETENTION_LOCK = threading.Lock()
+
+# "nothing is retained for this home" — distinct from a retained None, which is a CLEAN observation
+# that the home has no chain (a managed suppression) and must be served as such.
+_NO_RETENTION = object()
+
+
+def _chain_retention_key(home_key: str, ignore_user_config: bool) -> str:
+    """The retention slot for *home_key* under the ``--safe-mode`` / ``--ignore-user-config`` bypass.
+
+    "What chain may a new agent have for this home" has TWO answers once the bypass exists — with
+    and without the user layer — and one slot cannot hold both. One process routinely asks both
+    questions (a safe-mode CLI still hosts gateway, cron and TUI readers for the same home), so a
+    bypassed observation recording "no chain" under the plain key would make the next NON-bypassed
+    constructor serve "no chain" on a failed managed read when the user's last clean chain was the
+    correct answer — and the reverse would leak the ignored user chain into a bypassed constructor.
+    Still ONE record per question, not a second cache: the R4-2 bug class was two slots for one
+    fact, not one slot per distinct fact.
+    """
+    return f"{home_key}\x00no-user" if ignore_user_config else home_key
+
+
+def _record_clean_fallback_chain(home_key: str, chain: Optional[List[Any]], *,
+                                 epoch: Optional[int] = None) -> Optional[List[Any]]:
+    """Record a SUCCESSFUL fallback-chain observation for *home_key* and return it unchanged.
+
+    Called by both chain readers on their success paths. An empty/absent chain is recorded too: a
+    managed ``fallback_providers: []`` that read cleanly is the admin layer's current answer, and
+    forgetting it would let the previous, wider answer be served on the next failure (R4-2).
+
+    *epoch* is the observation's sequence number from
+    :func:`hermes_cli.config_effective.last_observation_epoch`, taken while the config lock was
+    held. A publication whose observation is OLDER than the one already on record is refused, so a
+    descheduled reader cannot resurrect a chain a later reader already saw revoked (R5-3). The
+    caller still gets its own observation back — only the shared retention is protected.
+    """
+    with _FALLBACK_CHAIN_RETENTION_LOCK:
+        if epoch is not None:
+            recorded = _LAST_CLEAN_FALLBACK_CHAIN_EPOCH.get(home_key)
+            if recorded is not None and recorded > epoch:
+                logger.debug("fallback chain: refusing to publish observation %s for %s over the "
+                             "newer observation %s already on record", epoch, home_key, recorded)
+                return chain
+            _LAST_CLEAN_FALLBACK_CHAIN_EPOCH[home_key] = epoch
+        _LAST_CLEAN_FALLBACK_CHAIN[home_key] = chain
+        _LAST_CLEAN_FALLBACK_CHAIN_AT[home_key] = time.monotonic()
+    return chain
+
+
+def _retained_fallback_chain(home_key: str) -> Any:
+    """The retained observation for *home_key*, or ``_NO_RETENTION``.
+
+    A retained ``None`` is returned as ``None``: it means "the last clean read said this home has no
+    chain", which is exactly the suppression a caller must honour. ``_NO_RETENTION`` means there is
+    no usable observation at all — nothing recorded (a cold process) or the record is older than
+    ``FALLBACK_CHAIN_RETENTION_GRACE_SECONDS`` (R4-6).
+    """
+    with _FALLBACK_CHAIN_RETENTION_LOCK:
+        if home_key not in _LAST_CLEAN_FALLBACK_CHAIN:
+            return _NO_RETENTION
+        recorded_at = _LAST_CLEAN_FALLBACK_CHAIN_AT.get(home_key)
+        if recorded_at is None or (time.monotonic() - recorded_at) > FALLBACK_CHAIN_RETENTION_GRACE_SECONDS:
+            logger.debug("fallback chain: the retained chain for %s is older than the %.0fs retention "
+                         "grace; serving no chain rather than a stale one",
+                         home_key, FALLBACK_CHAIN_RETENTION_GRACE_SECONDS)
+            return _NO_RETENTION
+        return _LAST_CLEAN_FALLBACK_CHAIN[home_key]
+
+
+def load_fail_closed_fallback_chain(home: Path) -> Optional[List[Any]]:
+    """The fallback chain for *home*, read FAIL-CLOSED against the shared per-home retention.
+
+    THE single chain-construction primitive for the agent constructors in this repo's own
+    surfaces — :meth:`GatewayConfigLoadersMixin._load_fallback_model` (gateway / API agents),
+    ``cron/scheduler.py``, ``tui_gateway/agent_callbacks.py``, ``hermes_cli/cli_init_mixin.py``
+    (classic CLI startup) and ``hermes_cli/oneshot.py`` — so there is one implementation of "what
+    chain may a newly constructed agent have" and one retention behind it rather than a third and
+    fourth cache (R5-2, extended to the CLI surfaces as R5-6 option 2).
+
+    It does NOT claim to cover every conceivable chain source: the activation seam
+    ``agent/chat_completion_helpers.try_activate_fallback`` is still ungated and revalidating an
+    already-clean chain mid-turn remains a separate (P3) question. The earlier wording here —
+    "every surface that builds a new agent" — contradicted the R5-6 nonclaim recorded 550 lines
+    below and is corrected to the enumeration above (R8 evidence-honesty finding).
+
+    A failed MANAGED read is a failed read (A44): the admin layer can only ever REMOVE or override
+    what the user file says — a managed ``fallback_providers: []`` suppresses a user chain — so
+    applying an unreadable managed file as an EMPTY overlay would hand the caller the user's
+    unconstrained chain while reporting success. On a failed read the last CLEAN answer for this home
+    is served instead, never the user's own chain; when nothing is on record (a cold process, or a
+    record past the retention grace) the answer IS ``None``, i.e. no chain.
+
+    :func:`record_clean_fallback_chain_observation` is the body; this wrapper only converts its
+    failed-read exception into the retained answer.
+
+    Under ``--safe-mode`` / ``--ignore-user-config`` the answer is the MANAGED layer's chain, or
+    none — never the user's. See :func:`record_clean_fallback_chain_observation`.
+    """
+    from hermes_cli.config_effective import user_config_bypassed
+    from hermes_constants import hermes_home_key
+    try:
+        return record_clean_fallback_chain_observation(home)
+    except Exception:
+        home_key = _chain_retention_key(hermes_home_key(home), user_config_bypassed())
+        retained = _retained_fallback_chain(home_key)
+        chain = None if retained is _NO_RETENTION else retained
+        logger.debug("fallback chain: config.yaml for %s did not read cleanly; serving the last clean "
+                     "chain (%s entries%s) rather than the unconstrained user chain",
+                     home, len(chain or []),
+                     ", nothing retained" if retained is _NO_RETENTION else "", exc_info=True)
+        return chain
+
+
+def record_clean_fallback_chain_observation(home: Path) -> Optional[List[Any]]:
+    """Read the chain for *home* fail-closed, PUBLISH the observation, and return it.
+
+    Raises whatever the fail-closed config read raised, so a caller that holds its own
+    last-known-good state keeps it (the per-turn refresh contract, #95066) instead of reading a
+    failed read as "chain removed". Only a SUCCESSFUL observation publishes — including an EMPTY
+    one, which is a clean managed suppression and must be retained AS a suppression (R4-2).
+
+    Separating this from :func:`load_fail_closed_fallback_chain` is what lets the per-turn refreshes
+    share the retention without changing their failure behaviour. ``tui_gateway``'s per-turn sync
+    used to call ``get_fallback_chain(load_user_config_effective(...))`` directly: fail-closed for
+    the agent in front of it, but publishing nothing, so a suppression it observed never reached the
+    record the CONSTRUCTORS read. The sequence that opened was: a constructor records chain ``F``;
+    the admin layer revokes it and a normal turn observes the suppression; the managed file then
+    stops reading; within the grace the next constructor serves ``F`` to a brand-new agent and the
+    ungated activation seam installs it (R9, the R8 review's P2 counterexample).
+
+    The observation epoch is captured while the config lock is still effectively the read's own, and
+    BEFORE ``get_fallback_chain`` runs, so the publication can be ordered against a concurrent
+    reader's (R5-3). Every writer therefore carries an epoch; a publication with none could not be
+    refused and would be able to overwrite a strictly newer observation.
+
+    ``--safe-mode`` / ``--ignore-user-config`` is honoured HERE, at the one function that owns what
+    chain a new agent may have, rather than inside ``load_user_config_effective`` (whose ~20 other
+    callers have their own contract with that flag) and rather than at each call site (five
+    constructors plus two per-turn syncs, which is how the R9 repair came to cover construction but
+    not the first turn — R10/F1/D-1). The user layer is suppressed; the MANAGED overlay still
+    applies and is still read fail-closed, so the bypass cannot be used to escape administrator
+    policy or A44. The observation is retained under its own key
+    (:func:`_chain_retention_key`) so the two questions never contaminate each other.
+    """
+    from hermes_cli.config_effective import (last_observation_epoch, load_user_config_effective,
+                                             user_config_bypassed)
+    ignore_user_config = user_config_bypassed()
+    cfg = load_user_config_effective(home / "config.yaml", fail_closed=True,
+                                     ignore_user_config=ignore_user_config)
+    return publish_clean_fallback_chain_observation(home, cfg, epoch=last_observation_epoch(),
+                                                    ignore_user_config=ignore_user_config)
+
+
+def publish_clean_fallback_chain_observation(home: Path, cfg: dict, *, epoch,
+                                             ignore_user_config: bool) -> Optional[List[Any]]:
+    """Publish a retention observation from an ALREADY-COMPLETED fail-closed read.
+
+    The caller finished its own ``load_user_config_effective(..., fail_closed=True)`` and hands
+    over that read's config, observation epoch AND the bypass identity the read was made under, so
+    ONE physical observation serves both the caller's derivation and this shared retention — a
+    reader that observed a suppression must publish it (R14-3), and the single-observation
+    direction is the recorded R11-2 follow-up. ``ignore_user_config`` is REQUIRED and must be the
+    read's own setting, never re-sampled here: an in-process bypass transition between read and
+    publication would otherwise file a user-inclusive chain into the safe-mode slot (R15-2).
+    Ordering semantics are unchanged: the epoch is the read's own, captured before any derivation.
+    """
+    from hermes_constants import hermes_home_key
+    home_key = _chain_retention_key(hermes_home_key(home), ignore_user_config)
+    return _record_clean_fallback_chain(home_key, get_fallback_chain(cfg) or None, epoch=epoch)
+
 
 _BUSY_INPUT_MODES = {"interrupt", "queue", "steer"}
 
@@ -505,20 +717,96 @@ class GatewayConfigLoadersMixin:
 
     @staticmethod
     def _load_fallback_model() -> list | None:
-        """Fallback chain: ``fallback_providers`` (kept first) merged with legacy ``fallback_model``."""
-        from gateway.run import _load_gateway_config
-        try:
-            # Canonical gateway loader (fail-open): managed overlay + ${VAR} expansion apply here too.
-            return get_fallback_chain(_load_gateway_config()) or None
-        except Exception:
-            return None
+        """Fallback chain: ``fallback_providers`` (kept first) merged with legacy ``fallback_model``.
+
+        Read FAIL-CLOSED, per Hermes home. This is the chain source for every agent created without
+        a confirmed runtime lock (``gateway/platforms/api_server.py``: ``"fallback_model": None if
+        confirmed_runtime_lock else GatewayRunner._load_fallback_model()``), and the admin layer can
+        only ever REMOVE or override what the user file says — a managed ``fallback_providers: []``
+        suppresses a user chain. Through the fail-OPEN ``_load_gateway_config`` an unreadable managed
+        file was applied as an EMPTY overlay, so a newly created API agent received exactly the chain
+        the admin layer had suppressed, and ``agent.chat_completion_helpers.try_activate_fallback``
+        installs chain entries with no A44 gate of its own (CA-P2/P3-6 round 3).
+
+        On a failed read the last CLEAN answer for that home is served, never the user's
+        unconstrained chain: a managed file that stopped reading says nothing about the chain the
+        admin layer last allowed, so dropping straight to "no chain" would silently disable failover
+        for every agent created afterwards while an allowed chain was on record. Per home, because
+        one process serves many profiles and a single runner-wide slot would hand a secondary profile
+        the default profile's chain.
+
+        When there is NOTHING on record for the home — a cold process, or a record past the retention
+        grace — the answer IS None, i.e. no chain. An earlier version of this docstring claimed the
+        reader never returns an empty chain either; that was wrong for exactly these two cases, which
+        are also the fail-closed ones, so the behaviour is kept and the claim corrected (R4-7).
+
+        The retention is ONE slot per home shared with ``_refresh_fallback_model``
+        (``_record_clean_fallback_chain`` / ``_retained_fallback_chain``), and it records successful
+        EMPTY observations too, so a clean suppression is retained as a suppression. With two
+        divergent caches a suppression seen only by the refresh left this reader holding the older,
+        wider chain, and the next managed failure served that REVOKED chain to a new API agent
+        (R4-2). The retention is also time-bounded (``FALLBACK_CHAIN_RETENTION_GRACE_SECONDS``), so
+        a permanently broken managed file does not serve the stale chain forever (R4-6).
+
+        A torn USER file reaches this path too, where ``config_effective``'s last-known-good/backup
+        rescue would otherwise have recovered it: on a cold process during an ordinary
+        ``config.yaml`` edit a brand-new API agent therefore gets no failover rather than the user's
+        chain. That is the deliberate trade — the alternative is distinguishing a torn user read from
+        a failed managed read here, and only the managed failure is the one A44 cares about, but the
+        A44 rule is "a failed read is a failed read" and this seam cannot tell a torn write from a
+        hostile one (R4-5, recorded, not closed).
+
+        The gate is applied HERE rather than in ``_load_gateway_config``: that loader is the
+        documented fail-open primitive with ~15 callers whose contract is "``{}`` on any error", and
+        converting it would change all of them. Same shape ``_refresh_fallback_model`` already uses.
+
+        The body is :func:`load_fail_closed_fallback_chain`, which ``cron/scheduler.py``,
+        ``tui_gateway/agent_callbacks.py``, ``hermes_cli/cli_init_mixin.py`` and
+        ``hermes_cli/oneshot.py`` now share: closing only THIS constructor left the others feeding
+        the same ungated activation seam from fail-open reads (R4-4, closed as R5-2; the two CLI
+        surfaces converted as R5-6 option 2).
+
+        That does NOT make the activation seam
+        (``agent/chat_completion_helpers.try_activate_fallback``) safe to leave ungated, and the
+        constructor work must not be read as closing it. Both reviewer lanes agreed the
+        constructor/activation split is valid — the seam only walks ``agent._fallback_chain``, so an
+        empty chain hits the exhaustion guard and the seam cannot manufacture an entry — but that is
+        an argument about what the seam can do with what it is GIVEN, not a gate on the seam:
+
+        - a chain that was clean when the agent was constructed and is revoked mid-session is still
+          installable by the seam. The per-turn refreshes narrow the window (and, since R9, publish
+          what they observe to the shared retention), but they run at turn START, not at activation;
+        - gating the seam itself needs the A44 observation threaded through the mid-turn retry loop
+          (CA-P2/P3-6's standing P3 follow-up). That is the remaining open item, deliberately NOT
+          attempted here, and it is a design question for review rather than a silent widening.
+
+        The interactive-CLI per-turn sync is no longer an exception to this. R10 converted
+        ``cli_chat_turn_mixin._sync_fallback_chain_with_config`` onto
+        :func:`record_clean_fallback_chain_observation`, so it reads fail-closed AND **publishes**
+        what it observes into this shared retention (NC-7, the CLI half of the R5-2/R9 TUI fix) and
+        honours ``--safe-mode`` / ``--ignore-user-config`` on the first turn. The earlier wording
+        here — that it "publishes nothing to the shared retention … recorded rather than fixed" —
+        described the pre-R10 code and is corrected (R9 §3.2/D-7 directed the correction; R10's own
+        code then contradicted the original text outright).
+
+        For the record, the classic CLI does NOT build one agent per process: nine
+        ``_retire_agent`` call sites rebuild it after turns have run
+        (``cli_chat_turn_mixin.py:85,376``; ``cli_agent_setup_mixin.py:340,511``;
+        ``cli_model_switch_mixin.py:928``; ``cli_commands_mixin.py:1571,1576,2610,2668``), each
+        landing on a fresh ``AIAgent`` at ``cli_agent_setup_mixin.py:662``. That rebuild path
+        sources its chain from the fresher instance slot ``self._fallback_model``
+        (``cli_agent_setup_mixin.py:685``), which the per-turn sync sets on a clean read and leaves
+        untouched on a failed one — so the slot and the shared record now move together.
+        """
+        from gateway.run import _gateway_config_home
+        return load_fail_closed_fallback_chain(_gateway_config_home())
 
     def _refresh_fallback_model(self) -> list | None:
         """Re-read fallback_providers from disk for the next agent create/reuse.
 
         Lets a chain edited after startup reach messaging sessions (cron already re-reads per job).
         A TRANSIENT read/parse failure (user mid-edit, non-atomic write) keeps the last known-good
-        chain; only a successful read that genuinely lacks the key clears it.
+        chain for THAT HOME; only a successful read that genuinely lacks the key clears it.
 
         Cron already does this per job via ``get_fallback_chain``; the gateway previously froze
         ``self._fallback_model`` at process start, so a chain configured (or changed) after ``hermes
@@ -528,29 +816,28 @@ class GatewayConfigLoadersMixin:
         Reads the ACTIVE gateway home (the routed profile under multiplexing, else the launch home)
         and keeps one last-known-good chain per home: a single runner-wide slot filled from the launch
         home handed every secondary profile the default profile's fallback chain.
+
+        The answer is a HOME-BOUND LOCAL, and the ``_NO_RETENTION`` case is explicitly ``None``.
+        ``self._fallback_model`` used to be the fall-through source on that path, and it is a single
+        instance slot not keyed by ``hermes_home_key``, which failed open twice (R5-1):
+
+        - **expiry restored a known-revoked chain.** This method observed ``F``; the static reader
+          observed a clean managed suppression for the same home; the managed file broke; past
+          ``FALLBACK_CHAIN_RETENTION_GRACE_SECONDS`` the retention reported ``_NO_RETENTION`` and
+          this method served ``F`` again — so the R4-6 grace failed closed on the static reader and
+          OPEN here, the opposite of its stated invariant;
+        - **cross-home leak.** Home A refreshed to ``F``; routing moved to home B, whose config did
+          not read and for which nothing was retained; this method returned home A's ``F``,
+          violating the per-home rule the retention dict exists to enforce.
+
+        ``self._fallback_model`` is still assigned — it is the instance's current answer and the turn
+        path reads it — but it is never the SOURCE, so it cannot answer for a home that has nothing
+        on record.
         """
         from gateway.run import _gateway_config_home
-        from hermes_constants import hermes_home_key
-        home = _gateway_config_home()
-        by_home = getattr(self, "_fallback_model_by_home", None)
-        if by_home is None:
-            by_home = self._fallback_model_by_home = {}
-        home_key = hermes_home_key(home)
-        try:
-            from hermes_cli.config_effective import load_user_config_effective
-            cfg_path = home / "config.yaml"
-            if not cfg_path.exists():
-                by_home[home_key] = self._fallback_model = None
-                return self._fallback_model
-            # fail_closed: a torn mid-edit write must raise so the per-home last known-good chain
-            # below survives, instead of being WIPED by an empty fail-open result.
-            cfg = load_user_config_effective(cfg_path, fail_closed=True)
-        except Exception:
-            logger.debug("fallback_providers refresh: config.yaml read failed; keeping last known-good chain", exc_info=True)
-            self._fallback_model = by_home.get(home_key, self._fallback_model)
-            return self._fallback_model
-        by_home[home_key] = self._fallback_model = get_fallback_chain(cfg) or None
-        return self._fallback_model
+        chain = load_fail_closed_fallback_chain(_gateway_config_home())
+        self._fallback_model = chain
+        return chain
 
     @staticmethod
     def _apply_fallback_chain_to_agent(agent: Any, chain: list | None) -> None:

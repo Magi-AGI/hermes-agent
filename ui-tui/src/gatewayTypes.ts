@@ -142,6 +142,9 @@ export interface ConfigMtimeResponse {
    *  changes (cosmetic writes like /skin must not trigger reconnects). */
   mcp_rev?: string
   mtime?: number
+  /** Content revision of config.yaml (+ managed config). Changes on a same-size
+   *  edit that kept the mtime; "" when the backend could not read it. */
+  rev?: string
 }
 
 export interface ConfigGetValueResponse {

@@ -208,7 +208,7 @@ def skill_matches_environment(frontmatter: Dict[str, Any]) -> bool:
     return any(_detect_environment(tag) for tag in tags if tag)
 
 
-_RAW_CONFIG_CACHE: Dict[Tuple[str, int, int, int, int], Dict[str, Any]] = {}
+_RAW_CONFIG_CACHE: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
 
 
 def _raw_config_cache_clear() -> None:
@@ -216,34 +216,47 @@ def _raw_config_cache_clear() -> None:
     _RAW_CONFIG_CACHE.clear()
 
 
-def _config_cache_key(config_path: Path) -> Optional[Tuple[str, int, int, int, int]]:
-    """``(path, *file_signature)`` identity of config.yaml, or None when unreadable/absent."""
+def _read_config_snapshot(config_path: Path) -> Optional[Tuple[Tuple[Any, ...], bytes]]:
+    """``((path, *content_signature), bytes)`` of config.yaml from ONE read, or None when
+    unreadable/absent. Content-keyed: a same-size in-place edit keeps the Windows metadata (A43)."""
     try:
-        from utils import file_signature
-        return (str(config_path), *file_signature(config_path.stat()))
+        from utils import content_signature
+        with open(config_path, "rb") as handle:
+            st = os.fstat(handle.fileno())
+            data = handle.read()
     except OSError:
         return None
+    return (str(config_path), *content_signature(st, data)), data
+
+
+def _config_cache_key(config_path: Path) -> Optional[Tuple[Any, ...]]:
+    """``(path, *content_signature)`` identity of config.yaml, or None when unreadable/absent."""
+    snapshot = _read_config_snapshot(config_path)
+    return snapshot[0] if snapshot is not None else None
 
 
 def _load_raw_config() -> Dict[str, Any]:
-    """Read config.yaml with an mtime+size keyed cache (no hermes_cli.config import)."""
+    """Read config.yaml with a content-keyed cache (no hermes_cli.config import)."""
     config_path = get_config_path()
     if not config_path.exists():
         return {}
-    cache_key = _config_cache_key(config_path)
-    cached = _RAW_CONFIG_CACHE.get(cache_key) if cache_key is not None else None
+    snapshot = _read_config_snapshot(config_path)
+    if snapshot is None:
+        logger.debug("Could not read skill config %s", config_path)
+        return {}
+    cache_key, data = snapshot
+    cached = _RAW_CONFIG_CACHE.get(cache_key)
     if cached is not None:
         return cached
     try:
-        parsed = yaml_load(config_path.read_text(encoding="utf-8"))
+        parsed = yaml_load(data.decode("utf-8"))
     except Exception as e:
         logger.debug("Could not read skill config %s: %s", config_path, e)
         return {}
     if not isinstance(parsed, dict):
         return {}
-    if cache_key is not None:
-        _RAW_CONFIG_CACHE.clear()
-        _RAW_CONFIG_CACHE[cache_key] = parsed
+    _RAW_CONFIG_CACHE.clear()
+    _RAW_CONFIG_CACHE[cache_key] = parsed
     return parsed
 
 

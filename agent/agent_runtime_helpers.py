@@ -2440,54 +2440,47 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     )
 
 
-def repair_tool_call(agent, tool_name: str) -> str | None:
-    """Repair a mismatched tool name (case, separators, CamelCase, ``_tool`` suffixes twice so
-    ``TodoTool_tool`` reduces fully, then fuzzy match) before aborting. Returns the repaired
-    name if in valid_tool_names, else None."""
-    from difflib import get_close_matches
+def case_only_registered_name(tool_name: str) -> str | None:
+    """The one registered tool name equal to *tool_name* ignoring case (separators unchanged), or
+    None. Counts EVERY registration in the process, the global map and every profile overlay, so
+    a name that differs from another profile's tool only by case is ambiguous here. None as well
+    when the registry cannot be read: fail safe, rename nothing."""
     if not tool_name:
         return None
-    # VolcEngine api/plan leaks XML attribute fragments into tool_use.name (`terminal"
-    # parameter="command" ...`); trim at the first quote/angle bracket. Do NOT split on whitespace:
-    # "write file" must reach ``_norm`` -> ``write_file``.
-    # `terminal" parameter="command" string="true` `execute_code" parameter="code" string="true`
-    # `session_search" parameter="session_id" string="true` We trim at the first unambiguous XML/quote
-    # character so the rest of the repair pipeline (lowercase / snake_case / fuzzy match) can resolve the
-    # cleaned name to a real tool. Crucially we DO NOT split on whitespace: legitimate inputs like "write
-    # file" must keep flowing through ``_norm`` -> ``write_file`` (covered by test_space_to_underscore in
-    # tests/agent/test_repair_tool_call_name.py). See #33007.
-    for _xml_sep in ('"', "'", "<", ">"):
-        _idx = tool_name.find(_xml_sep)
-        if _idx > 0:
-            tool_name = tool_name[:_idx]
-    if not tool_name:
-        return None
-    _norm = lambda s: s.lower().replace("-", "_").replace(" ", "_")  # noqa: E731
-    _camel_snake = lambda s: re.sub(r"(?<!^)(?=[A-Z])", "_", s).lower()  # noqa: E731
+    try:
+        from tools.registry import registry
 
-    def _strip_tool_suffix(s: str) -> str | None:
-        lc = s.lower()
-        return next((s[: -len(sfx)].rstrip("_-") for sfx in ("_tool", "-tool", "tool") if lc.endswith(sfx)), None)
-    # Cheap fast-paths first.
-    lowered = tool_name.lower()
-    if lowered in agent.valid_tool_names:
-        return lowered
-    normalized = _norm(tool_name)
-    if normalized in agent.valid_tool_names:
-        return normalized
-    cands: set[str] = {tool_name, lowered, normalized, _camel_snake(tool_name)}
-    for _ in range(2):  # strip trailing tool-suffix up to twice (TodoTool_tool needs it)
-        extra: set[str] = set()
-        for c in cands:
-            stripped = _strip_tool_suffix(c)
-            if stripped:
-                extra.update((stripped, _norm(stripped), _camel_snake(stripped)))
-        cands |= extra
-    for c in cands:
-        if c and c in agent.valid_tool_names:
-            return c
-    matches = get_close_matches(lowered, agent.valid_tool_names, n=1, cutoff=0.7)
-    return matches[0] if matches else None
+        names = registry.get_tool_names_all_scopes()
+    except Exception:
+        return None
+    folded = tool_name.casefold()
+    matches = [n for n in names if n.casefold() == folded]
+    return matches[0] if len(matches) == 1 else None
+
+
+def repair_tool_call(agent, tool_name: str) -> str | None:
+    """Case-only repair of a tool name the model sent (MAGI DIVERGENCE from upstream, 2026-09-30).
+
+    Upstream (#520, extended by #14784 and #33007) also lowercased, mapped ``-``/space to ``_``,
+    split camelCase, stripped ``_tool`` suffixes, trimmed XML fragments and finally fuzzy-matched
+    (difflib, 0.7) against the visible tools. Any of those can land on a DIFFERENT tool than the
+    one the model named (``read_terminal`` -> ``terminal``, ``write-file`` -> ``write_file``, a
+    restricted or another profile's tool -> a visible one), and running the wrong tool cannot be
+    undone. Three review rounds of guards around the fuzzy step kept finding new ways through,
+    so it was removed (Lake, round 6): an unknown name now gets an honest error listing the
+    callable tools instead.
+
+    What remains: *tool_name* differs from a registered name only by letter case
+    (``Write_File`` -> ``write_file``), exactly ONE registered name matches case-insensitively
+    across the whole process (every profile overlay included), and that name is visible to this
+    session. Otherwise None. An exact visible name is returned unchanged."""
+    if not tool_name:
+        return None
+    valid = agent.valid_tool_names
+    if tool_name in valid:
+        return tool_name
+    target = case_only_registered_name(tool_name)
+    return target if target is not None and target in valid else None
 
 
 # Placeholder for an empty non-final message the provider would reject. Kept identical to the stub

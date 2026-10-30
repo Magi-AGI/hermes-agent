@@ -1,6 +1,7 @@
 """Shared utility functions for hermes-agent."""
 
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -141,8 +142,30 @@ def file_signature(st: os.stat_result) -> "tuple[int, int, int, int]":
     replace and ctime cannot be backdated from user space, so the pair catches those writers.
     On Windows ``st_ino`` may be 0 and ``st_ctime_ns`` is the creation time — both stable across
     an in-place rewrite, so the key degrades to mtime + size there rather than misfiring.
+
+    Metadata alone is NOT enough for a cache of settings: on Windows a same-size in-place edit
+    inside the mtime tick (or with the mtime restored) keeps all four fields. Settings caches key
+    on :func:`content_signature` instead.
     """
     return (st.st_mtime_ns, st.st_size, st.st_ino, st.st_ctime_ns)
+
+
+def content_signature(st: os.stat_result, data: bytes) -> "tuple[int, int, int, int, bytes]":
+    """:func:`file_signature` plus a SHA-256 of the bytes that were read: the change-detection key
+    for caches of parsed settings files (config.yaml, .env). The digest catches the edit metadata
+    cannot see (same size, same mtime, Windows' stable ino/ctime). Callers parse the SAME ``data``
+    they sign, so the cached value and its key come from one read."""
+    return (*file_signature(st), hashlib.sha256(data).digest())
+
+
+def file_content_signature(path: Union[str, os.PathLike]) -> "tuple[int, int, int, int, bytes]":
+    """:func:`content_signature` of *path* from one open (fstat + read on the same handle).
+    Raises ``OSError`` when the file is absent or unreadable. One open + read + hash of a
+    config-sized file (~0.1 ms on Windows); used where a cache must not trust metadata."""
+    with open(path, "rb") as handle:
+        st = os.fstat(handle.fileno())
+        data = handle.read()
+    return content_signature(st, data)
 
 
 def _preserve_file_mode(path: Path) -> "int | None":
@@ -261,14 +284,15 @@ def _copy_fallback(tmp_str: str, real_path: str) -> None:
     os.unlink(tmp_str)
 
 
-def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
+def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path], recheck=None) -> str:
     """Atomically move *tmp_path* onto *target*, preserving symlinks.
 
     Resolves a symlink first so ``os.replace`` writes the real file in place and the symlink
     survives. Otherwise identical to ``os.replace`` unless the rename fails with EXDEV/EBUSY
     (cross-device, bind-mount, busy file: copy/fsync/unlink immediately — these never clear on
     retry) or a Windows rename contended by another open handle (winerror 5/32/33: bounded retry,
-    then in-place rewrite).
+    then in-place rewrite). *recheck()* (a compare-and-swap) runs again before every retry and
+    before the fallback: a contended rename sleeps, and the target may change meanwhile.
     """
     target_str = str(target)
     real_path = os.path.realpath(target_str) if os.path.islink(target_str) else target_str
@@ -285,6 +309,8 @@ def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
             from agent.retry_utils import jittered_backoff
             for attempt in range(1, _REPLACE_RETRY_ATTEMPTS + 1):
                 time.sleep(jittered_backoff(attempt, base_delay=_REPLACE_RETRY_BASE_DELAY_S, max_delay=_REPLACE_RETRY_MAX_DELAY_S))
+                if recheck is not None:
+                    recheck()
                 try:
                     os.replace(tmp_str, real_path)
                     return real_path
@@ -299,6 +325,8 @@ def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
                      getattr(exc, "winerror", None) or errno.errorcode.get(exc.errno or 0, exc.errno),
                      "in-place rewrite" if contended else "copy")
         # The rewrite re-raises its own error, so an ACL denial is reported as such, not as contention.
+        if recheck is not None:
+            recheck()
         (_rewrite_in_place if contended else _copy_fallback)(tmp_str, real_path)
     return real_path
 
@@ -359,7 +387,8 @@ def rmtree_readonly(path: Union[str, Path], *, ignore_errors: bool = False) -> N
 
 
 def _atomic_write(path: Path, write, *, prefix: str, encoding: str = "utf-8", mode: "int | None" = None,
-                  preserve_owner: bool = True, binary: bool = False, fsync_dir: bool = False) -> None:
+                  preserve_owner: bool = True, binary: bool = False, fsync_dir: bool = False,
+                  before_replace=None) -> None:
     """Temp file + fsync + :func:`atomic_replace`, then re-apply owner/mode.
 
     *write(f)* emits the payload into the open handle (text, or bytes when *binary*). The temp file
@@ -370,7 +399,8 @@ def _atomic_write(path: Path, write, *, prefix: str, encoding: str = "utf-8", mo
     gets what ``open(path, "w")`` would have given it (process umask) — the callers this replaced
     wrote at umask, and silently tightening every fresh cache/state file to 0600 breaks shared
     volume mounts; an existing target with no *mode* keeps mkstemp's bits, as before. *fsync_dir*
-    also fsyncs the resolved target's parent so the rename itself is durable. The temp file is
+    also fsyncs the resolved target's parent so the rename itself is durable. *before_replace()* runs
+    right before the rename (a compare-and-swap recheck may raise there). The temp file is
     removed on any failure — ``BaseException`` on purpose, so KeyboardInterrupt / SystemExit still
     clean up.
     """
@@ -391,7 +421,9 @@ def _atomic_write(path: Path, write, *, prefix: str, encoding: str = "utf-8", mo
             write(f)
             f.flush()
             os.fsync(f.fileno())
-        replaced = Path(atomic_replace(tmp_path, path))  # symlink-preserving actual destination
+        if before_replace is not None:
+            before_replace()
+        replaced = Path(atomic_replace(tmp_path, path, recheck=before_replace))  # symlink-preserving actual destination
         _restore_file_metadata(replaced, original_owner, mode)
         if fsync_dir:
             fsync_directory(replaced.parent)
@@ -528,9 +560,16 @@ def atomic_yaml_write(path: Union[str, Path], data: Any, *, default_flow_style: 
     _atomic_write(path, _write, prefix=f".{path.stem}_", mode=_mode_for_write(path, create_mode))
 
 
-def _roundtrip_load(path: Path):
+class ConfigChangedDuringWrite(RuntimeError):
+    """The file no longer holds the bytes a read-modify-write was based on (compare-and-swap)."""
+
+
+def _roundtrip_load(path: Path, expected_signature: Any = None):
     """``(yaml_rt, CommentedMap)``: a ruamel round-trip loader keeping quotes/Unicode with 2-space
-    indents, plus *path* loaded through it (empty map when missing/blank)."""
+    indents, plus *path* loaded through it (empty map when missing/blank). With
+    ``expected_signature`` (a :func:`content_signature`, or None-for-absent via ``"absent"``), the bytes
+    loaded must be exactly the ones the caller's mutation was based on, else
+    :class:`ConfigChangedDuringWrite`: the merge base and the caller's view are then one observation."""
     from ruamel.yaml import YAML
     from ruamel.yaml.comments import CommentedMap
 
@@ -539,12 +578,34 @@ def _roundtrip_load(path: Path):
     yaml_rt.allow_unicode = True
     yaml_rt.default_flow_style = False
     yaml_rt.indent(mapping=2, sequence=4, offset=2)
-    data = yaml_rt.load(path.read_text(encoding="utf-8")) if path.exists() else None
+    try:
+        with open(path, "rb") as handle:
+            st = os.fstat(handle.fileno())
+            raw = handle.read()
+    except FileNotFoundError:
+        st = raw = None
+    if expected_signature is not None:
+        current = "absent" if raw is None else content_signature(st, raw)
+        if current != expected_signature:
+            raise ConfigChangedDuringWrite(f"{path} changed after it was read; not overwriting it")
+    data = yaml_rt.load(raw.decode("utf-8")) if raw is not None else None
     return yaml_rt, data if isinstance(data, CommentedMap) else CommentedMap(data or {})
 
 
-def _roundtrip_dump(path: Path, yaml_rt, config) -> None:
-    _atomic_write(path, lambda f: yaml_rt.dump(config, f), prefix=f".{path.stem}_", mode=_preserve_file_mode(path))
+def _roundtrip_dump(path: Path, yaml_rt, config, expected_signature: Any = None) -> None:
+    def _recheck() -> None:
+        # Compare-and-swap, second look: the merge + dump took time, so re-verify the target still holds
+        # the bytes the merge was based on right before the rename. What remains unprotected is the
+        # rename syscall itself (no conditional replace / shared lock with external editors).
+        try:
+            current = file_content_signature(path)
+        except FileNotFoundError:
+            current = "absent"
+        if current != expected_signature:
+            raise ConfigChangedDuringWrite(f"{path} changed while it was being saved; not overwriting it")
+
+    _atomic_write(path, lambda f: yaml_rt.dump(config, f), prefix=f".{path.stem}_", mode=_preserve_file_mode(path),
+                  before_replace=_recheck if expected_signature is not None else None)
 
 
 def atomic_roundtrip_yaml_update(path: Union[str, Path], key_path: str, value: Any) -> None:
@@ -597,12 +658,15 @@ def atomic_roundtrip_yaml_update(path: Union[str, Path], key_path: str, value: A
 _YAML11_AMBIGUOUS_WORDS = frozenset({"y", "n", "yes", "no", "true", "false", "on", "off", "null", "~"})
 
 
-def atomic_roundtrip_yaml_save(path: Union[str, Path], new_state: dict) -> None:
+def atomic_roundtrip_yaml_save(path: Union[str, Path], new_state: dict, *, expected_signature: Any = None) -> None:
     """Persist a full config-state dict while preserving comments and ordering.
 
     Comment-safe replacement for ``yaml.safe_dump(cfg, f)``: writes the whole file from
     ``new_state`` through ruamel round-trip mode so existing comments, key order, quotes and
-    readable Unicode survive.
+    readable Unicode survive. Keys absent from ``new_state`` are deleted, so ``new_state`` must come
+    from the file's CURRENT content: pass the ``content_signature`` it was read from as
+    ``expected_signature`` (``"absent"`` for no file) and a concurrent edit raises
+    :class:`ConfigChangedDuringWrite` instead of being overwritten.
     """
     from ruamel.yaml.comments import CommentedMap
     from ruamel.yaml.scalarstring import DoubleQuotedScalarString
@@ -613,7 +677,7 @@ def atomic_roundtrip_yaml_save(path: Union[str, Path], new_state: dict) -> None:
 
     mkdir_under_hermes_home(path.parent)
     require_readable_config_before_write(path)
-    yaml_rt, existing = _roundtrip_load(path)
+    yaml_rt, existing = _roundtrip_load(path, expected_signature)
 
     def _merge(dst: CommentedMap, src: dict) -> None:
         for key, value in src.items():
@@ -633,7 +697,7 @@ def atomic_roundtrip_yaml_save(path: Union[str, Path], new_state: dict) -> None:
             del dst[key]
 
     _merge(existing, new_state)
-    _roundtrip_dump(path, yaml_rt, existing)
+    _roundtrip_dump(path, yaml_rt, existing, expected_signature)
 
 
 def safe_json_loads(text: str, default: Any = None) -> Any:

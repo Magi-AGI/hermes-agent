@@ -21,6 +21,8 @@ def _login(monkeypatch, provider_id):
 
 def _config(monkeypatch, model_cfg):
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"model": model_cfg})
+    # resolve_provider reads the provider and the read outcome from one observation (A44).
+    monkeypatch.setattr("hermes_cli.config.load_config_with_status", lambda: ({"model": model_cfg}, None))
 
 
 def _no_aws(monkeypatch):

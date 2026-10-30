@@ -594,12 +594,31 @@ class MCPServerTransportMixin:
         if not self._advertises_tools():
             logger.info("MCP server '%s': does not advertise 'tools' capability — "
                         "skipping tools/list (prompts/resources remain available)", self.name)
+            # A session without the capability has published an EMPTY list with NO hints: whatever
+            # the previous connection had (tools, ttl, cache scope) does not describe this session.
+            if self._list_published:
+                self._publish_tool_list([], {})
+                return
+            self._list_cache_meta = {}
             self._tools = []
         else:
             async with self._rpc_lock:
-                self._list_cache_meta = {}
-                self._tools = await _core._paginate_full_list(
-                    self.session.list_tools, "tools", self.name, cache_meta_out=self._list_cache_meta)
+                session = self.session
+                if session is None:
+                    return
+                list_meta: dict = {}
+                tools = await _core._paginate_full_list(
+                    session.list_tools, "tools", self.name, cache_meta_out=list_meta)
+            if self.session is not session:
+                return  # this connection was replaced mid-list; its successor discovers for itself
+            if self._list_published:
+                # A reconnect while the previous connection's list is still published (for any
+                # profile, adopter-only names included): this list is the live truth, so publish it
+                # and its own hints.
+                self._publish_tool_list(tools, list_meta)
+                return
+            self._list_cache_meta = list_meta
+            self._tools = tools
         self._register_discovered_tools_if_needed()
 
     def _register_discovered_tools_if_needed(self) -> None:
@@ -613,7 +632,8 @@ class MCPServerTransportMixin:
             owned = [key for key, live in _core._servers.items() if live is self]
         if not owned and not self._ready.is_set():
             return
-        self._registered_tool_names = _registration._register_server_tools(self.name, self, self._config)
+        # Writes ``_registered_tool_names`` itself, under the connection lock (MCP-P2-1 round 2).
+        _registration._register_server_tools(self.name, self, self._config)
         with _core._lock:  # a retained initial-failure server that just published tools has recovered
             for key in owned:
                 if _core._servers.get(key) is self:

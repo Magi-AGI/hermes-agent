@@ -1509,6 +1509,9 @@ platform_toolsets:
 # Each server's tools are automatically discovered and registered.
 # See website/docs/user-guide/features/mcp.md for full documentation.
 #
+# mcp:
+#   interactive_oauth: true   # false = MCP OAuth never opens a browser on its own; only `hermes mcp login <server>` / the desktop Login button may
+#
 # Stdio servers (spawn a subprocess):
 #   command: the executable to run
 #   args: command-line arguments
@@ -1724,6 +1727,21 @@ stt:
 #
 # No configuration needed - logging is always enabled.
 # To disable, you would need to modify the source code.
+
+# =============================================================================
+# File Logging (logs/agent.log, errors.log, gateway.log, gui.log)
+# =============================================================================
+# logging:
+#   level: INFO          # minimum level for agent.log: DEBUG, INFO, WARNING
+#   max_size_mb: 5       # size per log file before rotation (per process on Windows)
+#   backup_count: 3      # rotated backups to keep
+#   retention_days: 7    # Windows writes per-process segments under logs/<name>.d/ (no shared
+#                        # file, no cross-process lock); segments older than this are pruned when
+#                        # a process starts logging. 0 = never prune. A "${VAR}" value resolves in
+#                        # this home's .env (plus the launch environment for the profile that was
+#                        # launched). Anything unreadable or unresolved means: prune nothing. When a
+#                        # managed scope is configured (HERMES_MANAGED_DIR, or /etc/hermes present)
+#                        # this version never prunes: the overlay is not read for retention yet.
 
 # =============================================================================
 # Code Execution Sandbox (Programmatic Tool Calling)

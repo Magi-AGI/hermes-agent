@@ -32,13 +32,27 @@ class CLIChatTurnMixin:
     def _sync_fallback_chain_with_config(self, agent) -> None:
         """Adopt ``fallback_providers`` edits made while this chat is open (#95066) — the same
         per-turn, fail-closed contract as the Desktop/TUI and messaging gateways: a torn config.yaml
-        keeps the last known-good chain instead of reading as "chain removed"."""
+        keeps the last known-good chain instead of reading as "chain removed".
+
+        Reads through ``record_clean_fallback_chain_observation``, the same primitive the five agent
+        constructors use, for two reasons (R10):
+
+        - It honours ``--safe-mode`` / ``--ignore-user-config``. This runs at
+          ``chat()``'s ``:80``, BEFORE the agent thread starts, so on the very FIRST turn it used to
+          undo the suppressed startup chain and hand the agent the user's full chain before the
+          first model call (F1/D-1). A constructor-only repair never covered it.
+        - It PUBLISHES the observation into the shared per-home retention, so a suppression this
+          turn observes is visible to the next constructor instead of that constructor serving the
+          older, wider retained answer (NC-7, the CLI half of the R5-2/R9 TUI fix).
+
+        Failure behaviour is unchanged: the primitive raises on a failed read, and this keeps the
+        chain already in hand rather than publishing or applying anything."""
         from cli import logger
         try:
             from gateway.run import GatewayRunner
-            from hermes_cli.config_effective import load_user_config_effective
-            from hermes_cli.fallback_config import get_fallback_chain
-            self._fallback_model = get_fallback_chain(load_user_config_effective(fail_closed=True))
+            from gateway.run_config_loaders import record_clean_fallback_chain_observation
+            from hermes_constants import get_hermes_home
+            self._fallback_model = record_clean_fallback_chain_observation(get_hermes_home()) or []
         except Exception as e:
             logger.debug("fallback chain sync skipped (keeping current chain): %s", e)
             return

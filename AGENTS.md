@@ -218,7 +218,9 @@ hermes-agent/
 ```
 
 **User state:** `~/.hermes/config.yaml` (settings), `~/.hermes/.env` (secrets only),
-`~/.hermes/logs/` (`agent.log` INFO+, `errors.log` WARNING+, `gateway.log`); all
+`~/.hermes/logs/` (`agent.log` INFO+, `errors.log` WARNING+, `gateway.log`; on Windows each
+process writes its own segments under `logs/<stem>.d/` instead of the shared file — no
+cross-process lock — and readers merge them by timestamp via `hermes_cli/logs_merge.py`); all
 profile-aware via `get_hermes_home()`. Browse logs with `hermes logs [--follow] [--level] [--session]`.
 
 **Dependency chain:** `tools/registry.py` (no deps) ← `tools/*.py` (register at import) ←

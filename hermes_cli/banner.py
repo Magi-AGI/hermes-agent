@@ -660,10 +660,12 @@ def banner_snapshot_fingerprint() -> Optional[str]:
     paths = _quiet(_inputs)
     if paths is None:
         return None
+    from utils import file_content_signature
     parts = [f"v{_BANNER_SNAPSHOT_VERSION}"]
     for p in paths:
-        st = _quiet(p.stat)
-        parts.append(f"{p.name}:{st.st_mtime_ns}:{st.st_size}" if st else f"{p.name}:absent")
+        # Content, not mtime + size: a same-size Windows edit keeps both (A43).
+        sig = _quiet(lambda p=p: file_content_signature(p))
+        parts.append(f"{p.name}:{sig[0]}:{sig[1]}:{sig[4].hex()}" if sig else f"{p.name}:absent")
     # Code checkout: version + git HEAD when available (post-update change).
     parts.append(str(VERSION))
     state = get_git_banner_state()

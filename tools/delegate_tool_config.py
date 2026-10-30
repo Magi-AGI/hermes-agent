@@ -465,31 +465,181 @@ _ROUTING_FILTER_DEFAULTS = (
 _NOUS_PROVIDERS = frozenset({"nous", "nous-portal", "nousresearch"})
 
 
-def _resolve_child_fallback_chain(parent_agent, routing_cfg: Any, pinned: bool) -> Optional[List[Dict[str, Any]]]:
+class _NoAuthorizedAnswer:
+    """Sentinel: the home's configuration gave no authoritative answer for this owner.
+
+    Distinct from an authoritative empty chain. ``None`` cannot carry both meanings — that
+    conflation IS defect R11-1 — and an empty list cannot stand in for "no answer" either, because
+    an administrator's ``fallback_providers: []`` is a real answer that must suppress failover
+    rather than inherit. A class-level sentinel (never an instance, never ``...``) keeps the two
+    cases distinguishable with ``is``.
+    """
+
+
+def _authorized_child_chain(owner_path: Optional[tuple], *, inheritance_probe: bool = False) -> Any:
+    """The child fallback chain the home's CLEAN configuration authorizes for *owner_path*.
+
+    ``inheritance_probe=True`` is the absent/null-route caller (R12-1 → R15): nothing was declared
+    on the route, so a silent clean config is the normal state of a home, not a misconfiguration —
+    the flag mutes the no-answer warning and demotes a failed read to debug (agy R13 finding 3).
+    It changes LOGGING ONLY: both modes perform one fail-closed read and publish the retention
+    observation from that same read (R14-3: a probe that observes a suppression must publish it;
+    single-observation = the R11-2 follow-up, now implemented for this caller).
+
+    Three possible answers, because "no answer" and "authoritatively no chain" are different
+    (R11-1, found by both R11 reviewer lanes, adjudicated P2):
+
+    - :class:`_NoAuthorizedAnswer` — nothing authoritative was observed: the configuration did not
+      read cleanly, the route named no configuration owner, the owner section declares no
+      ``fallback_providers`` at all, or what it declares normalizes to nothing (every entry
+      malformed). The caller drops back to its default, which is the fail-closed direction and the
+      behaviour every R10/R11 arm pinned.
+    - ``[]`` — the clean configuration authoritatively declares an EMPTY chain for this owner. That
+      is an administrator (or user) explicitly disabling child failover, so the caller must honour
+      it instead of substituting the parent's chain. The parent's chain comes from the ROOT key, a
+      different key from the one the declaration suppressed, so inheriting here would hand a child
+      exactly the entries the policy disabled for children.
+    - a nonempty chain — installed as the child's chain.
+
+    R10 gated a declared chain on a clean root observation but then **discarded that observation**
+    and installed the earlier declaration unchanged. Two things went wrong, both found by both
+    reviewer lanes (R10-2):
+
+    - ``_load_config()`` prefers the import-time fail-open ``cli.CLI_CONFIG`` snapshot under
+      ``HERMES_IGNORE_USER_CONFIG=1``, so a process that imported ``cli`` before the flag was
+      applied had the user's ``delegation`` section frozen in it. The gate's clean, bypassed read
+      contained no authorization for that chain, yet returned ``True``;
+    - a declaration obtained while the managed file was unreadable survived a later clean repair
+      that suppressed ``delegation.fallback_providers`` — the gate checked *readability*, never the
+      *repaired policy*.
+
+    So the answer is now DERIVED from the authoritative read instead of merely blessed by it: the
+    same fail-closed, bypass-aware effective config the five constructors read, narrowed to the
+    declaration's own configuration owner. A legitimately declared chain is unaffected (the clean
+    config declares it, so the derived answer IS it); a declaration the clean config does not
+    contain can no longer reach a child agent.
+
+    Since R15 this helper performs ONE fail-closed read and publishes the shared per-home retention
+    from that same observation (``publish_clean_fallback_chain_observation``), so the publication
+    and this authorization derive from one immutable observation + epoch — the R11-2 follow-up,
+    implemented here. The delegation surface keeps publishing what it observes (R10/NC-7), and a
+    probe that observes a suppression publishes it for the constructors that read retention (R14-3).
+    """
+    from gateway.run_config_loaders import publish_clean_fallback_chain_observation
+    from hermes_cli.config_effective import (last_observation_epoch, load_user_config_effective,
+                                             user_config_bypassed)
+    from hermes_constants import get_hermes_home
+    home = get_hermes_home()
+    try:
+        ignore_user_config = user_config_bypassed()
+        cfg = load_user_config_effective(home / "config.yaml", fail_closed=True,
+                                         ignore_user_config=ignore_user_config)
+        publish_clean_fallback_chain_observation(home, cfg, epoch=last_observation_epoch(),
+                                                 ignore_user_config=ignore_user_config)
+    except Exception as exc:
+        if inheritance_probe:
+            # Nothing was declared on the route; a failed probe just keeps the vetted default.
+            logger.debug("delegation: the inheritance probe could not read the config cleanly; "
+                         "the child keeps the inherited default: %s", exc)
+        else:
+            logger.warning("delegation: the config for this home did not read cleanly, so the declared "
+                           "child fallback chain is not authorized; using the inherited default: %s", exc)
+        return _NoAuthorizedAnswer
+    if owner_path is None:
+        # A per-call route (``credentials_cfg``) owns its provider/model/endpoint, but it named no
+        # configuration section to authorize a CHAIN against, and an unauthorized chain on a new
+        # agent is the R10-2 defect. No in-tree per-call caller declares one (``auxiliary.review``
+        # carries provider/model/base_url/api_key/api_mode only).
+        logger.warning("delegation: a per-call route declared a child fallback chain without a "
+                       "configuration owner to authorize it; using the inherited default")
+        return _NoAuthorizedAnswer
+    section: Any = cfg
+    for key in owner_path:
+        section = section.get(key) if isinstance(section, dict) else None
+    declared = section.get("fallback_providers") if isinstance(section, dict) else None
+    if isinstance(declared, list) and not declared:
+        # An authoritative empty LIST, written as such in the clean (managed-overlaid) config: a
+        # deliberate disable of this owner's child failover. Absent/null is not this case and is
+        # not reachable here -- it leaves ``declared`` None and falls through to "no answer".
+        logger.info("delegation: the clean config for this home authoritatively disables the child "
+                    "fallback chain under %s; the child gets no failover", ".".join(owner_path))
+        return []
+    authorized = get_fallback_chain({"fallback_providers": declared})
+    if authorized:
+        return authorized
+    # The owner is silent (or malformed-only). The caller's inherited default comes from the ROOT
+    # chain, so a clean root revocation binds inheritance too (R14-2) — judged by the CANONICAL
+    # root interpretation (R15-1): either supported key explicitly ``[]`` AND no entries survive
+    # the merged read. Legacy ``fallback_model: []`` is a valid suppression; a modern ``[]``
+    # beside a live legacy chain is NOT a total revocation.
+    root_keys = (cfg.get("fallback_providers"), cfg.get("fallback_model")) if isinstance(cfg, dict) else ()
+    if (not get_fallback_chain(cfg)
+            and any(isinstance(declared_root, list) and not declared_root for declared_root in root_keys)):
+        logger.info("delegation: the clean config for this home authoritatively revokes the root "
+                    "fallback chain; a new child under %s inherits no failover", ".".join(owner_path))
+        return []
+    if not inheritance_probe:
+        logger.warning("delegation: the clean config for this home authorizes no child fallback "
+                       "chain under %s; using the inherited default", ".".join(owner_path))
+    return _NoAuthorizedAnswer
+
+
+def _resolve_child_fallback_chain(parent_agent, routing_cfg: Any, pinned: bool, *,
+                                  owner_path: Optional[tuple] = ("delegation",)
+                                  ) -> Optional[List[Dict[str, Any]]]:
     """Fallback chain for a child, owned by the same config block as its route.
 
-    Pinned children (provider, endpoint or model override) never borrow the parent chain;
-    unpinned children inherit it when ``fallback_providers`` is absent/null. An explicit ``[]``
-    disables fallback either way. Malformed entries are dropped by the canonical normalizer.
+    Pinned children (provider, endpoint or model override) never borrow the parent chain; unpinned
+    children inherit it when ``fallback_providers`` is absent/null AND the clean config gives no
+    answer of its own. The clean answer binds both routes wholesale (R12-1 → R15): a nonempty
+    authorized chain installs even on an undeclared route (R14-1); an authoritative ``[]`` — the
+    owner's, or the root's when the owner is silent (R14-2) — disables failover. A route's explicit
+    ``[]`` disables without authorization. Malformed entries are dropped by the canonical
+    normalizer.
+
+    A declared chain is not installed as given: it is replaced by what the declaration's own
+    configuration owner authorizes under a fail-closed, bypass-aware read
+    (:func:`_authorized_child_chain`). The section it was read from is fail-open — and, under the
+    bypass, can be the import-time ``cli.CLI_CONFIG`` snapshot — so without that binding
+    delegation is an unvetted chain source for a brand-new agent (R10/F2, R10-2). An explicit
+    ``[]`` on the route still needs no authorization: it only ever removes failover.
+
+    That authorization has THREE answers and they are not interchangeable (R11-1):
+
+    - no authoritative answer (failed read, no configuration owner, nothing declared, or a
+      declaration that normalizes to nothing) → the default: the parent's chain for an unpinned
+      child, no chain for a pinned one. Fail-closed means "drop to the vetted default", not
+      "destroy failover";
+    - an authoritative ``[]`` → **no chain**, never the parent's, on the declared AND the
+      absent/null route alike (R12-1), and equally when the owner is silent but the same clean
+      read revokes the ROOT key the inherited default came from (R14-2). The policy that
+      suppressed ``fallback_providers`` did not authorize a chain for children, so inheriting
+      would defeat an explicit disable with a chain read from a different key or moment;
+    - a nonempty authorized chain → that chain, on both routes (R14-1): its absence from an
+      unvetted route snapshot cannot override the owner's clean declaration.
     """
     default = None if pinned else (getattr(parent_agent, "_fallback_chain", None) or None)
     declared = routing_cfg.get("fallback_providers") if isinstance(routing_cfg, dict) else None
-    if declared is None:
-        return default
     if declared == []:
         return None
-    normalized = get_fallback_chain({"fallback_providers": declared})
-    if not normalized:
-        logger.warning("delegation fallback_providers has no usable routes; using the %s default",
-                       "pinned" if pinned else "inherited")
-    return normalized or default
+    if owner_path is None:
+        return default
+    # R12-1 → R15: the clean answer binds BOTH routes wholesale. A nonempty authorized chain
+    # installs even when the (unvetted, possibly stale) route declared nothing — the owner's clean
+    # declaration cannot be overridden by its absence from a snapshot (R14-1, pinned included); an
+    # authoritative [] (owner, or root when the owner is silent — R14-2) disables; only a genuine
+    # no-answer (failed read included) falls to the inherited default.
+    authorized = _authorized_child_chain(owner_path, inheritance_probe=declared is None)
+    if authorized is _NoAuthorizedAnswer:
+        return default
+    return authorized or None
 
 
 def _resolve_child_runtime(
     parent_agent, delegation_cfg: dict, parent_api_key: Any, *, model: Optional[str], override_provider: Optional[str],
     override_base_url: Optional[str], override_api_key: Optional[str], override_api_mode: Optional[str],
     override_acp_command: Optional[str], override_acp_args: Optional[List[str]],
-    routing_cfg: Optional[Dict[str, Any]] = None,
+    routing_cfg: Optional[Dict[str, Any]] = None, routing_owner_path: Optional[tuple] = ("delegation",),
 ) -> Dict[str, Any]:
     """Child credentials, transport and routing (config override > parent inherit) as ``AIAgent`` kwargs. Rules that
     are easy to break: api_mode is re-derived (not inherited) when the child's provider differs from the parent's
@@ -588,9 +738,12 @@ def _resolve_child_runtime(
         "reasoning_config": child_reasoning,
         # Resolve routing and recovery policy from the same configuration owner. A pinned provider, endpoint, or
         # model never borrows the parent's chain; an explicitly declared child chain still remains available.
+        # The authorization owner travels WITH the route: the general section is authorized
+        # against ``delegation``, a per-call route against its own owner (R10-2).
         "fallback_model": _resolve_child_fallback_chain(
             parent_agent, delegation_cfg if routing_cfg is None else routing_cfg,
-            pinned=bool(override_provider or override_base_url or model)),
+            pinned=bool(override_provider or override_base_url or model),
+            owner_path=("delegation",) if routing_cfg is None else routing_owner_path),
         "openrouter_min_coding_score": getattr(parent_agent, "openrouter_min_coding_score", None),
         # Routing filters reset to their defaults under a pinned provider (see _ROUTING_FILTER_DEFAULTS).
         **{a: d if override_provider else getattr(parent_agent, a, d) for a, d in _ROUTING_FILTER_DEFAULTS},

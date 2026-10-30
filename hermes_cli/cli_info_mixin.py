@@ -15,7 +15,7 @@ import time
 
 from hermes_constants import is_termux as _is_termux_environment
 from rich.markup import escape as _escape
-from utils import base_url_hostname, file_signature
+from utils import base_url_hostname, file_content_signature
 
 from hermes_cli.cli_modal_mixin import _gated_confirm
 from hermes_cli.colors import Colors as _Colors
@@ -848,7 +848,7 @@ class CLIInfoMixin:
         if not cfg_path.exists():
             return
         try:
-            sig = file_signature(cfg_path.stat())
+            sig = file_content_signature(cfg_path)  # content-keyed: same-size Windows edits (A43)
         except OSError:
             return
         if sig == self._config_sig:
@@ -905,11 +905,16 @@ class CLIInfoMixin:
         if choice is None:
             return
         with self._busy_command(self._slow_command_status(cmd_original)):
-            self._reload_mcp()
+            self._reload_mcp(explicit=True)
 
-    def _reload_mcp(self):
+    def _reload_mcp(self, explicit: bool = False):
         """Reload MCP servers: disconnect all, re-read config.yaml, reconnect, then refresh the
-        agent's tool list so the model sees the updated tools on the next turn."""
+        agent's tool list so the model sees the updated tools on the next turn.
+
+        ``explicit``: the user asked for this reload (``/reload-mcp``). Only then are ``lazy: true``
+        servers live-connected instead of registered from the schema cache, so a server cached with
+        zero tools (Unity bridge while the Editor was closed) is asked again. The config watcher's
+        automatic reload passes nothing and keeps the lazy cache (no relay spawned unasked)."""
         try:
             from tools.mcp_tool_lifecycle import shutdown_mcp_servers
             from tools.mcp_tool_discovery import discover_mcp_tools
@@ -922,7 +927,8 @@ class CLIInfoMixin:
 
             shutdown_mcp_servers()
             reprobe_tool_availability()  # explicit reload also re-probes check_fn availability
-            new_tools = discover_mcp_tools()  # reads config.yaml fresh
+            # reads config.yaml fresh; only a user-requested reload bypasses the lazy cache
+            new_tools = discover_mcp_tools(bypass_lazy_cache=True) if explicit else discover_mcp_tools()
 
             with _lock:
                 connected_servers = set(_servers.keys())

@@ -70,6 +70,29 @@ def _make_cli(env_overrides=None, config_overrides=None, **kwargs):
         importlib.reload(_cli_restore)
 
 
+def _write_user_config_chain(chain_config):
+    """Write the fallback keys into the REAL ``$HERMES_HOME/config.yaml`` this test runs against.
+
+    ``HermesCLI.__init__`` no longer reads its fallback chain out of the in-memory ``CLI_CONFIG``
+    ``_make_cli`` injects: it reads the user ``config.yaml`` fail-closed through the one shared
+    chain primitive, so that a managed ``fallback_providers: []`` cannot be dropped by a fail-open
+    overlay. ``CLI_CONFIG`` is therefore no longer the seam for this one key, and a test that only
+    injects it asserts nothing about the chain the CLI actually builds.
+
+    The autouse ``_hermetic_environment`` fixture already points ``HERMES_HOME`` at a per-test
+    tempdir, so this writes a real file in a real temp home — the same shape the production read
+    sees — rather than patching the loader out.
+    """
+    import yaml
+
+    from hermes_constants import get_hermes_home
+
+    config_path = get_hermes_home() / "config.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(yaml.safe_dump(chain_config), encoding="utf-8")
+    return config_path
+
+
 class TestMaxTurnsResolution:
     """max_turns must always resolve to a positive integer, never None."""
 
@@ -108,6 +131,12 @@ class TestVerboseAndToolProgress:
 
 class TestFallbackChainInit:
     def test_merges_new_and_legacy_fallback_config(self):
+        _write_user_config_chain({
+            "fallback_providers": [
+                {"provider": "openrouter", "model": "anthropic/claude-sonnet-4.6"},
+            ],
+            "fallback_model": {"provider": "nous", "model": "Hermes-4"},
+        })
         cli = _make_cli(config_overrides={
             "fallback_providers": [
                 {"provider": "openrouter", "model": "anthropic/claude-sonnet-4.6"},

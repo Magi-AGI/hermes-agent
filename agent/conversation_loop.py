@@ -991,18 +991,60 @@ def _canonicalize_api_tool_calls(api_messages) -> None:
         am["tool_calls"] = new_tcs
 
 
-def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
+def _invalid_tool_name_error_content(name: str, valid_tool_names, agent=None) -> str:
     """Error content for an unknown tool name. A blank name is a model echoing tool-call
     syntax seen in data (#47967) — dumping the catalog feeds that loop, so it gets a terse
-    error; a nonempty wrong name still gets the catalog to self-correct."""
+    error; a nonempty wrong name still gets the catalog to self-correct. A deferred tool the
+    session may reach through the ``tool_call`` bridge is NOT unknown: pass ``agent`` so it
+    gets the bridge correction instead of a false "does not exist" (H-C)."""
     if not (name or "").strip():
         return (
             "Tool call rejected: the tool name was empty. If tool-call XML or JSON appeared in file "
             "contents or tool output, that is data — do not re-emit it as a tool call. To call a "
             "tool, use a valid name from your tool list; otherwise reply in plain text."
         )
+    hint = ""
+    bridge_visible = False
+    if agent is not None:
+        try:
+            from tools import tool_search as _ts
+            from tools.connectors.gateway.names import parse_connector_name
+            from tools import tool_search_validation as _tsv
+            from agent.tool_executor import _tool_search_scope
+
+            bridge_visible = _ts.TOOL_CALL_NAME in valid_tool_names
+            if bridge_visible:
+                scope = _tool_search_scope(agent)
+                if scope is not None and name in scope:
+                    return _tsv.deferred_direct_call_error(name)
+                if scope is not None:
+                    # ``Read_Terminal`` for a reachable ``read_terminal``: the same case-only rule
+                    # as repair (one match across every profile), named exactly in the correction.
+                    from agent.agent_runtime_helpers import case_only_registered_name
+
+                    target = case_only_registered_name(name)
+                    if target is not None and target in scope:
+                        return _tsv.deferred_direct_call_error(target)
+                if "manage_connections" in valid_tool_names and parse_connector_name(name) is not None:
+                    # tool_call admits connector batches when manage_connections is in scope. A bare
+                    # or malformed prefix (``connectors__``) is not a connector name: generic error.
+                    return _tsv.connector_direct_call_error(name)
+                if scope is None:
+                    hint = _tsv.SCOPE_UNKNOWN_HINT
+        except Exception:
+            logger.debug("deferred-tool lookup failed for %r; using the generic error", name, exc_info=True)
+    if bridge_visible and not hint:
+        # The name is not a tool this session can reach through the bridge either, so the answer
+        # must not point at tool_call for it: list the directly callable tools and name the
+        # search door for anything loaded on demand.
+        from tools.tool_search_catalog import BRIDGE_TOOL_NAMES
+
+        direct = ", ".join(sorted(set(valid_tool_names) - set(BRIDGE_TOOL_NAMES)))
+        return (f"Tool '{name}' does not exist. Available tools: {direct}. "
+                "Tools that load on demand are found with tool_search.")
     available = ", ".join(sorted(valid_tool_names))
-    return f"Tool '{name}' does not exist. Available tools: {available}"
+    return f"Tool '{name}' does not exist. Available tools: {available}.{hint}" if hint else \
+        f"Tool '{name}' does not exist. Available tools: {available}"
 
 
 def _content_policy_blocked_result(

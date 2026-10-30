@@ -1695,7 +1695,20 @@ def _packaged_desktop_launch_command(packaged_executable: Path) -> list[str]:
 
 
 def cmd_gui(args: argparse.Namespace):
-    """Build and launch the native Electron desktop GUI."""
+    """Build and launch the native Electron desktop GUI (or ``stop`` a wedged one)."""
+    if getattr(args, "action", None) == "stop":
+        # 'stop' contradicts every build/launch flag; silently ignoring one would do whichever
+        # half the user did not mean (agy R5-8).
+        conflicting = [name for name in ("source", "build_only", "fake_boot", "ignore_existing",
+                                         "skip_build", "local", "force_build",
+                                         "setup_tcc_identity") if getattr(args, name, False)]
+        if conflicting or getattr(args, "hermes_root", None) or getattr(args, "cwd", None):
+            print("hermes desktop stop takes no build/launch flags; drop "
+                  + ", ".join("--" + n.replace("_", "-") for n in conflicting) if conflicting
+                  else "hermes desktop stop takes no build/launch flags")
+            sys.exit(2)
+        from hermes_cli.main_desktop_stop import cmd_desktop_stop
+        sys.exit(cmd_desktop_stop())
     from hermes_cli.main import PROJECT_ROOT
     from hermes_cli.main_install_repair import _resolve_node_runtime_npm
     desktop_dir = PROJECT_ROOT / "apps" / "desktop"

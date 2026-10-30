@@ -5,6 +5,7 @@ review does not wait for the slowest sibling."""
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import json
 import logging
@@ -228,6 +229,10 @@ _SYNC_FALLBACK_NOTES = {
         "SYNCHRONOUSLY and the result is included above. Raise "
         "delegation.max_concurrent_children in config.yaml to allow more concurrent background delegations."
     ),
+    "schedule_failure": (
+        "The background scheduler could not accept this delegation, so the subagent(s) ran "
+        "SYNCHRONOUSLY and the result is included above."
+    ),
 }
 
 def _run_sync_with_note(batch: _Batch, reason: str) -> str:
@@ -411,6 +416,37 @@ def _restore_parent_cancellation(unit: _Batch) -> None:
     for _, _, child in unit.children:
         _attach_child(unit.parent_agent, child)
 
+
+def _teardown_refused_batch(batch: _Batch, error: str) -> None:
+    """A refused batch never runs, so nothing else will release what _build_children acquired:
+    each child's AIAgent + HTTP client, its OWNED SessionDB refcount, its _active_children entry,
+    its 'spawning' roster card, and the live transcript files (agy R2-1/R2-2). Best-effort per
+    item — a teardown failure must not replace the structured refusal with an exception."""
+    from tools.delegate_tool_child_run import _close_child, _safe_progress
+    for _i, _task, child in batch.children:
+        with contextlib.suppress(Exception):
+            _detach_child(batch.parent_agent, child)
+        with contextlib.suppress(Exception):
+            _safe_progress(getattr(child, "tool_progress_callback", None), "subagent.complete",
+                           status="rejected", preview=error)
+        with contextlib.suppress(Exception):
+            _close_child(child, "Failed to close a capacity-refused child agent")
+        with contextlib.suppress(Exception):
+            from tools.code_kernel import shutdown_kernels_for_delegated_child
+            shutdown_kernels_for_delegated_child(str(getattr(child, "session_id", "") or ""))
+    entry = {"status": "rejected", "error": error, "exit_reason": "at_capacity"}
+    for writer in batch.live_writers:
+        if writer is None:
+            continue
+        with contextlib.suppress(Exception):
+            writer.finalize(dict(entry))
+    with contextlib.suppress(Exception):
+        from tools.delegation_live_log import update_manifest_statuses
+        update_manifest_statuses(batch.live_deleg_id,
+                                 [{"task_index": i, "status": "rejected"}
+                                  for i, _t, _c in batch.children])
+
+
 def _dispatch_background(batch: _Batch) -> str:
     """Dispatch the call as independent async units (see ``_units_of``) and return the tool result JSON. Every unit
     of one call shares ONE pool slot (``slot_key``), so grouping never changes capacity accounting. Falls back to
@@ -449,11 +485,30 @@ def _dispatch_background(batch: _Batch) -> str:
             continue
         _restore_parent_cancellation(unit)
         if not dispatched:
+            if dispatch.get("reason") == "capacity":
+                # Gate H5 (the H-M orphan class): a capacity rejection must never silently become
+                # a BLOCKING synchronous run — that run then outlives the generic tool timeout and
+                # its children are orphaned. Refuse loudly, and OWN the teardown the sync fallback
+                # used to provide (agy R2-1/R2-2): close every pre-built child (agent, owned
+                # SessionDB, kernels), complete its roster card, finalize the live transcripts.
+                logger.warning("delegate_task: async pool at capacity; refusing the batch "
+                               "rather than degrading to a blocking synchronous run: %s",
+                               dispatch.get("error", "rejected"))
+                error = dispatch.get("error", "Async delegation capacity reached; "
+                                     "wait for a running delegation to finish, then retry.")
+                _teardown_refused_batch(batch, error)
+                return json.dumps({
+                    "status": "rejected", "reason": "at_capacity", "results": [], "error": error,
+                    "note": ("The background delegation pool was at capacity "
+                             "(delegation.max_concurrent_children), so this call was REFUSED "
+                             "rather than run synchronously. Wait for a running delegation's "
+                             "result to re-enter the chat, then retry, or reduce the fan-out."),
+                }, ensure_ascii=False)
             logger.info(
-                "delegate_task: async pool at capacity (%s); running the whole batch synchronously instead.",
+                "delegate_task: async scheduling failed (%s); running the whole batch synchronously instead.",
                 dispatch.get("error", "rejected"),
             )
-            return _run_sync_with_note(batch, "at_capacity")
+            return _run_sync_with_note(batch, "schedule_failure")
         # Later units of an admitted call share its slot and cannot be capacity-rejected; a scheduler failure runs
         # the unit inline so no task is silently dropped.
         logger.warning("delegate_task: unit %d/%d not accepted (%s); running it inline.", k + 1, len(units), dispatch.get("error"))

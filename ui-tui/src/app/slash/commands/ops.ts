@@ -89,7 +89,10 @@ export const opsCommands: SlashCommand[] = [
       // `always` additionally persists approvals.mcp_reload_confirm=false.
       const a = (arg || '').trim().toLowerCase()
 
-      const params: { session_id: string | null; confirm?: boolean; always?: boolean } = {
+      // explicit: the user typed /reload-mcp, so lazy servers are live-connected (config-sync
+      // reloads leave it unset and keep the lazy schema cache).
+      const params: { session_id: string | null; confirm?: boolean; always?: boolean; explicit: boolean } = {
+        explicit: true,
         session_id: ctx.sid
       }
 

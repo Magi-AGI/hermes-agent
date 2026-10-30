@@ -46,6 +46,12 @@ def test_stderr_survives_logging_threshold(caplog, level):
     assert not any("ordinary-output" in message for message in messages)
 
 
+def _log_text(stem) -> str:
+    """Layout-agnostic: the shared file on POSIX, this process's segments on Windows."""
+    segments = sorted((stem.parent / f"{stem.stem}.d").glob("*.log"))
+    return "".join(p.read_text(encoding="utf-8") for p in [stem, *segments] if p.exists())
+
+
 @pytest.mark.windows_only
 @pytest.mark.parametrize("stream", ["stdout", "stderr"])
 def test_complete_records_reach_redacted_logs(tmp_path, monkeypatch, caplog, stream):
@@ -77,14 +83,14 @@ def test_complete_records_reach_redacted_logs(tmp_path, monkeypatch, caplog, str
             )
         assert result.returncode == 0
         hermes_logging.flush_log_queue()
-        text = (log_dir / "agent.log").read_text(encoding="utf-8")
+        text = _log_text(log_dir / "agent.log")
         assert secret not in text
         assert "u" * 8191 + "\u20ac" in text
         assert "\ufffd" not in text
         assert "oversized-start" not in text and "oversized-end" not in text
         assert "recovered" in text and "tail \u20ac" in text
         assert "omitted" in text.lower()
-        gui_text = (log_dir / "gui.log").read_text(encoding="utf-8")
+        gui_text = _log_text(log_dir / "gui.log")
         assert "recovered" in gui_text and secret not in gui_text
     finally:
         hermes_logging._reset_queued_handlers()

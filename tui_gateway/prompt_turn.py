@@ -734,10 +734,7 @@ def _absorb_turn_result(
             _prev_override = _restore.get("override")
             _prev_model = _restore.get("model")
             _prev_provider = _restore.get("provider")
-            if _prev_override is None:
-                session.pop("model_override", None)
-            else:
-                session["model_override"] = _prev_override
+            _publish_model_override(session, _prev_override)
             if _prev_model:
                 _raw = (
                     f"{_prev_model} --provider {_prev_provider}" if _prev_provider else _prev_model)
@@ -748,10 +745,8 @@ def _absorb_turn_result(
                         persist_override=False)  # session-internal restore, never config.yaml
                 except Exception as _moa_restore_exc:
                     logger.warning("MoA one-shot model restore failed: %s", _moa_restore_exc)
-        elif _restore is None:
-            session.pop("model_override", None)
         else:
-            session["model_override"] = _restore
+            _publish_model_override(session, _restore)
     status_note = None
     if isinstance(result, dict):
         if isinstance(result.get("messages"), list):

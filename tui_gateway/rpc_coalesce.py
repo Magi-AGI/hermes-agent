@@ -26,12 +26,11 @@ import atexit
 import concurrent.futures
 import dataclasses
 import json
-import os
 from pathlib import Path
 from typing import Any, Callable, Hashable
 
 from tui_gateway.rpc_lanes import SingleFlight
-from utils import file_signature
+from utils import file_content_signature
 
 MODEL_OPTIONS = SingleFlight()
 SESSION_LIST = SingleFlight()
@@ -46,10 +45,12 @@ _MODEL_OPTIONS_PROFILE_FILES = (".env", "auth.json")
 
 
 def _stat_fingerprint(paths) -> tuple:
+    """Content signature per file: a same-length in-place key rotation keeps the Windows metadata,
+    and a request after it must not join a build that read the old key (A43)."""
     out = []
     for path in paths:
         try:
-            out.append(file_signature(os.stat(path)))
+            out.append(file_content_signature(path))
         except OSError:
             out.append(None)
     return tuple(out)

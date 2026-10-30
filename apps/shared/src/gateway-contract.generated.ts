@@ -537,7 +537,7 @@ export interface ConfigGetParams {
   cwd?: string | null
   session_id?: string | null
 }
-/** Union of every getter's payload: ``value`` for the simple words, ``config`` for ``full``, ``mtime`` / ``mcp_rev`` for the poller, ``model`` / ``provider`` / ``providers`` for ``provider``, ``home`` / ``display`` for ``profile``, ``cwd`` / ``branch`` for ``project``, ``prompt``. */
+/** Union of every getter's payload: ``value`` for the simple words, ``config`` for ``full``, ``mtime`` / ``mcp_rev`` / ``rev`` for the poller, ``model`` / ``provider`` / ``providers`` for ``provider``, ``home`` / ``display`` for ``profile``, ``cwd`` / ``branch`` for ``project``, ``prompt``. */
 export interface ConfigGetResult {
   value?: string | null
   display?: string | null
@@ -552,6 +552,7 @@ export interface ConfigGetResult {
   prompt?: string | null
   mtime?: number | null
   mcp_rev?: string | null
+  rev?: string | null
 }
 /** ``hermes_cli/models.py::list_available_providers`` row. */
 export interface ConfigProviderRef {
@@ -3376,12 +3377,13 @@ export type ReloadEnvParams = Record<string, never>
 export interface ReloadEnvResult {
   updated: number
 }
-/** Without ``confirm`` the handler may answer ``confirm_required`` (per ``approvals.mcp_reload_confirm``); ``always`` persists the opt-out; ``rev`` is the config revision the caller wants loaded (coalescing). */
+/** Without ``confirm`` the handler may answer ``confirm_required`` (per ``approvals.mcp_reload_confirm``); ``always`` persists the opt-out; ``rev`` is the config revision the caller wants loaded (coalescing). ``explicit`` marks a reload the USER asked for (the typed ``/reload-mcp``): ``lazy: true`` servers are then live-connected instead of registered from the schema cache, and the request never coalesces into an automatic reload. Config-sync and write-through reloads leave it false. */
 export interface ReloadMcpParams {
   session_id?: string | null
   confirm?: boolean
   always?: boolean
   rev?: string | null
+  explicit?: boolean
 }
 export interface ReloadMcpResult {
   status: ReloadMcpStatus

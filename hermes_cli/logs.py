@@ -1,12 +1,12 @@
 """``hermes logs`` — view and filter Hermes log files.
 
 ``hermes logs [name] [-n N] [-f] [--level L] [--session S] [--component C] [--since 1h]``;
-``hermes logs list`` shows the available files.
+``hermes logs list`` shows the available files. A log is read as one timeline merged from its
+rotations, its live file and (Windows) its per-process segments — ``hermes_cli.logs_merge``.
 """
 
 import re
 import sys
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Sequence
@@ -27,6 +27,8 @@ LOG_FILES = {
 
 # "2026-04-05 22:35:00[,123]" at the start of a line.
 _TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})")
+# "agent.log.3": a rotated backup, merged into the timeline like the live file.
+_ROTATION_NAME_RE = re.compile(r".+\.log\.\d+$")
 _LEVEL_RE = re.compile(r"\s(DEBUG|INFO|WARNING|ERROR|CRITICAL)\s")
 # Logger name: the token before ":" after the level and optional "[session]" tag,
 # e.g. "INFO gateway.run:" or "INFO [sess_abc] tools.terminal_tool:".
@@ -106,11 +108,21 @@ def tail_log(
         print(f"Unknown log: {log_name!r}. Available: {', '.join(sorted(LOG_FILES))}")
         sys.exit(1)
 
-    log_path = get_hermes_home() / "logs" / filename
-    if not log_path.exists():
-        print(f"Log file not found: {log_path}")
-        print("(Logs are created when Hermes runs — try 'hermes chat' first)")
+    from hermes_cli.logs_merge import follow_merged, log_sources, read_merged_tail
+
+    log_dir = get_hermes_home() / "logs"
+    try:
+        sources = log_sources(log_dir, filename)
+    except PermissionError:
+        print(f"Permission denied: {log_dir}")
         sys.exit(1)
+    if not sources:
+        if not follow:
+            print(f"Log file not found: {log_dir / filename}")
+            print("(Logs are created when Hermes runs — try 'hermes chat' first)")
+            sys.exit(1)
+        # A fresh Windows home has no file until the first record: wait for it.
+        print(f"(no {filename} under {display_hermes_home()}/logs/ yet — waiting for the first write)")
 
     since_dt = None
     if since:
@@ -138,11 +150,18 @@ def tail_log(
                    since=since_dt, component_prefixes=component_prefixes)
     has_filters = any(v is not None for v in filters.values())
 
+    extents: dict = {}
+    verdicts: dict = {}
+    identities: dict = {}
+    problems: list = []
     try:
-        lines = _read_tail(log_path, num_lines, has_filters=has_filters, **filters)
+        lines = read_merged_tail(log_dir, filename, num_lines, has_filters=has_filters, extents=extents,
+                                 verdicts=verdicts, identities=identities, problems=problems, **filters)
     except PermissionError:
-        print(f"Permission denied: {log_path}")
+        print(f"Permission denied: {log_dir / filename}")
         sys.exit(1)
+    for path, exc in problems:
+        print(f"(skipped unreadable {path}: {exc})", file=sys.stderr)
 
     filter_parts = [
         f"{label}={value}" for label, value in
@@ -159,67 +178,10 @@ def tail_log(
     if not follow:
         return
     try:
-        _follow_log(log_path, **filters)
+        follow_merged(log_dir, filename, lambda line: print(line, end="", flush=True),
+                      start_positions=extents, start_passing=verdicts, start_identities=identities, **filters)
     except KeyboardInterrupt:
         print("\n--- stopped ---")
-
-
-def _read_tail(path: Path, num_lines: int, *, has_filters: bool = False, **filters) -> list:
-    """Read the last *num_lines* matching lines; ``filters`` are ``_matches_filters`` kwargs."""
-    if not has_filters:
-        return _read_last_n_lines(path, num_lines)
-    # Over-read so enough lines survive filtering.
-    raw_lines = _read_last_n_lines(path, max(num_lines * 20, 2000))
-    return [l for l in raw_lines if _matches_filters(l, **filters)][-num_lines:]
-
-
-def _read_all_lines(path: Path) -> list:
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        return f.readlines()
-
-
-def _read_last_n_lines(path: Path, n: int) -> list:
-    """Read the last N lines; files over 1MB are read in growing chunks from the end."""
-    try:
-        size = path.stat().st_size
-        if size == 0:
-            return []
-        if size <= 1_048_576:
-            return _read_all_lines(path)[-n:]
-
-        with open(path, "rb") as f:
-            chunk_size = 8192
-            lines = []
-            pos = size
-            while pos > 0 and len(lines) <= n + 1:
-                read_size = min(chunk_size, pos)
-                pos -= read_size
-                f.seek(pos)
-                chunk_lines = f.read(read_size).split(b"\n")
-                if lines:
-                    # Join the chunk's trailing partial line with our leading partial line.
-                    lines[0] = chunk_lines[-1] + lines[0]
-                    lines = chunk_lines[:-1] + lines
-                else:
-                    lines = chunk_lines
-                chunk_size = min(chunk_size * 2, 65536)
-            decoded = [raw.decode("utf-8", errors="replace") + "\n" for raw in lines if raw.strip()]
-            return decoded[-n:]
-    except Exception:
-        return _read_all_lines(path)[-n:]
-
-
-def _follow_log(path: Path, **filters) -> None:
-    """Poll a log file for new content and print matching lines."""
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        f.seek(0, 2)
-        while True:
-            line = f.readline()
-            if not line:
-                time.sleep(0.3)
-            elif _matches_filters(line, **filters):
-                print(line, end="")
-                sys.stdout.flush()
 
 
 def _size_label(size: int) -> str:
@@ -248,13 +210,33 @@ def list_logs() -> None:
         print(f"No logs directory at {display_hermes_home()}/logs/")
         return
 
+    from hermes_logging_segments import SEGMENT_RE
+
     print(f"Log files in {display_hermes_home()}/logs/:\n")
     found = False
     for entry in sorted(log_dir.iterdir()):
-        if entry.is_file() and entry.suffix == ".log":
+        if entry.is_file() and (entry.suffix == ".log" or _ROTATION_NAME_RE.match(entry.name)):
             st = entry.stat()
             age_str = _age_label(datetime.fromtimestamp(st.st_mtime))
             print(f"  {entry.name:<25} {_size_label(st.st_size):>8}   {age_str}")
+            found = True
+        elif entry.is_dir() and entry.suffix == ".d":
+            # Windows per-process segments: one row per log, summed. A segment pruned by another
+            # process between the listing and the stat is simply not counted.
+            stats = []
+            for p in entry.iterdir():
+                if not SEGMENT_RE.match(p.name):
+                    continue
+                try:
+                    stats.append(p.stat())
+                except OSError:
+                    continue
+            if not stats:
+                continue
+            age_str = _age_label(datetime.fromtimestamp(max(st.st_mtime for st in stats)))
+            total = sum(st.st_size for st in stats)
+            print(f"  {entry.name + '/':<25} {_size_label(total):>8}   {age_str}   "
+                  f"({len(stats)} process segment{'s' if len(stats) != 1 else ''})")
             found = True
 
     if not found:

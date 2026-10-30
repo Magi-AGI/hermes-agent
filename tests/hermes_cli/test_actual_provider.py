@@ -525,7 +525,11 @@ def test_actual_oneshot_reasoning_override_reaches_agent(monkeypatch):
         lambda **_kwargs: None,
     )
     monkeypatch.setattr(oneshot, "_create_session_db_for_oneshot", lambda: None)
-    monkeypatch.setattr(oneshot, "get_fallback_chain", lambda _cfg: [])
+    # The chain is not what this test is about; neutralize it at the one-shot constructor's own
+    # seam. That used to be a module-level ``get_fallback_chain`` import; the chain read is now
+    # ``_fail_closed_fallback_chain_for_oneshot`` (fail-closed against the shared per-home
+    # retention), so the stub moves with it. Same intent, same empty chain.
+    monkeypatch.setattr(oneshot, "_fail_closed_fallback_chain_for_oneshot", lambda: [])
     monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
 
     response, _result = oneshot._run_agent(

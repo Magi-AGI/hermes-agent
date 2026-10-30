@@ -367,6 +367,63 @@ class ComputeHost:
         sid = str(frame.get("sid") or "")
         session = server._sessions.get(sid)
         frame_version = int(frame.get("history_version") or 0)
+        override = frame.get("model_override")
+        # Compare against what the parent LAST SENT, not the host's current override: reading
+        # the parent's echo of an older value as a fresh request switched the host straight
+        # back after a host-side /model switch (Codex HS-C3). Slash acks now reconcile — they
+        # carry the transportable override, the parent adopts it (snapshot-guarded), and
+        # producing the ack advances the last-seen value below (HS-C5) — but this guard still
+        # covers non-slash frames and parents that predate the ack field. The first frame for
+        # a session this
+        # process has never tracked falls back to the host's current value; a session built
+        # below gets seeded at build time so a later echo never reads as a request (HS-C3
+        # round 2). Tracking advances only AFTER a successful adoption: a failed switch must
+        # leave the request pending, or a re-sent frame would silently run on the old model
+        # (Codex HS-C4).
+        last_seen_parent = (session.get("_parent_model_override_seen", session.get("model_override"))
+                            if session is not None else None)
+        if session is not None and override is not None and override != last_seen_parent:
+            # The cached agent was built under the OLD override: running this turn on it would
+            # execute on the wrong model while the parent UI reports the new one (agy R4-6).
+            # Switch IN PLACE — exactly what _commit_agent_switch does for in-process sessions.
+            # Never tear the session down for this: close() ends the live row in state.db and
+            # kills its sandboxes/browsers, and a store reload bricks oversized or seed-only
+            # transcripts (agy R5-2). A failed switch raises, erroring the turn loudly instead
+            # of running it on the wrong model.
+            agent = session.get("agent")
+            if agent is not None:
+                # Under the session's profile scope with secrets hydrated: switch_model resolves
+                # endpoint/credentials from config and credential pools, so an unscoped call
+                # reads the LAUNCH profile's files — or fails closed under multiplex (agy
+                # round 6, R5-2b). A string override is the session.create shorthand for "same
+                # provider, this model", and a dict without a provider means the same — the
+                # agent's current provider, never "" (R5-2a/c: new_provider is required
+                # positionally, and '' is not a provider).
+                current_provider = getattr(agent, "provider", "") or ""
+                with server._session_profile_runtime_scope(session, hydrate_secrets=True):
+                    if isinstance(override, dict):
+                        agent.switch_model(
+                            new_model=override.get("model"),
+                            new_provider=override.get("provider") or current_provider,
+                            api_key=override.get("api_key") or "",
+                            base_url=override.get("base_url") or "",
+                            api_mode=override.get("api_mode") or "")
+                    else:
+                        agent.switch_model(new_model=str(override), new_provider=current_provider)
+            session["model_override"] = override
+            session["_parent_model_override_seen"] = override
+        elif (session is not None and override is None
+              and last_seen_parent is not None):
+            # The parent CLEARED its pin. Resolving the profile default from inside the host is
+            # a separate problem (recorded, agy R5-2.3): until then the agent keeps its current
+            # model, loudly, rather than guessing.
+            logging.getLogger(__name__).warning(
+                "compute host: parent cleared model_override for sid=%s; the live agent keeps "
+                "its current model until the session is rebuilt", sid)
+            session["_parent_model_override_seen"] = None
+        elif session is not None:
+            # Echo of an unchanged parent value: keep tracking current without acting.
+            session["_parent_model_override_seen"] = override
         if session is not None:
             session["transport"] = self._transport
             if frame.get("cols") is not None:
@@ -379,6 +436,9 @@ class ComputeHost:
                 session["history_version"] = max(int(session.get("history_version", 0)), frame_version)
         else:
             session = self._build_server_session(server, frame, sid)
+            # Seed the tracking at build time: this frame's override IS the parent's current
+            # value, so a later echo of it must never read as a new request (HS-C3 round 2).
+            session["_parent_model_override_seen"] = frame.get("model_override")
         if isinstance(frame.get("attached_images"), list):
             session["attached_images"] = list(frame.get("attached_images") or [])
         return session
@@ -490,7 +550,7 @@ class ComputeHost:
         def body(server: Any, sid: str, request_id: Any) -> None:
             resp = server.handle_request({
                 "id": request_id, "method": "reload.mcp",
-                "params": {"session_id": sid, "confirm": True}})
+                "params": {"session_id": sid, "confirm": True, "explicit": bool(frame.get("explicit", False))}})
             self._reply("reload_mcp.ack", sid, request_id, response=resp)
         self._guarded(frame, "control.error", body)
 
@@ -555,6 +615,15 @@ class ComputeHost:
                 messages = server._history_to_messages(list(session.get("history") or []))
                 ack = {"output": output, **_history_meta(session), "messages": messages}
         ack["session_info"] = server._session_info(session.get("agent"), session)
+        # Reconcile the host's override back to the parent (Codex HS-C5): a host-side /model
+        # switch leaves the parent's stored override stale, and value equality on later frames
+        # cannot tell an explicit parent re-selection from a stale echo. The ack carries a
+        # TRANSPORTABLE selection — credentials never cross the pipe, and a callable key
+        # provider would not serialize anyway (HS-C7) — and producing it advances the host's
+        # last-seen parent value: the parent adopts this ack, so its next frame carries exactly
+        # this value and an immediate re-selection genuinely differs (HS-C5 round 2).
+        ack["model_override"] = _transportable_model_override(session.get("model_override"))
+        session["_parent_model_override_seen"] = ack["model_override"]
         return ack
 
     def _live_turns(self) -> list[concurrent.futures.Future]:
@@ -656,6 +725,18 @@ def _stdin_pipe_state(stdin: Any) -> str:
     err = ctypes.get_last_error()
     return {109: "writer closed (ERROR_BROKEN_PIPE)",
             6: "read end closed in this process (ERROR_INVALID_HANDLE)"}.get(err, f"error {err}")
+
+
+def _transportable_model_override(override):
+    """The JSON-safe, credential-free form of a model override for the control-ack pipe.
+
+    Credentials stay local to the process that resolved them; the receiving side re-resolves
+    endpoint/key from its own config when it needs them (the same rule the rest of the lane
+    enforces for info payloads)."""
+    if isinstance(override, dict):
+        return {k: v for k in ("model", "provider", "base_url", "api_mode")
+                for v in [override.get(k)] if isinstance(v, str) and v}
+    return override if isinstance(override, str) else None
 
 
 def _history_meta(session: dict) -> dict[str, Any]:

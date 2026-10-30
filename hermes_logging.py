@@ -3,37 +3,33 @@
 Log files: agent.log (INFO+, everything), errors.log (WARNING+), gateway.log (INFO+,
 gateway components; ``mode="gateway"``), gui.log (INFO+, dashboard/TUI-gateway;
 ``mode="gui"``). All are rotating files driven through one async queue and formatted
-with ``RedactingFormatter`` so secrets never reach disk.
+with ``RedactingFormatter`` so secrets never reach disk. On Windows each process writes
+its own segments under ``<stem>.d/`` instead of the shared file (``hermes_logging_segments``).
 """
 
 import atexit
 import copy
 import io
 import logging
+import math
 import os
+import re
 import queue
 import sys
 import threading
-from logging.handlers import QueueHandler, QueueListener
+import time
+from logging.handlers import BaseRotatingHandler, QueueHandler, QueueListener, RotatingFileHandler
 from pathlib import Path
 from typing import Optional, Sequence
 
-# Windows-ONLY swap (#44873): stdlib ``RotatingFileHandler.doRollover()`` calls
-# ``os.rename()``, which fails with ``PermissionError [WinError 32]`` whenever
-# another process holds an append handle on ``agent.log`` — essentially always
-# in Hermes (TUI, gateway, hy_memory, MCP servers, CLI commands all log) —
-# pinning the file at the size threshold and spamming stderr on every emit.
-# ``concurrent-log-handler`` serializes rollover with a cross-process lock.
-# POSIX keeps stdlib: renames of open files work, and managed mode (NixOS)
-# relies on stdlib's exact ``_open()``/``doRollover()`` lifecycle for the
-# 0660 chmod and eager file creation; CLH opens lazily and rotates differently.
-if sys.platform == "win32":
-    from concurrent_log_handler import (  # noqa: E402
-        ConcurrentRotatingFileHandler as RotatingFileHandler,
-    )
-else:
-    from logging.handlers import RotatingFileHandler  # noqa: E402
-
+# Windows: stdlib ``RotatingFileHandler.doRollover()`` renames, which fails with
+# ``PermissionError [WinError 32]`` whenever another process holds a handle on the shared
+# file — essentially always in Hermes (TUI, gateway, MCP servers, CLI commands all log). The
+# former fix, concurrent-log-handler's cross-process lock (#44873), made every writer wait on
+# every other one and put agent.log ~30 min behind the clock under convoys (gate H4). Windows
+# now gets per-process segment files (``hermes_logging_segments``): nothing shared, nothing
+# renamed. POSIX keeps stdlib on the shared file: renames of open files work, and managed mode
+# (NixOS) relies on stdlib's exact ``_open()``/``doRollover()`` lifecycle for the 0660 chmod.
 
 from hermes_constants import get_config_path, get_hermes_home, mkdir_under_hermes_home
 
@@ -65,20 +61,6 @@ def _safe_stderr():  # type: ignore[return]
         return wrapped
     except Exception:
         return stream  # best-effort: no buffer / wrapping failed -> original stream
-
-
-def _is_windows_concurrent_log_lock_timeout(exc: BaseException | None) -> bool:
-    """True for concurrent-log-handler's Windows lock timeout.
-
-    Slash-command workers and the gateway share rotating files on Windows Desktop;
-    when another process holds the rollover lock too long CLH raises this
-    RuntimeError, which must not escape into Desktop chat output.
-    """
-    return (
-        sys.platform == "win32"
-        and isinstance(exc, RuntimeError)
-        and "Cannot acquire lock after 20 attempts" in str(exc)
-    )
 
 
 def _is_unavailable_log_stream(exc: BaseException | None) -> bool:
@@ -177,7 +159,7 @@ def _known_log_homes() -> set[Path]:
         if isinstance(handler, _ProfileRoutingFileHandler):
             homes.add(handler._default_home)
             homes.update(handler._profile_homes)
-        elif isinstance(handler, RotatingFileHandler):
+        elif isinstance(handler, BaseRotatingHandler):
             try:
                 homes.add(Path(handler.baseFilename).resolve().parent.parent)
             except (TypeError, ValueError, OSError):
@@ -225,7 +207,7 @@ def setup_logging(
     # an existing router.
     if _adopt_secondary_home(home):
         return log_dir
-    cfg_level, cfg_max_size, cfg_backup = _read_logging_config()
+    cfg_level, cfg_max_size, cfg_backup, _ = _read_logging_config()
     level_name = (log_level or cfg_level or "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
     max_bytes = (max_size_mb or cfg_max_size or 5) * 1024 * 1024
@@ -290,6 +272,63 @@ def _quietly(fn) -> None:
         fn()
     except Exception:
         pass
+
+
+# ── Write-lag visibility (gate H4) ───────────────────────────────────────────────────────────
+# agent.log ran ~30 min behind the wall clock on 2026-10-28: the cross-process CLH lock plus a
+# reopen per record made the single queue-listener writer slower than record production, so every
+# log-based timeline silently lied. The writer is per-process on Windows now, but the lag stays
+# VISIBLE either way: a metric updated on every successful file write, and a rate-limited warning
+# to STDERR (warning into a lagging log would itself be read late).
+_LAST_WRITE_LAG: Optional[float] = None
+_LAG_WARNED_AT: float = 0.0
+_LAG_WARN_THRESHOLD_S = 60.0
+_LAG_WARN_INTERVAL_S = 300.0
+
+
+def last_write_lag_seconds() -> Optional[float]:
+    """Age of the most recently written record at the moment it reached its file (None = no
+    write yet). ~0 is healthy; minutes mean the writer is drowning and every log timestamp in
+    this profile's logs is running that far behind reality."""
+    return _LAST_WRITE_LAG
+
+
+def _note_write_lag(record: logging.LogRecord) -> None:
+    global _LAST_WRITE_LAG, _LAG_WARNED_AT
+    now = time.time()
+    _LAST_WRITE_LAG = lag = max(0.0, now - record.created)
+    if lag >= _LAG_WARN_THRESHOLD_S and now - _LAG_WARNED_AT >= _LAG_WARN_INTERVAL_S:
+        _LAG_WARNED_AT = now
+        try:
+            # The REAL stderr fd: slash commands run under redirect_stderr into the user's chat
+            # reply, and a dynamic sys.stderr write would land there (agy R2-4). With BOTH streams
+            # gone (daemon/GUI), skip entirely — print(file=None) would fall through to stdout, a
+            # protocol channel under stdio JSON-RPC (agy R3-4).
+            stream = sys.__stderr__ or sys.stderr
+            if stream is not None:
+                print(f"[hermes] log writer is {lag:.0f}s behind the clock; file-log timestamps lag "
+                      f"reality by that much", file=stream)
+        except Exception:
+            pass
+
+
+def _handle_file_handler_error(handler, record: logging.LogRecord, *, path: Optional[str] = None) -> None:
+    """``handleError`` shared by both file-handler kinds: a lost backing stream (EIO, closed file)
+    names *path* once and drops the stream so the next emit reopens it; anything else is stdlib's
+    report. The QueueListener must never turn a failing destination into one traceback per record."""
+    handler._last_emit_errored = True  # a swallowed failure is not a fresh write (write-lag gate)
+    exc = sys.exc_info()[1]
+    if _is_unavailable_log_stream(exc):
+        if not handler._unavailable_reported:
+            handler._unavailable_reported = True
+            _quietly(lambda: print(
+                f"hermes_logging: {path or handler.baseFilename} unavailable ({exc}); "
+                "file logging paused until it recovers", file=_safe_stderr()))
+        if handler.stream is not None:
+            _quietly(handler.stream.close)
+        handler.stream = None
+        return
+    logging.Handler.handleError(handler, record)
 
 
 class _ManagedRotatingFileHandler(RotatingFileHandler):
@@ -362,37 +401,20 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         # The kernel caches inode metadata, so this stat is sub-microsecond on a hot file.
         if self.stream is not None or os.path.exists(self.baseFilename):
             self._reopen_if_externally_rotated()
+        self._last_emit_errored = False
         super().emit(record)
         # A record actually reached the file: only now has the destination recovered. Resetting
         # in _open() is wrong — open() succeeds on a device whose write/flush still raise EIO,
         # which re-armed the report and printed the path once per record.
         if self.stream is not None:
             self._unavailable_reported = False
+        if not self._last_emit_errored:
+            # Success-gated: every write failure goes through handleError, so a swallowed failure
+            # must not count as a fresh write (agy R2-4).
+            _note_write_lag(record)
 
     def handleError(self, record: logging.LogRecord) -> None:
-        """Suppress the known Windows ``concurrent-log-handler`` lock timeout.
-
-        CLH's ``emit()`` routes that RuntimeError here, so this is the single point to
-        silence it before stdlib prints to stderr (which the Desktop slash-worker
-        captures into chat output).
-        """
-        exc = sys.exc_info()[1]
-        if _is_windows_concurrent_log_lock_timeout(exc):
-            return
-        if _is_unavailable_log_stream(exc):
-            # The QueueListener must not turn a failing log destination into a traceback for
-            # every queued record. Name the path once, drop the stale stream; the next emit
-            # reopens it if the destination has recovered.
-            if not self._unavailable_reported:
-                self._unavailable_reported = True
-                _quietly(lambda: print(
-                    f"hermes_logging: {self.baseFilename} unavailable ({exc}); "
-                    "file logging paused until it recovers", file=_safe_stderr()))
-            if self.stream is not None:
-                _quietly(self.stream.close)
-            self.stream = None  # type: ignore[assignment]
-            return
-        super().handleError(record)
+        _handle_file_handler_error(self, record)
 
     def _open(self):
         stream = super()._open()
@@ -407,14 +429,207 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         self._record_stream_stat()
 
 
+# Segment retention (gate H4): dead processes leave their last segments behind; every home this
+# process builds a file handler for is pruned once, by THAT home's ``logging.retention_days``
+# (profiles are independent islands: the launch profile's value never reaches a routed home).
+_pruned_log_dirs: set[Path] = set()
+
+
+def _retention_days(value) -> float:
+    """``logging.retention_days`` as a day count: ``None``, booleans, non-numbers and NaN fall
+    back to the default (``true`` is a config mistake, not one day; ``.nan`` would compare False
+    against every mtime and prune everything); ``.inf`` means keep forever."""
+    from hermes_logging_segments import DEFAULT_RETENTION_DAYS
+    if value is None or isinstance(value, bool):
+        return float(DEFAULT_RETENTION_DAYS)
+    try:
+        days = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return float(DEFAULT_RETENTION_DAYS)
+    if math.isnan(days):
+        return float(DEFAULT_RETENTION_DAYS)
+    return days
+
+
+def _observe_config_bytes(path: Path) -> bytes:
+    """The single observation of a home's config.yaml the retention policy is derived from."""
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
+def _retention_policy(home: Path) -> Optional[float]:
+    """The home's ``logging.retention_days`` observed FAIL-CLOSED: ``None`` when the policy could
+    not be read — an unreadable or broken config.yaml, a YAML root that is not a mapping, a
+    dangling symlink — and then nothing is deleted. A failed read is never the same as an absent
+    setting. Validation and the value come from the SAME bytes (one observation of the file): a
+    file that changes between a probe and a second read cannot yield a policy the probe never saw.
+
+    The administrator's managed overlay (``/etc/hermes`` or ``$HERMES_MANAGED_DIR``) is NOT read
+    here: whether an overlay exists but is unavailable (a link whose target is unmounted, an
+    ancestor that cannot be traversed, a file replaced non-atomically) cannot be told apart from
+    "no overlay" by any filesystem probe, and an overlay an administrator used to forbid pruning
+    must never vanish into the user's or the default policy. So when a managed scope MIGHT exist
+    this version prunes nothing (closure rounds 3–6). The home's own config decides only when no
+    managed scope is configured at all."""
+    config_path = Path(home) / "config.yaml"
+    try:
+        if _managed_scope_may_exist():
+            return None
+        if config_path.is_symlink() and not config_path.exists():
+            return None
+        user: dict = {}
+        if config_path.exists():
+            from utils import fast_safe_load
+            loaded = fast_safe_load(io.StringIO(_observe_config_bytes(config_path).decode("utf-8")))
+            if loaded is not None and not isinstance(loaded, dict):
+                return None
+            user = loaded or {}
+    except Exception:
+        return None
+    log_cfg = user.get("logging") if isinstance(user, dict) else None
+    if isinstance(log_cfg, dict) and "retention_days" in log_cfg:
+        value = log_cfg.get("retention_days")
+        if isinstance(value, str):
+            if "${" in value:
+                value = _resolve_retention_ref(value, home)
+                if value is None:
+                    return None
+            return _parse_retention_text(value)
+        return _retention_days(value)
+    return _retention_days(None)
+
+
+def _managed_scope_may_exist() -> bool:
+    """Whether an administrator's managed overlay MIGHT exist: ``HERMES_MANAGED_DIR`` is set to a
+    non-blank value, or (outside pytest) the platform default directory exists or is a link.
+    Mirrors the resolution order of ``managed_scope.get_managed_dir`` on EVERY platform — the
+    default is a POSIX path and drive-relative on Windows (``C:\\etc\\hermes``), but the canonical
+    resolver adopts such a directory there too, so retention must treat it as managed as well —
+    and never asks whether the scope is USABLE: unavailable and absent look the same to a probe,
+    and only the configured intent is trusted. A probe that fails (an ``OSError`` surfacing from
+    ``stat`` on a dangling ancestor) answers True."""
+    from hermes_cli import managed_scope
+    if os.environ.get("HERMES_MANAGED_DIR", "").strip():
+        return True
+    if managed_scope._under_pytest():
+        return False
+    default = managed_scope._DEFAULT_MANAGED_DIR
+    try:
+        return default.is_symlink() or default.exists()
+    except OSError:
+        return True
+
+
+def _parse_retention_text(text: str) -> Optional[float]:
+    """A textual retention value (a quoted literal or an expanded reference) parsed FAIL-CLOSED:
+    ``None`` for anything that is not a number — empty, prose, NaN, a value still holding a ``${``
+    template — because a policy the operator wrote but we cannot read must never become the
+    default. ``.inf``/``inf`` keep forever, as the unquoted YAML token does."""
+    text = text.strip()
+    if not text or "${" in text:
+        return None
+    if text.lower().lstrip("+") in (".inf", "inf"):
+        return math.inf
+    try:
+        days = float(text)
+    except (ValueError, OverflowError):
+        return None
+    if math.isnan(days):
+        return None
+    return days
+
+
+def _is_process_home(home: Path) -> bool:
+    """Whether *home* is the HERMES_HOME this process was launched under (task overrides ignored)."""
+    try:
+        from hermes_constants import get_process_hermes_home
+        return Path(home).expanduser().resolve() == get_process_hermes_home().expanduser().resolve()
+    except Exception:
+        return False
+
+
+def _observe_env_bytes(path: Path) -> bytes:
+    """The single observation of a home's ``.env`` the retention policy is derived from."""
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
+def _resolve_retention_ref(value: str, home: Path) -> Optional[str]:
+    """Expand ``${VAR}`` / ``${env:VAR}`` in a retention value under the OWNING scope, or ``None``
+    when any reference does not resolve there (an unreadable policy, never the default).
+
+    The routed handler for a profile is created on the shared logging worker, under whichever
+    process environment launched the gateway — profile A's ``RETENTION_DAYS=1`` must never
+    authorize pruning in profile B's home. A reference therefore resolves against the owning
+    home's ``.env`` (observed fail-closed); the process environment is consulted only when *home*
+    IS the process's own home (launch env is the documented way to pin a value for the profile you
+    launched). The managed overlay is never read (see ``_retention_policy``)."""
+    from hermes_cli.config import _ENV_REF_RE, _env_ref_var_name
+
+    from agent.secret_scope import _decode_env_bytes, _parse_env_text
+    env_path = Path(home) / ".env"
+    try:
+        # Observed fail-closed: a .env that exists but cannot be read is an unreadable policy,
+        # not an absent one (load_env_file's {} on OSError would fall through to the environ).
+        if env_path.is_symlink() or env_path.exists():
+            dotenv = _parse_env_text(_decode_env_bytes(_observe_env_bytes(env_path)))
+        else:
+            dotenv = {}
+    except OSError:
+        return None
+    own_home = _is_process_home(home)
+
+    def lookup(name: str) -> Optional[str]:
+        found = dotenv.get(name)
+        if found is None and own_home:
+            found = os.environ.get(name)
+        return found
+
+    def substitute(match: "re.Match[str]") -> str:
+        name = _env_ref_var_name(match.group(1))
+        found = lookup(name) if name else None
+        if found is None:
+            raise LookupError(name)
+        return found
+
+    try:
+        expanded = _ENV_REF_RE.sub(substitute, value)
+    except LookupError:
+        return None
+    # A nested reference in a .env value, or an unclosed ``${`` the pattern never matched, is still
+    # a template: unresolved, never a literal the parser might accept.
+    return None if "${" in expanded else expanded
+
+
+def _prune_segments_once(log_dir: Path) -> None:
+    key = log_dir.resolve()
+    if key in _pruned_log_dirs:
+        return
+    _pruned_log_dirs.add(key)
+    from hermes_logging_segments import prune_stale_segments
+    # The home is the unresolved parent: a symlinked or junctioned logs/ still belongs to it.
+    days = _retention_policy(Path(log_dir).parent)
+    if days is None:
+        return  # policy unknown → no deletion
+    prune_stale_segments(key, retention_days=days)
+
+
 def _new_file_handler(
     path: Path, *, level: int, max_bytes: int, backup_count: int, formatter
-) -> "_ManagedRotatingFileHandler":
-    """Create the ``logs/`` directory and a configured ``_ManagedRotatingFileHandler``."""
+) -> BaseRotatingHandler:
+    """Create the ``logs/`` directory and this host's file handler for *path*: per-process
+    segments on Windows, the shared managed rotating file elsewhere (module header)."""
     mkdir_under_hermes_home(path.parent)
-    handler = _ManagedRotatingFileHandler(
-        str(path), maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
-    )
+    _prune_segments_once(path.parent)
+    if sys.platform == "win32":
+        from hermes_logging_segments import _SegmentedFileHandler
+        handler = _SegmentedFileHandler(
+            str(path), maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
+        )
+    else:
+        handler = _ManagedRotatingFileHandler(
+            str(path), maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
+        )
     handler.setLevel(level)
     handler.setFormatter(formatter)
     return handler
@@ -427,7 +642,7 @@ class _ProfileRoutingFileHandler(logging.Handler):
     or dashboard event loop. Per-home handlers keep rotation, redaction and managed perms.
     """
 
-    def __init__(self, existing: RotatingFileHandler, profile_homes: Sequence[Path]) -> None:
+    def __init__(self, existing: BaseRotatingHandler, profile_homes: Sequence[Path]) -> None:
         """Take over *existing*'s path, level, rotation, formatter and filters."""
         super().__init__(level=existing.level)
         resolved = Path(existing.baseFilename).resolve()
@@ -438,7 +653,7 @@ class _ProfileRoutingFileHandler(logging.Handler):
         self._filename = resolved.name
         self._max_bytes = getattr(existing, "maxBytes", 0)
         self._backup_count = getattr(existing, "backupCount", 0)
-        self._profile_handlers: dict[Path, _ManagedRotatingFileHandler] = {}
+        self._profile_handlers: dict[Path, BaseRotatingHandler] = {}
         self._profile_handlers_lock = threading.RLock()
         self.setFormatter(existing.formatter)
         for log_filter in existing.filters:
@@ -452,7 +667,7 @@ class _ProfileRoutingFileHandler(logging.Handler):
             candidate = self._default_home
         return candidate if candidate in self._profile_homes else self._default_home
 
-    def _handler_for_home(self, home: Path) -> _ManagedRotatingFileHandler:
+    def _handler_for_home(self, home: Path) -> BaseRotatingHandler:
         with self._profile_handlers_lock:
             if home not in self._profile_handlers:
                 self._profile_handlers[home] = _new_file_handler(
@@ -486,8 +701,8 @@ class _ProfileRoutingFileHandler(logging.Handler):
         return True
 
 
-# Asynchronous file logging: an ``emit`` can block on the cross-process
-# rotation lock (module header); on an asyncio thread that stalls the loop and
+# Asynchronous file logging: an ``emit`` is disk I/O (and, on POSIX, can wait on
+# a rename of the shared file); on an asyncio thread that stalls the loop and
 # drops WebSocket clients. Every file handler is therefore driven by a single
 # QueueListener thread; loggers only do a non-blocking enqueue.
 
@@ -594,9 +809,9 @@ def release_profile_log_handlers(profile_home: str | Path) -> int:
     """Release this process's routed log files below a profile before it is removed.
 
     The Desktop serve process can route records for several profiles through one
-    ``QueueListener``. On Windows, each routed concurrent log handler keeps its
-    lock file open, so closing only external profile resources still leaves
-    ``logs/.__agent.lock`` and ``logs/.__errors.lock`` unavailable to rmtree.
+    ``QueueListener``. On Windows a routed handler keeps its current segment open, so
+    closing only external profile resources still leaves ``logs/<stem>.d/`` unavailable
+    to rmtree.
     """
     global _queue_listener
     try:
@@ -654,7 +869,7 @@ def enable_profile_log_routing(profile_homes: Sequence[str | Path]) -> bool:
             _queue_listener = None
         replacement = []
         for existing in _queued_file_handlers:
-            if isinstance(existing, RotatingFileHandler):
+            if isinstance(existing, BaseRotatingHandler):
                 replacement.append(_ProfileRoutingFileHandler(existing, homes))
                 _quietly(existing.close)
             else:
@@ -677,6 +892,7 @@ def _reset_queued_handlers() -> None:
         for h in list(_queued_file_handlers):
             _quietly(h.close)
         _queued_file_handlers.clear()
+        _pruned_log_dirs.clear()
         _log_queue = None
 
 
@@ -695,7 +911,7 @@ def _add_rotating_handler(
         # Already attached directly, or already covered by the profile router — for its default
         # home or any profile home it routes (a bare handler beside it would take every record).
         if getattr(existing, "_hermes_routed_log_path", None) == resolved or (
-            isinstance(existing, RotatingFileHandler)
+            isinstance(existing, BaseRotatingHandler)
             and Path(getattr(existing, "baseFilename", "")).resolve() == resolved
         ):
             return
@@ -719,34 +935,35 @@ def _add_rotating_handler(
         routed = _ProfileRoutingFileHandler(handler, sorted(homes))
         _quietly(handler.close)
         handler = routed
-    # Queue, not ``addHandler``: the rotation-lock wait never runs on the caller's thread.
+    # Queue, not ``addHandler``: file I/O never runs on the caller's thread.
     _register_queued_handler(handler)
 
 
-def _read_logging_config():
-    """Best-effort read of ``logging.*`` from config.yaml."""
+def _read_logging_config(home: Optional[Path] = None):
+    """Best-effort read of ``logging.*`` from *home*'s config.yaml (the current home by default)."""
     try:
+        config_path = (Path(home) / "config.yaml") if home is not None else get_config_path()
         # Prefer the shared effective-config cache (managed overlay included, so an administrator
         # can pin logging.*) so this reuses hermes_cli.main's early parse (one config.yaml parse
         # per process); fall back to a direct parse for bare hermes_logging consumers.
         try:
             from hermes_cli.config_effective import load_user_config_effective
-            cfg = load_user_config_effective(get_config_path())
+            cfg = load_user_config_effective(config_path)
         except Exception:
             from utils import fast_safe_load
-            config_path = get_config_path()
             cfg = {}
             if config_path.exists():
                 with open(config_path, "r", encoding="utf-8") as f:
                     cfg = fast_safe_load(f) or {}
         if not cfg:
-            return (None, None, None)
+            return (None, None, None, None)
         log_cfg = cfg.get("logging", {})
         if isinstance(log_cfg, dict):
-            return (log_cfg.get("level"), log_cfg.get("max_size_mb"), log_cfg.get("backup_count"))
+            return (log_cfg.get("level"), log_cfg.get("max_size_mb"), log_cfg.get("backup_count"),
+                    log_cfg.get("retention_days"))
     except Exception:
         pass
-    return (None, None, None)
+    return (None, None, None, None)
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

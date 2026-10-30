@@ -2,11 +2,11 @@
 
 A long-lived multiplex process (the Desktop's ``hermes serve`` backend) routes records to every
 served profile's ``logs/*.log`` through ``_ProfileRoutingFileHandler``, which lazily opens one
-rotating handler per home. On Windows that handler is ``ConcurrentRotatingFileHandler`` and keeps
-``logs/.__<name>.lock`` open, so ``delete_profile`` run inside that process fails ``rmtree`` with
+rotating handler per home. On Windows that handler keeps its current segment under
+``logs/<stem>.d/`` open, so ``delete_profile`` run inside that process fails ``rmtree`` with
 ``[WinError 32]``: the REST call returns 500, the Desktop drops the bot, the directory stays.
 The routing seam itself is platform-neutral, so the release and the directory removal are
-asserted on every OS (the lock-file symptom only reproduces on Windows).
+asserted on every OS (the open-handle symptom only reproduces on Windows).
 """
 
 import logging
@@ -54,7 +54,9 @@ def _log_into(profile: Path, *, adopt: bool) -> None:
     finally:
         reset_hermes_home_override(token)
     hermes_logging.flush_log_queue()
-    assert "routed record before deletion" in (profile / "logs" / "agent.log").read_text(encoding="utf-8")
+    stem = profile / "logs" / "agent.log"
+    written = [stem, *sorted((stem.parent / "agent.d").glob("*.log"))]
+    assert any(p.exists() and "routed record before deletion" in p.read_text(encoding="utf-8") for p in written)
 
 
 def _routers() -> list:

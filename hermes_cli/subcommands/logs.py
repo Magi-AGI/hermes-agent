@@ -26,6 +26,10 @@ Examples:
     hermes logs --since 1h         Lines from the last hour
     hermes logs --since 30m -f     Follow, starting from 30 min ago
     hermes logs list               List available log files with sizes
+
+A log is shown as one timeline merged from its rotations, its live file and — on
+Windows, where each process writes its own segments under logs/<name>.d/ — every
+process's segments, ordered by timestamp.
 """)
     logs_parser.add_argument(
         "log_name", nargs="?", default="agent",

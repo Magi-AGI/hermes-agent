@@ -368,6 +368,10 @@ def _compute_host_slash(sid: str, session: dict, name: str, command: str) -> tup
     waits longer and installs a late-ack adopter so a slow compression still lands here."""
     route_name = f"slash.{name}"
     is_compress = name == "compress"
+    # A /model control reserves its selection order at send time (Codex HS-C8); other
+    # commands never adopt, so they only read.
+    sent_seq = (_reserve_model_override_selection(session) if name == "model"
+                else int(session.get("_model_override_seq") or 0))
 
     def _on_late_ack(late: dict, _sid=sid) -> None:
         _adopt_late_compute_host_compress_ack(_sid, session, late, route_name=route_name)
@@ -384,6 +388,8 @@ def _compute_host_slash(sid: str, session: dict, name: str, command: str) -> tup
     if ack.get("type") in {"control.error", "error"}:
         return "rejected", str(ack.get("message") or f"compute-host {route_name} failed")
     _apply_compute_host_metadata_mirror(session, ack)
+    if name == "model":
+        _adopt_ack_model_override(session, ack, sent_seq=sent_seq)
     return "ok", str(ack.get("output") or "")
 
 

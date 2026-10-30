@@ -13,6 +13,10 @@ def build_gui_parser(subparsers, *, cmd_gui: Callable) -> None:
             "workspace Node dependencies, builds the current OS's unpacked "
             "Electron app, then launches that packaged artifact.")
     gui_parser.add_argument(
+        "action", nargs="?", choices=["stop"], default=None,
+        help="'stop': stop a wedged desktop app and the backends it owns (exact-PID, ledger-"
+             "verified; never touches the gateway, relay dashboard, or detached jobs)")
+    gui_parser.add_argument(
         "--source", action="store_true",
         help="Launch via `electron .` against apps/desktop/dist instead of the packaged app")
     gui_parser.add_argument(

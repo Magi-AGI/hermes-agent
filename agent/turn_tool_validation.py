@@ -88,14 +88,19 @@ def validate_tool_calls(
     # pre-API sanitizer keeps only the first call/result per id.
     agent._uniquify_tool_call_ids(tool_calls)
 
-    # Repair mismatched tool names before validating (model hallucinations).
+    # Case-only name repair (``Write_File`` -> ``write_file``) when exactly one registered name in
+    # the whole process matches and it is visible here; nothing else is ever renamed (no fuzzy or
+    # spelling repair: see agent_runtime_helpers.repair_tool_call). Every other unknown name stays
+    # invalid and gets an honest answer from _invalid_tool_name_error_content (the callable tools,
+    # or the tool_call / connector correction when that applies).
     for tc in tool_calls:
-        if tc.function.name not in valid_names:
-            repaired = agent._repair_tool_call(tc.function.name)
-            if repaired:
-                agent._vprint(f"{agent.log_prefix}🔧 Auto-repaired tool name: '{tc.function.name}' -> '{repaired}'",
-                              force=True, diagnostic=True)
-                tc.function.name = repaired
+        if tc.function.name in valid_names:
+            continue
+        repaired = agent._repair_tool_call(tc.function.name)
+        if repaired and repaired != tc.function.name:
+            agent._vprint(f"{agent.log_prefix}🔧 Auto-repaired tool name (case only): '{tc.function.name}' -> '{repaired}'",
+                          force=True, diagnostic=True)
+            tc.function.name = repaired
     invalid_tool_calls = [tc.function.name for tc in tool_calls if tc.function.name not in valid_names]
     # Mixed batch: error-result ONLY the invalid calls and run the valid
     # ones; voiding the turn discards real work. Strikes advance only when a
@@ -130,7 +135,7 @@ def validate_tool_calls(
         _append_tool_error_results(
             messages, tool_calls,
             lambda tc: (
-                _invalid_tool_name_error_content(tc.function.name, valid_names)
+                _invalid_tool_name_error_content(tc.function.name, valid_names, agent)
                 if tc.function.name not in valid_names
                 else "Skipped: another tool call in this turn used an invalid name. Please retry this tool call."
             ),

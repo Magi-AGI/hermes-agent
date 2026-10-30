@@ -401,9 +401,22 @@ def _memo_check(fn: Callable, memo: Dict[Callable, bool]) -> bool:
     return memo[fn]
 
 
+# Bumped by every explicit invalidation, so caches DERIVED from availability (the per-agent
+# tool_search scope) can tell an explicit re-probe (``/reload-mcp``, ``hermes tools enable``) apart
+# from TTL churn, without re-running probes on every lookup.
+_check_fn_epoch = 0
+
+
+def check_fn_cache_epoch() -> int:
+    """How many explicit ``invalidate_check_fn_cache`` calls this process has seen."""
+    return _check_fn_epoch
+
+
 def invalidate_check_fn_cache() -> None:
     """Drop all cached ``check_fn`` results (after config changes like ``hermes tools enable``)."""
+    global _check_fn_epoch
     with _check_fn_cache_lock:
+        _check_fn_epoch += 1
         _check_fn_cache.clear()
         _check_fn_last_good.clear()
         _check_fn_ever_good.clear()
@@ -513,6 +526,17 @@ class ToolRegistry:
 
     def get_tool_names_for_toolset(self, toolset: str) -> List[str]:
         return sorted(e.name for e in self._grouped(self._snapshot_entries()).get(toolset, []))
+
+    def get_tool_names_for_toolset_in_scope(self, toolset: str, scope: Optional[str]) -> List[str]:
+        """Names registered under *toolset* in exactly one slot (``None`` = the process-global map),
+        with no merging of the other: what one profile's overlay itself holds."""
+        with self._lock:
+            return sorted(n for n, e in self._slot(scope).items() if e.toolset == toolset)
+
+    def is_registered_anywhere(self, name: str) -> bool:
+        """Whether *name* is registered in the global map or in ANY profile overlay."""
+        with self._lock:
+            return name in self._tools or any(name in overlay for overlay in self._scoped_tools.values())
 
     def register_toolset_alias(self, alias: str, toolset: str) -> None:
         """Register an explicit alias for a canonical toolset name."""
@@ -919,6 +943,16 @@ class ToolRegistry:
 
     def get_all_tool_names(self) -> List[str]:
         return sorted(entry.name for entry in self._snapshot_entries())
+
+    def get_tool_names_all_scopes(self) -> frozenset:
+        """Every registered name: the global map plus EVERY profile overlay, not only the current
+        profile's. For decisions that must know whether a name could belong to some other tool
+        anywhere in the process (tool-name repair); never for listing tools to a model."""
+        with self._lock:
+            names = set(self._tools)
+            for overlay in self._scoped_tools.values():
+                names.update(overlay)
+        return frozenset(names)
 
     def get_schema(self, name: str) -> Optional[dict]:
         """Raw schema dict, bypassing check_fn filtering (token estimates, introspection)."""

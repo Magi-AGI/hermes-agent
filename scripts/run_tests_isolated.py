@@ -105,7 +105,8 @@ def _sandbox_env(box: Path) -> dict:
 
 
 def _log_snapshot(problems: list[str]) -> dict:
-    """{(st_dev, st_ino): (path, size)} for every live log incl. rotated ones; failures -> problems."""
+    """{(st_dev, st_ino): (path, size)} for every live log incl. rotated ones and the Windows
+    per-process segments under logs/<stem>.d/; failures -> problems."""
     snap = {}
 
     def _entries(d: Path, *, dirs: bool) -> list[Path]:
@@ -120,6 +121,7 @@ def _log_snapshot(problems: list[str]) -> dict:
             return []
 
     log_dirs = [LIVE_ROOT / "logs"] + [p / "logs" for p in _entries(LIVE_ROOT / "profiles", dirs=True)]
+    log_dirs += [sd for d in list(log_dirs) for sd in _entries(d, dirs=True) if sd.name.endswith(".d")]
     paths = [p for d in log_dirs for p in _entries(d, dirs=False) if ".log" in p.name]
     for p in paths:
         try:

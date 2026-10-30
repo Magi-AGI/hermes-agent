@@ -113,11 +113,12 @@ class TestCaptureLogSnapshot:
 
 
     def test_race_truncate_after_resolve_reports_empty(self, hermes_home, monkeypatch):
-        """If the log is truncated between resolve and stat, say 'empty', not 'missing'."""
+        """If the log is truncated between source discovery and the read, say 'empty', not
+        'missing'."""
         log_path = hermes_home / "logs" / "agent.log"
         from hermes_cli import debug
 
-        monkeypatch.setattr(debug, "_resolve_log_path", lambda _name: log_path)
+        monkeypatch.setattr(debug, "_snapshot_sources", lambda _name: [log_path])
         log_path.write_text("")
 
         snap = debug._capture_log_snapshot("agent", tail_lines=10)

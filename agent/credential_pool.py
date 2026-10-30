@@ -60,12 +60,17 @@ def _load_config_safe() -> Optional[dict]:
 
     ``load_config_readonly()`` skips the deepcopy ``load_config()`` pays per
     call; the picker calls ``load_pool()`` once per provider row, which made
-    that copy the dominant cost of ``model.options``.
+    that copy the dominant cost of ``model.options``. Inside a payload build's
+    ``models_dev.config_snapshot()`` block the build's ONE snapshot is reused:
+    each load re-reads config.yaml to validate its cache (A43), and a picker
+    build made ~90 of them.
     """
     try:
+        from agent.models_dev import bound_config_snapshot
         from hermes_cli.config import load_config_readonly
 
-        return load_config_readonly()
+        snapshot = bound_config_snapshot()
+        return snapshot if snapshot is not None else load_config_readonly()
     except Exception:
         return None
 

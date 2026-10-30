@@ -1720,6 +1720,11 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
         # OAuth refresh); anything else re-raises.
         is_auth = isinstance(resolve_exc, AuthError)
         is_transient_net = _is_transient_provider_resolve_error(resolve_exc)
+        # A failed config read is not a credential problem, and the chain comes from that same failed
+        # read: never walk it into another provider (A44).
+        from hermes_cli.runtime_provider import fallback_chain_walk_allowed
+        if not fallback_chain_walk_allowed(resolve_exc):
+            raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc
         if not (is_auth or is_transient_net):
             raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc
 
@@ -1736,7 +1741,7 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
             try:
                 from hermes_cli.fallback_config import effective_runtime_provider, resolve_entry_api_key
 
-                fb_kwargs = {"requested": fb_provider, "target_model": fb_model}
+                fb_kwargs = {"requested": fb_provider, "target_model": fb_model, "request_origin": "fallback"}
                 if entry.get("base_url"):
                     fb_kwargs["explicit_base_url"] = entry["base_url"]
                 fb_api_key = resolve_entry_api_key(entry)
@@ -2339,6 +2344,28 @@ class _CronAgentSetup:
     fallback_notice: Optional[str] = None
 
 
+def _fail_closed_fallback_chain_for_cron() -> Any:
+    """The fallback chain a NEW cron agent may be constructed with, read FAIL-CLOSED.
+
+    ``jc.cfg`` comes from ``_load_cron_job_config``, which reads the config FAIL-OPEN (no
+    ``fail_closed``, every failure swallowed to ``{}`` with a "using defaults" warning) because the
+    rest of the job's resolution — model pinning, prefill, toolsets — genuinely prefers defaults over
+    refusing to run. The fallback chain does not: a failed MANAGED read is a failed read (A44), the
+    admin layer can only ever REMOVE or override what the user file says, so applying an unreadable
+    managed file as an empty overlay would hand this agent exactly the chain a managed
+    ``fallback_providers: []`` was suppressing — and
+    ``agent/chat_completion_helpers.try_activate_fallback`` installs chain entries with no gate of
+    its own (R4-4, closed as R5-2).
+
+    Shares the gateway constructor's ONE per-home retention
+    (``gateway/run_config_loaders.load_fail_closed_fallback_chain``) rather than adding a third
+    cache: two slots for one fact is the R4-2 bug class. Resolved against ``_get_hermes_home()``, so
+    the per-profile ticker records under the home whose job is running.
+    """
+    from gateway.run_config_loaders import load_fail_closed_fallback_chain
+    return load_fail_closed_fallback_chain(_get_hermes_home())
+
+
 def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _CronAgentSetup:
     """Resolve model/runtime/reasoning/pool for the run, in the original gate order: exfil guard ->
     preflight (may block) -> runtime (+ fallback chain) -> credential pool -> MCP."""
@@ -2366,7 +2393,7 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
     setup.reasoning_config = _resolve_job_reasoning_config(
         job, _cfg if isinstance(_cfg, dict) else {}, str(setup.model)
     )
-    setup.fallback_model = get_fallback_chain(_cfg) or None
+    setup.fallback_model = _fail_closed_fallback_chain_for_cron()
     setup.credential_pool = _load_credential_pool(setup.runtime, job_id)
     # MCP servers must be registered before AIAgent is constructed.
     _init_cron_mcp_tools(job_id)

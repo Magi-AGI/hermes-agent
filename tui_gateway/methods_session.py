@@ -553,9 +553,29 @@ class _Resume:
         return record
 
     def claim(self, sid: str, record: dict) -> dict | None:
-        """Register ``record`` live under the resume lock, or reuse a concurrent winner's session."""
-        live = _claim_or_reuse_live(sid, self.target, record, None)
-        return None if live is None else _resume_reuse_live(self, *live)
+        """Register ``record`` live under the resume lock, or reuse a concurrent winner's session.
+        A 4007 from the reuse means the WINNER's slot vanished during the unlocked payload build —
+        the slot is free again, so the claim retries once instead of surfacing a refusal every
+        consumer reads as "session does not exist". The retry is gated (agy C2-2): the durable row
+        must still exist (a concurrent delete must NOT be resurrected by re-registering ``record``),
+        and the compression tip must not have rotated (``record`` was built for the pre-rotation
+        target; the surfaced refusal lets ``session.resume``'s retry re-resolve the lineage).
+        A second loss returns the refusal (today's twice-lost-race answer)."""
+        for _ in range(2):
+            live = _claim_or_reuse_live(sid, self.target, record, None)
+            if live is None:
+                return None
+            resp = _resume_reuse_live(self, *live)
+            if (resp.get("error") or {}).get("code") != 4007:
+                return resp
+            if self.db is None or (row := self.db.get_session(self.target)) is None:
+                return resp
+            self.found = row  # follow-tip must resolve against the FRESH row (agy C3-2)
+            before = self.target
+            _resume_follow_tip(self)
+            if self.target != before:
+                return resp
+        return resp
 
     def restore(self):
         """``(sanitized model history, display history, raw history)`` for a cold/eager resume."""
@@ -705,11 +725,107 @@ def _resume_guard(ctx: _Resume) -> dict | None:
 
 
 def _resume_reuse_live(ctx: _Resume, sid: str, session: dict) -> dict:
-    """Reattach an already-live session under the resume lock (held across the client-gone check,
-    transport attach and reap cancel so grace expiry is atomic). _live_session_payload ATTACHES this
-    caller alongside the client(s) already streaming instead of taking the slot from them."""
+    """Reattach an already-live session. Only the ownership CLAIM — client-gone check, reap cancel,
+    transport attach, cols/touch — holds the process-global ``_session_resume_lock``; the payload
+    build (the config/model/git/DB reads that convoyed every resume in the process behind this one
+    lock) runs OUTSIDE it, exactly as ``session.activate`` already builds its payload. A refusal
+    RE-CHECK follows the build, and the volatile turn fields are re-sampled under ``history_lock``
+    so a turn that settled mid-build is reported settled (a frozen ``running: true`` delivered
+    after that turn's own ``message.complete`` wedged the desktop composer permanently).
+    ``_resume_reuse_live_locked`` stays the fully-locked inline variant for the eager double-check.
+    A 4007 from the claim or the re-check means the LIVE slot vanished mid-resume; ``session.resume``
+    re-verifies the stored row and falls through once to the non-live dispatch, so only a truly
+    deleted session ever reads as "not found" to group chats and hosted rooms."""
+    transport = current_transport() or _stdio_transport
     with _session_resume_lock:
-        return _resume_reuse_live_locked(ctx, sid, session)
+        if (refusal := _reattach_refusal(ctx.rid, sid, session)) is not None:
+            return refusal
+        _cancel_ws_orphan_reap(sid)  # unconditionally: the fast path must never race the reap Timer
+        # setdefault as _resume_live_unpersisted does: a live record registered before its first
+        # payload build has no lock yet.
+        with session.setdefault("history_lock", threading.Lock()):
+            _apply_live_session_touch(sid, session, cols=ctx.cols, transport=transport, touch=True)
+    def _volatile_watermark():
+        # Everything a mid-build mutation can change that the payload reports (agy C2-1: a 1-bit
+        # ``running`` comparison missed ABA transitions and hydration/commit-only changes).
+        with session["history_lock"]:
+            return (bool(session.get("running")), _turn_started_at(session),
+                    len(session.get("display_history_prefix") or []) + len(session.get("history") or []),
+                    bool(session.get("resume_hydrating")), int(session.get("resume_message_count") or 0),
+                    session.get("history_version"))
+
+    messages_included = not ctx.omit_messages and not ctx.defer_history
+    for rebuilt in (False, True):
+        before = _volatile_watermark()
+        payload = _live_session_payload(sid, session, omit_messages=ctx.omit_messages)
+        with _session_resume_lock:
+            if (refusal := _reattach_refusal(ctx.rid, sid, session)) is not None:
+                return refusal
+            # A LIVE peer pruned from the fanout mid-build re-attaches here (the recovery path a
+            # transient fanout write failure relies on). A stdio/in-process caller is never
+            # "contained" beside a live WS peer, and a dead socket already got the dead-socket
+            # contract at the claim — neither must re-fire this (agy C1-3).
+            if _transport_is_live_peer(transport) and not _session_transport_contains(session, transport):
+                with session["history_lock"]:
+                    _rebind_live_transport(sid, session, transport)
+            running, turn_started_at, live_count, hydrating, hydrated_count, _ = after = _volatile_watermark()
+            stable = after == before
+            if not stable and not rebuilt and messages_included:
+                # The session changed during the unlocked build and the caller wants MESSAGES: the
+                # snapshot predates the change (a settled reply would vanish from the transcript,
+                # agy C1-2.1/C2-1). One rebuild, then whatever the second pass built stands.
+                continue
+            # Everything below is assembled UNDER the resume lock, as the fully-locked build was
+            # (agy C2-4: unlocked status/registry reads paired torn fields with fresh ones).
+            if stable or not messages_included:
+                # Refresh the volatile fields: sampled together, so the result is coherent. With
+                # messages included and the watermark still moving after the rebuild, SKIP the
+                # refresh instead — the build's own snapshot is internally coherent, which is
+                # exactly what the fully-locked build returned in that race (agy C2-1 pass-2).
+                with session["history_lock"]:
+                    inflight, queued = _inflight_snapshot(session), _queued_prompt_snapshot(session)
+                status = _session_live_status(sid, session)
+                if status in ("working", "idle"):
+                    # Tie the running-derived arm to the locked sample; "waiting"/"starting" come
+                    # from their own sources and stand.
+                    status = "working" if running else "idle"
+                payload.update(running=running, turn_started_at=turn_started_at, status=status)
+                if ctx.omit_messages:
+                    payload["message_count"] = live_count
+                payload["session_key"] = refreshed_key = _session_lookup_key(session, fallback=sid)
+                if isinstance(info := payload.get("info"), dict):
+                    for key, value in (("running", running), ("turn_started_at", turn_started_at),
+                                       ("stored_session_id", refreshed_key)):
+                        if key in info:
+                            info[key] = value
+                for key, value in (("inflight", inflight), ("queued", queued)):
+                    if value:
+                        payload[key] = value
+                    else:
+                        payload.pop(key, None)
+                # The registry cards and todo state refresh WITH the volatile fields: a
+                # clarify/approval resolved mid-build must not be re-delivered. On the exhausted
+                # arm they stay at the build's values instead — one coherent snapshot wholesale,
+                # never fresh cards beside frozen turn state (agy C3-1).
+                for key, value in (("pending_approval", _pending_approval_request_payload(str(session.get("session_key") or ""))),
+                                   ("open_requests", _open_requests(sid)),
+                                   ("pending_connection", _pending_connection_request_payload(sid))):
+                    if value:
+                        payload[key] = value
+                    else:
+                        payload.pop(key, None)
+                payload = _attach_todo_state(payload, session)
+            payload["resumed"] = ctx.target
+            if ctx.defer_history:
+                # A FINISHED hydration's stored count goes stale as later turns commit (agy C2-3);
+                # it is authoritative only while hydration is still running.
+                payload.update(messages=[], hydrating=hydrating,
+                               message_count=(hydrated_count or payload["message_count"]) if hydrating
+                               else payload["message_count"])
+            # A lazy watch session never owns a run loop — overlay the child-run registry last.
+            if session.get("agent") is None and _child_run_active(ctx.target):
+                payload.update(running=True, status="streaming")
+            return _ok(ctx.rid, payload)
 
 
 def _resume_reuse_live_locked(ctx: _Resume, sid: str, session: dict) -> dict:
@@ -721,8 +837,12 @@ def _resume_reuse_live_locked(ctx: _Resume, sid: str, session: dict) -> dict:
                                     transport=current_transport() or _stdio_transport)
     payload["resumed"] = ctx.target
     if ctx.defer_history:
-        payload.update(messages=[], hydrating=bool(session.get("resume_hydrating")),
-                       message_count=int(session.get("resume_message_count") or payload["message_count"]))
+        # The stored hydration count is authoritative only WHILE hydration runs; afterwards it
+        # goes stale as turns commit (agy C2-3) — the payload's own live count is then right.
+        hydrating = bool(session.get("resume_hydrating"))
+        payload.update(messages=[], hydrating=hydrating,
+                       message_count=(int(session.get("resume_message_count") or payload["message_count"])
+                                      if hydrating else payload["message_count"]))
     # A lazy watch session never owns a run loop — overlay the child-run registry.
     if session.get("agent") is None and _child_run_active(ctx.target):
         payload.update(running=True, status="streaming")
@@ -833,44 +953,52 @@ def _resume_eager(ctx: _Resume) -> dict:
                 auth_user_id=_transport_auth_user_id(current_transport()), **stored_runtime_overrides)
         except Exception as e:
             return _err(ctx.rid, 5000, resume_failed_message(e))
+    reuse_resp = None
     with _session_resume_lock:
         live = _find_live_session_by_key(ctx.target, ctx.profile_home)
         if live is not None:
-            with contextlib.suppress(Exception):
-                agent.close()
-            return _resume_reuse_live_locked(ctx, *live)
-        try:
-            with _profile_build_scope(ctx.profile_home):
-                _init_session(sid, ctx.target, agent, history, cols=ctx.cols, cwd=ctx.profile_resume_cwd,
-                              session_db=ctx.db, source=source, explicit_cwd=bool(ctx.profile_resume_cwd))
-                # Ownership TRANSFER: the agent holds the handle for life (AIAgent.close() releases it). The
-                # owns_db drop is UNCONDITIONAL — the session is registered against the handle, so the finally
-                # must not close it even if the transfer was refused (a leak beats "closed database" every
-                # turn). Gated on owns_db: the SHARED launch handle must never move onto one session.
+            # Lost the double-check: reuse the winner under the SAME hold (the check and the
+            # init below must share one critical section, or two eager losers could double-
+            # mint), but close the eagerly built agent AFTER release - its provider/HTTP
+            # teardown must not extend the hold (sweep S2-b).
+            reuse_resp = _resume_reuse_live_locked(ctx, *live)
+        else:
+            try:
+                with _profile_build_scope(ctx.profile_home):
+                    _init_session(sid, ctx.target, agent, history, cols=ctx.cols, cwd=ctx.profile_resume_cwd,
+                                  session_db=ctx.db, source=source, explicit_cwd=bool(ctx.profile_resume_cwd))
+                    # Ownership TRANSFER: the agent holds the handle for life (AIAgent.close() releases it). The
+                    # owns_db drop is UNCONDITIONAL — the session is registered against the handle, so the finally
+                    # must not close it even if the transfer was refused (a leak beats "closed database" every
+                    # turn). Gated on owns_db: the SHARED launch handle must never move onto one session.
+                    if ctx.owns_db:
+                        _transfer_db_to_agent(agent, ctx.db)
+                    ctx.owns_db = False
+                if (session := _sessions.get(sid)) is not None:
+                    if stored_runtime_overrides.get("model_override") is not None:
+                        _publish_model_override(session, stored_runtime_overrides["model_override"])
+                    model_config = _parse_model_config(ctx.found.get("model_config"), quiet=True)
+                    if _row_follows_profile(ctx.found):
+                        session["follow_profile_config"] = True
+                        session["composer_override_profile"] = (
+                            model_config.get("composer_override_profile")
+                            if stored_runtime_overrides.get("model_override") else None)
+                    # Each turn re-binds HERMES_HOME (mid-turn memory/skills reads); lease claimed lazily on turn 1.
+                    if ctx.profile_home is not None:
+                        session["profile_home"] = str(ctx.profile_home)
+                    session.update(display_history_prefix=display_history_prefix, active_session_lease=None)
+            except Exception as e:
+                # _init_session registers _sessions[sid] BEFORE its first db read; left in place the fast path
+                # would serve that dead session forever.
                 if ctx.owns_db:
-                    _transfer_db_to_agent(agent, ctx.db)
-                ctx.owns_db = False
-            if (session := _sessions.get(sid)) is not None:
-                if stored_runtime_overrides.get("model_override") is not None:
-                    session["model_override"] = stored_runtime_overrides["model_override"]
-                model_config = _parse_model_config(ctx.found.get("model_config"), quiet=True)
-                if _row_follows_profile(ctx.found):
-                    session["follow_profile_config"] = True
-                    session["composer_override_profile"] = (
-                        model_config.get("composer_override_profile")
-                        if stored_runtime_overrides.get("model_override") else None)
-                # Each turn re-binds HERMES_HOME (mid-turn memory/skills reads); lease claimed lazily on turn 1.
-                if ctx.profile_home is not None:
-                    session["profile_home"] = str(ctx.profile_home)
-                session.update(display_history_prefix=display_history_prefix, active_session_lease=None)
-        except Exception as e:
-            # _init_session registers _sessions[sid] BEFORE its first db read; left in place the fast path
-            # would serve that dead session forever.
-            if ctx.owns_db:
-                with _sessions_lock:
-                    _sessions.pop(sid, None)
-            return _err(ctx.rid, 5000, resume_failed_message(e))
-        session = _sessions.get(sid) or {}
+                    with _sessions_lock:
+                        _sessions.pop(sid, None)
+                return _err(ctx.rid, 5000, resume_failed_message(e))
+            session = _sessions.get(sid) or {}
+    if reuse_resp is not None:
+        with contextlib.suppress(Exception):
+            agent.close()
+        return reuse_resp
     return _resume_response(
         ctx, sid, session, info=_session_info(agent, session), display=display_history, count_source=raw_history,
         started_at=float(session.get("created_at") or time.time()),
@@ -893,16 +1021,36 @@ def _(rid, params: dict) -> dict:
         if (resp := _resume_guard(ctx)) is not None:
             return resp
         ctx.profile_resume_cwd = _str_param(ctx.found, "cwd") or _profile_configured_cwd(ctx.profile_home)
-        # Fast path: reuse a session live IN THIS PROFILE (never another profile's runtime).
-        with _session_resume_lock:
-            live = _find_live_session_by_key(ctx.target, ctx.profile_home)
-        if live is not None:
-            return _resume_reuse_live(ctx, *live)
-        if ctx.lazy:
-            return _resume_lazy(ctx)
-        if ctx.eager_build:
-            return _resume_eager(ctx)
-        return _resume_deferred(ctx) if ctx.defer_history else _resume_cold(ctx)
+        for attempt in (0, 1):
+            # Fast path: reuse a session live IN THIS PROFILE (never another profile's runtime).
+            with _session_resume_lock:
+                live = _find_live_session_by_key(ctx.target, ctx.profile_home)
+            if live is not None:
+                resp = _resume_reuse_live(ctx, *live)
+            elif ctx.lazy:
+                resp = _resume_lazy(ctx)
+            elif ctx.eager_build:
+                resp = _resume_eager(ctx)
+            else:
+                resp = _resume_deferred(ctx) if ctx.defer_history else _resume_cold(ctx)
+            if attempt or (resp.get("error") or {}).get("code") != 4007:
+                return resp
+            # A LIVE slot vanished mid-resume — on the fast path, or inside a dispatch path's
+            # claim whose concurrent winner died during the unlocked build (agy C1-1). The STORED
+            # row may well survive, and 4007 reads as "session does not exist" to every consumer
+            # (group chats fork their history on it, hosted rooms fail the turn). Re-verify the
+            # durable row, re-resolve the compression tip and the guard against the FRESH row
+            # (agy C1-4/C2-2: a mid-build compression retires the parent row, and reopening it
+            # would fork the lineage), then try ONCE more. A genuinely deleted session keeps the
+            # refusal.
+            if (row := ctx.db.get_session(ctx.target)) is None:
+                return resp
+            ctx.found = row
+            _resume_follow_tip(ctx)
+            if (guarded := _resume_guard(ctx)) is not None:
+                return guarded
+            ctx.profile_resume_cwd = _str_param(ctx.found, "cwd") or _profile_configured_cwd(ctx.profile_home)
+        return resp
     finally:
         # Refcounting alone does not release the sqlite fds: SessionDB pins ITSELF (atexit.register) once its
         # background token writer starts; only close() unregisters.

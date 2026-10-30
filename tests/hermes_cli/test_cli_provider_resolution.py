@@ -126,6 +126,25 @@ def _import_cli():
     return importlib.import_module("cli")
 
 
+def _write_user_fallback_chain(chain):
+    """Put *chain* in the REAL ``$HERMES_HOME/config.yaml`` the CLI startup reads.
+
+    ``HermesCLI.__init__`` reads its fallback chain fail-closed from the user ``config.yaml``
+    through the one shared chain primitive rather than from the in-memory ``CLI_CONFIG``, so a
+    managed ``fallback_providers: []`` cannot be dropped by a fail-open overlay. ``CLI_CONFIG``
+    stays the seam for every other key; for this one the file is the seam. The autouse
+    ``_hermetic_environment`` fixture already points ``HERMES_HOME`` at a per-test tempdir.
+    """
+    import yaml
+
+    from hermes_constants import get_hermes_home
+
+    config_path = get_hermes_home() / "config.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(yaml.safe_dump({"fallback_providers": chain}), encoding="utf-8")
+    return config_path
+
+
 def test_provider_flag_uses_named_custom_default_model(monkeypatch):
     """`--provider <custom>` without `-m` uses that entry's default_model (#86978)."""
     cli = _import_cli()
@@ -625,6 +644,11 @@ def test_startup_fallback_re_resolves_reasoning_for_the_fallback_model(monkeypat
     cli = _import_cli()
     monkeypatch.setattr(cli, "_cprint", lambda *a, **k: None)
     monkeypatch.setitem(cli.CLI_CONFIG, "model", {"default": "primary-model", "provider": "openai-codex"})
+    # The chain is read from the user config.yaml fail-closed at startup now, not out of the
+    # in-memory CLI_CONFIG, so the chain this test needs the startup swap to find has to exist on
+    # disk. CLI_CONFIG keeps the key too: `_resolve_runtime_with_fallback` and the reasoning
+    # re-resolution below both still read it from there.
+    _write_user_fallback_chain([{"provider": "zai", "model": "glm-5.3-flash"}])
     monkeypatch.setitem(cli.CLI_CONFIG, "fallback_providers", [{"provider": "zai", "model": "glm-5.3-flash"}])
     monkeypatch.setitem(cli.CLI_CONFIG, "agent", {
         **cli.CLI_CONFIG.get("agent", {}), "reasoning_effort": "medium",

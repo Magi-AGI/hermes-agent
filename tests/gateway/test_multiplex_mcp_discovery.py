@@ -76,7 +76,8 @@ async def test_reload_mcp_only_touches_requesting_profile(
     def fake_shutdown(*, scope=None) -> None:
         seen.append(("shutdown", scope, get_hermes_home()))
 
-    def fake_discover() -> list[str]:
+    def fake_discover(**kwargs) -> list[str]:  # R9: the gateway /reload-mcp is explicit
+        assert kwargs == {"bypass_lazy_cache": True}, kwargs
         seen.append(("discover", get_hermes_home()))
         return []
 
@@ -133,7 +134,7 @@ async def test_reload_mcp_formats_scoped_connection_keys_before_refreshing_cache
         {launch_key: launch_scope, worker_key: worker_scope},
     )
     monkeypatch.setattr(_mcp_lifecycle, "shutdown_mcp_servers", lambda **_kwargs: None)
-    monkeypatch.setattr(_mcp_discovery, "discover_mcp_tools", lambda: [])
+    monkeypatch.setattr(_mcp_discovery, "discover_mcp_tools", lambda **_kw: [])  # R9: explicit reload kwarg
 
     event = MessageEvent(
         text="/reload-mcp", message_id="m1",
@@ -179,12 +180,15 @@ async def test_reload_mcp_reports_a_shared_server_to_a_non_owner_profile(
     monkeypatch.setattr(mcp_tool, "_servers", {"shared": live_server})
     monkeypatch.setattr(mcp_tool, "_server_scope_keys", {"shared": launch_scope})
     monkeypatch.setattr(mcp_tool, "_server_tool_scopes", {"shared": {launch_scope}}, raising=False)
+    # R10: per-profile policy records are connection state like the scope map above; isolate them too.
+    monkeypatch.setattr(mcp_tool, "_server_scope_configs", {}, raising=False)
+    monkeypatch.setattr(mcp_tool, "_server_scope_epochs", {}, raising=False)
     monkeypatch.setattr(mcp_tool, "_server_connecting", set())
     monkeypatch.setattr(mcp_tool, "_server_connect_errors", {})
     monkeypatch.setattr(mcp_tool, "_lazy_server_configs", {})
     monkeypatch.setattr(mcp_tool, "_mcp_registry_scope", lambda: worker_scope)
 
-    def fake_discover() -> list[str]:
+    def fake_discover(**_kw) -> list[str]:  # R9: the gateway /reload-mcp passes bypass_lazy_cache=True
         from tools import mcp_tool_registration as _mcp_registration
         _mcp_registration.register_connected_into_current_scope({"shared": {}})
         return ["mcp__shared__tool"]
@@ -285,7 +289,12 @@ def test_shared_server_tools_are_callable_and_removed_on_non_owner_reload(
             "_server_scope_keys": dict(mcp_tool._server_scope_keys),
             "_server_tool_scopes": dict(mcp_tool._server_tool_scopes),
             "_mcp_tool_server_names": dict(mcp_tool._mcp_tool_server_names),
+            # R10: per-profile policy records are connection state; isolate them like the rest.
+            "_server_scope_configs": dict(mcp_tool._server_scope_configs),
+            "_server_scope_epochs": dict(mcp_tool._server_scope_epochs),
         }
+        mcp_tool._server_scope_configs.clear()
+        mcp_tool._server_scope_epochs.clear()
         mcp_tool._servers.clear()
         mcp_tool._server_scope_keys.clear()
         mcp_tool._server_tool_scopes.clear()

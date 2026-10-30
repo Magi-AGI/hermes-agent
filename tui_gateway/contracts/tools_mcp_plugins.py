@@ -111,12 +111,16 @@ method("reload.env", params=ReloadEnvParams, result=ReloadEnvResult,
 
 class ReloadMcpParams(Params):
     """Without ``confirm`` the handler may answer ``confirm_required`` (per ``approvals.mcp_reload_confirm``);
-    ``always`` persists the opt-out; ``rev`` is the config revision the caller wants loaded (coalescing)."""
+    ``always`` persists the opt-out; ``rev`` is the config revision the caller wants loaded (coalescing).
+    ``explicit`` marks a reload the USER asked for (the typed ``/reload-mcp``): ``lazy: true`` servers are
+    then live-connected instead of registered from the schema cache, and the request never coalesces
+    into an automatic reload. Config-sync and write-through reloads leave it false."""
 
     session_id: str | None = None
     confirm: bool = False
     always: bool = False
     rev: str | None = None
+    explicit: bool = False
 
 
 class ReloadMcpStatus(WireEnum):

@@ -232,6 +232,64 @@ def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> No
     _mirror_frame_session_info(session, frame)
 
 
+def _publish_model_override(session: dict, value):
+    """The ONE parent-side writer of ``session["model_override"]``: assign (``None`` pops) and
+    COMMIT a selection order above every reserved one, under ``history_lock``; returns the
+    previous value. Two counters order selections against in-flight host acks (Codex
+    HS-C6/HS-C8): ``_model_override_seq`` is the last COMMITTED order and
+    ``_model_override_reserved`` the highest order handed to a forwarded ``/model`` control.
+    A publication supersedes every open reservation — an equal-value re-selection or a /new
+    reset is still newer intent than any ack still in flight."""
+    with _history_lock(session):
+        prev = session.get("model_override")
+        if value is None:
+            session.pop("model_override", None)
+        else:
+            session["model_override"] = value
+        committed = max(int(session.get("_model_override_seq") or 0),
+                        int(session.get("_model_override_reserved") or 0)) + 1
+        session["_model_override_seq"] = committed
+        session["_model_override_reserved"] = committed
+    return prev
+
+
+def _reserve_model_override_selection(session: dict) -> int:
+    """Reserve the next selection order for a ``/model`` control about to be forwarded.
+
+    Two overlapping ``/model`` controls that merely READ the order would share it, and
+    whichever ack arrived first would win over the later selection (Codex HS-C8). A
+    reservation is NOT a commit: a control that fails or times out leaves nothing behind, so
+    an older control's successful ack still adopts (HS-C8 residual) — only a newer COMMIT
+    (adoption or publication) supersedes it."""
+    with _history_lock(session):
+        reserved = max(int(session.get("_model_override_seq") or 0),
+                       int(session.get("_model_override_reserved") or 0)) + 1
+        session["_model_override_reserved"] = reserved
+        return reserved
+
+
+def _adopt_ack_model_override(session: dict, ack: dict, *, sent_seq: int) -> None:
+    """Adopt a host-reported model override from a ``/model`` ack whose reservation is
+    ``sent_seq`` — ONLY if nothing newer has been COMMITTED since (adopted or published).
+    A later reservation that failed committed nothing and does not block this one; a later
+    adoption or publication does. Adoption commits the reservation's own order. Callers
+    restrict this to ``/model`` acks: any other forwarded command's ack reports the host's
+    CURRENT override, which may predate a selection the host has not received yet."""
+    if not isinstance(ack, dict) or "model_override" not in ack:
+        return
+    with _history_lock(session):
+        if int(sent_seq) <= int(session.get("_model_override_seq") or 0):
+            return
+        value = ack.get("model_override")
+        if value is None:
+            session.pop("model_override", None)
+        else:
+            session["model_override"] = value
+        session["_model_override_seq"] = int(sent_seq)
+        session["_model_override_reserved"] = max(
+            int(session.get("_model_override_reserved") or 0), int(sent_seq))
+
+
 def _adopt_frame_message_count(session: dict, frame: dict) -> None:
     """Caller holds history_lock."""
     if frame.get("message_count") is not None:

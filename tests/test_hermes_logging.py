@@ -11,12 +11,9 @@ from unittest.mock import patch
 import pytest
 
 import hermes_logging
-# Use whatever RotatingFileHandler class hermes_logging actually resolved so
-# the autouse fixture's isinstance checks (which strip rotating handlers
-# between tests) match the real handlers on every platform. hermes_logging
-# aliases concurrent-log-handler's ConcurrentRotatingFileHandler on Windows
-# (the #44873 fix) but keeps stdlib RotatingFileHandler on POSIX, so importing
-# the name from the module under test keeps the two in lockstep.
+# Both file-handler kinds (the POSIX shared-file handler and the Windows per-process
+# segment handler) derive from stdlib RotatingFileHandler, so one isinstance check
+# matches the real handlers on every platform.
 from hermes_logging import RotatingFileHandler
 
 
@@ -52,6 +49,13 @@ def _reset_logging_state():
     root.setLevel(prev_root_level)
     hermes_logging._logging_initialized = False
     hermes_logging.clear_session_context()
+
+
+def _log_text(stem: Path) -> str:
+    """Everything written for *stem* (``…/logs/agent.log``), whichever layout the host uses: the
+    shared file on POSIX, this process's segments under ``<stem>.d/`` on Windows."""
+    segments = sorted((stem.parent / f"{stem.stem}.d").glob("*.log"))
+    return "".join(p.read_text(encoding="utf-8") for p in [stem, *segments] if p.exists())
 
 
 @pytest.fixture
@@ -111,10 +115,24 @@ class TestSetupLogging:
         # Flush handlers
         hermes_logging.flush_log_queue()
 
-        agent_log = hermes_home / "logs" / "agent.log"
-        assert agent_log.exists()
-        content = agent_log.read_text()
+        # Layout-agnostic: the shared file on POSIX, this process's segment on Windows.
+        content = _log_text(hermes_home / "logs" / "agent.log")
         assert "test message for agent.log" in content
+
+    @pytest.mark.windows_only
+    def test_windows_writes_per_process_segments_and_takes_no_cross_process_lock(self, hermes_home):
+        """Gate H4: no shared agent.log, no concurrent-log-handler lock file — each process owns
+        its segment under agent.d/ and the writer never waits on another process."""
+        hermes_logging.setup_logging(hermes_home=hermes_home)
+        logging.getLogger("test_hermes_logging.segments").info("segment me")
+        hermes_logging.flush_log_queue()
+
+        logs = hermes_home / "logs"
+        assert not (logs / "agent.log").exists()
+        assert not list(logs.glob(".__*.lock"))
+        segments = list((logs / "agent.d").glob("*.log"))
+        assert len(segments) == 1
+        assert "segment me" in segments[0].read_text(encoding="utf-8")
 
     def test_profile_routing_follows_context_home(self, hermes_home, tmp_path):
         """Desktop multiplex cron records are written to their owning profile."""
@@ -135,12 +153,8 @@ class TestSetupLogging:
             reset_hermes_home_override(token)
         hermes_logging.flush_log_queue()
 
-        assert "profile-routed cron record" in (
-            profile_home / "logs" / "agent.log"
-        ).read_text()
-        assert "profile-routed cron record" not in (
-            hermes_home / "logs" / "agent.log"
-        ).read_text()
+        assert "profile-routed cron record" in _log_text(profile_home / "logs" / "agent.log")
+        assert "profile-routed cron record" not in _log_text(hermes_home / "logs" / "agent.log")
 
     def test_release_profile_log_handlers_closes_only_deleted_profile(self, hermes_home, tmp_path):
         """Profile deletion releases its routed log files without disturbing another profile."""
@@ -181,8 +195,8 @@ class TestSetupLogging:
         assert all(deleted_home.resolve() not in handler._profile_handlers for handler in routers)
         assert all(deleted_home.resolve() not in handler._profile_homes for handler in routers)
         assert all(other_home.resolve() in handler._profile_handlers for handler in routers)
-        assert "other profile log handles" in (other_home / "logs" / "agent.log").read_text()
-        assert "other profile log handles" in (other_home / "logs" / "errors.log").read_text()
+        assert "other profile log handles" in _log_text(other_home / "logs" / "agent.log")
+        assert "other profile log handles" in _log_text(other_home / "logs" / "errors.log")
 
     def test_a_second_home_routes_instead_of_stacking_an_unfiltered_handler(self, hermes_home, tmp_path):
         """A dashboard or serve backend builds agents for several profiles in ONE process, and each
@@ -209,8 +223,8 @@ class TestSetupLogging:
         logger.info("turn of the launch profile")
         hermes_logging.flush_log_queue()
 
-        a_log = (hermes_home / "logs" / "agent.log").read_text()
-        b_log = (profile_home / "logs" / "agent.log").read_text()
+        a_log = _log_text(hermes_home / "logs" / "agent.log")
+        b_log = _log_text(profile_home / "logs" / "agent.log")
         assert "turn of profile b" in b_log and "turn of profile b" not in a_log
         assert "turn of the launch profile" in a_log and "turn of the launch profile" not in b_log
 
@@ -235,8 +249,8 @@ class TestSetupLogging:
             reset_hermes_home_override(token)
         hermes_logging.flush_log_queue()
 
-        assert (profile_home / "logs" / "agent.log").read_text().count("once please") == 1
-        assert "once please" not in (hermes_home / "logs" / "agent.log").read_text()
+        assert _log_text(profile_home / "logs" / "agent.log").count("once please") == 1
+        assert "once please" not in _log_text(hermes_home / "logs" / "agent.log")
 
     def test_a_component_log_added_after_routing_is_routed_too(self, hermes_home, tmp_path):
         """setup_logging(mode="gateway") for an already-known home AFTER a second home turned
@@ -258,9 +272,9 @@ class TestSetupLogging:
         logger.info("gw-a")
         hermes_logging.flush_log_queue()
 
-        a_log = (hermes_home / "logs" / "gateway.log").read_text()
+        a_log = _log_text(hermes_home / "logs" / "gateway.log")
         assert "gw-a" in a_log and "gw-b" not in a_log
-        assert "gw-b" in (profile_home / "logs" / "gateway.log").read_text()
+        assert "gw-b" in _log_text(profile_home / "logs" / "gateway.log")
 
 
 
@@ -319,9 +333,7 @@ class TestGatewayMode:
 
         hermes_logging.flush_log_queue()
 
-        gw_log = hermes_home / "logs" / "gateway.log"
-        assert gw_log.exists()
-        assert "telegram connected" in gw_log.read_text()
+        assert "telegram connected" in _log_text(hermes_home / "logs" / "gateway.log")
 
     def test_gateway_log_rejects_non_gateway_records(self, hermes_home):
         """gateway.log does NOT capture records from tools.*, agent.*, etc."""
@@ -335,11 +347,9 @@ class TestGatewayMode:
 
         hermes_logging.flush_log_queue()
 
-        gw_log = hermes_home / "logs" / "gateway.log"
-        if gw_log.exists():
-            content = gw_log.read_text()
-            assert "running command" not in content
-            assert "compressing context" not in content
+        content = _log_text(hermes_home / "logs" / "gateway.log")
+        assert "running command" not in content
+        assert "compressing context" not in content
 
 
 
@@ -367,9 +377,7 @@ class TestGuiMode:
 
         hermes_logging.flush_log_queue()
 
-        gui_log = hermes_home / "logs" / "gui.log"
-        assert gui_log.exists()
-        content = gui_log.read_text()
+        content = _log_text(hermes_home / "logs" / "gui.log")
         assert "dashboard online" in content
         assert "ws connected" in content
         assert "gateway event" not in content
@@ -388,8 +396,7 @@ class TestSessionContext:
 
         hermes_logging.flush_log_queue()
 
-        agent_log = hermes_home / "logs" / "agent.log"
-        content = agent_log.read_text()
+        content = _log_text(hermes_home / "logs" / "agent.log")
         assert "[abc123]" in content
         assert "tagged message" in content
 
@@ -487,10 +494,11 @@ class TestAddRotatingHandler:
         hermes_logging.set_session_context("factory_test")
         logger.info("test msg")
         hermes_logging.flush_log_queue()
-        content = log_path.read_text()
+        content = _log_text(log_path)
         assert "[factory_test]" in content
 
         # Clean up
+    @pytest.mark.linux_only  # managed mode is a NixOS install; Windows writes segments instead
     def test_managed_mode_initial_open_sets_group_writable(self, tmp_path):
         log_path = tmp_path / "managed-open.log"
         formatter = logging.Formatter("%(message)s")
@@ -511,94 +519,396 @@ class TestAddRotatingHandler:
 
 
 
-class TestWindowsConcurrentLogLockTimeout:
-    """Windows concurrent-log-handler lock timeouts stay inside logging."""
-
-    def _make_logger_and_handler(self, log_path: Path):
-        logger = logging.getLogger(f"_test_concurrent_lock_timeout_{log_path.stem}")
-        logger.handlers.clear()
-        logger.propagate = False
-        logger.setLevel(logging.INFO)
-
-        handler = hermes_logging._ManagedRotatingFileHandler(
-            str(log_path), maxBytes=1, backupCount=1, encoding="utf-8",
-        )
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        logger.addHandler(handler)
-        return logger, handler
-
-    @pytest.mark.windows_only
-    def test_helper_only_matches_windows_concurrent_lock_timeout(self):
-        # Windows-only: concurrent-log-handler (and therefore its cross-process
-        # lock timeout) is only installed on Windows — faking sys.platform
-        # exercised the string check without the handler that raises it.
-        assert hermes_logging._is_windows_concurrent_log_lock_timeout(
-            RuntimeError("Cannot acquire lock after 20 attempts")
-        )
-        assert not hermes_logging._is_windows_concurrent_log_lock_timeout(
-            RuntimeError("some other logging failure")
-        )
-
-    @pytest.mark.linux_only
-    def test_helper_never_matches_off_windows(self):
-        # On POSIX the suppression must stay inert: stdlib RotatingFileHandler
-        # is in use, so this RuntimeError text is never a CLH lock timeout.
-        assert not hermes_logging._is_windows_concurrent_log_lock_timeout(
-            RuntimeError("Cannot acquire lock after 20 attempts")
-        )
-
-    @pytest.mark.windows_only
-    def test_lock_timeout_routed_to_handle_error_is_suppressed(self, tmp_path, capsys):
-        """Mirror CLH's real control flow.
-
-        ``concurrent-log-handler``'s ``emit()`` wraps its whole body in
-        ``try/except Exception: self.handleError(record)``, so the lock
-        RuntimeError raised in ``_do_lock()`` is caught *inside* CLH and routed
-        to ``handleError`` with the exception live in ``sys.exc_info()``.  We
-        invoke ``handleError`` the same way CLH would and assert no traceback
-        reaches stderr (the slash-worker surface).
-
-        Windows-only: the suppression is keyed on the real host, and only on
-        Windows is the base handler CLH at all — the fake platform gave us the
-        branch without the handler that raises."""
-        logger, handler = self._make_logger_and_handler(tmp_path / "agent.log")
-        record = logger.makeRecord(
-            logger.name, logging.INFO, __file__, 0, "force rollover", (), None,
-        )
-        try:
-            try:
-                raise RuntimeError("Cannot acquire lock after 20 attempts")
-            except RuntimeError:
-                handler.handleError(record)
-
-            captured = capsys.readouterr()
-            assert "Cannot acquire lock after 20 attempts" not in captured.err
-            assert "--- Logging error ---" not in captured.err
-        finally:
-            logger.removeHandler(handler)
-            handler.close()
-
-
-
 class TestReadLoggingConfig:
     """_read_logging_config() reads from config.yaml."""
 
     def test_returns_none_when_no_config(self, hermes_home):
-        level, max_size, backup = hermes_logging._read_logging_config()
-        assert level is None
-        assert max_size is None
-        assert backup is None
+        assert all(value is None for value in hermes_logging._read_logging_config())
 
     def test_reads_logging_section(self, hermes_home):
         import yaml
         config = {"logging": {"level": "DEBUG", "max_size_mb": 10, "backup_count": 5}}
         (hermes_home / "config.yaml").write_text(yaml.dump(config))
 
-        level, max_size, backup = hermes_logging._read_logging_config()
+        level, max_size, backup = hermes_logging._read_logging_config()[:3]
         assert level == "DEBUG"
         assert max_size == 10
         assert backup == 5
 
+    def test_logging_retention_days_reaches_the_segment_pruner(self, hermes_home):
+        """config.yaml ``logging.retention_days`` → setup_logging prunes dead-process segments
+        older than that under this home, keeps younger ones, and never touches legacy files."""
+        import os
+        import time
+        import yaml
+
+        (hermes_home / "config.yaml").write_text(yaml.dump({"logging": {"retention_days": 1}}))
+        logs = hermes_home / "logs" / "agent.d"
+        logs.mkdir(parents=True)
+        stale = logs / "11-20261001-000000.1.log"
+        fresh = logs / "12-20261029-000000.1.log"
+        legacy = hermes_home / "logs" / "agent.log.1"
+        for path, age_days in ((stale, 3), (fresh, 0.5), (legacy, 30)):
+            path.write_text("x\n", encoding="utf-8")
+            stamp = time.time() - age_days * 86400
+            os.utime(path, (stamp, stamp))
+
+        hermes_logging.setup_logging(hermes_home=hermes_home)
+
+        assert not stale.exists()
+        assert fresh.exists() and legacy.exists()
+
+
+
+    def test_each_routed_home_is_pruned_by_its_own_retention(self, hermes_home, tmp_path):
+        """Multiplex: profile B's segments are pruned by B's config.yaml, never by the launch
+        profile's — A's one-day retention must not delete B's thirty-day history."""
+        import os
+        import time
+        import yaml
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        home_b = tmp_path / "profile-b"
+        home_b.mkdir()
+        (hermes_home / "config.yaml").write_text(yaml.dump({"logging": {"retention_days": 1}}))
+        (home_b / "config.yaml").write_text(yaml.dump({"logging": {"retention_days": 30}}))
+        stale_a = hermes_home / "logs" / "agent.d" / "11-20261001-000000.1.log"
+        stale_b = home_b / "logs" / "agent.d" / "11-20261001-000000.1.log"
+        for path in (stale_a, stale_b):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("x\n", encoding="utf-8")
+            stamp = time.time() - 5 * 86400
+            os.utime(path, (stamp, stamp))
+
+        hermes_logging.setup_logging(hermes_home=hermes_home)
+        assert hermes_logging.enable_profile_log_routing([hermes_home, home_b]) is True
+        token = set_hermes_home_override(home_b)
+        try:
+            logging.getLogger("agent.retention-routing-test").info("touch b")
+        finally:
+            reset_hermes_home_override(token)
+        hermes_logging.flush_log_queue()
+
+        assert not stale_a.exists()
+        assert stale_b.exists()
+
+
+    def test_a_boolean_retention_is_not_a_day_count(self, hermes_home):
+        """`retention_days: true` is a config mistake, not "one day": fall back to the default
+        instead of pruning everything older than 24 h (H4-R1-3b)."""
+        import os
+        import time
+        import yaml
+
+        (hermes_home / "config.yaml").write_text(yaml.dump({"logging": {"retention_days": True}}))
+        three_days = hermes_home / "logs" / "agent.d" / "11-20261001-000000.1.log"
+        three_days.parent.mkdir(parents=True)
+        three_days.write_text("x\n", encoding="utf-8")
+        stamp = time.time() - 3 * 86400
+        os.utime(three_days, (stamp, stamp))
+
+        hermes_logging.setup_logging(hermes_home=hermes_home)
+
+        assert three_days.exists()
+
+
+    def test_an_infinite_retention_disables_pruning(self, hermes_home):
+        """`retention_days: .inf` is "keep forever", not the default (H4-R2-6)."""
+        import os
+        import time
+        import yaml
+
+        (hermes_home / "config.yaml").write_text(yaml.dump({"logging": {"retention_days": float("inf")}}))
+        ancient = hermes_home / "logs" / "agent.d" / "11-20201001-000000.1.log"
+        ancient.parent.mkdir(parents=True)
+        ancient.write_text("x\n", encoding="utf-8")
+        stamp = time.time() - 2000 * 86400
+        os.utime(ancient, (stamp, stamp))
+
+        hermes_logging.setup_logging(hermes_home=hermes_home)
+
+        assert ancient.exists()
+
+
+    def test_an_unreadable_config_never_authorizes_pruning(self, hermes_home):
+        """Deletion needs a successfully observed policy: when the home's config cannot be read,
+        nothing is pruned — a failed read is not "no retention setting" (Codex LL-C1)."""
+        import os
+        import time
+
+        (hermes_home / "config.yaml").mkdir()  # a config path that exists but cannot be read
+        stale = hermes_home / "logs" / "agent.d" / "11-20261001-000000.1.log"
+        stale.parent.mkdir(parents=True)
+        stale.write_text("x\n", encoding="utf-8")
+        stamp = time.time() - 400 * 86400
+        os.utime(stale, (stamp, stamp))
+
+        hermes_logging.setup_logging(hermes_home=hermes_home)
+
+        assert stale.exists()
+
+    def test_an_oversized_retention_integer_falls_back_to_the_default(self, hermes_home):
+        """``retention_days: 1e400``-sized integers overflow float(); that is a config mistake,
+        not a crash at handler construction (Codex LL-L2)."""
+        assert hermes_logging._retention_days(10 ** 400) == 7.0
+
+
+    def test_a_config_that_is_not_a_mapping_never_authorizes_pruning(self, hermes_home):
+        """``retention_days = 0`` typed into config.yaml parses as a YAML string, not a mapping:
+        that is an unreadable policy, not an absent one (H4-R6-4)."""
+        import os
+        import time
+
+        (hermes_home / "config.yaml").write_text("retention_days = 0\n", encoding="utf-8")
+        stale = hermes_home / "logs" / "agent.d" / "11-20261001-000000.1.log"
+        stale.parent.mkdir(parents=True)
+        stale.write_text("x\n", encoding="utf-8")
+        stamp = time.time() - 400 * 86400
+        os.utime(stale, (stamp, stamp))
+
+        hermes_logging.setup_logging(hermes_home=hermes_home)
+
+        assert stale.exists()
+
+
+    def test_the_retention_policy_is_derived_from_the_bytes_it_validated(self, hermes_home, monkeypatch):
+        """Validation and policy must come from ONE observation of config.yaml: a file that is a
+        valid mapping when probed but is replaced before a second read must not yield a different
+        policy (Codex LL-C1). The seam is the single bytes observation."""
+        calls = []
+
+        def observe(path):
+            calls.append(path)
+            return b"logging:\n  retention_days: 0\n" if len(calls) == 1 else b"retention_days = 0\n"
+
+        (hermes_home / "config.yaml").write_text("logging:\n  retention_days: 0\n", encoding="utf-8")
+        monkeypatch.setattr(hermes_logging, "_observe_config_bytes", observe)
+        assert hermes_logging._retention_policy(hermes_home) == 0.0
+        assert len(calls) == 1
+
+    def test_a_configured_managed_scope_disables_pruning_in_this_version(self, hermes_home, monkeypatch, tmp_path):
+        """Lake's scope ruling after Codex round 6 (option 2): whether an administrator's overlay
+        exists but is unavailable cannot be told apart from "no overlay" by any filesystem probe,
+        so when a managed scope MIGHT exist (``HERMES_MANAGED_DIR`` set, or the platform default
+        present) this version never prunes and never reads the managed files. Only the home's own
+        config decides, and only when no managed scope is configured."""
+        managed = tmp_path / "managed"
+        managed.mkdir()
+        (hermes_home / "config.yaml").write_text("logging:\n  retention_days: 30\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+        (managed / "config.yaml").write_text("logging:\n  retention_days: 0\n", encoding="utf-8")
+        assert hermes_logging._retention_policy(hermes_home) is None  # an admin pin exists: never prune
+        (managed / "config.yaml").write_text("logging:\n  retention_days: 1\n", encoding="utf-8")
+        assert hermes_logging._retention_policy(hermes_home) is None  # never adopted either: not read
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "corp-link" / "hermes"))  # unavailable ancestry
+        assert hermes_logging._retention_policy(hermes_home) is None
+        monkeypatch.delenv("HERMES_MANAGED_DIR", raising=False)  # no managed scope: the home decides
+        assert hermes_logging._retention_policy(hermes_home) == 30.0
+        # Outside pytest the platform default is probed on EVERY platform, exactly as the
+        # canonical resolver (managed_scope.get_managed_dir) adopts it — on Windows the POSIX
+        # path is drive-relative (C:\etc\hermes), but the resolver accepts such a directory, so
+        # an install that has one is a managed install and must not be pruned (Codex round 7).
+        from hermes_cli import managed_scope
+        monkeypatch.setattr(managed_scope, "_under_pytest", lambda: False)
+        monkeypatch.setattr(managed_scope, "_DEFAULT_MANAGED_DIR", managed)
+        assert hermes_logging._managed_scope_may_exist() is True
+        assert hermes_logging._retention_policy(hermes_home) is None
+        monkeypatch.setattr(managed_scope, "_DEFAULT_MANAGED_DIR", tmp_path / "no-such-dir")
+        assert hermes_logging._managed_scope_may_exist() is False
+        assert hermes_logging._retention_policy(hermes_home) == 30.0
+
+
+    def test_an_env_templated_retention_value_is_expanded_and_an_unresolved_one_blocks_pruning(self, hermes_home, monkeypatch):
+        """``retention_days: "${HERMES_RETENTION_DAYS}"`` is how an administrator pins the value
+        from the service environment; it must expand like every other config value, and an
+        unresolvable reference is an unreadable policy, not the default (H4-R8-3)."""
+        (hermes_home / "config.yaml").write_text('logging:\n  retention_days: "${HERMES_RETENTION_DAYS}"\n', encoding="utf-8")
+        monkeypatch.setenv("HERMES_RETENTION_DAYS", "0")
+        assert hermes_logging._retention_policy(hermes_home) == 0.0
+        monkeypatch.delenv("HERMES_RETENTION_DAYS", raising=False)
+        assert hermes_logging._retention_policy(hermes_home) is None
+
+
+    def test_a_routed_home_resolves_retention_references_in_its_own_scope_never_the_launch_environment(self, hermes_home, monkeypatch, tmp_path):
+        """Codex round 3 (H4-R9-1, P2): the routed handler for profile B is created on the shared
+        logging worker under profile A's process environment. A's launch env must never satisfy
+        B's ``${RETENTION_DAYS}``: B's own ``.env`` decides, an unresolved reference under B is an
+        unreadable policy (no pruning) even when A's environment would resolve it, and only the
+        process's own home may take the value from its launch environment. With a managed scope
+        configured nothing is pruned at all (S19)."""
+        routed = tmp_path / "profile-b"
+        routed.mkdir()
+        (routed / "config.yaml").write_text('logging:\n  retention_days: "${RETENTION_DAYS}"\n', encoding="utf-8")
+        (routed / ".env").write_text("RETENTION_DAYS=0\n", encoding="utf-8")
+        monkeypatch.setenv("RETENTION_DAYS", "1")  # profile A's launch environment
+        assert hermes_logging._retention_policy(routed) == 0.0  # B's .env, not A's env
+        (routed / ".env").write_text("# nothing pinned here\n", encoding="utf-8")
+        assert hermes_logging._retention_policy(routed) is None  # unresolved under B: fail closed
+        (hermes_home / "config.yaml").write_text('logging:\n  retention_days: "${RETENTION_DAYS}"\n', encoding="utf-8")
+        assert hermes_logging._retention_policy(hermes_home) == 1.0  # the process's own home
+        managed = tmp_path / "managed"
+        managed.mkdir()
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+        (managed / "config.yaml").write_text('logging:\n  retention_days: "${RETENTION_DAYS}"\n', encoding="utf-8")
+        assert hermes_logging._retention_policy(routed) is None  # no managed .env pin: the environ is no authority (Codex r4)
+
+
+    def test_a_managed_env_pin_is_never_read_and_never_authorizes_pruning(self, hermes_home, monkeypatch, tmp_path):
+        """H4-R10-1 (P2) and Codex round 4 (H4-R11-1) are moot under S19: ``os.environ`` is not the
+        administrator's scope once ``load_hermes_dotenv`` has published profile A's ``.env`` over
+        it, no record proves what the service was launched with, and the managed ``.env`` is not
+        read either — with a managed scope configured nothing is pruned."""
+        routed = tmp_path / "profile-b"
+        routed.mkdir()
+        (routed / "config.yaml").write_text("logging:\n  retention_days: 30\n", encoding="utf-8")
+        managed = tmp_path / "managed"
+        managed.mkdir()
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+        (managed / "config.yaml").write_text('logging:\n  retention_days: "${RETENTION_DAYS}"\n', encoding="utf-8")
+        monkeypatch.setenv("RETENTION_DAYS", "1")  # what profile A's .env published
+        for pin in ("RETENTION_DAYS=0\n", "RETENTION_DAYS=1\n", "# no pin here\n"):
+            (managed / ".env").write_text(pin, encoding="utf-8")
+            # Option 2: with a managed scope configured nothing is pruned and nothing managed is
+            # read — neither the admin's .env nor the environ (Codex round 4) can authorize deletion.
+            assert hermes_logging._retention_policy(routed) is None, pin
+
+    def test_an_expanded_retention_value_that_is_not_a_number_blocks_pruning(self, hermes_home, monkeypatch):
+        """H4-R10-2 (P2): an expansion that yields ``""``, text, a still-templated value (nested
+        ``${}`` in .env, an unclosed ``${``) is an unreadable policy, never the 7-day default;
+        ``.inf`` from the environment still means keep forever."""
+        cfg = hermes_home / "config.yaml"
+        cfg.write_text('logging:\n  retention_days: "${RETENTION_DAYS}"\n', encoding="utf-8")
+        for bad in ("", "abc", "nan"):
+            monkeypatch.setenv("RETENTION_DAYS", bad)
+            assert hermes_logging._retention_policy(hermes_home) is None, bad
+        monkeypatch.setenv("RETENTION_DAYS", ".inf")
+        assert hermes_logging._retention_policy(hermes_home) == float("inf")
+        (hermes_home / ".env").write_text("RETENTION_DAYS=${BASE_RETENTION}\n", encoding="utf-8")
+        monkeypatch.setenv("RETENTION_DAYS", "1")
+        assert hermes_logging._retention_policy(hermes_home) is None  # nested reference: unresolved
+        (hermes_home / ".env").unlink()
+        cfg.write_text('logging:\n  retention_days: "${RETENTION_DAYS"\n', encoding="utf-8")
+        assert hermes_logging._retention_policy(hermes_home) is None  # unclosed template
+        cfg.write_text('logging:\n  retention_days: "abc"\n', encoding="utf-8")
+        assert hermes_logging._retention_policy(hermes_home) is None  # literal text
+
+    def test_an_unreadable_home_env_blocks_pruning_instead_of_falling_back_to_the_process_environment(self, hermes_home, monkeypatch):
+        """H4-R10-3 (P2): the home's ``.env`` is observed fail-closed like config.yaml; a file that
+        exists but cannot be read is an unreadable policy even when the process environment
+        would resolve the reference."""
+        (hermes_home / "config.yaml").write_text('logging:\n  retention_days: "${RETENTION_DAYS}"\n', encoding="utf-8")
+        (hermes_home / ".env").write_text("RETENTION_DAYS=0\n", encoding="utf-8")
+        monkeypatch.setenv("RETENTION_DAYS", "1")
+        assert hermes_logging._retention_policy(hermes_home) == 0.0
+
+        def denied(path):
+            raise PermissionError(13, "denied", str(path))
+
+        monkeypatch.setattr(hermes_logging, "_observe_env_bytes", denied)
+        assert hermes_logging._retention_policy(hermes_home) is None
+
+    def test_process_home_identity_expands_the_user_and_ignores_task_overrides(self, hermes_home, monkeypatch, tmp_path):
+        """H4-R10-4 (P3): the process-home test goes through hermes_constants and expands ``~``."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.setenv("HERMES_HOME", "~/own-home")
+        (tmp_path / "own-home").mkdir()
+        assert hermes_logging._is_process_home(Path("~/own-home")) is True
+        assert hermes_logging._is_process_home(tmp_path / "own-home") is True
+        assert hermes_logging._is_process_home(tmp_path / "other") is False
+
+
+    def test_a_dangling_managed_link_blocks_pruning_instead_of_reading_as_absence(self, hermes_home, monkeypatch, tmp_path):
+        """Codex round 4 (H4-R11-3, P2): an unobserved dangling ``<managed_dir>/.env`` (or
+        ``config.yaml``) symlink is ``_ABSENT`` to the managed reader, so the pin it normally
+        supplies vanished into the fallback. A link that exists but resolves nowhere is an
+        unreadable policy for both managed files."""
+        from hermes_cli import managed_scope
+
+        managed = tmp_path / "managed"
+        managed.mkdir()
+        dangling: set = set()
+        try:
+            os.symlink(str(tmp_path / "missing-secrets.env"), str(managed / ".env"))
+        except (OSError, NotImplementedError):
+            # No symlink privilege on this host: present the same observation (is_symlink() True,
+            # exists() False) for the paths the test dangles.
+            real_is_symlink = Path.is_symlink
+            monkeypatch.setattr(Path, "is_symlink", lambda self: str(self) in dangling or real_is_symlink(self))
+            dangling.add(str(managed / ".env"))
+
+            def os_symlink(_target, link):
+                dangling.add(str(link))
+
+            monkeypatch.setattr(os, "symlink", os_symlink)
+        (managed / "config.yaml").write_text('logging:\n  retention_days: "${RETENTION_DAYS}"\n', encoding="utf-8")
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+        monkeypatch.setenv("RETENTION_DAYS", "7")
+        managed_scope.invalidate_managed_cache()
+        routed = tmp_path / "profile-b"
+        routed.mkdir()
+        (routed / "config.yaml").write_text("logging:\n  retention_days: 30\n", encoding="utf-8")
+        try:
+            assert hermes_logging._retention_policy(routed) is None
+            (managed / ".env").unlink(missing_ok=True)
+            dangling.discard(str(managed / ".env"))
+            (managed / "config.yaml").unlink()
+            os.symlink(str(tmp_path / "missing-config.yaml"), str(managed / "config.yaml"))
+            managed_scope.invalidate_managed_cache()
+            assert hermes_logging._retention_policy(routed) is None
+        finally:
+            managed_scope.invalidate_managed_cache()
+
+
+    def test_cold_start_with_an_unavailable_managed_source_keeps_existing_segments(self, hermes_home, monkeypatch, tmp_path):
+        """Codex round 5 (H4-R12-1, H4-R12-2, P2): the administrator's pin is unavailable at cold
+        start — the managed DIRECTORY is a link whose target is unmounted, or the managed config
+        link is repointed between a probe and the read. Neither is "no managed policy": an old
+        segment under a user policy that would prune it must SURVIVE the sweep."""
+        import os
+        import time
+        from hermes_cli import managed_scope
+
+        (hermes_home / "config.yaml").write_text("logging:\n  retention_days: 1\n", encoding="utf-8")
+        logs = hermes_home / "logs" / "agent.d"
+        logs.mkdir(parents=True)
+        stale = logs / "11-20261001-000000.1.log"
+        stale.write_text("x\n", encoding="utf-8")
+        stamp = time.time() - 3 * 86400
+        os.utime(stale, (stamp, stamp))
+
+        def sweep():
+            monkeypatch.setattr(hermes_logging, "_pruned_log_dirs", set())
+            managed_scope.invalidate_managed_cache()
+            hermes_logging._prune_segments_once(hermes_home / "logs")
+
+        # (0) Codex round 6 (H4-R13-2): the managed directory is reached through an ancestor that
+        # is unavailable — the candidate itself is not a link, is not a directory, does not exist.
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "corp-link" / "hermes"))
+        sweep()
+        assert stale.exists(), "a managed scope configured through unavailable ancestry is an unreadable policy"
+
+        # (a) the managed directory itself is a dangling link (its target is unmounted)
+        dangling_dir = tmp_path / "etc-hermes"
+        real_is_symlink = Path.is_symlink
+        monkeypatch.setattr(Path, "is_symlink", lambda self: str(self) == str(dangling_dir) or real_is_symlink(self))
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(dangling_dir))
+        sweep()
+        assert stale.exists(), "a dangling managed directory link is an unreadable policy, not an absent one"
+
+        # (b) the managed config link is valid at a pre-read probe and dangling at the read
+        managed = tmp_path / "managed"
+        managed.mkdir()
+        (managed / "config.yaml").write_text("logging:\n  retention_days: 0\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+
+        def repointed_before_read(path):
+            raise FileNotFoundError(2, "repointed", str(path))
+
+        monkeypatch.setattr(managed_scope, "_read_managed_bytes", repointed_before_read)
+        monkeypatch.setattr(Path, "is_symlink", lambda self: str(self) == str(managed / "config.yaml") or real_is_symlink(self))
+        sweep()
+        assert stale.exists(), "a managed source that vanished at the authoritative read is an unreadable policy"
 
 
 class TestExternalRotationRecovery:
@@ -631,6 +941,7 @@ class TestExternalRotationRecovery:
         handler.emit(record)
         hermes_logging.flush_log_queue()
 
+    @pytest.mark.linux_only  # renaming an open file is the POSIX logrotate shape Windows cannot do
     def test_recovers_after_external_rename(self, tmp_path):
         """logrotate-style external rename: ``mv gateway.log gateway.log.1``.
 
@@ -685,6 +996,7 @@ class TestExternalRotationRecovery:
             handler.close()
 
 
+    @pytest.mark.linux_only  # same: external rename of the open shared file
     def test_gateway_log_attached_after_external_rotation_then_re_setup(
         self, hermes_home,
     ):

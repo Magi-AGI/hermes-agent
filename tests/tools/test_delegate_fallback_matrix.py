@@ -1,4 +1,13 @@
-"""Pin x delegation.fallback_providers decision table for child agents (#80450, #65038)."""
+"""Pin x delegation.fallback_providers decision table for child agents (#80450, #65038).
+
+R11: a DECLARED chain is no longer installed as given — it is replaced by what the
+declaration's own configuration owner authorizes under a fail-closed, bypass-aware read
+(``delegate_tool_config._authorized_child_chain``), because a declaration the clean config does
+not contain was reaching a brand-new child agent (R10-2). The declared-chain rows below therefore
+write the chain into the home's ``config.yaml``, which is where production reads it from:
+``routing_cfg`` IS the ``delegation`` section of that file. The pin/absent/empty/malformed rows
+are unaffected and still run without any config at all.
+"""
 
 from unittest.mock import MagicMock, patch
 
@@ -22,30 +31,104 @@ def _parent(chain=None):
     return parent
 
 
+def _clear_chain_caches():
+    """Every config cache AND the shared per-home chain retention — a fresh process's state.
 
-# (pinned, declared fallback_providers, expected) — the six cells plus the malformed edges.
+    The authorization read publishes a clean observation into the per-home retention
+    (``gateway/run_config_loaders``), so without this a chain observed by one test could be
+    served to another through the retention rather than read from its own config.
+    """
+    from gateway import run_config_loaders
+    from hermes_cli import config, config_effective, managed_scope
+
+    for cache in (config._LOAD_CONFIG_CACHE, config._RAW_CONFIG_CACHE,
+                  config._LAST_EXPANDED_CONFIG_BY_PATH):
+        cache.clear()
+    config_effective._EFFECTIVE_CACHE.clear()
+    config_effective._LAST_GOOD_USER_RAW.clear()
+    managed_scope.invalidate_managed_cache()
+    for attr in ("_LAST_CLEAN_FALLBACK_CHAIN", "_LAST_CLEAN_FALLBACK_CHAIN_AT",
+                 "_LAST_CLEAN_FALLBACK_CHAIN_EPOCH"):
+        slot = getattr(run_config_loaders, attr, None)
+        if slot is not None:
+            slot.clear()
+
+
+def _home_declaring(tmp_path, monkeypatch, declared):
+    """Point ``HERMES_HOME`` at *tmp_path* and declare *declared* as the delegation chain there."""
+    import yaml
+
+    from hermes_constants import set_hermes_home_override
+
+    monkeypatch.delenv("HERMES_IGNORE_USER_CONFIG", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"delegation": {"fallback_providers": declared}}), encoding="utf-8")
+    token = set_hermes_home_override(tmp_path)
+    _clear_chain_caches()
+    return token
+
+
+@pytest.fixture
+def declaring_home(tmp_path, monkeypatch):
+    """A clean ``HERMES_HOME`` whose ``config.yaml`` declares ``DECLARED_CHAIN`` for delegation.
+
+    This is the configuration the declared-chain rows describe: the authorization read finds the
+    same chain ``routing_cfg`` carries, so it installs. Without a home the read authorizes nothing
+    and the declaration is correctly refused (that arm is covered in the R11 suite).
+    """
+    from hermes_constants import reset_hermes_home_override
+
+    token = _home_declaring(tmp_path, monkeypatch, list(DECLARED_CHAIN))
+    try:
+        yield tmp_path
+    finally:
+        reset_hermes_home_override(token)
+        _clear_chain_caches()
+
+
+# (pinned, declared fallback_providers, expected) — the cells that need no declaring config.
 @pytest.mark.parametrize(
     ("pinned", "declared", "expected"),
     [
         (True, "absent", None),                 # #80450: a pinned child fails loudly, never reroutes
         (True, None, None),
         (True, [], None),
-        (True, DECLARED_CHAIN, DECLARED_CHAIN),
         (False, "absent", PARENT_CHAIN),        # historical default preserved
         (False, None, PARENT_CHAIN),
         (False, [], None),                      # explicit [] disables fallback
-        (False, DECLARED_CHAIN, DECLARED_CHAIN),  # #65038: delegation.fallback_providers reaches the child
         (True, "not-a-list", None),
         (False, "not-a-list", PARENT_CHAIN),
         (True, [{"provider": "deepseek"}], None),
         (False, [{"provider": "deepseek"}], PARENT_CHAIN),
-        (False, [{"provider": "deepseek", "model": "x"}, {"provider": "deepseek"}],
-         [{"provider": "deepseek", "model": "x"}]),  # a valid route survives a malformed neighbour
     ],
 )
 def test_child_fallback_chain_matrix(pinned, declared, expected):
     cfg = {} if declared == "absent" else {"fallback_providers": declared}
     assert _resolve_child_fallback_chain(_parent(list(PARENT_CHAIN)), cfg, pinned=pinned) == expected
+
+
+# The declared-chain cells: the chain is authorized by the home's own clean config (#65038).
+@pytest.mark.parametrize("pinned", [True, False])
+def test_a_declared_chain_the_config_authorizes_reaches_the_child(pinned, declaring_home):
+    assert _resolve_child_fallback_chain(
+        _parent(list(PARENT_CHAIN)), {"fallback_providers": list(DECLARED_CHAIN)}, pinned=pinned
+    ) == DECLARED_CHAIN
+
+
+def test_a_malformed_neighbour_does_not_sink_a_valid_declared_route(tmp_path, monkeypatch):
+    """A valid route survives a malformed neighbour — through the authorization read."""
+    from hermes_constants import reset_hermes_home_override
+
+    declared = [{"provider": "deepseek", "model": "x"}, {"provider": "deepseek"}]
+    token = _home_declaring(tmp_path, monkeypatch, declared)
+    try:
+        assert _resolve_child_fallback_chain(
+            _parent(list(PARENT_CHAIN)), {"fallback_providers": declared}, pinned=False
+        ) == [{"provider": "deepseek", "model": "x"}]
+    finally:
+        reset_hermes_home_override(token)
+        _clear_chain_caches()
 
 
 def _spawn_kwargs(parent, cfg, **overrides):
@@ -196,7 +279,7 @@ def test_pinned_review_does_not_borrow_general_worker_chain(tmp_path, monkeypatc
     assert captured["fallback_model"] is None
 
 
-def test_declared_child_chain_activates_on_primary_failure():
+def test_declared_child_chain_activates_on_primary_failure(declaring_home):
     """The selected chain is accepted by the real fallback activation rail."""
     from agent.error_classifier import FailoverReason
     from run_agent import AIAgent
@@ -206,6 +289,7 @@ def test_declared_child_chain_activates_on_primary_failure():
         {"fallback_providers": list(DECLARED_CHAIN)},
         pinned=True,
     )
+    assert chain == DECLARED_CHAIN
     with (
         patch("model_tools.get_tool_definitions", return_value=[]),
         patch("model_tools.check_toolset_requirements", return_value={}),

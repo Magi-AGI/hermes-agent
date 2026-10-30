@@ -545,7 +545,7 @@ def _dispatch(**kwargs) -> Dict[str, Any]:
 
     with retirement.work() as admitted:
         if not admitted:
-            return {"status": "rejected", "error": "backend is retiring; reconnect to continue"}
+            return {"status": "rejected", "reason": "retiring", "error": "backend is retiring; reconnect to continue"}
         return _dispatch_admitted(**kwargs)
 
 
@@ -589,7 +589,7 @@ def _dispatch_admitted(
     with _records_lock:
         active_slots = {r.get("slot_key") or r["delegation_id"] for r in _records.values() if r.get("status") in _ACTIVE_STATES}
         if record["slot_key"] not in active_slots and len(active_slots) >= max_async_children:
-            return {"status": "rejected", "error": capacity_error}
+            return {"status": "rejected", "reason": "capacity", "error": capacity_error}
         _records[delegation_id] = record
         live_units = sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
     _persist_dispatch(record)
@@ -628,7 +628,7 @@ def _dispatch_admitted(
             _records.pop(delegation_id, None)
         with _DB_LOCK, _transaction() as conn:
             conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
-        return {"status": "rejected", "error": f"Failed to schedule async delegation{label}: {exc}"}
+        return {"status": "rejected", "reason": "schedule", "error": f"Failed to schedule async delegation{label}: {exc}"}
     if progress_fn is not None:
         _ensure_stale_monitor()
     return {"status": "dispatched", "delegation_id": delegation_id}

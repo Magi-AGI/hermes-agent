@@ -1205,6 +1205,8 @@ hermes logs [log_name] [options]
 
 View, tail, and filter Hermes log files. All logs are stored in `~/.hermes/logs/` (or `<profile>/logs/` for non-default profiles).
 
+A log is shown as **one timeline** merged by timestamp from its rotated backups (`agent.log.1`, …), its live file and — on Windows — every process's own segments. On Windows each Hermes process (desktop backend, gateway, CLI commands, slash workers) writes its own files under `logs/<name>.d/<pid>-<start>.<seq>.log` instead of sharing one `agent.log`, so no process ever waits on another's log lock; segments left by processes that have exited are pruned after `logging.retention_days` (default 7; `0` disables) the next time a process starts logging. `hermes logs list` shows one summed row per `<name>.d/` directory. Log size and backup count (`logging.max_size_mb`, `logging.backup_count`) apply per process there.
+
 ### Log files
 
 | Name | File | What it captures |

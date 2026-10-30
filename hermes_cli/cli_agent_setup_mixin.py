@@ -361,8 +361,10 @@ class CLIAgentSetupMixin:
         None when the error is not auth-related or no fallback resolves."""
         from cli import _cprint, logger
         from hermes_cli.auth import AuthError, primary_failure_wording
-        from hermes_cli.runtime_provider import resolve_runtime_provider
+        from hermes_cli.runtime_provider import fallback_chain_walk_allowed, resolve_runtime_provider
         if not isinstance(primary_exc, AuthError):
+            return None
+        if not fallback_chain_walk_allowed(primary_exc):  # never after a failed config read (A44)
             return None
         _fb_chain = self._fallback_model if isinstance(self._fallback_model, list) else []
         for _fb in _fb_chain:
@@ -374,7 +376,7 @@ class CLIAgentSetupMixin:
                 from hermes_cli.fallback_config import resolve_entry_api_key
                 # target_model: the fallback entry names the model that will be sent; without it the
                 # ladder keys off config `default` (see _ensure_runtime_credentials, #112600).
-                _fb_kwargs = {"requested": _fb_provider, "target_model": _fb_model}
+                _fb_kwargs = {"requested": _fb_provider, "target_model": _fb_model, "request_origin": "fallback"}
                 if _fb.get("base_url"):
                     _fb_kwargs["explicit_base_url"] = _fb["base_url"]
                 _fb_api_key = resolve_entry_api_key(_fb)

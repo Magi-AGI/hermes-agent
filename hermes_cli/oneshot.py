@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Optional
 
 from gateway.session_context import declare_stateless_channel
-from hermes_cli.fallback_config import get_fallback_chain
 
 _ALL_TOOLSETS = {"all", "*"}
 
@@ -393,6 +392,10 @@ def _resolve_model_and_provider(cfg: dict, model: Optional[str], provider: Optio
     choice = _ModelChoice(explicit_model or _configured_model(model_cfg), (provider or "").strip() or None)
     if choice.provider is not None or not explicit_model:
         return choice
+    # Below, a provider is picked for the model from aliases, env and available credentials. After a
+    # failed config read that may override the provider the file pins (A44); --provider still works.
+    from hermes_cli.auth import refuse_provider_selection_on_config_failure
+    refuse_provider_selection_on_config_failure("the model name (detecting which provider serves it)")
 
     # DIRECT_ALIASES (config.yaml ``model_aliases:``) map a user alias to (model, provider,
     # base_url) for endpoints outside any catalog (local servers, custom proxies, ...).
@@ -497,6 +500,69 @@ def _apply_stored_session_runtime(
     return choice
 
 
+def _fail_closed_fallback_chain_for_oneshot():
+    """The fallback chain a NEW one-shot agent may be constructed with, read FAIL-CLOSED.
+
+    ``cfg`` here is ``load_config()``, which is fail-open for this purpose by design: on a cold
+    managed-read failure with no merged last-known-good record in the process it falls through and
+    returns the USER configuration (``hermes_cli/config.py``, the ``snap.managed_error`` branch).
+    That is the right call for model/toolset resolution and the wrong one for the chain: a failed
+    MANAGED read is a failed read (A44), the admin layer can only ever REMOVE or override what the
+    user file says, so a managed ``fallback_providers: []`` that then stops parsing handed this
+    agent exactly the chain it was suppressing — and ``agent/chat_completion_helpers.
+    try_activate_fallback`` installs chain entries with no gate of its own, reached from
+    ``agent/turn_api_error.py`` on an ordinary primary failure.
+
+    A one-shot run is the worst case for that: there is no later turn, so the per-turn fail-closed
+    resync the interactive CLI and the gateways rely on never happens. This agent keeps whatever the
+    constructor gave it for its whole life (R5-6 option 2).
+
+    Shares the gateway constructor's ONE per-home retention
+    (``gateway/run_config_loaders.load_fail_closed_fallback_chain``), so a clean managed answer
+    recorded earlier in the process is still served and fail-closed does not mean "no failover
+    ever". ``gateway.session_context`` is already imported at module level, so the lazy import costs
+    0.003 s / 2 modules.
+    """
+    from gateway.run_config_loaders import load_fail_closed_fallback_chain
+    from hermes_constants import get_hermes_home
+    return load_fail_closed_fallback_chain(get_hermes_home())
+
+
+def _oneshot_resolution_config() -> dict:
+    """The config ``resolve_runtime_with_fallback`` may walk for a chain at resolution time.
+
+    The resolution-time walk (#81209) runs BEFORE ``AIAgent`` exists, so it is a SECOND, earlier
+    route onto the fallback chain than ``_fail_closed_fallback_chain_for_oneshot``. Under
+    ``--safe-mode`` / ``--ignore-user-config`` the plain ``load_config()`` it used to receive
+    still carried the user's chain (``load_config`` does not implement the bypass), so suppressing
+    only the constructor left this path open (R10/F1).
+
+    Returns the full ``load_config()`` normally — resolution needs defaults, provider keys and
+    routing, not just the chain. Under the bypass it returns the same config with the chain
+    replaced by the fail-closed, user-suppressed answer, which is the one key this function is
+    about; the managed layer still applies through that primitive. Narrowing the chain in place
+    rather than returning ``{}`` keeps credential and provider resolution working, which is the
+    behaviour ``--safe-mode`` has everywhere else.
+
+    BOTH chain keys are replaced. ``get_fallback_chain`` is the canonical normalizer the walker
+    uses and it merges ``fallback_providers`` AND legacy ``fallback_model``
+    (``hermes_cli/fallback_config.py``), so narrowing only the first left a user file that declares
+    its chain under the legacy key — or under both — handing the walker a deliberately-ignored
+    entry before any agent existed (R10-1, both reviewer lanes). The fail-closed primitive already
+    returns the COMPLETE merged chain for this home, so the whole answer goes in
+    ``fallback_providers`` and the legacy key is emptied rather than left to merge after it.
+    """
+    from hermes_cli.config import load_config
+    from hermes_cli.config_effective import user_config_bypassed
+    cfg = load_config()
+    if not user_config_bypassed():
+        return cfg
+    cfg = dict(cfg)
+    cfg["fallback_providers"] = _fail_closed_fallback_chain_for_oneshot() or []
+    cfg["fallback_model"] = []
+    return cfg
+
+
 def _run_agent(
     prompt: str,
     model: Optional[str] = None,
@@ -511,12 +577,13 @@ def _run_agent(
     """Build an AIAgent exactly like a normal CLI chat turn, run one conversation, and return
     ``(final_response, run_result)``. Imports are local to keep CLI startup cheap. *ledger* (set when
     ``--usage-file`` is requested) attaches this run's auxiliary usage to the result."""
-    from hermes_cli.config import load_config
     from hermes_cli.runtime_provider import resolve_runtime_with_fallback
     from hermes_cli.tools_config import _get_platform_tools
     from run_agent import AIAgent
 
-    cfg = load_config()
+    # Carries the fail-closed, bypass-aware chain under --safe-mode / --ignore-user-config; the
+    # plain load_config() everywhere else (see _oneshot_resolution_config).
+    cfg = _oneshot_resolution_config()
     choice = _resolve_model_and_provider(cfg, model, provider)
     # Resume resolves BEFORE the runtime provider: the session's stored model/route must
     # replace the ambient config (see _apply_stored_session_runtime) and the ended row must
@@ -584,7 +651,7 @@ def _run_agent(
             session_db=session_db,
             session_id=resume_sid,
             credential_pool=runtime.get("credential_pool"),
-            fallback_model=get_fallback_chain(cfg) or None,
+            fallback_model=_fail_closed_fallback_chain_for_oneshot(),
             ephemeral_system_prompt=skills_prompt,
             reasoning_config=reasoning_config,
             # The only interactive callback wired: no user sits at a terminal. Sudo prompts gate on

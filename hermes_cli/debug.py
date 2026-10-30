@@ -245,15 +245,21 @@ def _missing_log_note(log_name: str) -> str:
     return f"(not on this host: {reason}{f' — expected at {primary}' if primary else ''})"
 
 
-def _resolve_log_path(log_name: str) -> Optional[Path]:
-    """First non-empty candidate for *log_name* (primary, then the .1 rotation), or None."""
+def _snapshot_sources(log_name: str) -> list[Path]:
+    """Every non-empty file of *log_name*'s timeline — rotations, live file, per-process
+    segments — oldest first; empty when nothing was written."""
+    from hermes_cli.logs_merge import log_sources
     primary = _primary_log_path(log_name)
     if primary is None:
-        return None
-    for candidate in (primary, primary.parent / f"{primary.name}.1"):
-        if candidate.exists() and candidate.stat().st_size > 0:
-            return candidate
-    return None
+        return []
+    sources = []
+    for candidate in log_sources(primary.parent, primary.name):
+        try:
+            if candidate.stat().st_size > 0:
+                sources.append(candidate)
+        except OSError:
+            continue
+    return sources
 
 
 def _redact_log_text(text: str) -> str:
@@ -266,66 +272,37 @@ def _redact_log_text(text: str) -> str:
     return _EMAIL_ADDRESS_RE.sub("[REDACTED_EMAIL]", text)
 
 
-def _read_tail_bytes(
-    log_path: Path, size: int, max_bytes: int, tail_lines: int) -> tuple[bytes, bool]:
-    """Whole file, or (oversized) a backwards read holding ``max_bytes`` for the full upload AND
-    enough newlines for the summary tail from the same snapshot → (raw, truncated)."""
-    with open(log_path, "rb") as f:
-        if size <= max_bytes:
-            return f.read(), False
-        chunk_size = 8192
-        pos = size
-        chunks: list[bytes] = []
-        total = 0
-        newline_count = 0
-        while (pos > 0 and total < max_bytes * 2
-               and (total < max_bytes or newline_count <= tail_lines + 1)):
-            read_size = min(chunk_size, pos)
-            pos -= read_size
-            f.seek(pos)
-            chunk = f.read(read_size)
-            chunks.insert(0, chunk)
-            total += len(chunk)
-            newline_count += chunk.count(b"\n")
-            chunk_size = min(chunk_size * 2, 65536)
-        return b"".join(chunks), pos > 0
-
-
 def _capture_log_snapshot(
     log_name: str, *, tail_lines: int, max_bytes: int = _MAX_LOG_BYTES, redact: bool = True,
 ) -> LogSnapshot:
     """Capture a log once and derive the summary tail and full-log views from that single read
-    (a rotation between two reads would make the report look newer than the uploaded log)."""
-    log_path = _resolve_log_path(log_name)
-    if log_path is None:
+    (a rotation between two reads would make the report look newer than the uploaded log).
+    The read merges every file of the log's timeline (``hermes_cli.logs_merge``)."""
+    from hermes_cli.logs_merge import read_merged_snapshot
+
+    sources = _snapshot_sources(log_name)
+    if not sources:
+        from hermes_cli.logs_merge import log_sources
         primary = _primary_log_path(log_name)
-        tail = "(file empty)" if primary and primary.exists() else _missing_log_note(log_name)
+        present = bool(primary and log_sources(primary.parent, primary.name))  # files exist, all empty
+        tail = "(file empty)" if present else _missing_log_note(log_name)
         return LogSnapshot(path=None, tail_text=tail, full_text=None)
 
+    newest = sources[-1]
     try:
-        size = log_path.stat().st_size
-        if size == 0:  # truncated between _resolve_log_path and stat
-            return LogSnapshot(path=log_path, tail_text="(file empty)", full_text=None)
-        raw, truncated = _read_tail_bytes(log_path, size, max_bytes, tail_lines)
-        full_raw = raw
-        if truncated and len(full_raw) > max_bytes:
-            cut = len(full_raw) - max_bytes
-            # Drop a partial first line only when the cut lands genuinely mid-line.
-            on_boundary = cut > 0 and full_raw[cut - 1 : cut] == b"\n"
-            full_raw = full_raw[cut:]
-            if not on_boundary and b"\n" in full_raw:
-                full_raw = full_raw.split(b"\n", 1)[1]
-        all_text = raw.decode("utf-8", errors="replace")
+        all_text, full_text, truncated = read_merged_snapshot(
+            sources, max_bytes=max_bytes, tail_lines=tail_lines)
+        if not all_text:  # truncated between _snapshot_sources and the read
+            return LogSnapshot(path=newest, tail_text="(file empty)", full_text=None)
         tail_text = "".join(all_text.splitlines(keepends=True)[-tail_lines:]).rstrip("\n")
-        full_text = full_raw.decode("utf-8", errors="replace")
         if truncated:
             full_text = f"[... truncated — showing last ~{max_bytes // 1024}KB ...]\n{full_text}"
         if redact:
             tail_text = _redact_log_text(tail_text)
             full_text = _redact_log_text(full_text)
-        return LogSnapshot(path=log_path, tail_text=tail_text, full_text=full_text)
+        return LogSnapshot(path=newest, tail_text=tail_text, full_text=full_text)
     except Exception as exc:
-        return LogSnapshot(path=log_path, tail_text=f"(error reading: {exc})", full_text=None)
+        return LogSnapshot(path=newest, tail_text=f"(error reading: {exc})", full_text=None)
 
 
 # Logs the debug report tails, in output order. ``agent`` gets the full ``--lines`` budget;

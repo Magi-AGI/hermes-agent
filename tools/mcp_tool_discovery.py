@@ -250,17 +250,11 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
     _note_connect_success(server_name)
     with _core._lock:
         _core._lazy_server_configs.pop(key, None)
-        stale_fingerprint = _core._lazy_server_fingerprints.pop(key, None)
-        cached_names = _core._lazy_server_tool_names.pop(key, None) or []
+        _core._lazy_server_fingerprints.pop(key, None)
+        _core._lazy_server_tool_names.pop(key, None)
         server = _core._servers.get(key)
-        live_names = set(getattr(server, "_registered_tool_names", []) or [])
-    # The cached manifest may advertise tools the live server no longer serves.
-    phantom_names = [n for n in cached_names if n not in live_names]
-    if phantom_names:
-        for tool_name in phantom_names:
-            _registration._deregister_mcp_tool_all_scopes(key, tool_name)
-        logger.info("MCP server '%s': deregistered %d phantom cached tool(s) not served live (stale schema-cache "
-                    "fingerprint %s): %s", server_name, len(phantom_names), stale_fingerprint, ", ".join(phantom_names))
+    # Cached stubs the live server no longer serves were removed by the connection's first
+    # publication: the per-profile reconcile makes the owner's slot equal the live list.
     return server is not None and server.session is not None
 
 
@@ -285,14 +279,27 @@ def _get_connected_server_for_call(server_name: str) -> Optional[_core.MCPServer
         return _core._servers.get(key)
 
 
+def _outside_login_context():
+    """``tools.mcp_oauth.outside_login_context`` when OAuth support is importable, else a no-op."""
+    try:
+        from tools.mcp_oauth import outside_login_context
+    except Exception:  # pragma: no cover - OAuth support unavailable
+        import contextlib
+        return contextlib.nullcontext()
+    return outside_login_context()
+
+
 async def _discover_and_register_server(name: str, config: dict) -> List[str]:
     """Connect one server, register its tools; return the registered names."""
     # The claim fires inside _connect_server while this frame is suspended (list, not nonlocal).
     claimed: List[_core.MCPServerTask] = []
     claim_token = _core._connect_server_claim.set(claimed.append)
     try:
-        server = await asyncio.wait_for(_connect_server(name, config),
-                                        timeout=config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT))
+        # A session registration is long-lived: its run task must never carry a caller's login
+        # context (forced / dashboard flow) into later re-auths on its first transport.
+        with _outside_login_context():
+            server = await asyncio.wait_for(_connect_server(name, config),
+                                            timeout=config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT))
     except BaseException:
         server = claimed[0] if claimed else None
         task = server._task if server is not None else None
@@ -311,8 +318,10 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         _core._server_connecting.discard(key)
         _core._server_connect_errors.pop(key, None)
     _adopt_server(name, server)
-    registered_names = _registration._register_server_tools(name, server, config)
-    server._registered_tool_names = list(registered_names)
+    # The snapshot is written inside the connection lock by _register_server_tools; assigning it
+    # again out here could clobber a policy edit that landed in between (MCP-P2-1 round 2).
+    _registration._register_server_tools(name, server, config)
+    registered_names = list(server._registered_tool_names)
     logger.info("MCP server '%s' (%s): registered %d tool(s): %s", name,
                 "HTTP" if "url" in config else "stdio", len(registered_names), ", ".join(registered_names))
     return registered_names
@@ -493,32 +502,53 @@ def _log_summary(prefix: str, names, **lazy) -> None:
         logger.info(summary)
 
 
-def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
+def register_mcp_servers(servers: Dict[str, dict], *, bypass_lazy_cache: bool = False) -> List[str]:
     """Connect ``{name: config}`` servers and register their tools; idempotent for connected
-    names, ``enabled: false`` skipped without disconnecting. Returns every MCP tool name."""
+    names, ``enabled: false`` skipped without disconnecting. Returns every MCP tool name.
+
+    ``bypass_lazy_cache``: ONLY for an explicit user reload (``/reload-mcp`` typed or clicked):
+    ``lazy: true`` servers are live-connected instead of registered from the schema cache, so a
+    server whose cached list is empty (e.g. a Unity bridge cached while the Editor was closed) is
+    asked again. Every automatic path (startup, config watcher, profile reconcile) keeps the lazy
+    cache. OAuth is unaffected: the connect runs in the caller's context (``interactive_oauth``
+    and background suppression apply as for any connect)."""
     if not _core._ensure_mcp_sdk():
         logger.debug("MCP SDK not available -- skipping explicit MCP registration")
         return []
     servers = _config._filter_suspicious_mcp_servers(servers)
     try:
-        return _register_mcp_servers(servers)
+        return _register_mcp_servers(servers, bypass_lazy_cache=bypass_lazy_cache)
     finally:
         # An owner's scoped reload orphaned adopters of its shared connections: now that this
         # pass (its rediscovery) is done, give them their tools back under their own scope.
         _lifecycle._reregister_orphaned_adopters()
 
 
-def _register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
+def _register_mcp_servers(servers: Dict[str, dict], *, bypass_lazy_cache: bool = False) -> List[str]:
     scoped_healed = _registration.register_connected_into_current_scope(servers)
     if not servers:
         logger.debug("No explicit MCP servers provided")
         return _registration._existing_tool_names() if _core._mcp_registry_scope() is not None else []
+    if bypass_lazy_cache:
+        # A lazily registered (cache-only) server is not a connect candidate; drop that state
+        # (and its cached stubs) so the explicit reload connects it like any other server.
+        with _core._lock:
+            lazy_keys = [key for name in servers
+                         if (key := _resolve_server_key(name)) in _core._lazy_server_configs]
+        for key in lazy_keys:
+            _forget_lazy_server(key)
     new_servers = _select_new_servers(servers)
     if scoped_healed:
         logger.info("MCP: registered %d already-connected server(s) into this profile scope", scoped_healed)
     if not new_servers:
         return _registration._existing_tool_names()
-    new_servers, lazy_registered, lazy_server_count = _register_lazy_from_cache(new_servers)
+    if bypass_lazy_cache:
+        lazy_registered = lazy_server_count = 0
+        if new_servers:
+            logger.info("MCP: explicit reload -- live-connecting %d server(s), lazy schema cache bypassed",
+                        len(new_servers))
+    else:
+        new_servers, lazy_registered, lazy_server_count = _register_lazy_from_cache(new_servers)
     if not new_servers:
         if lazy_registered:
             logger.info("MCP: registered %d lazy tool(s) from schema cache (no processes spawned)",
@@ -553,7 +583,8 @@ def _acquire_discovery_lock_with_retry():
     return cookie
 
 
-def discover_mcp_tools(allowed_mcp_names: Optional[List[str]] = None) -> List[str]:
+def discover_mcp_tools(allowed_mcp_names: Optional[List[str]] = None, *,
+                       bypass_lazy_cache: bool = False) -> List[str]:
     """Entry point: load config, connect servers, register tools. [] without the ``mcp``
     package; idempotent (only servers missing from a previous call are retried).
 
@@ -589,7 +620,9 @@ def discover_mcp_tools(allowed_mcp_names: Optional[List[str]] = None) -> List[st
                                 if keys[name] not in _core._servers and keys[name] not in _core._server_connecting
                                 and _enabled(cfg)]
             prior_lazy = set(_core._lazy_server_configs)
-        tool_names = register_mcp_servers(servers)
+        # The keyword only on the explicit path: every automatic call stays exactly as it was.
+        tool_names = (register_mcp_servers(servers, bypass_lazy_cache=True) if bypass_lazy_cache
+                      else register_mcp_servers(servers))
         if new_server_names:
             # A lazily registered server never connected, so it must not be counted as failed
             # (the old summary read "N failed" for a healthy all-lazy config, #111717). Reporting

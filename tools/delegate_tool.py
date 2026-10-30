@@ -176,6 +176,9 @@ def _build_child_agent(
     # callers such as /review pass auxiliary.review here so fallback policy is
     # not accidentally read from the general delegation block.
     routing_cfg: Optional[Dict[str, Any]] = None,
+    # Where that block LIVES in config, so a declared child chain can be authorized against
+    # the clean, bypass-aware read of its own owner rather than any successful read (R10-2).
+    routing_owner_path: Optional[tuple] = ("delegation",),
     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
 ):
@@ -221,7 +224,7 @@ def _build_child_agent(
         override_base_url=override_base_url, override_api_key=override_api_key, override_api_mode=override_api_mode,
         override_acp_command=override_acp_command,
         override_acp_args=override_acp_args,
-        routing_cfg=routing_cfg,
+        routing_cfg=routing_cfg, routing_owner_path=routing_owner_path,
     )
     if override_request_overrides is not None:
         # honored whenever set, incl. the inherit branch where
@@ -364,7 +367,8 @@ def _run_single_child(
 def _build_children(
     task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
     top_role: str, max_iterations: int, parent_agent, routing_cfg: Dict[str, Any],
-    live_deleg_id: Optional[str], live_writers: list, task_images: Optional[List[Optional[List[str]]]] = None,
+    routing_owner_path: Optional[tuple], live_deleg_id: Optional[str], live_writers: list,
+    task_images: Optional[List[Optional[List[str]]]] = None,
 ) -> tuple[List[tuple], Optional[str]]:
     """Build every child on the main thread (construction is not thread-safe);
     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
@@ -376,7 +380,7 @@ def _build_children(
         "override_request_overrides": creds.get("request_overrides"),
         "override_acp_command": creds.get("command"),
         "override_acp_args": creds.get("args"),
-        "routing_cfg": routing_cfg,
+        "routing_cfg": routing_cfg, "routing_owner_path": routing_owner_path,
     }
     children = []
     for i, t in enumerate(task_list):
@@ -442,6 +446,7 @@ def delegate_task(
     output_schema: Optional[Dict[str, Any]] = None, images: Optional[List[str]] = None, action: Optional[str] = None,
     subagent_id: Optional[str] = None, message: Optional[str] = None, parent_agent=None,
     credentials_cfg: Optional[Dict[str, Any]] = None,
+    credentials_cfg_owner_path: Optional[tuple] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
@@ -490,6 +495,11 @@ def delegate_task(
     # a per-call routing owner shaped like the delegation config section. Keep
     # the route and its fallback policy together through child construction.
     routing_cfg = credentials_cfg if credentials_cfg is not None else cfg
+    # A per-call route carries no config location, so a chain declared in it has no owner to be
+    # authorized against and is refused rather than installed unvetted (R10-2). The general
+    # section's owner IS ``delegation``. ``credentials_cfg_owner_path`` lets a future internal
+    # caller name its own section (e.g. ``("auxiliary", "review")``) and keep a declared chain.
+    routing_owner_path = ("delegation",) if credentials_cfg is None else credentials_cfg_owner_path
     try:
         creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
     except ValueError as exc:
@@ -520,7 +530,8 @@ def delegate_task(
 
     children, err = _build_children(
         task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
-        routing_cfg=routing_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
+        routing_cfg=routing_cfg, routing_owner_path=routing_owner_path,
+        live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
     )
     if err:
         return tool_error(err)

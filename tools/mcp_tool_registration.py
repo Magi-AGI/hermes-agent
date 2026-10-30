@@ -118,32 +118,21 @@ def _restore_server_toolset_alias(key) -> None:
 
     server_name = _key_name(key)
     with _core._lock:
-        owned = [(server, set(_core._server_tool_scopes.get(k, ())))
-                 for k, server in _core._servers.items() if _key_name(k) == server_name]
-    if any(
-        registry.snapshot_registration(tool_name, scope=scope) is not None
-        for server, scopes in owned for scope in scopes
-        for tool_name in getattr(server, "_registered_tool_names", ())
-    ):
+        scopes = {None}
+        for k in list(_core._servers) + list(_core._lazy_server_configs):
+            if _key_name(k) == server_name:
+                scopes.add(_key_scope(k))
+                scopes.update(_core._server_tool_scopes.get(k, ()))
+        scopes.update(scope for (k, scope) in _core._server_scope_configs if _key_name(k) == server_name)
+    # Any profile's slot (owner, adopter-only, or lazy stubs), not only the owner's names.
+    if any(registry.get_tool_names_for_toolset_in_scope(f"mcp-{server_name}", scope) for scope in scopes):
         registry.register_toolset_alias(server_name, f"mcp-{server_name}")
 
 
 def _remove_server_scope(key, scope: str) -> None:
-    """Remove one profile's MCP overlay for a shared live connection."""
-    from tools.registry import registry
-
-    server_name = _key_name(key)
-    for tool_name in registry.get_tool_names_for_toolset(f"mcp-{server_name}"):
-        registry.deregister(tool_name, scope=scope)
-    with _core._lock:
-        scopes = set(_core._server_tool_scopes.get(key, ()))
-        scopes.discard(scope)
-        if scopes:
-            _core._server_tool_scopes[key] = scopes
-        else:
-            _core._server_tool_scopes.pop(key, None)
-        _core._server_trust_levels.pop(_server_key(server_name, scope, current=False), None)
-    _restore_server_toolset_alias(key)
+    """One profile stops using a shared live connection: a policy LOSS, recomputed (its live entries
+    go; its membership, policy and trust record go)."""
+    _set_profile_policy(key, scope, None)
 
 
 def _select_utility_schemas(server_name: str, server: "MCPServerTask", config: dict) -> List[dict]:
@@ -318,17 +307,15 @@ def _resolve_name_collisions(name: str, candidates: List[_Candidate]) -> List[_C
 
 
 def _register_candidates(name: str, candidates: List[_Candidate], *, check_fn: Callable,
-                         scope: Callable[[], Optional[str]], lazy: bool, key=None) -> List[str]:
-    """Register candidates under toolset ``mcp-{name}``; returns the names that landed. The
-    ownership pre-check is advisory (servers connect in parallel): ``registry.register()`` is
-    the atomic gate and its verdict is re-read after every call. *key* is the connection whose
-    ``_server_tool_scopes`` records the registering scope (default: this scope's own)."""
+                         scope: Callable[[], Optional[str]], lazy: bool) -> List[str]:
+    """Register LAZY (schema-cache) stubs under toolset ``mcp-{name}``; returns the names that
+    landed. A live connection's per-profile entries are written only by ``_reconcile_profile``.
+    The ownership pre-check is advisory: ``registry.register()`` is the atomic gate and its
+    verdict is re-read after every call."""
     from tools.registry import registry
     toolset_name = f"mcp-{name}"
     registered: List[str] = []
     scope_value = scope()
-    if key is None:
-        key = _server_key(name, scope_value, current=False)
     for c in candidates:
         existing_toolset = registry.get_toolset_for_tool(c.registry_name)
         if existing_toolset and existing_toolset != toolset_name:  # foreign owner: skip, preserve it
@@ -348,9 +335,6 @@ def _register_candidates(name: str, candidates: List[_Candidate], *, check_fn: C
             is_async=False, description=c.schema.get("description") or "", scope=scope_value)
         if registry.get_toolset_for_tool(c.registry_name) == toolset_name:
             _track_mcp_tool_server(c.registry_name, name)
-            if scope_value is not None:
-                with _core._lock:
-                    _core._server_tool_scopes.setdefault(key, set()).add(scope_value)
             registered.append(c.registry_name)
         elif not lazy:
             logger.error("MCP server '%s': registration of %s as '%s' was rejected by the registry; "
@@ -360,51 +344,448 @@ def _register_candidates(name: str, candidates: List[_Candidate], *, check_fn: C
     return registered
 
 
+def _tools_payload(server: "MCPServerTask", should_register) -> List[dict]:
+    """The cache rows for ``server._tools`` that *should_register* admits."""
+    rows = []
+    for t in server._tools:
+        if not should_register(t.name):
+            continue
+        # mcp 2.0 renamed every Tool model field to snake_case and left camelCase as a
+        # *serialization* alias only, which pydantic does not apply to attribute access: a bare
+        # camelCase getattr returns None on 2.x instead of raising. That silently wrote an empty
+        # ``inputSchema`` into the schema cache on every write-through, so a ``lazy: true`` server
+        # registered from cache with every parameter stripped. ``mcp_field`` reads both spellings.
+        schema_obj = mcp_field(t, "input_schema", "inputSchema")
+        rows.append({
+            "name": t.name, "description": t.description or "",
+            "inputSchema": schema_obj if isinstance(schema_obj, dict) else {},
+            "annotations": {"readOnlyHint": _annotation_read_only_hint(t)},  # lazy path trust-gates identically
+        })
+    return rows
+
+
 def _write_schema_cache(name: str, server: "MCPServerTask", config: dict, should_register) -> None:
-    """Write-through: persist the manifest so the next startup registers this server lazily (no spawn). Never raises."""
+    """Write-through (#56832): persist the list just published so the next startup registers this
+    server lazily (no spawn). Never raises.
+
+    The entry always mirrors the published list, INCLUDING an empty one: ``tools: []`` with the
+    fingerprint and that response's own hints. An empty entry is still a lazy hit (the next startup
+    registers nothing and connects nothing: servers such as the Unity bridge list zero tools while
+    their host app is closed, and each live connect spawns a costly relay process), and it stops
+    removed tools from being resurrected. Each profile using the connection gets its own entry,
+    under its own policy, from the per-profile reconcile (_write_profile_cache).
+
+    A failed write is logged at WARNING: until a later successful write, the next startup may
+    register the previous manifest."""
+    from tools.mcp_schema_cache import config_fingerprint, write_cache_entry
+
     try:
-        # Write-through (#56832): refresh the on-disk schema cache after a live connect so the next startup
-        # can lazily register this server without spawning it. Cache failures never break registration.
-        from tools.mcp_schema_cache import config_fingerprint, write_cache_entry
-        tools_payload = []
-        for t in server._tools:
-            if not should_register(t.name):
-                continue
-            # mcp 2.0 renamed every Tool model field to snake_case and left camelCase as a
-            # *serialization* alias only, which pydantic does not apply to attribute access: a bare
-            # camelCase getattr returns None on 2.x instead of raising. That silently wrote an empty
-            # ``inputSchema`` into the schema cache on every write-through, so a ``lazy: true`` server
-            # registered from cache with every parameter stripped. ``mcp_field`` reads both spellings.
-            schema_obj = mcp_field(t, "input_schema", "inputSchema")
-            tools_payload.append({
-                "name": t.name, "description": t.description or "",
-                "inputSchema": schema_obj if isinstance(schema_obj, dict) else {},
-                "annotations": {"readOnlyHint": _annotation_read_only_hint(t)},  # lazy path trust-gates identically
-            })
+        fingerprint = config_fingerprint(config)
         utility_payload = [{"schema": e["schema"], "handler_key": e["handler_key"]}
                            for e in _select_utility_schemas(name, server, config)]
-        cache_meta = getattr(server, "_list_cache_meta", None) or {}
-        write_cache_entry(name, config_fingerprint(config), tools=tools_payload, utility_tools=utility_payload,
-                          ttl_ms=cache_meta.get("ttl_ms"), cache_scope=cache_meta.get("cache_scope"))
+        hints = _list_hints(server)
     except Exception as exc:
-        logger.debug("MCP schema cache write failed for '%s': %s", name, exc)
+        logger.warning("MCP schema cache for '%s' not updated (%s); the next startup may use the previous manifest",
+                       name, exc)
+        return
+    try:
+        write_cache_entry(name, fingerprint, tools=_tools_payload(server, should_register),
+                          utility_tools=utility_payload, **hints)
+    except Exception as exc:
+        logger.warning("MCP schema cache write failed for '%s' (%s); the next startup may use the previous "
+                       "manifest until a live connect rewrites it", name, exc)
+
+
+def _list_hints(server: "MCPServerTask") -> dict:
+    cache_meta = getattr(server, "_list_cache_meta", None) or {}
+    return {"ttl_ms": cache_meta.get("ttl_ms"), "cache_scope": cache_meta.get("cache_scope")}
+
+
+def _policy_allows_utility(config: dict, handler_key: str) -> bool:
+    """``tools.resources`` / ``tools.prompts`` of *config* for one cached utility row (an unknown
+    handler key is dropped: a cache row must not widen what the reading profile allows)."""
+    family = _UTILITY_CAPABILITY_ATTRS.get(handler_key)
+    if family is None:
+        return False
+    return _parse_boolish(((config or {}).get("tools") or {}).get(family), default=True)
 
 
 def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> List[str]:
-    """Register a connected server's tools plus utilities (initial discovery and list_changed
-    refresh); returns the names. Toolset aliases derive from the live registry, not
-    ``toolsets.TOOLSETS``; lossy normalization collisions (``read-file``/``read_file``) fail closed."""
-    should_register = _make_tool_filter(name, config)
+    """PUBLISH ``server._tools`` (initial discovery, revival, list_changed refresh, reconnect): the
+    connection's published list changed, so every profile using it is recomputed by
+    ``_reconcile_connection`` (the owner under *config*, each adopter under its own policy).
+    Returns the owner's names. Lossy normalization collisions fail closed; a name another toolset
+    owns is never overwritten.
+
+    This function OWNS the PUBLICATION writes to ``server._registered_tool_names``: a published
+    name list is written here, inside ``_connection_lock(key)``, never by a caller after the lock
+    is released (MCP-P2-1 round 2). Callers used to assign the return value themselves, so an owner
+    policy edit interleaving between the reconcile and that assignment installed the correct
+    snapshot and had it overwritten with this publication's earlier names — status/tool counts then
+    read stale until the next reconcile. Use the return value; do not assign the attribute.
+
+    ONE carve-out, and it is not a publication: the TEARDOWN/PARK reset in
+    ``MCPServerTask._deregister_tools`` (``mcp_tool_server_run.py``, reached from ``shutdown()``
+    and from the park path) clears ``_list_published``, calls ``_reconcile_connection`` to empty
+    every profile, then assigns ``[]``. That assignment is outside this lock, but it cannot lose a
+    publication's write: it only ever stores the empty list that the reconcile it just ran has
+    already made true, and a publication racing it re-establishes both the registry entries and
+    the snapshot together under the lock. The single-writer rule constrains who may write a
+    NON-EMPTY list; the deregistration reset is idempotent with its own reconcile (R3-3).
+    """
     key = _server_key_for_task(server)
-    _record_tool_trust_metadata(name, config, server._tools, key)
-    candidates = _tool_candidates(name, server._tools, should_register, server.tool_timeout)
+    owner_scope = _core._server_registry_scope(key)
+    slot = (key, owner_scope)
+    # Was this task THE live connection for *key* when the publication started? The adoption paths
+    # pass ``require_live`` because they decide from a snapshot taken outside the lock; the owner
+    # path has the same exposure (relay finding R2): a teardown landing mid-publication pops the key
+    # and runs ``_forget_connection_profiles_locked``, after which writing the owner policy
+    # resurrects a record for a destroyed connection. It cannot simply pass ``require_live=True``,
+    # because a legitimate publication by a server that is NOT in ``_servers`` exists -- a retained
+    # initial-failure connection republishing once ``_ready`` is set
+    # (``mcp_tool_transport._register_discovered_tools_if_needed``). So the guard is conditional on
+    # having BEEN live: only a connection that was live and then vanished is a teardown.
+    #
+    # KNOWN RESIDUAL (R3-5), recorded rather than closed, with its width stated. This read takes
+    # ``_core._lock`` on its own and releases it before ``_connection_lock(key)`` is acquired
+    # below, so the two are not one atomic observation. A connection that is NOT yet the
+    # ``_servers`` entry when ``was_live`` is read, becomes it immediately after, and is then torn
+    # down before ``_set_profile_policy`` runs, carries ``was_live=False`` past the guard and can
+    # still resurrect a ghost owner record. That ordering is SUFFICIENT but not the only one: a
+    # teardown landing between ``_server_key_for_task``'s own lookup (``:87``) and this read
+    # reaches the same state, so the window is the whole span from that lookup to the policy write,
+    # not just the lock-release gap. Not merged into the publication lock on purpose: teardown
+    # orders against ``_core._lock``, never against ``_connection_lock(key)`` (relay R1), so
+    # holding ``_core._lock`` across the whole publication would be a lock-order inversion with
+    # ``_set_profile_policy``'s own acquisition rather than a fix. Closing it properly means
+    # teardown and publication sharing one liveness epoch; that is a design change beyond this
+    # round's scope and is the recorded follow-up. Blast radius: a ghost record for a destroyed
+    # connection (the MCP-P2-2 class), swept at the next discovery. Publication writes trust
+    # metadata and can reconcile registry/cache state, not membership alone, so the radius is
+    # wider than "a membership row" — but neither review lane established executable unauthorized
+    # exposure from it, which is why the rating stays P3.
+    with _core._lock:
+        was_live = _core._servers.get(key) is server
+    # Selecting the policy and writing it happen under the SAME per-connection lock as
+    # _set_profile_policy, so a concurrent owner edit cannot land between them; the policy epoch is
+    # re-validated before writing, so an edit that lands even re-entrantly restarts the selection
+    # (the round-10 stale-recompute rule).
+    with _connection_lock(key):
+        for _ in range(_RECONCILE_MAX_PASSES):
+            with _core._lock:
+                recorded = _core._server_scope_configs.get(slot)
+                epoch = _core._server_scope_epochs.get(slot, 0)
+            # A REPUBLICATION by the same connection task (list_changed, reconnect, revival) passes its
+            # connect-time config. If the owner's recorded policy is for the same route, it is the
+            # current policy (a config-only edit applied by the registration pass: trust,
+            # include/exclude): keep it, never revert it to the connect-time snapshot. A task's FIRST
+            # publication, or a different route, takes the passed config (a record from an earlier
+            # connection is not this task's policy).
+            policy = config
+            if (getattr(server, "_published_before", False) is True
+                    and isinstance(recorded, dict) and isinstance(config, dict)
+                    and _connection_identity(_without_visibility_filter(recorded))
+                    == _connection_identity(_without_visibility_filter(config))):
+                policy = recorded
+            _record_tool_trust_metadata(name, policy, server._tools, key)
+            with _core._lock:
+                if _core._server_scope_epochs.get(slot, 0) != epoch:
+                    continue  # the owner's policy moved while selecting: select again
+            server._list_published = True
+            server._published_before = True
+            _set_profile_policy(key, owner_scope, policy, server=server, reconcile=False,
+                                require_live=was_live)
+            return _publish_owner_names(key, server, _reconcile_connection(key, server))
+        logger.warning("MCP server '%s': owner policy kept changing during publication; publishing with the "
+                       "latest recorded policy", name)
+        with _core._lock:
+            latest = _core._server_scope_configs.get(slot)
+        policy = latest if isinstance(latest, dict) else config
+        _record_tool_trust_metadata(name, policy, server._tools, key)
+        server._list_published = True
+        server._published_before = True
+        _set_profile_policy(key, owner_scope, policy, server=server, reconcile=False,
+                            require_live=was_live)
+        return _publish_owner_names(key, server, _reconcile_connection(key, server))
+
+
+def _publish_owner_names(key, server, names: List[str]) -> List[str]:
+    """Settle ``server._registered_tool_names`` while the caller still holds ``_connection_lock``.
+
+    ``_reconcile_profile`` already writes the snapshot through ``_record_owner_name_snapshot`` for a
+    live owner, which is the normal path; this covers the one case that skips — a server publishing
+    while it is not (yet / any longer) the entry in ``_core._servers`` for *key*, e.g. a retained
+    initial-failure connection whose ``_ready`` is set (``mcp_tool_transport.
+    _register_discovered_tools_if_needed``). Doing it here rather than in the caller is the point:
+    inside the lock no policy edit can interleave, so this write can never clobber a newer snapshot.
+    """
+    with _core._lock:
+        if _core._servers.get(key) is server:
+            return names  # _record_owner_name_snapshot already wrote it under this same lock
+    try:
+        server._registered_tool_names = list(names)
+    except AttributeError:  # a test double without the slot
+        pass
+    return names
+
+
+# ---------------------------------------------------------------------------------------------
+# Per-profile state: ONE pure recompute (round 10)
+#
+# Every profile P that uses connection K (the owner, and each adopter) has, per K:
+#   live registry entries in toolset ``mcp-{name}`` in P's slot, and P's schema-cache entry.
+# Both are a pure function of two inputs:
+#   1. K's last PUBLISHED raw list (``server._tools`` / ``_list_cache_meta`` / capabilities,
+#      while ``server._list_published``; nothing once K is torn down), and
+#   2. P's current policy for K (``_server_scope_configs[(K, P)]``: tool filter,
+#      ``tools.resources`` / ``tools.prompts``; absent = P does not use K).
+# ``_reconcile_profile`` computes that function and applies the difference against P's OWN slot.
+# Input 1 changes go through ``_register_server_tools`` / teardown -> ``_reconcile_connection``;
+# input 2 changes go through ``_set_profile_policy``. Nothing else writes per-profile state.
+# Both run under one lock per connection, and a policy epoch makes an in-flight recompute whose
+# input moved under it (even re-entrantly) start over rather than publish a stale result.
+# ---------------------------------------------------------------------------------------------
+
+_CONNECTION_LOCKS = tuple(threading.RLock() for _ in range(32))
+_RECONCILE_MAX_PASSES = 8
+
+
+def _connection_lock(key) -> "threading.RLock":
+    return _CONNECTION_LOCKS[hash(key) % len(_CONNECTION_LOCKS)]
+
+
+def _profile_scopes(key) -> List[Optional[str]]:
+    """The owner's scope (ALWAYS: its slot must equal f(list, owner policy), which is empty when it
+    has none) and every scope holding a policy for *key*, owner first, then a stable order."""
+    owner = _core._server_registry_scope(key)
+    with _core._lock:
+        scopes = {scope for (k, scope) in _core._server_scope_configs if k == key}
+    scopes.add(owner)
+    return sorted(scopes, key=lambda s: (s != owner, "" if s is None else str(s)))
+
+
+def _sync_membership_locked(key) -> None:
+    """``_server_tool_scopes[key]`` = the owner's scope while the connection is live, plus every
+    non-None scope holding a policy for *key* (derived, never written elsewhere). Caller holds
+    ``_core._lock``."""
+    scopes = {scope for (k, scope) in _core._server_scope_configs if k == key and scope is not None}
+    owner = _core._server_scope_keys.get(key) or _key_scope(key)
+    if owner is not None and key in _core._servers:
+        scopes.add(owner)
+    if scopes:
+        _core._server_tool_scopes[key] = scopes
+    else:
+        _core._server_tool_scopes.pop(key, None)
+
+
+def _set_profile_policy(key, scope: Optional[str], config: Optional[dict], *, server=None,
+                        reconcile: bool = True, require_live: bool = False) -> List[str]:
+    """The ONLY writer of a profile's policy for a connection: gain (config for a new scope), change
+    (a different config), or loss (``None``). Recomputes that profile unless *reconcile* is False
+    (the caller reconciles the whole connection next). Returns the profile's landed names.
+
+    ``require_live``: the caller decided from a snapshot of ``_core._servers`` taken OUTSIDE this
+    lock -- the adoption pass in ``_register_connected_into_current_scope``, and the owner
+    publication in ``_register_server_tools``. A shutdown landing in that window has already run
+    ``_forget_connection_profiles_locked``, so writing the snapshot's
+    policy now would resurrect a record for a destroyed connection: a ghost policy and membership
+    that teardown will never revisit and that the orphan re-registration
+    (``mcp_tool_lifecycle._reregister_orphaned_adopters``, whose pending set was built from the
+    membership that existed AT teardown) cannot see, leaving the profile tool-less until its next
+    discovery. Re-validated here, a dead connection is a policy LOSS instead (the state teardown
+    left), so the next pass re-adopts or connects cleanly.
+
+    WHICH lock carries that invariant: ``_core._lock``, NOT ``_connection_lock(key)``.
+    ``mcp_tool_lifecycle.shutdown_mcp_servers`` never acquires a connection lock -- it pops
+    ``_core._servers`` and runs ``clear_selected_status`` -> ``_forget_connection_profiles_locked``
+    inside ``_core._lock``. So the liveness re-read and the policy write below sit in ONE
+    ``_core._lock`` block on purpose: that is what makes them atomic against the sweep.
+    ``_connection_lock(key)`` serializes publication against concurrent policy edits -- a
+    different race -- and would not order anything against teardown.
+    """
+    name = _key_name(key)
+    with _connection_lock(key):
+        owner = _core._server_registry_scope(key)
+        with _core._lock:
+            slot = (key, scope)
+            if require_live and config is not None:
+                live_now = _core._servers.get(key)
+                if live_now is None or getattr(live_now, "session", None) is None:
+                    logger.debug("MCP server '%s': connection was destroyed while profile %s was adopting it; "
+                                 "not recording a policy for the dead connection", name, scope)
+                    config = None
+            if config is None:
+                _core._server_scope_configs.pop(slot, None)
+            else:
+                _core._server_scope_configs[slot] = dict(config)
+            _core._server_scope_epochs[slot] = _core._server_scope_epochs.get(slot, 0) + 1
+            _sync_membership_locked(key)
+            if config is None:
+                _core._server_trust_levels.pop(_server_key(name, scope, current=False), None)
+        if config is not None:
+            # ``trust`` is part of the profile's policy, the owner's included: the call-time gate reads
+            # it by the profile's own key, so a policy-only ``full`` -> ``untrusted`` edit takes effect now.
+            _record_scope_trust(name, config, scope)
+        if not reconcile:
+            return []
+        landed = _reconcile_profile(key, scope, server=server)
+        _restore_server_toolset_alias(key)
+        return landed
+
+
+def _desired_candidates(name: str, server: "MCPServerTask", config: dict) -> List[_Candidate]:
+    """f(published list, policy) for one profile: its filter over the native tools plus the
+    utilities its ``tools.resources`` / ``tools.prompts`` allow (and the server advertises), after
+    the same collision resolution every registration uses."""
+    candidates = _tool_candidates(name, server._tools, _make_tool_filter(name, config), server.tool_timeout)
     candidates += _utility_candidates(name, _select_utility_schemas(name, server, config), server.tool_timeout)
-    registered = _register_candidates(
-        name, _resolve_name_collisions(name, candidates),
-        check_fn=_make_check_fn(name), scope=lambda: _core._server_registry_scope(key), lazy=False, key=key)
-    if registered:
-        _write_schema_cache(name, server, config, should_register)
-    return registered
+    return _resolve_name_collisions(name, candidates)
+
+
+def _apply_profile(name: str, scope: Optional[str], desired: List[_Candidate]) -> tuple:
+    """Make *scope*'s own slot hold exactly *desired* for toolset ``mcp-{name}``: register (or
+    overwrite) each desired entry, verified in THAT slot, and deregister whatever else the slot holds
+    for the toolset. A name another toolset owns (built-in, another server) is never overwritten.
+    Returns ``(landed names, failed)``."""
+    from tools.registry import registry
+
+    toolset = f"mcp-{name}"
+    actual = set(registry.get_tool_names_for_toolset_in_scope(toolset, scope))
+    check_fn = _make_check_fn(name)
+    landed: List[str] = []
+    failed = False
+    for c in desired:
+        existing = registry.get_entry(c.registry_name, scope=scope)
+        if existing is not None and existing.toolset != toolset:
+            if existing.toolset.startswith("mcp-"):
+                logger.error("MCP server '%s': %s normalizes to '%s', already owned by MCP toolset '%s' — skipping to "
+                             "preserve the existing owner", name, c.origin, c.registry_name, existing.toolset)
+            else:
+                logger.warning("MCP server '%s': %s (→ '%s') collides with built-in tool in toolset '%s' — skipping to "
+                               "preserve built-in", name, c.origin, c.registry_name, existing.toolset)
+            continue
+        try:
+            registry.register(
+                name=c.registry_name, toolset=toolset, schema=c.schema, handler=c.handler, check_fn=check_fn,
+                is_async=False, description=c.schema.get("description") or "", scope=scope)
+        except Exception as exc:
+            failed = True
+            logger.warning("MCP server '%s': registering '%s' failed (%s)", name, c.registry_name, exc)
+            continue
+        entry = registry.snapshot_registration(c.registry_name, scope=scope)
+        if entry is not None and entry.toolset == toolset:
+            _track_mcp_tool_server(c.registry_name, name)
+            landed.append(c.registry_name)
+        else:
+            logger.error("MCP server '%s': registration of %s as '%s' was rejected by the registry; "
+                         "skipping provenance/count updates", name, c.origin, c.registry_name)
+    for stale in sorted(actual - set(landed)):
+        registry.deregister(stale, scope=scope)
+        if not registry.is_registered_anywhere(stale):
+            _forget_mcp_tool_server(stale)
+    if landed:
+        registry.register_toolset_alias(name, toolset)
+    return landed, failed
+
+
+def _write_profile_cache(name: str, server: "MCPServerTask", config: dict, scope: Optional[str]) -> None:
+    """*scope*'s schema-cache entry = f(published list, its policy), under that profile's home."""
+    from pathlib import Path
+    from hermes_constants import hermes_home_key, reset_hermes_home_override, set_hermes_home_override
+
+    try:
+        here = hermes_home_key()
+    except Exception:
+        here = None
+    if scope is None or scope == here:
+        _write_schema_cache(name, server, config, _make_tool_filter(name, config))
+        return
+    token = set_hermes_home_override(Path(scope))
+    try:
+        _write_schema_cache(name, server, config, _make_tool_filter(name, config))
+    finally:
+        reset_hermes_home_override(token)
+
+
+def _reconcile_profile(key, scope: Optional[str], *, server=None) -> List[str]:
+    """Recompute one profile's live entries and cache for one connection from (published list,
+    policy) and apply the difference. Idempotent; safe to call for any input change."""
+    name = _key_name(key)
+    slot = (key, scope)
+    with _connection_lock(key):
+        for _ in range(_RECONCILE_MAX_PASSES):
+            with _core._lock:
+                config = _core._server_scope_configs.get(slot)
+                epoch = _core._server_scope_epochs.get(slot, 0)
+                live = server if server is not None else _core._servers.get(key)
+            # MCPServerTask always defines it (False until published); a bare double that lacks it
+            # stands for a connection whose ``_tools`` is its published list.
+            published = live is not None and bool(getattr(live, "_list_published", True))
+            desired = _desired_candidates(name, live, config) if (config is not None and published) else []
+            with _core._lock:
+                if _core._server_scope_epochs.get(slot, 0) != epoch:
+                    continue  # the policy moved while computing (possibly re-entrantly): recompute
+            landed, failed = _apply_profile(name, scope, desired)
+            with _core._lock:
+                if _core._server_scope_epochs.get(slot, 0) != epoch:
+                    continue  # moved while applying: the next pass converges on the new input
+            if config is not None and published:
+                if failed:
+                    logger.warning("MCP server '%s': live tools for profile %s incomplete; its schema cache "
+                                   "is left unchanged until a publication succeeds", name, scope)
+                else:
+                    _write_profile_cache(name, live, config, scope)
+            _record_owner_name_snapshot(key, scope, live, landed)
+            return landed
+    logger.warning("MCP server '%s': profile %s policy kept changing during reconcile; left for the next pass",
+                   name, scope)
+    return []
+
+
+def _record_owner_name_snapshot(key, scope: Optional[str], live, landed: List[str]) -> None:
+    """Keep the owner's ``_registered_tool_names`` equal to what its slot actually holds.
+
+    The snapshot is the status/tool-count source (``mcp_tool_discovery.get_mcp_status`` and the
+    ``_connected_summary`` line read ``len(server._registered_tool_names)``). It used to be written
+    only where ``_register_server_tools`` is CALLED (discovery, ``_publish_tool_list``), so an
+    owner-policy-only edit applied by the registration pass -- which reaches the registry through
+    ``_set_profile_policy`` -> ``_reconcile_profile`` and never republishes -- moved the live
+    entries while the snapshot kept the pre-edit names. Writing it here, in the one place that
+    computes the owner's landed set, makes the two equal for EVERY input change (publish, teardown,
+    policy edit), not only for a publication.
+    """
+    if live is None or scope != _core._server_registry_scope(key):
+        return
+    with _core._lock:
+        if _core._servers.get(key) is not live:
+            return  # a bare double or a replaced connection: not the live owner's snapshot
+    try:
+        live._registered_tool_names = list(landed)
+    except AttributeError:  # a test double without the slot
+        pass
+
+
+def _reconcile_connection(key, server=None) -> List[str]:
+    """Recompute EVERY profile using *key* (owner first) after input 1 (the published list, or its
+    absence at teardown) changed. Returns the OWNER's landed names."""
+    owner = _core._server_registry_scope(key)
+    owner_names: List[str] = []
+    with _connection_lock(key):
+        for scope in _profile_scopes(key):
+            names = _reconcile_profile(key, scope, server=server)
+            if scope == owner:
+                owner_names = names
+        _restore_server_toolset_alias(key)
+    return owner_names
+
+
+def _forget_connection_profiles_locked(key) -> None:
+    """Connection destroyed (shutdown): drop every profile's policy record for *key*. Its live state
+    was already emptied through ``_reconcile_connection`` at teardown. Caller holds ``_core._lock``."""
+    for slot in [slot for slot in _core._server_scope_configs if slot[0] == key]:
+        _core._server_scope_configs.pop(slot, None)
+        _core._server_scope_epochs[slot] = _core._server_scope_epochs.get(slot, 0) + 1
+    _core._server_tool_scopes.pop(key, None)
 
 
 def _server_enabled(config: dict) -> bool:
@@ -426,6 +807,15 @@ def _connection_identity(config: dict) -> tuple:
             _auth_type(config), _frozen(config.get("client_cert")), _frozen(config.get("client_key")))
 
 
+def _without_visibility_filter(config: dict) -> dict:
+    """*config* without ``tools.include`` / ``tools.exclude``: which tools a profile SEES is policy
+    (the reconcile applies it), not part of which connection it is."""
+    tools = config.get("tools")
+    if not isinstance(tools, dict) or not ({"include", "exclude"} & set(tools)):
+        return config
+    return {**config, "tools": {k: v for k, v in tools.items() if k not in ("include", "exclude")}}
+
+
 def _auth_type(config: dict) -> str:
     return (config.get("auth") or "").lower().strip()
 
@@ -433,10 +823,18 @@ def _auth_type(config: dict) -> str:
 def _same_server_route(server: Any, config: dict, *, cross_profile: bool = False) -> bool:
     """Whether *server* matches *config*, with OAuth connections never reusable across profiles.
 
+    WHICH TOOLS a profile sees (``tools.include`` / ``tools.exclude``) is its POLICY, applied by
+    its own reconcile against its own slot, not part of which connection it is: two profiles with
+    the same endpoint and credentials but different filters are the same route and share one
+    connection (one process; for stdio relays such as ``unity-*`` that is one child, not two).
+    The owner path already stripped the filter before calling here; stripping it HERE makes the
+    cross-profile adoption path agree, so route identity means the same thing on both.
+
     OAuth credentials live in the owning profile's token storage rather than the static config,
     so identical OAuth configs cannot prove that two profiles authenticate as the same account.
     """
-    if _connection_identity(getattr(server, "_config", {}) or {}) != _connection_identity(config):
+    if (_connection_identity(_without_visibility_filter(getattr(server, "_config", {}) or {}))
+            != _connection_identity(_without_visibility_filter(config))):
         return False
     # Identities match, so both sides carry the same normalised auth type.
     return not (cross_profile and _auth_type(config) == "oauth")
@@ -465,52 +863,51 @@ def _register_connected_into_current_scope(servers: dict) -> int:
     if scope is None:
         return 0
 
+    # This profile's current memberships (its own connections and those it adopted): each is a
+    # policy LOSS (config gone/disabled, route changed, connection down) or a policy CHANGE (config
+    # differs from the recorded one), recomputed immediately either way.
     with _core._lock:
-        stale = []
-        for key, scopes in _core._server_tool_scopes.items():
-            if scope not in scopes:
-                continue
+        memberships = [(key, recorded) for (key, s), recorded in _core._server_scope_configs.items() if s == scope]
+    for key, recorded in memberships:
+        with _core._lock:
             server = _core._servers.get(key)
-            config = servers.get(_key_name(key))
-            cross_profile = _key_scope(key) != scope
-            if (config is None or not _server_enabled(config) or server is None
-                    or getattr(server, "session", None) is None
-                    or not _same_server_route(server, config, cross_profile=cross_profile)):
-                stale.append(key)
-    for key in stale:
-        _remove_server_scope(key, scope)
+        config = servers.get(_key_name(key))
+        cross_profile = _key_scope(key) != scope
+        # ``_same_server_route`` strips the visibility filter on both sides, so owner and adopter
+        # are judged by the same route identity.
+        if (config is None or not _server_enabled(config) or server is None
+                or getattr(server, "session", None) is None
+                or not _same_server_route(server, config, cross_profile=cross_profile)):
+            _remove_server_scope(key, scope)
+        elif dict(config) != recorded:
+            # Same out-of-lock snapshot as the gain below: a connection torn down in the window
+            # must end as a policy loss, not as a changed policy for a dead key.
+            _set_profile_policy(key, scope, config, require_live=True)
 
     registered_servers = 0
     for name, config in servers.items():
         if not _server_enabled(config):
             continue
         with _core._lock:
-            if _server_key(name, scope, current=False) in _core._servers:
-                continue  # this profile has its own connection for the name
+            own = _server_key(name, scope, current=False)
+            if own in _core._servers or own in _core._lazy_server_configs:
+                continue  # this profile has its own connection (live or lazily registered) for the name
             # Any other profile's live connection with the same route AND credentials is shareable.
             shared = [(key, live) for key, live in _core._servers.items()
                       if _key_name(key) == name and getattr(live, "session", None) is not None
                       and _same_server_route(live, config, cross_profile=True)]
         if not shared:
             continue
-        key, server = shared[0]
-        # Visibility for this profile: the owner keeps teardown, this scope sees the connection.
+        key, _server = shared[0]
         with _core._lock:
-            _core._server_tool_scopes.setdefault(key, set()).add(scope)
-        _record_scope_trust(name, config, scope)
-        if registry.get_tool_names_for_toolset(f"mcp-{name}"):
-            continue
-        candidates = _tool_candidates(name, server._tools, _make_tool_filter(name, config), server.tool_timeout)
-        candidates += _utility_candidates(
-            name, _select_utility_schemas(name, server, config), server.tool_timeout)
-        names = _register_candidates(
-            name, _resolve_name_collisions(name, candidates),
-            check_fn=_make_check_fn(name), scope=lambda: scope, lazy=False, key=key)
-        if names:
+            already = (key, scope) in _core._server_scope_configs
+        if already:
+            continue  # reconciled above
+        # GAIN: the owner keeps teardown; this profile's state is recomputed under its own policy.
+        # ``shared`` was read outside the connection lock, so the write re-validates that the
+        # connection is still alive (else it would leave a ghost policy for a destroyed one).
+        if _set_profile_policy(key, scope, config, require_live=True):
             registered_servers += 1
-            with _core._lock:
-                server._registered_tool_names = sorted(
-                    set(getattr(server, "_registered_tool_names", []) or ()) | set(names))
     return registered_servers
 
 
@@ -527,7 +924,11 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
     cached_tools = _cached_tools(tools_from_cache_entry(entry))
     _record_tool_trust_metadata(name, config, cached_tools)
     candidates = _tool_candidates(name, cached_tools, _make_tool_filter(name, config), tool_timeout)
-    candidates += _utility_candidates(name, utility_tools_from_cache_entry(entry), tool_timeout)
+    # A cache row may have been written under another profile's policy (a shared connection's
+    # owner): only the families THIS config enables are registered.
+    utility_rows = [row for row in utility_tools_from_cache_entry(entry)
+                    if isinstance(row, dict) and _policy_allows_utility(config, str(row.get("handler_key") or ""))]
+    candidates += _utility_candidates(name, utility_rows, tool_timeout)
     registered = _register_candidates(
         name, candidates, check_fn=_make_check_fn(name), scope=_core._mcp_registry_scope, lazy=True)
     if registered:

@@ -4574,7 +4574,32 @@ def test_startup_runtime_detects_provider_for_model_env(monkeypatch):
     )
 
 
-def test_load_fallback_model_merges_chain_providers_first(monkeypatch):
+def _pin_tui_config(monkeypatch, tmp_path, cfg: dict) -> None:
+    """Make *cfg* the active TUI config on BOTH seams production reads.
+
+    ``_load_cfg`` is still the behavioural read for model/provider/toolsets, but the fallback chain
+    is no longer resolved through it: ``_load_fallback_model`` reads the config FAIL-CLOSED from
+    disk (``gateway.run_config_loaders.load_fail_closed_fallback_chain``) so an unreadable managed
+    overlay can never be applied as an empty one (R5-2). Patching only the dict seam would leave the
+    chain reader looking at the real home — "patch where production reads" (root AGENTS.md). The
+    on-disk file and the dict carry the SAME content, so every assertion below is unchanged.
+    """
+    import yaml
+
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    monkeypatch.setattr(server, "_active_config_path", lambda: cfg_path)
+    monkeypatch.setattr(server, "_load_cfg", lambda: cfg)
+    # The chain reader keeps ONE per-home retention; a record left by another test in this file
+    # must not answer for this home.
+    from gateway import run_config_loaders
+
+    for attr in ("_LAST_CLEAN_FALLBACK_CHAIN", "_LAST_CLEAN_FALLBACK_CHAIN_AT",
+                 "_LAST_CLEAN_FALLBACK_CHAIN_EPOCH"):
+        getattr(run_config_loaders, attr).clear()
+
+
+def test_load_fallback_model_merges_chain_providers_first(monkeypatch, tmp_path):
     # Parity with HermesCLI / gateway: fallback_providers stays first and keeps
     # its order, with any distinct legacy fallback_model entry merged in after
     # (deduped on provider/model/base_url).
@@ -4582,10 +4607,10 @@ def test_load_fallback_model_merges_chain_providers_first(monkeypatch):
         {"provider": "openrouter", "model": "openai/gpt-5.5"},
         {"provider": "anthropic", "model": "claude-sonnet-4-6"},
     ]
-    monkeypatch.setattr(
-        server,
-        "_load_cfg",
-        lambda: {
+    _pin_tui_config(
+        monkeypatch,
+        tmp_path,
+        {
             "fallback_model": {"provider": "legacy", "model": "legacy-model"},
             "fallback_providers": fallback_chain,
         },
@@ -4598,7 +4623,7 @@ def test_load_fallback_model_merges_chain_providers_first(monkeypatch):
     ]
 
 
-def test_make_agent_passes_configured_fallback_chain(monkeypatch):
+def test_make_agent_passes_configured_fallback_chain(monkeypatch, tmp_path):
     captured = {}
     fallback_chain = [
         {"provider": "openrouter", "model": "openai/gpt-5.5"},
@@ -4613,10 +4638,10 @@ def test_make_agent_passes_configured_fallback_chain(monkeypatch):
     monkeypatch.delenv("HERMES_TUI_PROVIDER", raising=False)
     monkeypatch.delenv("HERMES_DESKTOP", raising=False)
     monkeypatch.delenv("HERMES_DESKTOP_TERMINAL", raising=False)
-    monkeypatch.setattr(
-        server,
-        "_load_cfg",
-        lambda: {
+    _pin_tui_config(
+        monkeypatch,
+        tmp_path,
+        {
             "model": {"default": "gpt-5.5", "provider": "openai-codex"},
             "fallback_providers": fallback_chain,
         },
@@ -17348,7 +17373,7 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
     monkeypatch.setattr(server, "_get_db", lambda: None)
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(server, "_session_info", lambda agent, session=None: {"model": agent.model})
 
     def _emit(event, sid, payload=None):
         if event == "message.complete":
@@ -17415,7 +17440,7 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
     that copy without leaking the transport object.
     """
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(server, "_session_info", lambda agent, session=None: {"model": agent.model})
     agent = types.SimpleNamespace(model="model-live")
     session = _session(
         agent=agent,
@@ -17448,7 +17473,7 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
 
 
 def test_session_activate_switches_live_session_without_closing_siblings(monkeypatch):
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(server, "_session_info", lambda agent, session=None: {"model": agent.model})
     server._sessions["sid-a"] = _session(
         agent=types.SimpleNamespace(model="model-a"),
         history=[{"role": "user", "content": "old"}],
@@ -17485,7 +17510,7 @@ def test_session_activate_switches_live_session_without_closing_siblings(monkeyp
 
 
 def test_session_activate_can_omit_duplicate_desktop_transcript(monkeypatch):
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(server, "_session_info", lambda agent, session=None: {"model": agent.model})
     server._sessions["sid-large"] = _session(
         agent=types.SimpleNamespace(model="model-large"),
         history=[
@@ -20566,7 +20591,7 @@ class TestResolveRuntimeWithFallback:
         assert resolution.selected_model == "claude-sonnet-4-6"
         assert resolution.used_fallback is True
 
-    def test_make_agent_uses_fallback_on_auth_error(self, monkeypatch):
+    def test_make_agent_uses_fallback_on_auth_error(self, monkeypatch, tmp_path):
         """Integration: _make_agent falls back to configured fallback
         provider when the primary provider raises AuthError."""
         import types
@@ -20592,10 +20617,10 @@ class TestResolveRuntimeWithFallback:
         monkeypatch.delenv("HERMES_MODEL", raising=False)
         monkeypatch.delenv("HERMES_INFERENCE_MODEL", raising=False)
         monkeypatch.delenv("HERMES_TUI_PROVIDER", raising=False)
-        monkeypatch.setattr(
-            server,
-            "_load_cfg",
-            lambda: {
+        _pin_tui_config(
+            monkeypatch,
+            tmp_path,
+            {
                 "model": {"default": "gpt-5.5", "provider": "openai-codex"},
                 "fallback_providers": [
                     {"provider": "deepseek", "model": "deepseek-v4-pro"},

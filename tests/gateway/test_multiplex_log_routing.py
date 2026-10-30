@@ -37,8 +37,10 @@ def _emit_under(home: Path, name: str, level: int, msg: str) -> None:
 
 
 def _contains(home: Path, filename: str, needle: str) -> bool:
-    path = home / "logs" / filename
-    return path.exists() and needle in path.read_text()
+    """Layout-agnostic: the shared file on POSIX, this process's segments on Windows."""
+    stem = home / "logs" / filename
+    parts = [stem, *sorted((stem.parent / f"{stem.stem}.d").glob("*.log"))]
+    return any(p.exists() and needle in p.read_text(encoding="utf-8") for p in parts)
 
 
 def test_multiplex_gateway_routes_profile_records_to_their_own_logs(

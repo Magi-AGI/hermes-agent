@@ -2078,7 +2078,10 @@ def select_provider_and_model(args=None):
     # Effective provider the same way the CLI resolves it at startup:
     # config.yaml model.provider > env var > auto-detect
     config_provider = model_cfg.get("provider") if isinstance(model_cfg, dict) else None
-    effective_provider = config_provider or os.getenv("HERMES_INFERENCE_PROVIDER") or "auto"
+    # HERMES_INFERENCE_PROVIDER only stands in for a config that read cleanly (A44).
+    from hermes_cli.config import current_config_read_failure
+    env_provider = None if current_config_read_failure() else os.getenv("HERMES_INFERENCE_PROVIDER")
+    effective_provider = config_provider or env_provider or "auto"
 
     # User-defined custom providers from config.yaml: key → {name, base_url, api_key}
     _custom_provider_map = _named_custom_provider_map(config)

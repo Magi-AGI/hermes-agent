@@ -11,8 +11,6 @@ from hermes_cli.logs import (
     _matches_filters,
     _parse_line_timestamp,
     _parse_since,
-    _read_last_n_lines,
-    _read_tail,
 )
 
 
@@ -128,17 +126,6 @@ class TestMatchesFilters:
 # File reading
 # ---------------------------------------------------------------------------
 
-class TestReadTail:
-    def test_read_small_file(self, tmp_path):
-        log_file = tmp_path / "test.log"
-        lines = [f"2026-01-01 00:00:0{i} INFO x: line {i}\n" for i in range(10)]
-        log_file.write_text("".join(lines))
-
-        result = _read_last_n_lines(log_file, 5)
-        assert len(result) == 5
-        assert "line 9" in result[-1]
-
-
 # ---------------------------------------------------------------------------
 # LOG_FILES registry
 # ---------------------------------------------------------------------------
@@ -149,3 +136,110 @@ class TestLogFiles:
         assert "errors" in LOG_FILES
         assert "gateway" in LOG_FILES
         assert "gui" in LOG_FILES
+
+
+# ---------------------------------------------------------------------------
+# tail_log / list_logs over the merged layout
+# ---------------------------------------------------------------------------
+
+class TestTailLogFollow:
+    def test_follow_on_a_home_with_no_log_yet_waits_instead_of_exiting(self, tmp_path, monkeypatch, capsys):
+        """A fresh Windows home has no file until the first record (delay=True); `hermes logs -f`
+        must wait for it, not exit 1."""
+        import hermes_cli.logs_merge as merge
+        from hermes_cli.logs import tail_log
+
+        home = tmp_path / "home"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        calls = []
+        monkeypatch.setattr(merge, "follow_merged", lambda log_dir, filename, emit, **kw: calls.append((log_dir, filename)))
+        tail_log("agent", follow=True)
+        assert calls == [(home / "logs", "agent.log")]
+
+    def test_without_follow_a_missing_log_still_exits(self, tmp_path, monkeypatch):
+        import pytest
+        from hermes_cli.logs import tail_log
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        with pytest.raises(SystemExit):
+            tail_log("agent", follow=False)
+
+    def test_follow_resumes_from_the_extents_the_tail_read(self, tmp_path, monkeypatch, capsys):
+        """tail_log hands follow_merged the byte extents its initial tail consumed (H4-R1-2b)."""
+        import hermes_cli.logs_merge as merge
+        from hermes_cli.logs import tail_log
+
+        home = tmp_path / "home"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        seg = home / "logs" / "agent.d" / "1-20261030-100000.1.log"
+        seg.parent.mkdir(parents=True)
+        seg.write_bytes(b"2026-10-30 10:00:00 INFO a: one\n2026-10-30 10:00:01 INFO a: two\n")
+        captured = {}
+        monkeypatch.setattr(merge, "follow_merged", lambda log_dir, filename, emit, **kw: captured.update(kw))
+        tail_log("agent", follow=True)
+        assert captured["start_positions"] == {seg: seg.stat().st_size}
+
+
+class TestListLogs:
+    def test_list_shows_rotated_backups_and_sums_segments(self, tmp_path, monkeypatch, capsys):
+        from hermes_cli.logs import list_logs
+
+        home = tmp_path / "home"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        logs = home / "logs"
+        (logs / "agent.d").mkdir(parents=True)
+        (logs / "agent.log").write_text("live\n")
+        (logs / "agent.log.1").write_text("rotated\n")
+        (logs / "agent.d" / "1-20261030-100000.1.log").write_text("a\n")
+        (logs / "agent.d" / "2-20261030-100001.1.log").write_text("b\n")
+        list_logs()
+        out = capsys.readouterr().out
+        assert "agent.log.1" in out
+        assert "agent.d/" in out and "2 process segments" in out
+
+
+    def test_a_log_nobody_may_read_says_permission_denied(self, tmp_path, monkeypatch, capsys):
+        """When every file of the log refuses to open, say so and exit 1 — not an empty banner
+        with exit 0 (H4-R3-2b)."""
+        import pytest
+        import hermes_cli.logs_merge as merge
+        from hermes_cli.logs import tail_log
+
+        home = tmp_path / "home"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        seg = home / "logs" / "agent.d" / "1-20261030-100000.1.log"
+        seg.parent.mkdir(parents=True)
+        seg.write_text("2026-10-30 10:00:00 INFO a: one\n", encoding="utf-8")
+
+        def denied(path, n, *args, **kwargs):
+            raise PermissionError(13, "denied")
+
+        monkeypatch.setattr(merge, "_tail_lines", denied)
+        with pytest.raises(SystemExit):
+            tail_log("agent", follow=False)
+        assert "Permission denied" in capsys.readouterr().out
+
+
+    def test_a_partially_unreadable_log_prints_a_note_about_the_skipped_file(self, tmp_path, monkeypatch, capsys):
+        import hermes_cli.logs_merge as merge
+        from hermes_cli.logs import tail_log
+
+        home = tmp_path / "home"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        logs = home / "logs"
+        logs.mkdir(parents=True)
+        (logs / "agent.log.1").write_text("2026-10-30 09:00:00 INFO a: old\n", encoding="utf-8")
+        live = logs / "agent.log"
+        live.write_text("2026-10-30 10:00:00 INFO a: live\n", encoding="utf-8")
+        real = merge._tail_lines
+
+        def flaky(path, n, *args, **kwargs):
+            if path == live:
+                raise PermissionError(13, "denied")
+            return real(path, n, *args, **kwargs)
+
+        monkeypatch.setattr(merge, "_tail_lines", flaky)
+        tail_log("agent", follow=False)
+        out = capsys.readouterr()
+        assert "old" in out.out
+        assert "agent.log" in out.err and "skipped" in out.err.lower()

@@ -255,6 +255,50 @@ def _compress_session_history(
             # External mutation during compaction — drop the result so we don't clobber concurrent edits.
             finalize_context_engine_compression_notification(agent, committed=False)
             return 0, _get_usage(agent)
+        # Display continuity: fold the rows the compaction REMOVED into the display prefix, or
+        # the payload reconcile loses its anchor against the persisted display lineage and every
+        # post-compression turn vanishes from the transcript (agy R2-3: folding everything
+        # duplicated the preserved tail and inflated message counts). The real pipeline DEEP-COPIES
+        # every surviving row (agy R3-1 killed an identity-based fold) AND can append a synthetic
+        # replay row at the end or rewrite kept rows' content in place (agy R4-5 killed a suffix-
+        # aligned fold: one appended row made it duplicate the whole tail, and in-tail mutations
+        # re-folded kept rows on every later compaction). So the fold is alignment-free: a
+        # multiset of whole-row public-key fingerprints over after_messages, decremented as old rows
+        # match — an old row folds only when no unconsumed equal row survives. A kept-but-mutated
+        # row folds once (its pre-mutation text exists nowhere in after) and never again: the
+        # mutated text the history now holds matches itself on the next pass. The display keeps
+        # the removed rows plus the summary; only the MODEL history shrinks.
+        import json as _json
+
+        def _fingerprint(row):
+            # The WHOLE row, not just (role, content): two assistant rows with equal text but
+            # different tool_calls are different turns, and a content-only key let the removed
+            # one consume the survivor's match, erasing the wrong turn from the display
+            # (agy R5-1). Underscore-prefixed keys are storage bookkeeping, not conversation
+            # identity: DB-backed compactions restamp msg["_row_id"] in place on every
+            # SURVIVING row, which made a literal whole-row key match 0% of the kept tail and
+            # re-duplicate everything (agy round 6).
+            if not isinstance(row, dict):
+                return repr(row)
+            public = {k: v for k, v in row.items() if not str(k).startswith("_")}
+            try:
+                return _json.dumps(public, sort_keys=True, default=str)
+            except Exception:
+                return repr(sorted(public.items(), key=lambda kv: str(kv[0])))
+
+        surviving: dict = {}
+        for new_row in result.after_messages:
+            key = _fingerprint(new_row)
+            surviving[key] = surviving.get(key, 0) + 1
+        folded = []
+        for old_row in (session.get("history") or []):
+            key = _fingerprint(old_row)
+            if surviving.get(key, 0) > 0:
+                surviving[key] -= 1
+            else:
+                folded.append(old_row)
+        session["display_history_prefix"] = (
+            list(session.get("display_history_prefix") or []) + folded)
         session["history"] = result.after_messages
         session["history_version"] = history_version + 1
     return result.removed, _get_usage(agent)
@@ -272,13 +316,20 @@ def _sync_session_key_after_compress(
     old_key = session.get("session_key", "") or ""
     if not new_session_id or new_session_id == old_key:
         return
+    # The key CAS under history_lock decides the ONE winner before any lease-transfer I/O runs
+    # (agy R2-8: two concurrent callers syncing the same rotation both performed the filesystem
+    # transfer). The resume path's volatile refresh re-reads session_key under this lock (it is
+    # refreshed separately — not a component of the resume watermark, which observes
+    # history_version among others).
+    with session.setdefault("history_lock", threading.Lock()):
+        if session.get("session_key", "") == new_session_id:
+            return
+        session["session_key"] = new_session_id
     if not _transfer_active_session_slot(sid, session, new_session_id=new_session_id):
         logger.warning(
             "Compression session lease did not re-anchor: sid=%s old_session_id=%s new_session_id=%s",
             sid, old_key, new_session_id,
         )
-    # Even if the approval module fails to import, anchor session_key on the continuation id.
-    session["session_key"] = new_session_id
     with contextlib.suppress(Exception):
         from tools import approval
         with contextlib.suppress(Exception):

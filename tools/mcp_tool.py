@@ -263,7 +263,7 @@ async def _paginate_full_list(list_method, items_attr: str, server_name: str,
     first page's SEP-2549 hints. Callers must hold the server's ``_rpc_lock``."""
     items: list = []
     cursor = None
-    for _ in range(_MCP_LIST_MAX_PAGES):
+    for page_index in range(_MCP_LIST_MAX_PAGES):
         if not cursor:
             result = await list_method()
         else:
@@ -290,7 +290,9 @@ async def _paginate_full_list(list_method, items_attr: str, server_name: str,
                     result = await list_method(cursor=cursor)
             else:
                 result = await list_method(cursor=cursor)
-        if cache_meta_out is not None and not items:
+        # The FIRST RESPONSE's hints govern the list, even when that page carries zero items
+        # (``not items`` let an empty first page's hint be overwritten by page two's).
+        if cache_meta_out is not None and page_index == 0:
             # mcp 2.x fills ttl_ms=0 / cache_scope="private" when the server sends neither, and a
             # recorded 0 is "immediately stale" — every lazy lookup missed. Only wire values count.
             fields_set = getattr(result, "model_fields_set", None)
@@ -326,7 +328,8 @@ class MCPServerTask(MCPServerRunMixin, MCPServerTransportMixin, MCPServerHealthM
         "_recycled_reason", "initialize_result", "_ping_unsupported", "_list_cache_meta",
         "_reconnect_retries", "_session_proven", "_was_parked", "_inflight_tasks", "_reconnecting",
         "_suspect_reason", "_teardown_race", "_permanent_grace_used", "_stdio_child_pids",
-        "_ever_connected", "_sse_fallback", "_park_reason", "_last_park_line", "_park_probes")
+        "_ever_connected", "_sse_fallback", "_park_reason", "_last_park_line", "_park_probes",
+        "_list_published", "_published_before")
 
     def __init__(self, name: str):
         self.name = name
@@ -409,6 +412,12 @@ class MCPServerTask(MCPServerRunMixin, MCPServerTransportMixin, MCPServerHealthM
         self.initialize_result: Optional[Any] = None
         # SEP-2549 cache hints from the last tools/list (ttl_ms, cache_scope).
         self._list_cache_meta: dict = {}
+        # True while ``_tools`` is this connection's published list (set by publication, cleared
+        # at teardown): the per-profile reconcile publishes ``_tools`` only while it is.
+        self._list_published: bool = False
+        # True once this task has published a list: later publications are REPUBLICATIONS, which keep
+        # the owner's current (possibly edited) policy instead of the connect-time config.
+        self._published_before: bool = False
         # Latched when ``ping`` returns -32601; keepalives then use list_tools. Reset per connect.
         self._ping_unsupported: bool = False
 
@@ -493,6 +502,14 @@ _CIRCUIT_BREAKER_THRESHOLD, _CIRCUIT_BREAKER_COOLDOWN_SEC = 3, 60.0
 # ``_tool_read_only_hints`` by the connection key (the server's own tool annotations).
 _server_trust_levels: Dict[Any, str] = {}
 _tool_read_only_hints: Dict[Any, Dict[str, bool]] = {}
+# (connection key, scope) -> that profile's own server config, for EVERY profile using the connection
+# (the owner, under its own scope, which is None outside a multiplexer; and each adopter). Together
+# with the connection's published list it is the whole input of the per-profile reconcile
+# (mcp_tool_registration._reconcile_profile). Written only by _set_profile_policy.
+_server_scope_configs: Dict[Any, dict] = {}
+# (connection key, scope) -> policy epoch, bumped on every policy write so an in-flight reconcile
+# whose input changed under it recomputes instead of publishing a stale result.
+_server_scope_epochs: Dict[Any, int] = {}
 
 _TRUST_FULL, _TRUST_UNTRUSTED = "full", "untrusted"
 

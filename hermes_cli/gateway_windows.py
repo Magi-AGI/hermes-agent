@@ -1258,13 +1258,13 @@ def _report_gateway_start(via: str) -> None:
     else:
         print(f"✗ Gateway start via {via} FAILED — no stable gateway process detected within the verification window.")
         print("  (The process may have been created and then killed — e.g. by a parent Job Object, #91675.)")
-        print(f"  Check the log for startup errors:\n    type {_hermes_home()}\\logs\\gateway.log\n    type {_hermes_home()}\\logs\\gateway-stdio.log")
+        print(f"  Check the log for startup errors:\n    hermes logs gateway\n    type {_hermes_home()}\\logs\\gateway-stdio.log")
         _print_task_run_hint("  Recovery: schtasks /Run /TN {}   (starts the gateway outside any Job Object)")
 
 
 def _print_next_steps() -> None:
     print("\nNext steps:\n  hermes gateway status                      # Check status")
-    print(f"  type {_hermes_home()}\\logs\\gateway.log       # View logs")
+    print("  hermes logs gateway                        # View logs")
 
 
 def uninstall() -> None:
@@ -1811,5 +1811,5 @@ def restart() -> None:
     if not _wait_for_gateway_ready(timeout_s=15.0):
         raise RuntimeError(
             "Gateway restart did not produce a running gateway process. "
-            "Check logs/gateway.log and run `hermes gateway status`."
+            "Check `hermes logs gateway` and run `hermes gateway status`."
         )

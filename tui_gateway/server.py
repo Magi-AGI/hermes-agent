@@ -26,7 +26,7 @@ from hermes_constants import (
     get_hermes_home, get_hermes_home_override, get_process_hermes_home, profile_name_for_home,
     reset_hermes_home_override, set_hermes_home_override)
 from hermes_cli.env_loader import load_hermes_dotenv
-from utils import file_signature, is_truthy_value
+from utils import content_signature, fast_safe_load, is_truthy_value
 from hermes_state_ids import new_session_id
 from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import canonicalize_replay_history
@@ -1225,16 +1225,24 @@ def _load_cfg_raw() -> dict:
     """The active profile's config.yaml EXACTLY as written — the write-back primitive, ONLY for
     read→mutate→``_save_cfg`` round-trips and raw inspection (defaults / managed overlay / ``${VAR}``
     expansion applied here would be persisted on the next save). Behavioral reads use :func:`_load_cfg`.
-    Cache keyed on the resolved path so profiles don't clobber."""
+    Cache keyed on the resolved path so profiles don't clobber, and on the CONTENT of the bytes it
+    parsed: a metadata-only key let a same-size external edit hit, and the next ``_save_cfg`` wrote the
+    stale state back over it (A43)."""
     global _cfg_cache, _cfg_sig, _cfg_path
     with contextlib.suppress(Exception):
         p = _active_config_path()
-        sig = file_signature(p.stat()) if p.exists() else None
+        try:
+            with open(p, "rb") as handle:
+                st = os.fstat(handle.fileno())
+                raw = handle.read()
+        except FileNotFoundError:
+            return {}
+        sig = content_signature(st, raw)
         with _cfg_lock:
             if _cfg_cache is not None and _cfg_sig == sig and _cfg_path == p:
                 return copy.deepcopy(_cfg_cache)
-        from hermes_cli.config import read_user_config_raw
-        data = read_user_config_raw(p) if p.exists() else {}
+        loaded = fast_safe_load(raw.decode("utf-8")) or {}
+        data = loaded if isinstance(loaded, dict) else {}
         with _cfg_lock:  # cache the RAW config: _save_cfg writes _cfg_cache back to disk
             _cfg_cache, _cfg_sig, _cfg_path = copy.deepcopy(data), sig, p
         return data
@@ -1252,19 +1260,60 @@ def _load_cfg() -> dict:
     return {}
 
 
-def _save_cfg(cfg: dict):
+def _read_cfg_for_update(path: Path) -> tuple:
+    """``(signature, raw mapping)`` of *path* for a read-modify-write, from ONE read. Absent ->
+    ``("absent", {})``. Any other failure RAISES (an unreadable/unparseable file must never become an
+    empty base whose save deletes every other setting), as does a non-mapping root."""
+    try:
+        with open(path, "rb") as handle:
+            st = os.fstat(handle.fileno())
+            raw = handle.read()
+    except FileNotFoundError:
+        return "absent", {}
+    loaded = fast_safe_load(raw.decode("utf-8"))
+    if loaded is None:
+        loaded = {}
+    if not isinstance(loaded, dict):
+        raise ValueError(f"{path}: top level is a {type(loaded).__name__}, not a mapping; not saving")
+    return content_signature(st, raw), loaded
+
+
+_UPDATE_ATTEMPTS = 3
+
+
+def _update_cfg(mutate) -> None:
+    """Apply ``mutate(raw_mapping)`` to the active config.yaml as ONE transaction: a strict read of the
+    current bytes, the mutation, then a save that is refused if the file changed since that read
+    (compare-and-swap on the content signature); a concurrent edit is re-read and the mutation
+    re-applied on top of it. Never saves over a failed read (A43 closure r2)."""
+    from hermes_cli.config import _CONFIG_LOCK
+    from utils import ConfigChangedDuringWrite
+    path = _active_config_path()
+    for attempt in range(_UPDATE_ATTEMPTS):
+        with _CONFIG_LOCK:
+            signature, current = _read_cfg_for_update(path)
+            cfg = copy.deepcopy(current)
+            mutate(cfg)
+            try:
+                _save_cfg(cfg, expected_signature=signature)
+                return
+            except ConfigChangedDuringWrite:
+                if attempt + 1 == _UPDATE_ATTEMPTS:
+                    raise
+
+
+def _save_cfg(cfg: dict, *, expected_signature=None):
     global _cfg_cache, _cfg_sig, _cfg_path
     from utils import atomic_roundtrip_yaml_save
     path = _active_config_path()
     # Comment-, ordering- and Unicode-preserving write (a plain safe_dump clobbered hand-written configs);
-    # fails closed on an unreadable existing config.yaml like atomic_config_write.
-    atomic_roundtrip_yaml_save(path, cfg)
+    # fails closed on an unreadable existing config.yaml like atomic_config_write. Read-modify-write
+    # callers go through _update_cfg, which passes the signature its mapping was read from.
+    atomic_roundtrip_yaml_save(path, cfg, expected_signature=expected_signature)
     with _cfg_lock:
-        _cfg_cache, _cfg_path = copy.deepcopy(cfg), path
-        try:
-            _cfg_sig = file_signature(path.stat())
-        except Exception:
-            _cfg_sig = None
+        # Re-read on next use: signing the file after the write could file a concurrent edit's bytes
+        # under this dict (A43).
+        _cfg_cache, _cfg_sig, _cfg_path = None, None, None
 
 
 def _session_for_key(session_key: str) -> dict | None:
@@ -1462,6 +1511,11 @@ def _resolve_startup_runtime() -> tuple[str, str | None]:
     if explicit_provider := os.environ.get("HERMES_TUI_PROVIDER", "").strip():
         return model, explicit_provider
     if not (explicit_model := _env_model_seed()):
+        return model, None
+    from hermes_cli.config import current_config_read_failure
+    if current_config_read_failure():
+        # No provider detection or env stand-in after a failed config read (A44): the runtime
+        # resolves "auto", which refuses with the read error.
         return model, None
     with contextlib.suppress(Exception):
         from hermes_cli.model_switch import resolve_startup_model_route
@@ -1731,15 +1785,19 @@ def _append_model_switch_marker(session: dict | None, *, model: str, provider: s
 
 
 def _write_config_key(key_path: str, value):
-    # Write-back round-trip: raw read is mandatory — saving the overlaid/expanded view would persist it.
-    cfg = current = _load_cfg_raw()
+    # Write-back round-trip on the RAW file (saving the overlaid/expanded view would persist it), as one
+    # read-modify-write transaction (see _update_cfg).
     *parents, leaf = key_path.split(".")
-    for key in parents:
-        if not isinstance(current.get(key), dict):
-            current[key] = {}
-        current = current[key]
-    current[leaf] = value
-    _save_cfg(cfg)
+
+    def _set(cfg: dict) -> None:
+        current = cfg
+        for key in parents:
+            if not isinstance(current.get(key), dict):
+                current[key] = {}
+            current = current[key]
+        current[leaf] = value
+
+    _update_cfg(_set)
 
 
 _STATUSBAR_MODES = frozenset({"off", "top", "bottom"})
@@ -2099,7 +2157,12 @@ def _session_info(agent, session: dict | None = None) -> dict:
     if session is None:
         session = next((c for c in _sessions.values() if c.get("agent") is agent), None)
     sess = session or {}
-    mirror = _metadata_mirror(session)
+    # Freshness gate (agy R2-5/R3-2), refined: while _compute_host_active the HOST owns the
+    # session's state — the mirror outranks a PARKED in-process agent's stale attrs (and with no
+    # agent it is the only truth), even between turns or after isolation is toggled off for
+    # FUTURE turns. Only once the host association is gone (flag cleared on teardown/local
+    # re-adoption) must the mirror stop shadowing the live agent's own model/provider.
+    mirror = _metadata_mirror(session) if (agent is None or sess.get("_compute_host_active")) else {}
     cwd = _display_session_cwd(session)
     session_key = str(sess.get("session_key") or getattr(agent, "session_id", "") or "")
     personality = sess.get("personality", _display_cfg().get("personality") or "")
@@ -2280,6 +2343,9 @@ def _resolve_runtime_with_fallback(resolve_kwargs: dict | None = None) -> _Runti
     try:
         return _RuntimeFallbackResolution(resolve_runtime_provider(**(resolve_kwargs or {})), None, False)
     except AuthError as primary_exc:
+        from hermes_cli.runtime_provider import fallback_chain_walk_allowed
+        if not fallback_chain_walk_allowed(primary_exc):
+            raise  # never walk the configured chain while the config does not read cleanly (A44)
         for entry in _load_fallback_model() or []:
             fb_provider = str(entry.get("provider") or "").strip() if isinstance(entry, dict) else ""
             fb_model = str(entry.get("model") or "").strip() if isinstance(entry, dict) else ""
@@ -2287,7 +2353,7 @@ def _resolve_runtime_with_fallback(resolve_kwargs: dict | None = None) -> _Runti
                 continue
             try:
                 from hermes_cli.fallback_config import effective_runtime_provider, resolve_entry_api_key
-                fb_kwargs: dict = {"requested": fb_provider, "target_model": fb_model,
+                fb_kwargs: dict = {"requested": fb_provider, "target_model": fb_model, "request_origin": "fallback",
                                    **({"explicit_base_url": entry["base_url"]} if entry.get("base_url") else {})}
                 if fb_api_key := resolve_entry_api_key(entry):
                     fb_kwargs["explicit_api_key"] = fb_api_key
@@ -2810,7 +2876,10 @@ def _find_live_session_by_key(session_key: str, profile_home=_ANY_PROFILE) -> tu
 def _fallback_session_info(session: dict) -> dict:
     agent = session.get("agent")
     if agent is not None:
-        return _session_info(agent)
+        # Pass the session through: without it _session_info walks _sessions.values() UNLOCKED to
+        # find the agent's record (a dict-changed-size crash under concurrent mutation, and the
+        # wrong record after a mid-build agent swap).
+        return _session_info(agent, session)
     # The SESSION's own workspace, not the launch dir (wrong project in the desktop Files pane). `branch` is
     # always emitted ("" outside git) so a stale label clears; `desktop_contract` missing reads as "out of date".
     # Reporting `_default_session_cwd()` here told a lazily-resumed session's client that its workspace was
@@ -2819,10 +2888,42 @@ def _fallback_session_info(session: dict) -> dict:
     # so a client can clear a stale label instead of retaining it — the same contract `_lazy_session_info`
     # above already follows.
     cwd = _session_cwd(session)
-    return {
+    # The lazy info must describe the SESSION, not the launch (pre-existing, proven in the
+    # convoy-resume reviews). Model precedence: a compute-host mirror is the LIVE truth (/model
+    # inside the host updates it while the parent's cold-seeded override goes stale), then the
+    # stored override — a DICT in production, whose model string alone may be surfaced (its
+    # api_key must never reach the wire) — then the session's OWN profile config. Known residual:
+    # an ambient HERMES_MODEL env seed still wins inside _resolve_model (launch semantics shared
+    # by every caller), and a failed profile scope falls back to the launch read.
+    # The mirror speaks only for a session the compute host GENUINELY still owns: a stale
+    # ``_compute_host_active`` survives isolation toggle-off / host teardown until the next
+    # admission, and must not outvote a newer stored override (agy R2-5).
+    mirror = _metadata_mirror(session) if _session_uses_compute_host(session) else {}
+    override = session.get("model_override")
+    override_model = (str(override.get("model") or "") if isinstance(override, dict)
+                      else str(override or "")).strip()
+    model = str(mirror.get("model") or "").strip() or override_model
+    if not model:
+        if session.get("profile_home"):
+            try:
+                with _session_profile_runtime_scope(session, hydrate_secrets=False):
+                    model = _resolve_model()
+            except Exception:
+                logger.debug("lazy info: profile scope for %s failed; resolving unscoped",
+                             session.get("profile_home"), exc_info=True)
+        if not model:
+            model = _resolve_model()
+    info = {
         "cwd": cwd, "branch": git_probe.branch(cwd), "project": _project_info_for_cwd(cwd), "lazy": True,
-        "model": _resolve_model(), "skills": {}, "tools": {}, "desktop_contract": DESKTOP_BACKEND_CONTRACT,
+        "model": model, "skills": {}, "tools": {}, "desktop_contract": DESKTOP_BACKEND_CONTRACT,
     }
+    if name := profile_name_for_home(session.get("profile_home") or get_hermes_home()):
+        info["profile_name"] = name
+    if provider := str(mirror.get("provider") or "").strip():
+        info["provider"] = provider
+    if isinstance(usage := mirror.get("usage"), dict) and usage:
+        info["usage"] = dict(usage)
+    return info
 
 
 def _reconcile_display_with_live(db_display: list[dict], in_memory: list[dict]) -> list[dict]:
@@ -2870,18 +2971,25 @@ def _live_visible_history(session: dict, db, in_memory_fallback: list[dict]) -> 
     return in_memory_fallback
 
 
+def _apply_live_session_touch(sid: str, session: dict, *, cols: int | None,
+                              transport: Transport | None, touch: bool) -> None:
+    """The mutation slice of a live reattach — the caller HOLDS ``session["history_lock"]``.
+    Each arm is gated independently (``session.activate`` passes ``touch`` with no transport; the
+    resume claim passes all three), so callers compose exactly the mutations they own.
+    ``last_active`` drives idle-reap / LRU-eviction ordering and the active list."""
+    if cols is not None:
+        session["cols"] = cols
+    if transport is not None:
+        _rebind_live_transport(sid, session, transport)
+    if touch:
+        session["last_active"] = time.time()
+
+
 def _live_session_payload(
     sid: str, session: dict, *, cols: int | None = None, touch: bool = False,
     transport: Transport | None = None, omit_messages: bool = False) -> dict:
     with session["history_lock"]:
-        if cols is not None:
-            session["cols"] = cols
-        if transport is not None:
-            _rebind_live_transport(sid, session, transport)
-        if touch:
-            # #84417: do not re-fire the live turn's original user text from a stale server-queue
-            # self-duplicate after settle.
-            session["last_active"] = time.time()
+        _apply_live_session_touch(sid, session, cols=cols, transport=transport, touch=touch)
         in_memory_history = list(session.get("display_history_prefix") or []) + list(session.get("history") or [])
         inflight, queued = _inflight_snapshot(session), _queued_prompt_snapshot(session)
         running, turn_started_at = bool(session.get("running")), _turn_started_at(session)

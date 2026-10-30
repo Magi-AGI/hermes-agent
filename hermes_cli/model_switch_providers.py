@@ -604,7 +604,7 @@ def _probe_identity(api_key: Any, api_url: str, native_catalog_provider: str, ha
     from agent.command_token_source import CommandTokenSource
     from hermes_cli.config import _load_config_cache_sig, get_config_path
     from hermes_constants import get_hermes_home
-    from utils import file_signature
+    from utils import file_content_signature
 
     home = Path(get_hermes_home())
     credential = api_key.cache_identity if isinstance(api_key, CommandTokenSource) else (
@@ -612,7 +612,7 @@ def _probe_identity(api_key: Any, api_url: str, native_catalog_provider: str, ha
     inputs = []
     for path in (home / ".env", home / "auth.json"):
         try:
-            inputs.append(file_signature(path.stat()))
+            inputs.append(file_content_signature(path))  # content: same-size key rotation (A43)
         except OSError:
             inputs.append(None)
     return (str(home), _load_config_cache_sig(get_config_path())[1], tuple(inputs),

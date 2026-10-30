@@ -210,6 +210,31 @@ def local_batch_error(entries: List[Dict[str, Any]]) -> str:
     )
 
 
+def deferred_direct_call_error(name: str) -> str:
+    """Correction for the mirror mistake of ``not_deferrable_error``: a deferred tool called
+    directly by its own name. The generic unknown-name error ("does not exist", listing only
+    the visible tools) is false here, and models relay it as "the server is not connected"
+    (H-C, 2026-09-29) even when the same tool ran through ``tool_call`` a turn earlier."""
+    return (f"'{name}' is a deferred tool: it exists and is available, but it is not directly "
+            "callable. Invoke it through tool_call: "
+            f'{{"calls": [{{"name": "{name}", "arguments": {{...}}}}]}}. '
+            "Use tool_describe first if you need its parameter schema.")
+
+
+def connector_direct_call_error(name: str) -> str:
+    """A ``connectors__`` name called directly in a session whose ``tool_call`` admits connector
+    batches. Remote connector tools are never in the local registry, so reachability of THIS name
+    is not known here: the text names the door without asserting that the tool exists."""
+    return (f"'{name}' is a connector tool name. Connector tools are not directly callable: "
+            "invoke them through tool_call: "
+            f'{{"calls": [{{"name": "{name}", "arguments": {{...}}}}]}}. '
+            "Use tool_describe first to confirm it is available here and to get its parameter schema.")
+
+
+SCOPE_UNKNOWN_HINT = (" If this is a deferred tool (tool_search lists them), it is not directly "
+                      "callable: invoke it through tool_call.")
+
+
 def not_deferrable_error(name: str) -> str:
     """Rejection for a ``tool_call`` naming something that is not a deferred tool.
     Two different mistakes reach here and need opposite corrections: a directly-listed

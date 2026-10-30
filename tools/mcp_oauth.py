@@ -330,12 +330,60 @@ def _stdin_is_console() -> bool:
         return False
 
 
+def _config_allows_unattended_oauth() -> bool:
+    """``mcp.interactive_oauth`` from the active profile's config (default true = upstream
+    behaviour). False means only an explicit, user-started login (``force_interactive_oauth``)
+    may run a browser / loopback authorization flow.
+
+    Read with ``read_config_value_fresh``, not the general loader: one uncached read of the
+    current bytes whose value and success are a single observation. The loader can serve a value
+    that is not on disk (last-known-good or DEFAULT_CONFIG after a failed read, or a cached value
+    across a same-size in-place edit that keeps the Windows file signature), and a separate
+    failure check afterwards can look at a different file than the one that failed.
+
+    No config file, an empty file, or a clean read WITHOUT the key keeps the default. Everything
+    else fails CLOSED, because the key exists to guarantee no unattended browser: an unreadable
+    or unparseable user or managed config.yaml (including one that vanishes mid-read, and a
+    broken user file under a managed value), and a present value that is not a recognised
+    boolean. That includes an explicit ``null`` (``interactive_oauth:`` with no value): the key
+    is there, so someone meant to set it, and "no value" is not evidence that they meant true."""
+    try:
+        from hermes_cli.config import CONFIG_KEY_ABSENT, read_config_value_fresh
+        raw = read_config_value_fresh("mcp", "interactive_oauth")
+    except Exception:
+        logger.debug("config could not be read; no unattended MCP OAuth", exc_info=True)
+        return False
+    if raw is CONFIG_KEY_ABSENT:
+        return True
+    if isinstance(raw, bool):
+        return raw
+    if raw is None:
+        logger.warning("mcp.interactive_oauth is present but empty (null); treating it as false "
+                       "(no unattended OAuth browser flows)")
+        return False
+    lowered = str(raw).strip().lower()
+    if lowered in {"true", "1", "yes", "on"}:
+        return True
+    if lowered not in {"false", "0", "no", "off"}:
+        logger.warning("mcp.interactive_oauth=%r is not a boolean; treating it as false "
+                       "(no unattended OAuth browser flows)", raw)
+    return False
+
+
 def _is_interactive() -> bool:
-    """True if we can reasonably expect to interact with a user."""
+    """True if we can reasonably expect to interact with a user.
+
+    Precedence: context suppression (background work) > explicit user login
+    (``force_interactive_oauth``) > ``mcp.interactive_oauth: false`` > console heuristic.
+    Forced beats the config key on purpose: every non-interactive error tells the user to run
+    ``hermes mcp login <server>``, which is exactly the forced path, so letting the key win
+    would leave no way to authorize at all short of editing config."""
     if not _oauth_interactive_enabled.get():
         return False
     if _oauth_interactive_forced.get():
         return True
+    if not _config_allows_unattended_oauth():
+        return False
     return _stdin_is_console()
 
 
@@ -371,6 +419,24 @@ def suppress_interactive_oauth():
     callback actually runs (#35927). A threading.local would not cross that thread boundary.
     """
     return _contextvar_set(_oauth_interactive_enabled, False)
+
+
+@contextlib.contextmanager
+def outside_login_context():
+    """Run the block as if no explicit login were in progress: ``forced`` off and no dashboard
+    flow, while suppression and the config key still apply as usual. For code that creates a
+    LONG-LIVED server task (session registration): the task copies this context, its first
+    transport can serve for hours, and a 401 on it must not run a login's browser flow. A login's
+    own probe connect does not use this."""
+    from tools.mcp_dashboard_oauth import _current_dashboard_flow
+
+    forced_token = _oauth_interactive_forced.set(False)
+    flow_token = _current_dashboard_flow.set(None)
+    try:
+        yield
+    finally:
+        _current_dashboard_flow.reset(flow_token)
+        _oauth_interactive_forced.reset(forced_token)
 
 
 def enter_background_oauth_mode() -> None:
